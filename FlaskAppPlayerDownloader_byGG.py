@@ -36,7 +36,8 @@ Added sub-menu option on channels/vods/series.
 Added open imdb page for vods/series in sub-menu of vods/series, it just does a search for imdb title.
 Added local M3U file parsing in M3U connect options.
 Added EPG layout to items tab.
-Added option to cast to DLNA, Chromecast or Airplay
+Added cast to Chromecast, DLNA, Airplay feature.
+Added Multi-View feature that supports also external urls like youtube/twitch (does not work on age-gated content)
 Varius UI fixes, and adjustments.
 """
 
@@ -71,6 +72,13 @@ except ImportError:
     _CAST_AVAILABLE = False
     def register_cast_routes(*a, **kw): pass
     def get_cast_proxy(): return None
+
+try:
+    from multiview_addon import register_multiview_routes
+    _MULTIVIEW_AVAILABLE = True
+except ImportError:
+    _MULTIVIEW_AVAILABLE = False
+    def register_multiview_routes(*a, **kw): pass
 
 # ===================== OPTIONAL DEPS =====================
 
@@ -2119,11 +2127,17 @@ class XtreamClient:
                 exp = str(exp_raw)
         except Exception:
             exp = str(exp_raw)
-        max_conn = info.get("max_connections", "?")
+        max_conn_raw = info.get("max_connections", None)
+        max_conn_int = 0
+        try:
+            if max_conn_raw is not None:
+                max_conn_int = int(max_conn_raw)
+        except Exception:
+            pass
         active = info.get("active_cons", "?")
         status = info.get("status", "?")
-        self.log(f"[XTREAM] Account: user={self.username}  status={status}  expiry={exp}  connections={active}/{max_conn}")
-        return (self.username, exp)
+        self.log(f"[XTREAM] Account: user={self.username}  status={status}  expiry={exp}  connections={active}/{max_conn_raw}")
+        return (self.username, exp, max_conn_int)
 
     async def fetch_categories(self, mode: str):
         action_map = {"live": "get_live_categories", "vod": "get_vod_categories", "series": "get_series_categories"}
@@ -2513,10 +2527,12 @@ class M3UClient:
     async def account_info(self):
         if self._xtream_client:
             try:
-                return await self._xtream_client.account_info()
+                result = await self._xtream_client.account_info()
+                # XtreamClient.account_info() returns (ident, exp, max_conn) — pass through
+                return result
             except Exception:
                 pass
-        return ("M3U", "loaded")
+        return ("M3U", "loaded", 0)
 
     async def fetch_categories(self, mode: str):
         if self._xtream_client:
@@ -2871,7 +2887,7 @@ async def _connect_async():
                 xt = XtreamClient(detected["base"], detected["username"], detected["password"], state.log)
                 async with xt:
                     await xt.handshake()
-                    ident, exp = await xt.account_info()
+                    ident, exp, max_conn = await xt.account_info()
                     state.m3u_xtream_override = detected
                     state.log(f"[CONNECT] ✓ Xtream API connected: {ident} | {exp}")
                     for m in ("live", "vod", "series"):
@@ -2885,6 +2901,7 @@ async def _connect_async():
                     state.connected = True
                     state.set_status(f"Connected (Xtream via M3U): {ident} | {exp}")
                     return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
+                            "max_connections": max_conn, "portal_url": detected["base"],
                             "is_stalker": False}
             except Exception as e:
                 state.log(f"[CONNECT] Xtream failed ({e}) — falling back to M3U download…")
@@ -2897,7 +2914,9 @@ async def _connect_async():
             await client.handshake()
             state.m3u_cache = dict(client._all_groups)
             state._tvg_url_cache = client._tvg_url
-            ident, exp = await client.account_info()
+            _ai3 = await client.account_info()
+            ident, exp = _ai3[0], _ai3[1]
+            max_conn = _ai3[2] if len(_ai3) > 2 else 0
             state.log(f"[CONNECT] ✓ Connected: {ident} | {exp}")
             for m in ("live", "vod", "series"):
                 tmp = M3UClient(m3u_url, state.log, preloaded=state.m3u_cache)
@@ -2907,13 +2926,16 @@ async def _connect_async():
         state.connected = True
         state.set_status(f"Connected: {ident} | {exp}")
         return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
+                "max_connections": max_conn, "portal_url": state.m3u_url,
                 "is_stalker": state.is_stalker_portal}
 
     # MAC / Xtream
     if state.is_stalker_portal:
         state.log("[CONNECT] 🔌 Stalker portal detected — using StalkerPortalClient (/stalker_portal/server/load.php)")
     async with _make_client() as client:
-        ident, exp = await client.account_info()
+        _ai4 = await client.account_info()
+        ident, exp = _ai4[0], _ai4[1]
+        max_conn = _ai4[2] if len(_ai4) > 2 else 0
         state.log(f"[CONNECT] ✓ Connected: {ident} | {exp}")
         for m in ("live", "vod", "series"):
             try:
@@ -2926,6 +2948,7 @@ async def _connect_async():
     state.connected = True
     state.set_status(f"Connected: {ident} | {exp}")
     return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
+            "max_connections": max_conn, "portal_url": state.url or state.m3u_url,
             "is_stalker": state.is_stalker_portal}
 
 
@@ -2935,6 +2958,17 @@ flask_app = Flask(__name__)
 flask_app.config["SECRET_KEY"] = os.urandom(24)
 if _CAST_AVAILABLE:
     register_cast_routes(flask_app, state, run_async, _make_client)
+if _MULTIVIEW_AVAILABLE:
+    register_multiview_routes(flask_app)
+
+@flask_app.route('/api/multiview/available')
+def multiview_available():
+    """Probe endpoint — returns 200 if multiview_addon is loaded, 404 if not.
+    Mirrors the cast_addon pattern: the JS checks this on load and hides the
+    multiview buttons if the addon is not present."""
+    if _MULTIVIEW_AVAILABLE:
+        return '', 200
+    return '', 404
 
 # NOTE: Do NOT use a shared requests.Session for /api/proxy.
 # HLS.js downloads multiple fragments in parallel — each hits Flask in its own
@@ -3163,13 +3197,21 @@ def api_resolve():
         url = run_async(resolve())
         # Probe for HEVC on live streams only — if detected, serve via transcode proxy
         # so the browser never sees HEVC which it can't decode via MSE
+        is_multiview = request.args.get('mv') == '1'
         if url and isinstance(url, str) and 'play_token=' in url:
             try:
                 probe = _probe_hevc(url)
                 if probe:
-                    state.log(f"[RESOLVE] HEVC detected — routing to transcode proxy")
-                    transcode_url = f"/api/hls_proxy?transcode=1&url={quote(url, safe='')}"
-                    return jsonify({"url": transcode_url, "hevc": True})
+                    if is_multiview:
+                        # For multiview: return the raw URL + hevc=True flag.
+                        # multiview_addon.py will transcode inside its own ffmpeg
+                        # process — no proxy chain needed.
+                        state.log(f"[RESOLVE] HEVC detected — multiview will transcode internally")
+                        return jsonify({"url": url, "hevc": True})
+                    else:
+                        state.log(f"[RESOLVE] HEVC detected — routing to transcode proxy")
+                        transcode_url = f"/api/hls_proxy?transcode=1&url={quote(url, safe='')}"
+                        return jsonify({"url": transcode_url, "hevc": True})
             except Exception as pe:
                 state.log(f"[RESOLVE] HEVC probe failed: {pe}")
         return jsonify({"url": url})
@@ -6450,6 +6492,290 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   #sub-modal{max-height:96vh;border-radius:0}
   #sub-overlay{padding:0;align-items:flex-end}
 }
+
+/* ═══════════════════════════════════════════════════════════
+   MULTIVIEW  — CSS
+   mirrors multiview.js widget structure and cast_addon panel
+   positioning pattern
+════════════════════════════════════════════════════════════ */
+
+/* Full-viewport overlay panel — sits above #main, below header/botnav */
+#p-mv{
+  position:fixed;
+  top:var(--mv-top,44px);   /* updated in JS via _mvUpdateTop() */
+  left:0;right:0;
+  bottom:0;
+  z-index:200;
+  background:var(--bg);
+  display:none;           /* hidden until activated */
+  flex-direction:column;
+  overflow:hidden;
+  transition:top .35s cubic-bezier(.4,0,.2,1); /* follows cpanel open/close */
+}
+#p-mv.mv-active{ display:flex; }
+/* On mobile leave room for botnav */
+@media(max-width:899px){
+  #p-mv{ bottom:56px; }
+}
+/* Desktop multiview button — only shown on desktop (handled by JS) */
+#mv-desktop-btn.mv-btn-active{
+  background:var(--acc) !important;
+  color:#fff !important;
+  border-color:var(--acc2) !important;
+  box-shadow:0 2px 10px var(--glow2);
+}
+
+/* Toolbar — always-visible strip + collapsible body */
+#mv-toolbar{
+  display:flex;flex-direction:column;
+  background:var(--s1);border-bottom:1px solid var(--bdr);flex-shrink:0;
+}
+/* Always-visible strip: toggle arrow + close button */
+#mv-tb-strip{
+  display:flex;align-items:center;gap:5px;
+  padding:4px 8px;min-height:36px;
+}
+#mv-tb-toggle{
+  display:flex;align-items:center;gap:5px;
+  height:28px;padding:0 10px;font-size:12px;font-weight:600;
+  background:var(--s3);border:1px solid var(--bdr2);border-radius:var(--rss);
+  color:var(--txt2);cursor:pointer;
+}
+#mv-tb-toggle:hover{background:var(--s4);color:var(--txt)}
+#mv-tb-arrow{ font-size:10px;transition:transform .2s; }
+#mv-toolbar.tb-open #mv-tb-arrow{ transform:rotate(180deg); }
+/* Collapsible body */
+#mv-tb-body{
+  display:none;flex-wrap:wrap;align-items:center;gap:5px;
+  padding:5px 8px 7px;border-top:1px solid var(--bdr);
+}
+#mv-toolbar.tb-open #mv-tb-body{ display:flex; }
+#mv-toolbar button{
+  height:30px;padding:0 10px;font-size:12px;font-weight:600;
+}
+#mv-toolbar select{
+  height:30px;padding:0 6px;font-size:12px;background:var(--s3);
+  color:var(--txt);border:1px solid var(--bdr2);border-radius:var(--rsm);
+  cursor:pointer;
+}
+.mv-tb-sep{
+  width:1px;height:20px;background:var(--bdr2);margin:0 2px;
+}
+/* Close-multiview button — prominent, uses the same ⊞ icon as the entry button */
+#mv-close-btn{
+  font-size:13px;font-weight:700;letter-spacing:.5px;
+  padding:0 12px;
+  color:var(--txt) !important;
+  background:var(--s4) !important;
+  border:1px solid var(--bdr2) !important;
+  border-radius:var(--rss);
+  gap:4px;
+  transition:background .15s,border-color .15s,color .15s;
+}
+#mv-close-btn:hover{
+  background:var(--acc) !important;
+  border-color:var(--acc2) !important;
+  color:#fff !important;
+  box-shadow:0 2px 8px var(--glow2);
+}
+
+/* Gridstack container — updateGridBackground targets this */
+#mv-grid-wrap{
+  flex:1;overflow:auto;position:relative;
+}
+/* Mobile resize fix:
+   GridStack positions resize handles with small negative insets inside each item.
+   overflow:hidden on the wrapper would clip them; overflow:auto lets them render.
+   touch-action:none stops the browser treating the handle drag as a scroll
+   gesture — without this, touch-resize is silently swallowed on Android/iOS. */
+#mv-grid-wrap .ui-resizable-handle,
+#mv-grid-wrap .grid-stack-item > .ui-resizable-se,
+#mv-grid-wrap .grid-stack-item > .ui-resizable-sw,
+#mv-grid-wrap .grid-stack-item > .ui-resizable-ne,
+#mv-grid-wrap .grid-stack-item > .ui-resizable-nw,
+#mv-grid-wrap .grid-stack-item > .ui-resizable-n,
+#mv-grid-wrap .grid-stack-item > .ui-resizable-e,
+#mv-grid-wrap .grid-stack-item > .ui-resizable-s,
+#mv-grid-wrap .grid-stack-item > .ui-resizable-w {
+  touch-action: none !important;
+}
+/* Make resize handles larger on touch screens so they're easier to grab */
+@media(max-width:899px){
+  #mv-grid-wrap .ui-resizable-handle { min-width:20px; min-height:20px; }
+  #mv-grid-wrap .ui-resizable-se     { width:20px !important; height:20px !important; }
+  #mv-grid-wrap .ui-resizable-s,
+  #mv-grid-wrap .ui-resizable-e      { width:16px !important; height:16px !important; }
+}
+#mv-grid-wrap .grid-stack{
+  min-height:100%;height:100%;
+  background-color:var(--s1);
+  background-image:
+    linear-gradient(var(--bdr) 1px,transparent 1px),
+    linear-gradient(90deg,var(--bdr) 1px,transparent 1px);
+  background-size:var(--mv-cell-w,80px) var(--mv-cell-w,80px);
+}
+
+/* Widget content wrapper — mirrors .grid-stack-item-content styling */
+.mv-widget-content{
+  display:flex;flex-direction:column;
+  background:var(--s2);border-radius:6px;
+  border:1px solid var(--bdr);overflow:hidden;
+  height:100%;
+}
+.mv-widget-content.mv-active-player{
+  border-color:var(--acc);
+  box-shadow:0 0 0 2px var(--glow2);
+}
+
+/* Player header — mirrors .player-header in multiview.js widgetHTML */
+.mv-hdr{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:3px 6px;background:var(--s1);flex-shrink:0;min-height:28px;
+  touch-action:none; /* allow GridStack to intercept drag on mobile */
+}
+.mv-hdr-info{
+  flex:1;min-width:0;display:flex;flex-direction:column;gap:1px;overflow:hidden;
+}
+.mv-hdr-title{
+  font-size:11px;font-weight:700;color:var(--txt2);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+/* Portal name + connection count badge shown beneath the channel title */
+.mv-hdr-portal{
+  font-size:9px;color:var(--txt3);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;line-height:1.2;
+}
+.mv-hdr-portal:empty{display:none}
+/* Highlight when we know max connections and are approaching the limit */
+.mv-hdr-portal.mv-conn-warn{color:#f59e0b}
+.mv-hdr-portal.mv-conn-full{color:#ef4444}
+
+/* URL entry bar — shown inline below the header when the 🔗 button is clicked */
+.mv-url-bar{
+  display:flex;align-items:center;gap:4px;
+  padding:4px 6px;background:var(--s1);border-top:1px solid var(--bdr);
+  flex-shrink:0;
+}
+.mv-url-bar.mv-hidden{display:none}
+.mv-url-input{
+  flex:1;height:24px;font-size:11px;padding:0 6px;
+  background:var(--s3);border:1px solid var(--bdr2);border-radius:3px;
+  color:var(--txt);
+}
+.mv-url-input:focus{outline:none;border-color:var(--acc)}
+.mv-url-bar button{
+  height:24px;padding:0 7px;font-size:11px;flex-shrink:0;
+  background:var(--s3);border:1px solid var(--bdr2);border-radius:3px;
+  color:var(--txt2);cursor:pointer;
+}
+.mv-url-bar button:hover{background:var(--s4);color:var(--txt)}
+.mv-ctrl{
+  display:flex;align-items:center;gap:2px;flex-shrink:0;
+  overflow:hidden; /* clips when tile is too narrow */
+  min-width:0;
+}
+.mv-ctrl button{
+  height:22px;width:22px;min-width:22px;padding:0;font-size:11px;
+  background:none;border:1px solid transparent;border-radius:3px;
+  color:var(--txt2);display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;
+}
+.mv-ctrl button:hover{background:var(--s4);border-color:var(--bdr2);color:var(--txt)}
+.mv-ctrl input[type=range]{
+  width:44px;min-width:0;height:4px;padding:0;cursor:pointer;
+  accent-color:var(--acc);flex-shrink:1;
+}
+/* On very small tiles progressively hide lower-priority controls.
+   Priority order (highest→lowest): 📺 sel, 🔗 url, ⏸ pp, 🔊 mute, vol, ⛶ fs, ⏹ stop, ✕ rm */
+.mv-widget-content.mv-tiny .mv-vol       { display:none; }
+.mv-widget-content.mv-tiny .mv-fs-btn    { display:none; }
+.mv-widget-content.mv-xs   .mv-stop-btn  { display:none; }
+.mv-widget-content.mv-xs   .mv-pp-btn    { display:none; }
+.mv-widget-content.mv-xs   .mv-url-btn   { display:none; }
+
+/* Player body */
+.mv-body{flex:1;position:relative;background:#000;overflow:hidden;min-height:0}
+.mv-video{width:100%;height:100%;object-fit:contain;display:block}
+.mv-video.mv-hidden{display:none}
+
+/* Placeholder — mirrors .player-placeholder */
+.mv-placeholder{
+  position:absolute;inset:0;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:8px;
+  color:var(--txt3);font-size:11px;cursor:pointer;
+  background:var(--s2);
+}
+.mv-placeholder:hover{background:var(--s3);color:var(--txt2)}
+.mv-placeholder .mv-ph-ico{font-size:28px;opacity:.35}
+.mv-placeholder.mv-hidden{display:none}
+
+/* Channel selector modal — mirrors multiviewChannelSelectorModal */
+#mv-sel-overlay{
+  display:none;position:fixed;inset:0;z-index:1100;
+  background:rgba(0,0,0,.75);align-items:center;justify-content:center;
+}
+#mv-sel-overlay.open{display:flex}
+#mv-sel-modal{
+  background:var(--s2);border-radius:var(--r);
+  border:1px solid var(--bdr2);
+  width:min(400px,94vw);max-height:80vh;
+  display:flex;flex-direction:column;
+  box-shadow:var(--sh);
+}
+.mv-sel-hdr{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:12px 14px 10px;border-bottom:1px solid var(--bdr);flex-shrink:0;
+}
+.mv-sel-hdr h3{font-size:11px;font-weight:800;text-transform:uppercase;
+  letter-spacing:1.5px;color:var(--txt2)}
+#mv-sel-search{
+  margin:8px 10px;height:32px;font-size:12px;
+}
+#mv-sel-list{
+  flex:1;overflow-y:auto;padding:4px 6px;
+}
+.mv-ch-row{
+  display:flex;align-items:center;gap:8px;padding:6px 8px;
+  border-radius:var(--rsm);cursor:pointer;transition:background .12s;
+}
+.mv-ch-row:hover{background:var(--s4)}
+.mv-ch-logo{width:32px;height:22px;object-fit:contain;border-radius:3px;
+  background:var(--s3);flex-shrink:0}
+.mv-ch-name{font-size:12px;font-weight:600;color:var(--txt);
+  flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mv-sel-footer{padding:8px 10px;border-top:1px solid var(--bdr);flex-shrink:0;
+  display:flex;justify-content:flex-end}
+
+/* Save layout modal */
+#mv-save-overlay{
+  display:none;position:fixed;inset:0;z-index:1200;
+  background:rgba(0,0,0,.75);align-items:center;justify-content:center;
+}
+#mv-save-overlay.open{display:flex}
+#mv-save-modal{
+  background:var(--s2);border-radius:var(--r);border:1px solid var(--bdr2);
+  width:min(320px,90vw);padding:16px;box-shadow:var(--sh);
+}
+#mv-save-modal h3{font-size:11px;font-weight:800;text-transform:uppercase;
+  letter-spacing:1.5px;color:var(--txt2);margin-bottom:10px}
+#mv-save-name{height:34px;font-size:13px;margin-bottom:10px}
+.mv-save-btns{display:flex;gap:7px;justify-content:flex-end}
+.mv-save-btns button{height:32px;padding:0 14px;font-size:12px}
+
+/* Confirm overlay for layout operations */
+#mv-confirm-overlay{
+  display:none;position:fixed;inset:0;z-index:1300;
+  background:rgba(0,0,0,.75);align-items:center;justify-content:center;
+}
+#mv-confirm-overlay.open{display:flex}
+#mv-confirm-modal{
+  background:var(--s2);border-radius:var(--r);border:1px solid var(--bdr2);
+  width:min(340px,90vw);padding:18px;box-shadow:var(--sh);
+}
+#mv-confirm-title{font-weight:700;color:var(--txt);margin-bottom:6px}
+#mv-confirm-msg{font-size:12px;color:var(--txt2);margin-bottom:14px;line-height:1.5}
+.mv-confirm-btns{display:flex;gap:7px;justify-content:flex-end}
+.mv-confirm-btns button{height:32px;padding:0 14px;font-size:12px}
 </style>
 </head>
 <body>
@@ -6691,6 +7017,10 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
           <span id="pctrl-arrow" style="font-size:10px;color:var(--txt3);transition:transform .2s;display:inline-block">▲</span>
           <h3 style="font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1.5px;color:var(--txt2);margin:0">Player Controls</h3>
         </div>
+        <button id="mv-desktop-btn" onclick="event.stopPropagation();mvToggle()" title="Multi-View"
+          style="height:26px;padding:0 10px;font-size:12px;font-weight:700;border-radius:var(--rss);
+                 background:var(--s4);color:var(--txt2);border:1px solid var(--bdr2);
+                 letter-spacing:.5px;display:none">⊞ Multi-View</button>
       </div>
       <div id="pctrl-body" style="overflow:hidden;transition:max-height .25s ease;max-height:0">
         <div class="pinfo">
@@ -6810,6 +7140,93 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 
 </main>
 
+<!-- ═══════════════════════════════════════════════════════
+     MULTIVIEW PANEL  (fixed overlay above #main)
+     Structure mirrors multiview.js panel/widget layout
+════════════════════════════════════════════════════════ -->
+<div id="p-mv">
+
+  <!-- Toolbar — always-visible strip + collapsible controls body -->
+  <div id="mv-toolbar">
+    <!-- Strip: always visible — toggle + close -->
+    <div id="mv-tb-strip">
+      <button id="mv-tb-toggle" title="Show/hide toolbar controls" onclick="mvTbToggle()">
+        <span id="mv-tb-arrow">▾</span> Controls
+      </button>
+      <div style="flex:1"></div>
+      <button class="btn-ghost" id="mv-close-btn" title="Close Multi-View">⊞ Multi-View ✕</button>
+    </div>
+    <!-- Collapsible body — hidden on mobile after load -->
+    <div id="mv-tb-body">
+      <button class="btn-ghost" id="mv-add-btn"     title="Add player">＋ Add</button>
+      <button class="btn-ghost" id="mv-remove-btn"  title="Remove last player">－ Remove</button>
+      <div class="mv-tb-sep"></div>
+      <button class="btn-ghost" id="mv-layout-auto" title="Auto layout">⊞ Auto</button>
+      <button class="btn-ghost" id="mv-layout-1p1"  title="1+1: two equal players">1＋1</button>
+      <button class="btn-ghost" id="mv-layout-1p2"  title="1+2: large left, two stacked right">1＋2</button>
+      <div class="mv-tb-sep"></div>
+      <button class="btn-ghost" id="mv-save-btn"    title="Save current layout">💾 Save</button>
+      <select id="mv-layouts-sel" title="Saved layouts">
+        <option value="" disabled selected>Load layout…</option>
+      </select>
+      <button class="btn-ghost" id="mv-load-btn"    title="Load selected layout">Load</button>
+      <button class="btn-ghost" id="mv-delete-btn"  title="Delete selected layout">🗑</button>
+    </div>
+  </div>
+
+  <!-- Gridstack grid — id mirrors multiview.js GridStack.init('#multiview-grid') -->
+  <div id="mv-grid-wrap">
+    <div class="grid-stack" id="multiview-grid"></div>
+  </div>
+
+</div>
+
+<!-- ── Channel selector modal ──────────────────────────────
+     Mirrors multiviewChannelSelectorModal in multiview.js  -->
+<div id="mv-sel-overlay">
+  <div id="mv-sel-modal">
+    <div class="mv-sel-hdr">
+      <button id="mv-sel-back" style="display:none;background:none;border:none;
+        color:var(--txt2);font-size:13px;font-weight:700;padding:0 8px 0 0;
+        cursor:pointer;white-space:nowrap">← Back</button>
+      <h3 id="mv-sel-title">Browse Categories</h3>
+      <button class="btn-ghost" id="mv-sel-close"
+        style="height:26px;width:26px;padding:0;font-size:14px;flex-shrink:0">✕</button>
+    </div>
+    <input id="mv-sel-search" type="search" placeholder="Search…"/>
+    <div id="mv-sel-list"></div>
+    <div class="mv-sel-footer">
+      <button class="btn-ghost" id="mv-sel-cancel"
+        style="height:30px;padding:0 14px;font-size:12px">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Save layout modal ───────────────────────────────────
+     Mirrors saveLayoutModal in multiview.js              -->
+<div id="mv-save-overlay">
+  <div id="mv-save-modal">
+    <h3>Save Layout</h3>
+    <input id="mv-save-name" type="text" placeholder="Layout name…"/>
+    <div class="mv-save-btns">
+      <button class="btn-ghost" id="mv-save-cancel">Cancel</button>
+      <button class="btn-acc"   id="mv-save-ok">💾 Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Confirm modal (layout operations) ─────────────────── -->
+<div id="mv-confirm-overlay">
+  <div id="mv-confirm-modal">
+    <div id="mv-confirm-title">Confirm</div>
+    <div id="mv-confirm-msg"></div>
+    <div class="mv-confirm-btns">
+      <button class="btn-ghost" id="mv-confirm-cancel">Cancel</button>
+      <button class="btn-acc"   id="mv-confirm-ok">OK</button>
+    </div>
+  </div>
+</div>
+
 <!-- ITEM CONTEXT MENU -->
 <div id="item-menu">
   <div id="item-menu-hdr">Options</div>
@@ -6834,6 +7251,9 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   </button>
   <button class="nt" id="t-player" onclick="showT('p-player','t-player')">
     <span class="nt-ico">▶️</span><span>Player</span>
+  </button>
+  <button class="nt" id="t-mv" onclick="mvToggle()">
+    <span class="nt-ico">⊞</span><span>Multi</span>
   </button>
   <button class="nt" id="t-log" onclick="showT('p-log','t-log')">
     <span class="nt-ico">📜</span><span>Log</span>
@@ -7132,6 +7552,9 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js" crossorigin="anonymous"></script>
 <script>if(typeof Hls==='undefined'){document.write('<scr'+'ipt src="https://unpkg.com/hls.js@1.5.7/dist/hls.min.js"><\/scr'+'ipt>');}</script>
 <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridstack@10.3.1/dist/gridstack.min.css"/>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridstack@10.3.1/dist/gridstack-extra.min.css"/>
+<script src="https://cdn.jsdelivr.net/npm/gridstack@10.3.1/dist/gridstack-all.min.js"></script>
 <script>
 const CFG = {{ config | safe }};
 
@@ -7743,6 +8166,15 @@ async function doConnect(){
       const _portalHost = _rawUrl ? (()=>{try{return new URL(_rawUrl).hostname;}catch(e){return _rawUrl.replace(/https?:\/\//,'').split('/')[0].split(':')[0];}})() : '';
       document.getElementById('portal-name-label').textContent = _portalHost || '—';
       _favsPortalKey = (_portalHost || '—').trim();
+      // Populate multiview portal max-connection registry
+      // so the badge can show e.g. "myportal.tv  ·  2/4 connections"
+      if(d.max_connections && d.max_connections > 0 && (d.portal_url || _rawUrl)){
+        try {
+          const _pu = new URL(d.portal_url || _rawUrl);
+          const _pKey = _pu.hostname + (_pu.port ? ':'+_pu.port : '');
+          window._mvPortalMaxConns[_pKey] = d.max_connections;
+        } catch(e){}
+      }
       catsCache=d.categories||{};
       // Always land on Live categories after any connect
       mode='live';
@@ -10581,7 +11013,1270 @@ function wonFindChannel(btn, idx){
     document.getElementById('cast-fab').style.display = 'none';
   });
 </script>
+<script>
+  // Hide all Multi-View entry points if multiview_addon.py is not present.
+  // Mirrors the cast_addon pattern: probe returns 404 when addon is not loaded.
+  fetch('/api/multiview/available').then(r => {
+    if (!r.ok) _mvHideAll();
+  }).catch(() => {
+    _mvHideAll();
+  });
+  function _mvHideAll(){
+    // Desktop ⊞ Multi-View button in Player Controls bar
+    const desktopBtn = document.getElementById('mv-desktop-btn');
+    if(desktopBtn) desktopBtn.style.display = 'none';
+    // Mobile ⊞ Multi tab in bottom navigation
+    const mobileTab = document.getElementById('t-mv');
+    if(mobileTab) mobileTab.style.display = 'none';
+  }
+</script>
 <script src="/api/cast/ui.js"></script>
+<script>
+/* ═══════════════════════════════════════════════════════════════════════
+   MULTIVIEW  —  JavaScript (Phases 3–9)
+
+   Design cross-references:
+     multiview.js  → playChannelInWidget, stopAndCleanupPlayer,
+                     addPlayerWidget, attachWidgetEventListeners,
+                     setActivePlayer, pauseAndClearAllPlayers,
+                     handleVisibilityChange, saveLayout, loadSelectedLayout,
+                     applyPresetLayout, populateChannelSelector
+     server.js     → /stream dedup, /api/stream/stop reference guard
+     multiview_addon.py → /api/multiview/stream, /api/multiview/stream/stop,
+                          /api/multiview/layouts CRUD
+   ════════════════════════════════════════════════════════════════════════ */
+
+// ── STATE  (mirrors multiview.js top-level variables exactly) ────────────────
+// multiview.js: const players = new Map();
+const mvPlayers    = new Map();   // widgetId → mpegts player instance
+// multiview.js: const playerUrls = new Map();
+const mvUrls       = new Map();   // widgetId → original channel URL
+// multiview.js: let activePlayerId = null;
+let mvActiveId     = null;
+// multiview.js: let channelSelectorCallback = null;
+let mvSelCallback  = null;
+// multiview.js: let grid;
+let mvGrid         = null;
+// multiview.js: const MAX_PLAYERS = 9;
+const MV_MAX       = 9;
+
+// Portal tracking — maps widgetId → { portalKey, portalName, maxConn }
+// portalKey = hostname:port extracted from the resolved stream URL
+const mvPortalMeta  = new Map();
+
+// Optional override: populate window._mvPortalMaxConns[portalKey] = N
+// when you connect to a portal that exposes its max-connection limit
+// (Xtream API auth response includes user_info.max_connections).
+// The multiview UI reads from this object to show "N/M" instead of "N conn".
+if (!window._mvPortalMaxConns) window._mvPortalMaxConns = {};
+
+// Client identity — replaces server.js userId for stream key construction.
+// Mirrors server.js: const streamKey = `${userId}::${streamUrl}::${profileId}`;
+// Stored in localStorage so the same client_id survives page reloads within
+// a session (ffmpeg processes keyed by it remain valid).
+let mvClientId = (()=>{
+  try {
+    let id = localStorage.getItem('mv_client_id');
+    if(!id){ id = 'mv-' + Date.now() + '-' + Math.random().toString(36).slice(2,8); localStorage.setItem('mv_client_id',id); }
+    return id;
+  } catch(e){ return 'mv-'+Date.now(); }
+})();
+
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+
+// mirrors multiview.js isVODFile() — not used here but kept for completeness
+function _mvIsVod(url){ return /\.(mkv|mp4|avi|mov|m4v|flv|wmv|mpg|mpeg|webm)/i.test(url.split('?')[0]); }
+
+// ── Portal tracking helpers ───────────────────────────────────────────────────
+
+// Extract a stable portal key (hostname + port) and friendly display name from
+// any stream URL.  Used to group connections by portal for the badge display.
+function _mvPortalKeyFromUrl(url){
+  try {
+    const p = new URL(url);
+    const key  = p.hostname + (p.port ? ':'+p.port : '');
+    // Display name: just hostname, strip leading 'www.'
+    const name = p.hostname.replace(/^www\./,'');
+    return { key, name };
+  } catch(e) {
+    return { key: 'unknown', name: 'unknown' };
+  }
+}
+
+// Recount active connections per portal and refresh all widget portal badges.
+// Called whenever a player starts or stops.
+function _mvUpdatePortalBadges(){
+  // Tally connections per portalKey
+  const counts = {};
+  for(const meta of mvPortalMeta.values()){
+    if(!meta || !meta.portalKey) continue;
+    counts[meta.portalKey] = (counts[meta.portalKey] || 0) + 1;
+  }
+
+  // Update each widget's badge
+  for(const [wid, meta] of mvPortalMeta.entries()){
+    const cEl = document.getElementById('mwc-' + wid);
+    if(!cEl || !meta) continue;
+    const badge = cEl.querySelector('.mv-hdr-portal');
+    if(!badge) continue;
+
+    const count   = counts[meta.portalKey] || 1;
+    const maxConn = window._mvPortalMaxConns[meta.portalKey] || 0;
+    const connStr = maxConn > 0 ? `${count}/${maxConn}` : `${count}`;
+    const label   = count === 1 ? 'connection' : 'connections';
+    badge.textContent = `${meta.portalName}  ·  ${connStr} ${label}`;
+
+    // Colour-code badge when approaching / hitting the limit
+    badge.classList.remove('mv-conn-warn','mv-conn-full');
+    if(maxConn > 0){
+      if(count >= maxConn)           badge.classList.add('mv-conn-full');
+      else if(count >= maxConn - 1)  badge.classList.add('mv-conn-warn');
+    }
+  }
+}
+
+// ── URL / YouTube play helper ─────────────────────────────────────────────────
+
+// Detect URLs that need yt-dlp resolution before we can stream them.
+function _mvNeedsResolve(url){
+  return /youtube\.com\/|youtu\.be\/|twitch\.tv\/|dailymotion\.com|vimeo\.com/i.test(url);
+}
+
+// Play an arbitrary URL (IPTV direct stream, YouTube, etc.) inside a widget.
+// If the URL belongs to a supported site, we call /api/multiview/resolve_url
+// first to get a streamable direct URL, then feed it through the normal
+// mpegts.js + ffmpeg proxy pipeline.
+async function _mvPlayFromUrl(wid, rawUrl, cEl){
+  if(!cEl){ console.warn('[MV] _mvPlayFromUrl: cEl is null for wid='+wid); return; }
+  rawUrl = (rawUrl||'').trim();
+  if(!rawUrl){ toast('Enter a URL first', 'wrn'); return; }
+
+  const titleEl = cEl ? cEl.querySelector('.mv-hdr-title') : null;
+  if(titleEl) titleEl.textContent = 'Resolving…';
+
+  let finalUrl    = rawUrl;
+  let channelName = '';
+
+  if(_mvNeedsResolve(rawUrl)){
+    // Ask the server to resolve via yt-dlp
+    try {
+      const r = await fetch('/api/multiview/resolve_url', {
+        method:  'POST',
+        headers: {'Content-Type':'application/json'},
+        body:    JSON.stringify({url: rawUrl})
+      });
+      const d = await r.json();
+      if(d.error){
+        toast('Resolve error: ' + d.error, 'err');
+        if(titleEl) titleEl.textContent = 'No Channel';
+        return;
+      }
+      finalUrl    = d.url;
+      channelName = d.title || '';
+    } catch(e){
+      toast('Could not resolve URL: ' + e, 'err');
+      if(titleEl) titleEl.textContent = 'No Channel';
+      return;
+    }
+  }
+
+  // Build a friendly display name from the URL if yt-dlp didn't give one
+  if(!channelName){
+    try {
+      const p = new URL(rawUrl);
+      channelName = p.hostname.replace(/^www\./,'') + (p.pathname !== '/' ? ' · '+p.pathname.split('/').filter(Boolean).pop() : '');
+    } catch(e){ channelName = rawUrl.slice(0,40); }
+  }
+
+  // Synthesise a channel object for _mvPlayChannel
+  const { key: _synthKey, name: _synthName } = _mvPortalKeyFromUrl(finalUrl);
+  const synth = {
+    name:             channelName,
+    _direct_url:      finalUrl,   // skips the /api/resolve call in _mvPlayChannel
+    id:               'custom-url-' + Date.now(),
+    _portal_override: { key: _synthKey, name: _synthName }
+  };
+
+  await _mvPlayChannel(wid, synth, cEl);
+}
+
+// ── Toolbar collapse ─────────────────────────────────────────────────────────
+
+// On mobile the toolbar body starts collapsed so the grid gets maximum space.
+// On desktop it starts expanded since there is plenty of room.
+function _mvTbInit(){
+  const tb = document.getElementById('mv-toolbar');
+  if(!tb) return;
+  const isMobile = window.innerWidth < 900;
+  // Start collapsed on mobile, expanded on desktop
+  tb.classList.toggle('tb-open', !isMobile);
+  _mvFitCellHeight();
+}
+
+function mvTbToggle(){
+  const tb = document.getElementById('mv-toolbar');
+  if(!tb) return;
+  tb.classList.toggle('tb-open');
+  _mvFitCellHeight();
+}
+
+// Auto-collapse toolbar after a layout loads (mobile only).
+function _mvTbCollapseIfMobile(){
+  if(window.innerWidth >= 900) return;
+  const tb = document.getElementById('mv-toolbar');
+  if(tb) tb.classList.remove('tb-open');
+  _mvFitCellHeight();
+}
+
+// Simple confirm dialog using our custom modal
+// mirrors multiview.js showConfirm() calls
+let _mvConfirmOk = null;
+function _mvConfirm(title, msg, onOk, onCancel){
+  document.getElementById('mv-confirm-title').textContent = title;
+  document.getElementById('mv-confirm-msg').textContent   = msg;
+  _mvConfirmOk = onOk;
+  document.getElementById('mv-confirm-overlay').classList.add('open');
+  document.getElementById('mv-confirm-cancel').onclick = ()=>{
+    document.getElementById('mv-confirm-overlay').classList.remove('open');
+    if(onCancel) onCancel();
+  };
+}
+document.getElementById('mv-confirm-ok').addEventListener('click', ()=>{
+  document.getElementById('mv-confirm-overlay').classList.remove('open');
+  if(_mvConfirmOk) _mvConfirmOk();
+  _mvConfirmOk = null;
+});
+
+// ── INIT / OPEN / CLOSE ───────────────────────────────────────────────────────
+
+// ── Top-position tracking ─────────────────────────────────────────────────────
+// p-mv must sit directly below the header (which grows when cpanel opens).
+// We read the live offsetHeight of #hdr and push it into the CSS variable
+// --mv-top.  Called on open, on cpanel toggle, and on window resize.
+function _mvUpdateTop(){
+  const hdr = document.getElementById('hdr');
+  const h   = hdr ? hdr.offsetHeight : 44;
+  document.documentElement.style.setProperty('--mv-top', h + 'px');
+  // Refit cell height now that the panel height has changed.
+  // This is what makes the grid expand to fill the space when the connect
+  // panel closes (the most common case after first connect).
+  _mvFitCellHeight();
+}
+
+// Patch toggleCP so the panel top follows the connect panel animation.
+// We poll offsetHeight for the duration of the CSS transition (350 ms).
+(function(){
+  const _origToggleCP = window.toggleCP;
+  const _origCloseCP  = window.closeCP;
+  function _trackCpTransition(){
+    let t = 0;
+    const iv = setInterval(()=>{
+      _mvUpdateTop();
+      t += 30;
+      if(t >= 400) clearInterval(iv);
+    }, 30);
+  }
+  window.toggleCP = function(){
+    if(typeof _origToggleCP === 'function') _origToggleCP();
+    _trackCpTransition();
+  };
+  window.closeCP = function(){
+    if(typeof _origCloseCP === 'function') _origCloseCP();
+    _trackCpTransition();
+  };
+})();
+
+// Keep top in sync on window resize too
+window.addEventListener('resize', ()=>{ _mvUpdateTop(); _mvFitCellHeight(); });
+
+// Show/hide the desktop multiview button (only meaningful on desktop ≥900px)
+function _mvSyncDesktopBtn(){
+  const btn  = document.getElementById('mv-desktop-btn');
+  if(!btn) return;
+  const isDesktop = window.innerWidth >= 900;
+  btn.style.display = isDesktop ? '' : 'none';
+  const isOpen = document.getElementById('p-mv').classList.contains('mv-active');
+  btn.classList.toggle('mv-btn-active', isOpen);
+}
+window.addEventListener('resize', _mvSyncDesktopBtn);
+
+// Toggle: open if closed, close if open.
+// Called from both the desktop pctrl-hdr button and the mobile botnav tab.
+function mvToggle(){
+  const isOpen = document.getElementById('p-mv').classList.contains('mv-active');
+  if(isOpen){ mvClose(); } else { mvOpen(); }
+}
+
+// Called from ⊞ button in pctrl-hdr (desktop) and botnav t-mv tab (mobile).
+function mvOpen(){
+  _mvUpdateTop();
+  const panel = document.getElementById('p-mv');
+  panel.classList.add('mv-active');
+
+  // Highlight the botnav button (mobile)
+  document.querySelectorAll('.nt').forEach(b=>b.classList.remove('on'));
+  const tb = document.getElementById('t-mv');
+  if(tb) tb.classList.add('on');
+
+  _mvSyncDesktopBtn();
+
+  // mirrors multiview.js initMultiView()
+  if(mvGrid){ _mvTbInit(); _mvLoadLayouts(); return; }
+
+  // First time — initialise grid
+  mvGrid = GridStack.init({
+    float: true,
+    cellHeight: '8vh',
+    margin: 5,
+    column: 12,
+    alwaysShowResizeHandle: true,  // always show on all platforms, not just mobile
+    resizable: { handles: 'e, se, s, sw, w' },
+    // Restrict drag to the header bar so touch on the video body scrolls normally.
+    // On mobile this prevents the video area from eating drag gestures.
+    handle: '.mv-hdr',
+    handleClass: 'mv-hdr',
+  }, '#multiview-grid');
+
+  _mvUpdateGridBg();
+  mvGrid.on('change', _mvUpdateGridBg);
+
+  _mvSetupListeners();
+  _mvTbInit();
+  _mvLoadLayouts();
+
+  // Default layout on first open: 1+2
+  // One large player left (w:8), two stacked right (w:4, h:5 each)
+  mvGrid.batchUpdate();
+  try {
+    _mvAddWidget(null, {x:0, y:0, w:8, h:10});
+    _mvAddWidget(null, {x:8, y:0, w:4, h:5});
+    _mvAddWidget(null, {x:8, y:5, w:4, h:5});
+  } finally {
+    mvGrid.commit();
+  }
+
+  // Fit cell height AFTER widgets are in DOM so offsetHeight is accurate
+  setTimeout(_mvFitCellHeight, 50);
+
+  // ResizeObserver on the grid wrapper fires whenever the wrapper's rendered
+  // size changes — after CSS transitions finish, after toolbar collapse,
+  // after orientation changes, after the connect panel animates closed.
+  // This is more reliable than polling and fires at the right moment.
+  if(window.ResizeObserver && !mvGrid._mvWrapRO){
+    mvGrid._mvWrapRO = new ResizeObserver(()=> _mvFitCellHeight());
+    const wrap = document.getElementById('mv-grid-wrap');
+    if(wrap) mvGrid._mvWrapRO.observe(wrap);
+  }
+}
+
+// mirrors multiview.js cleanupMultiView()
+async function mvClose(){
+  document.getElementById('p-mv').classList.remove('mv-active');
+  document.getElementById('mv-confirm-overlay').classList.remove('open');
+  document.getElementById('mv-sel-overlay').classList.remove('open');
+  document.getElementById('mv-save-overlay').classList.remove('open');
+  mvSelCallback = null; _mvSelMode = 'cats'; _mvSelCat = null; _mvSelItems = [];
+
+  _mvSyncDesktopBtn();
+
+  // Remove botnav highlight — restore previous tab highlight
+  document.querySelectorAll('.nt').forEach(b=>b.classList.remove('on'));
+  const prevPanel = document.querySelector('#main .panel.active');
+  if(prevPanel){
+    const tid = prevPanel.id.replace('p-','t-');
+    const tb  = document.getElementById(tid);
+    if(tb) tb.classList.add('on');
+  }
+
+  if(!mvGrid) return;
+
+  const stops = Array.from(mvPlayers.keys()).map(id => _mvStopCleanup(id, true));
+  await Promise.all(stops);
+  mvGrid.removeAll();
+  mvPlayers.clear();
+  mvUrls.clear();
+  mvPortalMeta.clear();
+  mvActiveId    = null;
+  mvSelCallback = null;
+}
+
+// ── GRID BACKGROUND + CELL HEIGHT ────────────────────────────────────────────
+// mirrors multiview.js updateGridBackground()
+// Extended to also recalculate cellHeight so the grid always fills the panel.
+//
+// Root cause of empty space:
+//   cellHeight:'8vh' × 10 rows = 80vh.  Panel height ≈ (100vh - header) = ~95vh.
+//   Fixed '8vh' leaves ~15vh of dead space at the bottom.
+// Fix: compute cellHeight = availablePanelPx / TARGET_ROWS each time.
+const _MV_TARGET_ROWS = 10;   // grid coordinate space matches our default 1+2 layout
+
+function _mvUpdateGridBg(){
+  const gs = document.querySelector('#mv-grid-wrap .grid-stack');
+  if(!gs || !mvGrid) return;
+  const cols   = mvGrid.getColumn ? mvGrid.getColumn() : 12;
+  const cellW  = gs.offsetWidth / cols;
+  gs.style.setProperty('--mv-cell-w', cellW + 'px');
+  // Recompute cell height to fill the available panel height exactly
+  _mvFitCellHeight();
+}
+
+function _mvFitCellHeight(){
+  if(!mvGrid) return;
+  // Read the grid wrapper height directly — it is a flex:1 child so the browser
+  // has already computed the correct height after any layout pass, including
+  // mid-transition states where panel.offsetHeight would be stale.
+  const wrap = document.getElementById('mv-grid-wrap');
+  if(!wrap) return;
+  const available = wrap.offsetHeight;
+  if(available <= 0) return;
+  const cellH = Math.max(40, Math.floor(available / _MV_TARGET_ROWS));
+  mvGrid.cellHeight(cellH, true);
+}
+
+// ── WIDGET ───────────────────────────────────────────────────────────────────
+
+// Monotonic counter for widget IDs.
+// CRITICAL: Date.now() returns the same value when multiple widgets are
+// batch-created in the same millisecond (default layout, preset layouts).
+// Duplicate IDs mean document.getElementById('mwc-'+wid) returns the FIRST
+// element — all subsequent widgets get the wrong content element and their
+// event listeners are attached to the wrong DOM node → they appear dead.
+let _mvWidgetSeq = 0;
+
+// mirrors multiview.js addPlayerWidget(channel, layout)
+function _mvAddWidget(channel, layout){
+  if(mvGrid.getGridItems().length >= MV_MAX){
+    toast('Maximum ' + MV_MAX + ' players', 'wrn'); return null;
+  }
+  layout = layout || {};
+  // Use layout.id if restoring a saved layout; otherwise generate a unique id.
+  // Combine counter + timestamp so ids are unique across page reloads too.
+  const wid = layout.id || ('mv-' + (++_mvWidgetSeq) + '-' + Date.now());
+
+  // mirrors multiview.js widgetHTML — exact same structure/classes
+  const html = `
+    <div class="mv-widget-content" id="mwc-${wid}">
+      <div class="mv-hdr">
+        <div class="mv-hdr-info">
+          <span class="mv-hdr-title">No Channel</span>
+          <span class="mv-hdr-portal"></span>
+        </div>
+        <div class="mv-ctrl">
+          <button class="mv-sel-btn"  title="Select IPTV channel">📺</button>
+          <button class="mv-url-btn"  title="Play URL / YouTube">🔗</button>
+          <button class="mv-pp-btn"   title="Play/Pause">⏸</button>
+          <button class="mv-mute-btn" title="Mute">🔊</button>
+          <input  type="range" class="mv-vol" min="0" max="1" step="0.05" value="0.5"/>
+          <button class="mv-fs-btn"   title="Fullscreen">⛶</button>
+          <button class="mv-stop-btn" title="Stop">⏹</button>
+          <button class="mv-rm-btn"   title="Remove player">✕</button>
+        </div>
+      </div>
+      <div class="mv-url-bar mv-hidden">
+        <input type="text" class="mv-url-input" placeholder="Paste URL or YouTube link and press Enter…"/>
+        <button class="mv-url-play-btn">▶ Play</button>
+        <button class="mv-url-close-btn">✕</button>
+      </div>
+      <div class="mv-body">
+        <div class="mv-placeholder" id="${wid}" data-channel-id="">
+          <span class="mv-ph-ico">▶</span>
+          <span>📺 Select IPTV channel &nbsp;|&nbsp; 🔗 Play URL</span>
+        </div>
+        <video class="mv-video mv-hidden" muted playsinline></video>
+      </div>
+    </div>`;
+
+  const el = mvGrid.addWidget({
+    id: wid, content: html,
+    w: layout.w || 4, h: layout.h || 4,
+    x: layout.x,      y: layout.y
+  });
+
+  const contentEl = document.getElementById('mwc-' + wid);
+  if(contentEl){
+    _mvAttachListeners(contentEl, wid);
+    // Watch widget width and add size-hint classes so CSS can hide
+    // low-priority controls when the tile is too small to show them all.
+    if(window.ResizeObserver){
+      const ro = new ResizeObserver(entries=>{
+        for(const e of entries){
+          const w = e.contentRect.width;
+          contentEl.classList.toggle('mv-tiny', w < 220);
+          contentEl.classList.toggle('mv-xs',   w < 140);
+        }
+      });
+      ro.observe(contentEl);
+    }
+  }
+  if(channel)   _mvPlayChannel(wid, channel, contentEl);
+  return el;
+}
+
+// mirrors multiview.js attachWidgetEventListeners()
+function _mvAttachListeners(cEl, wid){
+  const placeholder  = cEl.querySelector('.mv-placeholder');
+  const videoEl      = cEl.querySelector('.mv-video');
+  const gsItem       = cEl.closest('.grid-stack-item');
+
+  // Open channel selector — mirrors openSelector in multiview.js
+  const openSel = ()=>{
+    mvSelCallback = (ch)=> _mvPlayChannel(wid, ch, cEl);
+    _mvPopulateSelector();
+    document.getElementById('mv-sel-overlay').classList.add('open');
+  };
+
+  cEl.querySelector('.mv-sel-btn').addEventListener('click', openSel);
+  if(placeholder) placeholder.addEventListener('click', openSel);
+
+  // ── URL button & URL bar ──────────────────────────────────────────────────
+  const urlBar      = cEl.querySelector('.mv-url-bar');
+  const urlInput    = cEl.querySelector('.mv-url-input');
+  const urlPlayBtn  = cEl.querySelector('.mv-url-play-btn');
+  const urlCloseBtn = cEl.querySelector('.mv-url-close-btn');
+
+  // Toggle the URL bar on/off
+  cEl.querySelector('.mv-url-btn').addEventListener('click', e=>{
+    e.stopPropagation();
+    if(urlBar.classList.toggle('mv-hidden')){
+      // just hid it — nothing else to do
+    } else {
+      // just shown it — focus the input
+      urlInput.focus();
+      urlInput.select();
+    }
+  });
+
+  // Play from URL bar
+  const doPlayUrl = async ()=>{
+    urlBar.classList.add('mv-hidden');
+    await _mvPlayFromUrl(wid, urlInput.value, cEl);
+    urlInput.value = '';
+  };
+  urlPlayBtn.addEventListener('click',  e=>{ e.stopPropagation(); doPlayUrl(); });
+  urlInput.addEventListener('keydown',  e=>{ if(e.key==='Enter'){ e.stopPropagation(); doPlayUrl(); }});
+  urlCloseBtn.addEventListener('click', e=>{ e.stopPropagation(); urlBar.classList.add('mv-hidden'); });
+
+  // Stop — mirrors multiview.js .stop-btn listener
+  cEl.querySelector('.mv-stop-btn').addEventListener('click', e=>{
+    e.stopPropagation();
+    _mvStopCleanup(wid, true);
+  });
+
+  // Remove widget — mirrors multiview.js .remove-widget-btn listener
+  cEl.querySelector('.mv-rm-btn').addEventListener('click', e=>{
+    e.stopPropagation();
+    _mvStopCleanup(wid, true);
+    if(gsItem) mvGrid.removeWidget(gsItem);
+  });
+
+  // Mute toggle — mirrors multiview.js muteBtn listener
+  const muteBtn = cEl.querySelector('.mv-mute-btn');
+  muteBtn.addEventListener('click', e=>{
+    e.stopPropagation();
+    videoEl.muted = !videoEl.muted;
+    muteBtn.textContent = videoEl.muted ? '🔇' : '🔊';
+  });
+
+  // Play/Pause — mirrors multiview.js playPauseBtn listener
+  const ppBtn = cEl.querySelector('.mv-pp-btn');
+  ppBtn.addEventListener('click', e=>{
+    e.stopPropagation();
+    if(videoEl.paused){ videoEl.play(); ppBtn.textContent='⏸'; }
+    else              { videoEl.pause(); ppBtn.textContent='▶'; }
+  });
+  videoEl.addEventListener('play',  ()=>{ ppBtn.textContent='⏸'; });
+  videoEl.addEventListener('pause', ()=>{ ppBtn.textContent='▶'; });
+
+  // Volume slider — mirrors multiview.js volume-slider listener
+  cEl.querySelector('.mv-vol').addEventListener('input', e=>{
+    e.stopPropagation();
+    videoEl.volume = parseFloat(e.target.value);
+    if(videoEl.volume > 0){ videoEl.muted = false; muteBtn.textContent='🔊'; }
+  });
+
+  // Fullscreen — mirrors multiview.js fullscreen-btn listener
+  cEl.querySelector('.mv-fs-btn').addEventListener('click', e=>{
+    e.stopPropagation();
+    if(videoEl.requestFullscreen) videoEl.requestFullscreen();
+    else if(videoEl.webkitRequestFullscreen) videoEl.webkitRequestFullscreen();
+  });
+
+  // Click anywhere on widget → make it the active player
+  cEl.addEventListener('click', ()=> _mvSetActive(wid));
+}
+
+// ── PLAY ─────────────────────────────────────────────────────────────────────
+
+// mirrors multiview.js playChannelInWidget(widgetId, channel, gridstackItemContentEl)
+async function _mvPlayChannel(wid, channel, cEl){
+  if(!cEl) return;
+
+  // mirrors: await stopAndCleanupPlayer(widgetId, false)  ← cleanup without UI reset
+  await _mvStopCleanup(wid, false);
+
+  const videoEl      = cEl.querySelector('.mv-video');
+  const placeholder  = cEl.querySelector('.mv-placeholder');
+  const titleEl      = cEl.querySelector('.mv-hdr-title');
+
+  titleEl.textContent = channel.name || 'Channel';
+  if(placeholder) placeholder.dataset.channelId = channel.id || '';
+
+  // Show video, hide placeholder
+  videoEl.classList.remove('mv-hidden');
+  if(placeholder) placeholder.classList.add('mv-hidden');
+
+  // ── Resolve the actual stream URL ──────────────────────────────────────────
+  // The channel object from allItems may not have a direct URL yet —
+  // it needs /api/resolve (same path as playItem in the main player).
+  // mirrors multiview.js: playerUrls.set(widgetId, channel.url)
+  // Strip the HEVC transcode proxy wrapper if the stored URL points at
+  // /api/hls_proxy — that proxy is for the main browser player, not multiview.
+  // Multiview's own ffmpeg handles HEVC via stream-copy.
+  function _mvStripProxy(u){
+    if(!u || !u.includes('/api/hls_proxy')) return u;
+    try {
+      const params = new URLSearchParams(u.split('?')[1] || '');
+      return params.get('url') || u;
+    } catch(e){ return u; }
+  }
+  let resolvedUrl = _mvStripProxy(channel._direct_url || channel._url || channel.url || '');
+
+  if(!resolvedUrl && channel.name){
+    // Need to resolve — same fetch as playItem()
+    try {
+      // ?mv=1 tells the server to return the raw URL even for HEVC streams.
+      // The server also returns hevc:true so we can tell multiview_addon to
+      // transcode the stream internally instead of serving raw HEVC that most
+      // browsers cannot decode via MSE.
+      const r = await fetch('/api/resolve?mv=1', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({item: channel, mode: 'live', category: curCat || {}})
+      });
+      const d = await r.json();
+      resolvedUrl = d.url || '';
+      if(d.hevc) channel._mv_transcode = true;
+    } catch(e){ toast('MV: resolve error: ' + e, 'err'); }
+  }
+
+  if(!resolvedUrl){
+    toast('Could not resolve URL for: ' + (channel.name || '?'), 'err');
+    _mvStopCleanup(wid, true); return;
+  }
+
+  // Store original URL — mirrors multiview.js: playerUrls.set(widgetId, channel.url)
+  mvUrls.set(wid, resolvedUrl);
+
+  // ── Record portal metadata for the connection-count badge ─────────────────
+  // Allow caller to override portal info (e.g. when playing a custom URL)
+  const portalInfo = channel._portal_override || _mvPortalKeyFromUrl(resolvedUrl);
+  mvPortalMeta.set(wid, {
+    portalKey:  portalInfo.key,
+    portalName: portalInfo.name,
+  });
+  // Refresh all badges (connection counts change when this widget starts)
+  _mvUpdatePortalBadges();
+
+  // ── Build the proxy stream URL ─────────────────────────────────────────────
+  // mirrors server.js /stream GET handler stream key:
+  //   streamKey = `${userId}::${streamUrl}::${profileId}`
+  // We route through multiview_addon.py /api/multiview/stream which handles
+  // dedup and reference counting server-side.
+  const proxyUrl = '/api/multiview/stream?'
+    + 'url='        + encodeURIComponent(resolvedUrl)
+    + '&client_id=' + encodeURIComponent(mvClientId)
+    + (channel._mv_transcode ? '&transcode=1' : '');
+
+  // ── Create mpegts.js player ────────────────────────────────────────────────
+  // mirrors multiview.js mpegts.createPlayer block exactly
+  if(typeof mpegts === 'undefined' || !mpegts.isSupported()){
+    toast('Browser does not support MSE — cannot use Multi-View', 'err');
+    _mvStopCleanup(wid, true); return;
+  }
+
+  // mirrors multiview.js mpegtsConfig
+  const player = mpegts.createPlayer({
+    type:   'mse',
+    isLive: true,
+    url:    proxyUrl
+  }, {
+    enableStashBuffer: true,
+    stashInitialSize:  4096,
+    liveBufferLatency: 2.0,
+  });
+
+  // mirrors multiview.js player.on(mpegts.Events.ERROR ...)
+  player.on(mpegts.Events.ERROR, (errType, errDetail)=>{
+    console.error('[MV] mpegts error wid=' + wid, errType, errDetail);
+    // Only toast if the panel is still open (don't spam after mvClose)
+    if(document.getElementById('p-mv').classList.contains('mv-active'))
+      toast('Stream error: ' + (channel.name||wid), 'err');
+    _mvStopCleanup(wid, true);
+  });
+
+  // mirrors multiview.js: players.set(widgetId, player)
+  mvPlayers.set(wid, player);
+  player.attachMediaElement(videoEl);
+  player.load();
+
+  try {
+    await player.play();
+    _mvSetActive(wid);
+  } catch(e){
+    // mirrors multiview.js: if(err.name !== 'AbortError')
+    if(e && e.name !== 'AbortError'){
+      console.error('[MV] play() error wid=' + wid, e);
+      if(document.getElementById('p-mv').classList.contains('mv-active'))
+        toast('Could not play: ' + (channel.name||wid), 'err');
+      _mvStopCleanup(wid, true);
+    }
+  }
+}
+
+// ── STOP / CLEANUP ────────────────────────────────────────────────────────────
+
+// mirrors multiview.js stopAndCleanupPlayer(widgetId, resetUI)
+async function _mvStopCleanup(wid, resetUI){
+  // 1. Tell the server to kill the ffmpeg process for this widget.
+  //
+  //    RACE CONDITION FIX:
+  //    We must AWAIT this request before _mvPlayChannel starts a new ffmpeg
+  //    process for the same widget.  If we fire-and-forget, the old ffmpeg is
+  //    still connected to the IPTV source when the new one starts — two
+  //    simultaneous connections to the same portal account → the provider kills
+  //    one of them (the "1-connection limit" symptom).
+  //
+  //    multiview.js reference (stopAndCleanupPlayer / stopStream in api.js):
+  //      stopPromises.push(stopStream(originalUrl));
+  //      await Promise.all(stopPromises);   ← server stop IS awaited
+  //
+  //    mirrors server.js POST /api/stream/stop reference guard:
+  //      if (activeStreamInfo.references > 1) → kept alive for other widgets
+  if(mvUrls.has(wid)){
+    const url = mvUrls.get(wid);
+    mvUrls.delete(wid);
+    // Await so old ffmpeg is confirmed dead before caller starts a new one.
+    await fetch('/api/multiview/stream/stop', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ url: url, client_id: mvClientId })
+    }).catch(()=>{});
+  }
+
+  // 2. Clear portal metadata and refresh connection-count badges.
+  if(mvPortalMeta.has(wid)){
+    mvPortalMeta.delete(wid);
+    _mvUpdatePortalBadges();
+  }
+
+  // 3. Destroy mpegts player — fire-and-forget to prevent blocking.
+  //    mirrors multiview.js: Promise.resolve().then(() => { player.destroy() })
+  if(mvPlayers.has(wid)){
+    const player = mvPlayers.get(wid);
+    mvPlayers.delete(wid);  // remove from map immediately
+    Promise.resolve().then(()=>{
+      try { player.pause(); player.unload(); player.detachMediaElement(); player.destroy(); }
+      catch(e){ /* non-critical */ }
+    });
+  }
+
+  // 4. Reset UI
+  if(resetUI){
+    const cEl = document.getElementById('mwc-' + wid);
+    if(cEl){
+      const videoEl     = cEl.querySelector('.mv-video');
+      const placeholder = cEl.querySelector('.mv-placeholder');
+      const titleEl     = cEl.querySelector('.mv-hdr-title');
+      const portalBadge = cEl.querySelector('.mv-hdr-portal');
+      if(videoEl){ videoEl.src=''; videoEl.removeAttribute('src'); videoEl.load(); videoEl.classList.add('mv-hidden'); }
+      if(placeholder){ placeholder.classList.remove('mv-hidden'); placeholder.dataset.channelId=''; }
+      if(titleEl) titleEl.textContent = 'No Channel';
+      if(portalBadge){ portalBadge.textContent=''; portalBadge.className='mv-hdr-portal'; }
+      cEl.classList.remove('mv-active-player');
+    }
+    if(mvActiveId === wid) mvActiveId = null;
+  }
+}
+
+// ── ACTIVE PLAYER ─────────────────────────────────────────────────────────────
+
+// mirrors multiview.js setActivePlayer(widgetId)
+// Only updates the visual highlight (active border) — does NOT touch mute state.
+// Each player controls its own audio independently via its 🔊/🔇 button.
+// Removing auto-mute prevents the jarring behaviour where clicking any control
+// on Player B silently kills audio on Player A.
+function _mvSetActive(wid){
+  if(mvActiveId === wid) return;
+
+  // Remove highlight from old active player (audio untouched)
+  if(mvActiveId){
+    const oldEl = document.getElementById('mwc-' + mvActiveId);
+    if(oldEl) oldEl.classList.remove('mv-active-player');
+  }
+
+  // Add highlight to new active player (audio untouched)
+  const newEl = document.getElementById('mwc-' + wid);
+  if(newEl) newEl.classList.add('mv-active-player');
+
+  mvActiveId = wid;
+}
+
+// ── REMOVE LAST PLAYER ────────────────────────────────────────────────────────
+// mirrors multiview.js removeLastPlayer()
+async function _mvRemoveLast(){
+  const items = mvGrid.getGridItems();
+  if(!items.length){ toast('No players to remove', 'wrn'); return; }
+  // Sort by timestamp embedded in widget id (same sort as multiview.js)
+  const sorted = items.slice().sort((a,b)=>{
+    const ta = parseInt((a.gridstackNode.id||'0').split('-')[1]||0);
+    const tb = parseInt((b.gridstackNode.id||'0').split('-')[1]||0);
+    return ta - tb;
+  });
+  const last = sorted[sorted.length-1];
+  if(!last) return;
+  const ph  = last.querySelector('.mv-placeholder');
+  const wid = ph ? ph.id : last.gridstackNode.id;
+  await _mvStopCleanup(wid, false);
+  mvGrid.removeWidget(last);
+}
+
+// ── VISIBILITY CHANGE ─────────────────────────────────────────────────────────
+//
+// GOAL: audio and video must keep playing even when the user switches to
+// another tab or alt-tabs away from the window.
+//
+// Strategy:
+//   • When hidden  → do NOTHING.  The browser may throttle JS timers but
+//     mpegts.js feeds its video element directly from an MSE SourceBuffer
+//     which the browser will not suspend mid-stream for an active video
+//     element.  We deliberately do NOT mute or pause anything here.
+//
+//   • When visible → if the browser suspended/paused the active player's
+//     <video> (seen on some Chromium builds with aggressive background
+//     throttling), we resume it immediately so the user hears sound right away.
+//
+document.addEventListener('visibilitychange', ()=>{
+  if(document.hidden) return;   // ← tab hidden: leave everything alone
+  if(!document.getElementById('p-mv').classList.contains('mv-active')) return;
+
+  // Tab became visible again — resume ALL players the browser may have paused
+  // or re-muted during background throttling.  Since each player now controls
+  // its own audio independently, we restore each one to its pre-hide state:
+  // paused players stay paused; playing-but-muted players stay muted.
+  for(const [wid, player] of mvPlayers.entries()){
+    const cEl = document.getElementById('mwc-' + wid);
+    if(!cEl) continue;
+    const v  = cEl.querySelector('.mv-video');
+    if(!v || v.ended) continue;
+
+    // If the browser silently muted a video that the user had unmuted, restore it.
+    // We infer the user's intent from the mute-button label.
+    const mb = cEl.querySelector('.mv-mute-btn');
+    const userWantsAudio = mb && mb.textContent === '🔊';
+    if(userWantsAudio && v.muted){
+      v.muted = false;
+    }
+
+    // Resume playback if the browser suspended the element while it was playing.
+    if(v.paused && !v.ended && !v.muted){
+      v.play().catch(()=>{});
+    }
+  }
+});
+
+// mirrors multiview.js applyPresetLayout() exactly — same coordinates, same logic
+function _mvApplyPreset(name){
+  const numPlayers = mvGrid.getGridItems().length;
+
+  if(name==='auto' && numPlayers===0){ _mvAddWidget(); return; }
+
+  const doApply = async ()=>{
+    // mirrors cleanupMultiView() then batch-add
+    const stops = Array.from(mvPlayers.keys()).map(id => _mvStopCleanup(id, false));
+    await Promise.all(stops);
+    mvPlayers.clear(); mvUrls.clear(); mvActiveId = null;
+    if(mvGrid) mvGrid.removeAll();
+
+    let layout = [];
+
+    if(name==='auto'){
+      let cols, rows;
+      // mirrors multiview.js auto-layout calculation exactly
+      if(numPlayers<=1){cols=1;rows=1;}
+      else if(numPlayers===2){cols=2;rows=1;}
+      else if(numPlayers===3){cols=3;rows=1;}
+      else if(numPlayers===4){cols=2;rows=2;}
+      else if(numPlayers<=6){cols=3;rows=2;}
+      else{cols=3;rows=3;}
+      const ww = Math.floor(12/cols);
+      const wh = Math.floor(9/rows);
+      for(let i=0;i<numPlayers;i++){
+        layout.push({x:(i%cols)*ww, y:Math.floor(i/cols)*wh, w:ww, h:wh});
+      }
+    } else if(name==='1+1'){
+      // Two equal players.
+      // Desktop: side by side full height.
+      // Mobile: stacked vertically, each half the grid height.
+      if(window.innerWidth < 900){
+        layout = [{x:0,y:0,w:12,h:5},{x:0,y:5,w:12,h:5}];
+      } else {
+        layout = [{x:0,y:0,w:6,h:10},{x:6,y:0,w:6,h:10}];
+      }
+    } else if(name==='1+2'){
+      // Large player on the left, two smaller ones stacked on the right.
+      // Same on desktop and mobile.
+      layout = [{x:0,y:0,w:8,h:10},
+                {x:8,y:0,w:4,h:5},{x:8,y:5,w:4,h:5}];
+    }
+
+    mvGrid.batchUpdate();
+    try { layout.forEach(ld => _mvAddWidget(null, ld)); }
+    finally { mvGrid.commit(); setTimeout(_mvFitCellHeight, 50); }
+  };
+
+  if(numPlayers > 0){
+    _mvConfirm(
+      'Apply \'' + name + '\' Layout?',
+      'This will stop all current streams and apply the new layout. Are you sure?',
+      doApply
+    );
+  } else {
+    doApply();
+  }
+}
+
+// ── CHANNEL SELECTOR ─────────────────────────────────────────────────────────
+
+// mirrors multiview.js populateChannelSelector()
+// ── CHANNEL SELECTOR — FULL CATEGORY BROWSER ─────────────────────────────────
+//
+// mirrors the main UI's browseC() / renderItems() flow:
+//   1. Opens on category list (catsCache['live'])
+//   2. Click a category → fetch items via /api/items (same endpoint as browseC)
+//   3. Click an item   → calls mvSelCallback(item), closes modal
+//   4. Back button     → return to category list
+//
+// This replaces the old allItems-only approach which was limited to
+// whatever category was loaded in the main browse panel.
+
+let _mvSelMode     = 'cats';   // 'cats' | 'items'
+let _mvSelCat      = null;     // current category object when in items mode
+let _mvSelItems    = [];       // items loaded for current category
+
+function _mvPopulateSelector(){
+  // Reset to category list every time the modal opens
+  _mvSelMode  = 'cats';
+  _mvSelCat   = null;
+  _mvSelItems = [];
+  document.getElementById('mv-sel-search').value = '';
+  _mvRenderSel();
+
+  // Wire search to re-render current view
+  document.getElementById('mv-sel-search').oninput = ()=> _mvRenderSel();
+}
+
+function _mvRenderSel(){
+  const listEl  = document.getElementById('mv-sel-list');
+  const titleEl = document.getElementById('mv-sel-title');
+  const backBtn = document.getElementById('mv-sel-back');
+  const q       = document.getElementById('mv-sel-search').value.trim().toLowerCase();
+
+  if(_mvSelMode === 'cats'){
+    titleEl.textContent   = 'Browse Categories';
+    backBtn.style.display = 'none';
+    document.getElementById('mv-sel-search').placeholder = 'Search categories…';
+
+    // Use catsCache['live'] populated during connect — same source as main UI
+    const cats = (catsCache && catsCache['live']) ? catsCache['live'] : allCats;
+    if(!cats || !cats.length){
+      listEl.innerHTML = '<div style="text-align:center;padding:24px;color:var(--txt3);font-size:12px">No categories — connect to a portal first</div>';
+      return;
+    }
+    const filtered = q ? cats.filter(c=>(c.title||'').toLowerCase().includes(q)) : cats;
+
+    if(!filtered.length){
+      listEl.innerHTML = '<div style="text-align:center;padding:16px;color:var(--txt3);font-size:12px">No categories match</div>';
+      return;
+    }
+
+    listEl.innerHTML = filtered.map((c,i)=>`
+      <div class="mv-ch-row" data-ci="${i}" style="cursor:pointer">
+        <span class="mv-ch-logo" style="font-size:18px;background:none;display:flex;align-items:center;justify-content:center">📁</span>
+        <span class="mv-ch-name">${esc(c.title||'?')}</span>
+        <span style="color:var(--txt3);font-size:14px;flex-shrink:0">›</span>
+      </div>`).join('');
+
+    listEl.querySelectorAll('.mv-ch-row').forEach(row=>{
+      row.addEventListener('click', ()=>{
+        const cat = filtered[parseInt(row.dataset.ci)];
+        if(cat) _mvSelOpenCat(cat);
+      });
+    });
+
+  } else {
+    // Items mode
+    titleEl.textContent   = _mvSelCat ? (_mvSelCat.title||'Channels') : 'Channels';
+    backBtn.style.display = '';
+    document.getElementById('mv-sel-search').placeholder = 'Search channels…';
+
+    const playable = _mvSelItems.filter(it=> !it._is_series_group && !it._is_show_item);
+    const filtered = q ? playable.filter(it=>(it.name||it.o_name||'').toLowerCase().includes(q)) : playable;
+
+    if(!filtered.length){
+      listEl.innerHTML = '<div style="text-align:center;padding:16px;color:var(--txt3);font-size:12px">' +
+        (_mvSelItems.length ? 'No channels match' : 'Loading…') + '</div>';
+      return;
+    }
+
+    listEl.innerHTML = filtered.map((it,i)=>{
+      const name    = it.name || it.o_name || 'Unknown';
+      const logo    = it.logo || it.stream_icon || it.cover || '';
+      const logoSrc = logo && logo.startsWith('http') ? '/api/proxy?url='+encodeURIComponent(logo) : (logo||'');
+      return `<div class="mv-ch-row" data-ii="${i}">
+        ${logoSrc
+          ? `<img class="mv-ch-logo" src="${esc(logoSrc)}" onerror="this.style.display='none'">`
+          : `<span class="mv-ch-logo" style="background:var(--s4)"></span>`}
+        <span class="mv-ch-name">${esc(name)}</span>
+      </div>`;
+    }).join('');
+
+    listEl.querySelectorAll('.mv-ch-row').forEach(row=>{
+      row.addEventListener('click', ()=>{
+        const it = filtered[parseInt(row.dataset.ii)];
+        if(!it) return;
+        document.getElementById('mv-sel-overlay').classList.remove('open');
+        if(mvSelCallback){ mvSelCallback(it); mvSelCallback=null; }
+      });
+    });
+  }
+}
+
+async function _mvSelOpenCat(cat){
+  _mvSelCat   = cat;
+  _mvSelMode  = 'items';
+  _mvSelItems = [];
+  document.getElementById('mv-sel-search').value = '';
+
+  // Show spinner immediately while fetching
+  document.getElementById('mv-sel-list').innerHTML =
+    '<div style="text-align:center;padding:24px;color:var(--txt3);font-size:12px">Loading…</div>';
+  document.getElementById('mv-sel-title').textContent = cat.title || 'Channels';
+  document.getElementById('mv-sel-back').style.display = '';
+
+  try {
+    // Same endpoint as the main UI's browseC() function
+    const r = await fetch('/api/items', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({category: cat, mode: 'live', browse: true})
+    });
+    const d = await r.json();
+    _mvSelItems = d.items || [];
+  } catch(e){
+    _mvSelItems = [];
+    toast('Could not load category: ' + (cat.title||'?'), 'err');
+  }
+
+  _mvRenderSel();
+}
+
+// ── LAYOUT PERSISTENCE ────────────────────────────────────────────────────────
+
+// mirrors multiview.js loadLayouts() → populateLayoutsDropdown()
+async function _mvLoadLayouts(){
+  try {
+    const r = await fetch('/api/multiview/layouts');
+    if(!r.ok) return;
+    const layouts = await r.json();
+    const sel = document.getElementById('mv-layouts-sel');
+    sel.innerHTML = '<option value="" disabled selected>Load layout…</option>';
+    layouts.forEach(l=>{
+      const opt = document.createElement('option');
+      opt.value       = l.id;
+      opt.textContent = l.name;
+      sel.appendChild(opt);
+    });
+    // Store on window for load callback
+    window._mvLayouts = layouts;
+  } catch(e){ console.warn('[MV] loadLayouts error', e); }
+}
+
+// mirrors multiview.js saveLayout()
+async function _mvSaveLayout(){
+  const name = document.getElementById('mv-save-name').value.trim();
+  if(!name){ toast('Layout name required', 'wrn'); return; }
+
+  const items = mvGrid.getGridItems();
+  if(!items.length){ toast('No players to save', 'wrn'); return; }
+
+  const layoutData = items.map(item=>{
+    const node = item.gridstackNode;
+    const ph   = item.querySelector('.mv-placeholder');
+    return { x:node.x, y:node.y, w:node.w, h:node.h,
+             id: ph?.id || node.id,
+             channelId: ph?.dataset.channelId || null };
+  });
+
+  try {
+    const r = await fetch('/api/multiview/layouts',{
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({name, layout_data: layoutData})
+    });
+    if(r.ok){
+      toast('Layout saved: ' + name, 'ok');
+      document.getElementById('mv-save-overlay').classList.remove('open');
+      document.getElementById('mv-save-name').value = '';
+      _mvLoadLayouts();
+      _mvTbCollapseIfMobile();
+    }
+  } catch(e){ toast('Save failed: ' + e, 'err'); }
+}
+
+// mirrors multiview.js loadSelectedLayout()
+function _mvLoadSelected(){
+  const sel = document.getElementById('mv-layouts-sel');
+  const id  = parseInt(sel.value);
+  if(!id) return;
+  const layout = (window._mvLayouts||[]).find(l=> l.id === id);
+  if(!layout){ toast('Layout not found', 'err'); return; }
+
+  _mvConfirm(
+    'Load \'' + layout.name + '\'?',
+    'This will stop all current streams and load the selected layout.',
+    async ()=>{
+      const stops = Array.from(mvPlayers.keys()).map(wid => _mvStopCleanup(wid, false));
+      await Promise.all(stops);
+      mvPlayers.clear(); mvUrls.clear(); mvActiveId = null;
+      mvGrid.removeAll();
+
+      mvGrid.batchUpdate();
+      try { layout.layout_data.forEach(ld => _mvAddWidget(null, ld)); }
+      finally { mvGrid.commit(); setTimeout(_mvFitCellHeight, 50); }
+      _mvTbCollapseIfMobile();
+    }
+  );
+}
+
+// mirrors multiview.js deleteLayout()
+async function _mvDeleteSelected(){
+  const sel = document.getElementById('mv-layouts-sel');
+  const id  = parseInt(sel.value);
+  if(!id){ toast('Select a layout to delete', 'wrn'); return; }
+
+  _mvConfirm('Delete Layout?', 'Are you sure you want to delete this layout?', async ()=>{
+    try {
+      const r = await fetch('/api/multiview/layouts/' + id, {method:'DELETE'});
+      if(r.ok){ toast('Layout deleted', 'ok'); _mvLoadLayouts(); }
+    } catch(e){ toast('Delete failed: ' + e, 'err'); }
+  });
+}
+
+// ── EVENT LISTENER SETUP ─────────────────────────────────────────────────────
+
+// mirrors multiview.js setupMultiViewEventListeners()
+function _mvSetupListeners(){
+  document.getElementById('mv-add-btn')      .addEventListener('click', ()=> _mvAddWidget());
+  document.getElementById('mv-remove-btn')   .addEventListener('click', ()=> _mvRemoveLast());
+  document.getElementById('mv-layout-auto')  .addEventListener('click', ()=> _mvApplyPreset('auto'));
+  document.getElementById('mv-layout-1p1')   .addEventListener('click', ()=> _mvApplyPreset('1+1'));
+  document.getElementById('mv-layout-1p2')   .addEventListener('click', ()=> _mvApplyPreset('1+2'));
+  document.getElementById('mv-close-btn')    .addEventListener('click', ()=> mvClose());
+  document.getElementById('mv-save-btn')     .addEventListener('click', ()=>{
+    document.getElementById('mv-save-overlay').classList.add('open');
+  });
+  document.getElementById('mv-save-ok')      .addEventListener('click', ()=> _mvSaveLayout());
+  document.getElementById('mv-save-cancel')  .addEventListener('click', ()=>{
+    document.getElementById('mv-save-overlay').classList.remove('open');
+  });
+  document.getElementById('mv-load-btn')     .addEventListener('click', ()=> _mvLoadSelected());
+  document.getElementById('mv-delete-btn')   .addEventListener('click', ()=> _mvDeleteSelected());
+
+  // Channel selector close/back buttons
+  document.getElementById('mv-sel-back').addEventListener('click', ()=>{
+    _mvSelMode  = 'cats';
+    _mvSelCat   = null;
+    _mvSelItems = [];
+    document.getElementById('mv-sel-search').value = '';
+    _mvRenderSel();
+  });
+  document.getElementById('mv-sel-close').addEventListener('click', ()=>{
+    document.getElementById('mv-sel-overlay').classList.remove('open');
+    mvSelCallback = null;
+  });
+  document.getElementById('mv-sel-cancel').addEventListener('click', ()=>{
+    document.getElementById('mv-sel-overlay').classList.remove('open');
+    mvSelCallback = null;
+  });
+  // Close selector on overlay click
+  document.getElementById('mv-sel-overlay').addEventListener('click', e=>{
+    if(e.target === document.getElementById('mv-sel-overlay')){
+      document.getElementById('mv-sel-overlay').classList.remove('open');
+      mvSelCallback = null;
+    }
+  });
+
+  // mirrors multiview.js: close panel on outside click
+  // (not applicable here since we're a full-overlay panel, but
+  //  Escape key is a good UX addition that mirrors the Node.js app behaviour)
+  document.addEventListener('keydown', e=>{
+    if(e.key==='Escape' && document.getElementById('p-mv').classList.contains('mv-active')){
+      // Close modals first, then the panel
+      if(document.getElementById('mv-confirm-overlay').classList.contains('open')){
+        document.getElementById('mv-confirm-overlay').classList.remove('open');
+      } else if(document.getElementById('mv-save-overlay').classList.contains('open')){
+        document.getElementById('mv-save-overlay').classList.remove('open');
+      } else if(document.getElementById('mv-sel-overlay').classList.contains('open')){
+        // If browsing items, go back to cats; if at cats level, close modal
+        if(_mvSelMode === 'items'){
+          _mvSelMode = 'cats'; _mvSelCat = null; _mvSelItems = [];
+          document.getElementById('mv-sel-search').value = '';
+          _mvRenderSel();
+        } else {
+          document.getElementById('mv-sel-overlay').classList.remove('open');
+          mvSelCallback = null;
+        }
+      } else {
+        mvClose();
+      }
+    }
+  });
+}
+
+// ── HOOK INTO EXISTING _switchTab ────────────────────────────────────────────
+// On mobile, switching tabs just HIDES the multiview overlay — streams keep
+// running and the grid layout is preserved. Coming back restores exactly where
+// you left off. Only the explicit ⊞ ✕ button triggers a full teardown.
+//
+// On desktop the panel is a fixed overlay that coexists with the main UI,
+// so we also just hide it (same behaviour, consistent).
+function mvHide(){
+  const panel = document.getElementById('p-mv');
+  if(!panel.classList.contains('mv-active')) return;
+  panel.classList.remove('mv-active');
+  _mvSyncDesktopBtn();
+  // Restore botnav highlight to whichever real tab is active
+  document.querySelectorAll('.nt').forEach(b=>b.classList.remove('on'));
+  const prevPanel = document.querySelector('#main .panel.active');
+  if(prevPanel){
+    const tid = prevPanel.id.replace('p-','t-');
+    const tb  = document.getElementById(tid);
+    if(tb) tb.classList.add('on');
+  }
+}
+
+(function(){
+  const _orig = window._switchTab;
+  window._switchTab = function(pid, tid){
+    // Just hide — do NOT destroy. Layout and streams survive the tab switch.
+    mvHide();
+    if(typeof _orig === 'function') _orig(pid, tid);
+  };
+  // Show the desktop button once DOM is ready
+  _mvUpdateTop();
+  _mvSyncDesktopBtn();
+})();
+</script>
 </body>
 </html>
 """
