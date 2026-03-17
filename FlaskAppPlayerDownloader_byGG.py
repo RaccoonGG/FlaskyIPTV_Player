@@ -18,6 +18,7 @@ Added support for Xtream CatchUp (where supported and available by Xtream portal
 Added Favourites and saving them across sessions in browser memory.
 Added Whats on TV Now button, it checks external EPG url (you have to set it) for current time, and lists you programs and channels that are playing it,
 Clicking on Search Icon will check currently active portal if your portal has channel that you requested. (experimental, needs testing and good external EPG)
+Fixed different channel url outputs not playing correctly, fixed hevc channels not going thru ffmpeg.
 Varius UI fixes.
 """
 
@@ -2775,6 +2776,54 @@ def api_episodes():
         return jsonify({"error": str(e), "episodes": []})
 
 
+def _probe_hevc(url: str) -> bool:
+    """Read first ~1880 bytes of a MPEG-TS stream and return True if video is HEVC (stream_type 0x24).
+    Times out quickly — failure is non-fatal, we just skip the transcode."""
+    try:
+        hdrs = {"User-Agent": "VLC/3.0", "Accept": "*/*"}
+        r = _requests_lib.get(url, headers=hdrs, stream=True, timeout=5, verify=False,
+                              proxies={"http": None, "https": None})
+        raw = b""
+        for chunk in r.iter_content(1880):
+            raw += chunk
+            if len(raw) >= 1880:
+                break
+        r.close()
+        pmt_pid = None
+        i = 0
+        while i + 188 <= len(raw):
+            pkt = raw[i:i+188]; i += 188
+            if pkt[0] != 0x47: continue
+            pid = ((pkt[1] & 0x1f) << 8) | pkt[2]
+            has_adapt = bool(pkt[3] & 0x20); has_pay = bool(pkt[3] & 0x10)
+            if not has_pay: continue
+            off = 4
+            if has_adapt: off = 5 + pkt[4]
+            if off >= 188: continue
+            if pkt[1] & 0x40: off += 1  # pointer field
+            if pid == 0 and pmt_pid is None:
+                pos = off + 8
+                while pos + 3 < 188:
+                    pn = (pkt[pos] << 8) | pkt[pos+1]
+                    pp = ((pkt[pos+2] & 0x1f) << 8) | pkt[pos+3]
+                    pos += 4
+                    if pn != 0: pmt_pid = pp; break
+            elif pmt_pid and pid == pmt_pid:
+                sec = pkt[off:]
+                if len(sec) < 12: continue
+                pi_len = ((sec[10] & 0x0f) << 8) | sec[11]
+                pos = 12 + pi_len
+                while pos + 4 < len(sec) - 4:
+                    st = sec[pos]
+                    ei = ((sec[pos+3] & 0x0f) << 8) | sec[pos+4]
+                    if st == 0x24: return True   # HEVC
+                    pos += 5 + ei
+                return False
+        return False
+    except Exception:
+        return False
+
+
 @flask_app.route("/api/resolve", methods=["POST"])
 def api_resolve():
     data = request.get_json(force=True)
@@ -2788,6 +2837,17 @@ def api_resolve():
                 return await client.resolve_item_url(mode, item, cat)
 
         url = run_async(resolve())
+        # Probe for HEVC on live streams only — if detected, serve via transcode proxy
+        # so the browser never sees HEVC which it can't decode via MSE
+        if url and isinstance(url, str) and 'play_token=' in url:
+            try:
+                probe = _probe_hevc(url)
+                if probe:
+                    state.log(f"[RESOLVE] HEVC detected — routing to transcode proxy")
+                    transcode_url = f"/api/hls_proxy?transcode=1&url={quote(url, safe='')}"
+                    return jsonify({"url": transcode_url, "hevc": True})
+            except Exception as pe:
+                state.log(f"[RESOLVE] HEVC probe failed: {pe}")
         return jsonify({"url": url})
     except Exception as e:
         state.log(f"[RESOLVE] Error: {type(e).__name__}: {e}")
@@ -4424,15 +4484,30 @@ def api_hls_proxy():
         "Access-Control-Allow-Methods": "GET, OPTIONS",
         "Access-Control-Allow-Headers": "*",
     }
-    # Remux to MPEG-TS via ffmpeg — copy streams, no re-encode
-    cmd = [
-        ffmpeg, "-hide_banner", "-nostdin",
-        "-user_agent", "Mozilla/5.0",
-        "-i", url,
-        "-c", "copy",
-        "-f", "mpegts",
-        "pipe:1",
-    ]
+    transcode = request.args.get("transcode", "0") == "1"
+    if transcode:
+        # Re-encode HEVC/unsupported video → H.264, keep audio as AAC
+        # Used as fallback when browser MSE rejects the native codec (e.g. HEVC)
+        cmd = [
+            ffmpeg, "-hide_banner", "-nostdin",
+            "-user_agent", "Mozilla/5.0",
+            "-i", url,
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-f", "mpegts",
+            "pipe:1",
+        ]
+    else:
+        # Remux to MPEG-TS via ffmpeg — copy streams, no re-encode
+        cmd = [
+            ffmpeg, "-hide_banner", "-nostdin",
+            "-user_agent", "Mozilla/5.0",
+            "-i", url,
+            "-c", "copy",
+            "-f", "mpegts",
+            "pipe:1",
+        ]
     try:
         proc = subprocess.Popen(
             cmd,
@@ -4456,6 +4531,107 @@ def api_hls_proxy():
     h = dict(cors)
     h["Content-Type"] = "video/mp2t"
     return Response(stream_with_context(_gen()), status=200, headers=h)
+
+
+@flask_app.route("/api/codec_probe")
+def api_codec_probe():
+    """Read first ~8 TS packets from a stream, parse PAT/PMT, return codec info.
+    stream_type 36 = HEVC/H.265. Used by the player to decide whether to transcode
+    before mpegts.js tries (and fails) to push HEVC into MSE.
+    Returns: {"hevc": bool, "video_codec": str, "audio_codec": str, "stream_types": [...]}
+    """
+    url = request.args.get("url", "").strip()
+    if not url or not url.startswith(("http://", "https://")):
+        return jsonify({"error": "invalid url"}), 400
+    try:
+        headers = {"User-Agent": "VLC/3.0.0 LibVLC/3.0.0", "Accept": "*/*"}
+        resp = _requests_lib.get(url, headers=headers, stream=True, timeout=8,
+                                 verify=False, proxies={"http": None, "https": None})
+        # Read enough bytes to find PAT + PMT (each 188 bytes, usually in first ~2KB)
+        raw = b""
+        for chunk in resp.iter_content(chunk_size=1880):
+            raw += chunk
+            if len(raw) >= 1880:
+                break
+        resp.close()
+
+        # Parse TS packets to find PMT and extract stream types
+        STREAM_TYPE_NAMES = {
+            0x01: "mpeg1_video", 0x02: "mpeg2_video", 0x1b: "h264",
+            0x24: "hevc", 0x42: "avs", 0x10: "mpeg4_video",
+            0x03: "mp3", 0x04: "mp3", 0x0f: "aac", 0x11: "aac",
+            0x81: "ac3", 0x83: "ac3", 0x06: "private",
+        }
+        pmt_pid = None
+        stream_types = []
+
+        i = 0
+        while i + 188 <= len(raw):
+            pkt = raw[i:i+188]
+            i += 188
+            if pkt[0] != 0x47:
+                continue
+            pid = ((pkt[1] & 0x1f) << 8) | pkt[2]
+            payload_start = bool(pkt[1] & 0x40)
+            has_adaptation = bool(pkt[3] & 0x20)
+            has_payload    = bool(pkt[3] & 0x10)
+            if not has_payload:
+                continue
+            offset = 4
+            if has_adaptation:
+                adapt_len = pkt[4]
+                offset = 5 + adapt_len
+            if offset >= 188:
+                continue
+            if payload_start:
+                offset += 1  # pointer field
+
+            # PAT: pid == 0
+            if pid == 0 and pmt_pid is None:
+                # PAT section: skip table_id(1) + section header(3) + transport_stream_id(2) + version(1) + section_number(2)
+                sec = pkt[offset:]
+                if len(sec) < 12:
+                    continue
+                # Find first program != 0
+                pos = offset + 8  # skip to program entries
+                while pos + 3 < 188:
+                    prog_num = (pkt[pos] << 8) | pkt[pos+1]
+                    prog_pid = ((pkt[pos+2] & 0x1f) << 8) | pkt[pos+3]
+                    pos += 4
+                    if prog_num != 0:
+                        pmt_pid = prog_pid
+                        break
+
+            # PMT
+            elif pmt_pid and pid == pmt_pid:
+                sec = pkt[offset:]
+                if len(sec) < 12:
+                    continue
+                # Skip table header: table_id(1)+section_length(2)+prog_num(2)+version(1)+sec_num(2)+last_sec(1)+pcr_pid(2)+program_info_len(2)
+                hdr_len = 12
+                prog_info_len = ((sec[10] & 0x0f) << 8) | sec[11]
+                pos = hdr_len + prog_info_len
+                while pos + 4 < len(sec) - 4:  # -4 for CRC
+                    stype = sec[pos]
+                    es_pid = ((sec[pos+1] & 0x1f) << 8) | sec[pos+2]
+                    es_info_len = ((sec[pos+3] & 0x0f) << 8) | sec[pos+4]
+                    stream_types.append(stype)
+                    pos += 5 + es_info_len
+                break  # got what we need
+
+        hevc = 0x24 in stream_types
+        video_st = next((s for s in stream_types if s in (0x01,0x02,0x1b,0x24,0x42,0x10)), None)
+        audio_st = next((s for s in stream_types if s in (0x03,0x04,0x0f,0x11,0x81,0x83,0x06)), None)
+
+        return jsonify({
+            "hevc":         hevc,
+            "video_codec":  STREAM_TYPE_NAMES.get(video_st, f"0x{video_st:02x}") if video_st else "unknown",
+            "audio_codec":  STREAM_TYPE_NAMES.get(audio_st, f"0x{audio_st:02x}") if audio_st else "unknown",
+            "stream_types": [f"0x{s:02x}" for s in stream_types],
+        })
+    except Exception as e:
+        state.log(f"[CODEC_PROBE] Error: {e}")
+        return jsonify({"error": str(e), "hevc": False}), 200
 
 
 # ===================== HTML TEMPLATE =====================
@@ -5032,9 +5208,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
         <button class="mt" data-m="vod" onclick="setMode('vod')">🎬<span class="mt-txt"> VOD</span></button>
         <button class="mt" data-m="series" onclick="setMode('series')">📂<span class="mt-txt"> Series</span></button>
       </div>
-      <button class="ph-act-btn" onclick="openDrawer('cats')" title="Download / Actions">
-        ⚡ Actions<span class="ph-act-badge" id="ph-cat-badge"></span>
-      </button>
+      <!-- Category-level actions accessible via FAB on mobile only -->
     </div>
     <div style="padding:8px 10px 0;flex-shrink:0;display:flex;flex-direction:column;gap:6px">
       <div class="tag-bar" id="tag-bar" style="display:none"></div>
@@ -5061,7 +5235,12 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
       <button class="btn-ghost btn-sm" id="backbtn" onclick="goBack()" disabled>◀ Back</button>
     </div>
     <div style="padding:10px 10px 0;display:flex;flex-direction:column;gap:6px;flex-shrink:0">
-      <div class="bcrum" id="bcrum"><span class="bc-s">Categories</span></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
+        <div class="bcrum" id="bcrum" style="flex:1;min-width:0"><span class="bc-s">Categories</span></div>
+        <button class="ph-act-btn" onclick="openDrawer('items')" title="Download / Actions" id="ph-items-act-btn">
+          ⚡ Actions<span class="ph-act-badge" id="ph-item-badge"></span>
+        </button>
+      </div>
       <div class="sbar"><span class="sico">🔍</span>
         <input id="isrch" type="search" placeholder="Search items…" oninput="filterItems()">
       </div>
@@ -5823,7 +6002,10 @@ async function playItem(i){
   }catch(e){setNP('✗ '+e.message);}
 }
 
+let _playerStopped = false;  // set true when user stops — blocks any pending retries
+
 function _destroyPlayers(){
+  _playerStopped = true;
   if(hlsObj){hlsObj.destroy();hlsObj=null;}
   if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
   vid.pause(); vid.removeAttribute('src'); vid.load();
@@ -5831,6 +6013,10 @@ function _destroyPlayers(){
 
 function doPlay(url, name, opts={}){
   pUrl=url; pName=name||url;
+  _playerStopped = false;                        // new play — clear stop flag
+  window._mseTranscodeFired = false;             // reset MSE transcode guard
+  if(window._ptRetries) window._ptRetries = {}; // reset play_token retry counter
+  if(window._mpegRetries) window._mpegRetries = {}; // reset general retry counter
   setNP('▶ '+pName);
   document.getElementById('pu').textContent=url;
   document.getElementById('ppbtn').textContent='⏸';
@@ -5839,7 +6025,8 @@ function doPlay(url, name, opts={}){
 
   _destroyPlayers();
 
-  const px='/api/proxy?url='+encodeURIComponent(url);
+  // Local /api/ URLs (transcode proxy) must never be wrapped in /api/proxy again
+  const px = url.startsWith('/api/') ? url : '/api/proxy?url='+encodeURIComponent(url);
   const u=url.toLowerCase().split('?')[0];
   const qs=url.toLowerCase();
   const fallbackUrl=opts.fallbackUrl||null;
@@ -5855,7 +6042,8 @@ function doPlay(url, name, opts={}){
                || qs.includes('extension=m3u8');
 
   const isMpegTs = !isStorageUrl && (
-               qs.includes('play_token=')   // MAC portals: short-lived token = raw MPEG-TS stream
+               url.includes('/api/hls_proxy') // server-side transcode proxy
+               || qs.includes('play_token=')  // MAC portals: short-lived token = raw MPEG-TS stream
                || u.endsWith('.ts')
                || u.endsWith('.mpg')
                || u.endsWith('/mpegts')
@@ -5888,8 +6076,17 @@ function doPlay(url, name, opts={}){
     hlsObj.on(Hls.Events.ERROR,(_,data)=>{
       if(data.fatal){
         alog('[HLS] '+data.type+': '+data.details,'e');
+        // 503/403/404 = channel offline — destroy and stop, never retry
+        const hc = data?.response?.code || 0;
+        if(hc===503 || hc===403 || hc===404){
+          alog('[HLS] Channel unavailable ('+hc+') — stopping','e');
+          setNP('✗ Channel unavailable ('+hc+')');
+          document.getElementById('ppbtn').textContent='▶';
+          if(hlsObj){ hlsObj.destroy(); hlsObj=null; }
+          return;
+        }
         if(data.type===Hls.ErrorTypes.NETWORK_ERROR)
-          setTimeout(()=>{if(hlsObj)hlsObj.startLoad();},2500);
+          setTimeout(()=>{if(hlsObj && !_playerStopped)hlsObj.startLoad();},2500);
         else if(data.type===Hls.ErrorTypes.MEDIA_ERROR)
           hlsObj.recoverMediaError();
       }
@@ -5906,13 +6103,9 @@ function doPlay(url, name, opts={}){
 
   } else if(mpegtsOk){
     // ── Raw MPEG-TS via mpegts.js ──────────────────────────────
-    // isLive=true for live channels, false for catchup/VOD (prevents SourceBuffer errors)
     const isLiveStream = (opts.isLive !== false);
     mpegtsObj=mpegts.createPlayer({
-      type:'mse',
-      isLive: isLiveStream,
-      url:px,
-      cors:true,
+      type:'mse', isLive: isLiveStream, url:px, cors:true,
     },{
       enableWorker:false,
       liveBufferLatencyChasing: isLiveStream,
@@ -5922,7 +6115,7 @@ function doPlay(url, name, opts={}){
     });
     mpegtsObj.attachMediaElement(vid);
     mpegtsObj.load();
-    // For catchup/VOD: seek to start once metadata is ready
+        // For catchup/VOD: seek to start once metadata is ready
     if(!isLiveStream){
       vid.addEventListener('loadedmetadata', function _seekStart(){
         vid.removeEventListener('loadedmetadata', _seekStart);
@@ -5932,14 +6125,84 @@ function doPlay(url, name, opts={}){
     }
     mpegtsObj.on(mpegts.Events.ERROR,(et,ed)=>{
       const msg=(ed?.msg||JSON.stringify(ed));
-      alog('[MPEGTS] '+et+': '+msg,'e');
+      const etStr = String(et||'');
+      const edStr = String(ed||'');
+      alog('[MPEGTS] '+etStr+': '+msg,'e');
       const hasPlayToken = url.toLowerCase().includes('play_token=');
-      // play_token URLs: token is short-lived — re-resolve rather than replay stale URL
+      const httpCode = ed?.code || ed?.httpStatusCode || 0;
+      // MediaMSEError = codec unsupported by browser (e.g. HEVC/H.265)
+      // Match both strict type check AND string fallback from the log: "MediaError: MediaMSEError"
+      const isMSEError = (et===mpegts.ErrorTypes.MEDIA_ERROR || etStr==='MediaError')
+                      && (edStr.includes('MSE') || edStr.includes('mse') || msg.includes('MSE'));
+      if(isMSEError){
+        if(!_playerStopped && !url.includes('transcode=1') && !window._mseTranscodeFired){
+          window._mseTranscodeFired = true; // guard: only fire once per play session
+          alog('[MPEGTS] MSE codec error — re-encoding via ffmpeg (H.264)…','w');
+          const transcodeUrl='/api/hls_proxy?transcode=1&url='+encodeURIComponent(url);
+          // Defer to next tick — cannot safely destroy mpegts from within its own error callback
+          setTimeout(()=>{
+          if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
+          vid.pause(); vid.removeAttribute('src'); vid.load();
+          _playerStopped = false;
+          if(typeof mpegts!=='undefined' && mpegts.isSupported()){
+            setNP('▶ '+name+' [transcoding HEVC→H.264]');
+            mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:transcodeUrl,cors:true},{
+              enableWorker:false,
+              liveBufferLatencyChasing:true,
+              liveBufferLatencyMaxLatency:12,
+              liveBufferLatencyMinRemain:3,
+            });
+            mpegtsObj.attachMediaElement(vid);
+            mpegtsObj.load();
+            vid.play().catch(()=>{});
+            mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
+              if(!_playerStopped){
+                alog('[MPEGTS/transcode] '+et2+': '+(ed2?.msg||JSON.stringify(ed2)),'e');
+                setNP('✗ Transcode failed — ffmpeg may not support this codec');
+                document.getElementById('ppbtn').textContent='▶';
+              }
+            });
+          } else {
+            // mpegts.js unavailable — try native src as last resort
+            vid.src=transcodeUrl; vid.play().catch(()=>{});
+          }
+          }, 0); // end setTimeout defer
+        }
+        return;
+      }
+      // 503/403/404 = channel offline — stop immediately, never retry
+      if(httpCode===503 || httpCode===403 || httpCode===404){
+        alog('[MPEGTS] Channel unavailable ('+httpCode+') — stopping','e');
+        setNP('✗ Channel unavailable ('+httpCode+')');
+        document.getElementById('ppbtn').textContent='▶';
+        return;
+      }
+      // play_token URLs: re-resolve for fresh token, but cap at 2 retries
       if(isLiveStream && et===mpegts.ErrorTypes.NETWORK_ERROR && hasPlayToken){
-        alog('[MPEGTS] play_token stream failed — re-resolving for fresh token…','w');
-        if(pIdx>=0) setTimeout(()=>playItem(pIdx), 500);
+        if(!window._ptRetries) window._ptRetries = {};
+        const _rk = pIdx+'|'+url.slice(-20);
+        window._ptRetries[_rk] = (window._ptRetries[_rk]||0)+1;
+        if(window._ptRetries[_rk] <= 2 && !_playerStopped){
+          alog('[MPEGTS] play_token failed (attempt '+window._ptRetries[_rk]+'/2) — re-resolving…','w');
+          if(pIdx>=0) setTimeout(()=>{ if(!_playerStopped) playItem(pIdx); },1000);
+        } else {
+          alog('[MPEGTS] play_token failed after 2 retries — channel may be offline','e');
+          setNP('✗ Stream unavailable: '+name);
+          document.getElementById('ppbtn').textContent='▶';
+          window._ptRetries[_rk]=0;
+        }
       } else if(isLiveStream && et===mpegts.ErrorTypes.NETWORK_ERROR){
-        setTimeout(()=>{ if(mpegtsObj){ mpegtsObj.unload(); mpegtsObj.load(); vid.play().catch(()=>{}); }},2000);
+        if(!window._mpegRetries) window._mpegRetries = {};
+        const _mk = String(pIdx)+'|'+url.slice(-20);
+        window._mpegRetries[_mk] = (window._mpegRetries[_mk]||0)+1;
+        if(window._mpegRetries[_mk] <= 3 && !_playerStopped){
+          setTimeout(()=>{ if(mpegtsObj && !_playerStopped){ mpegtsObj.unload(); mpegtsObj.load(); vid.play().catch(()=>{}); }},2000);
+        } else if(!_playerStopped){
+          alog('[MPEGTS] Stream failed after retries — channel may be offline','e');
+          setNP('✗ Stream unavailable: '+name);
+          document.getElementById('ppbtn').textContent='▶';
+          window._mpegRetries[_mk]=0;
+        }
       } else if(!isLiveStream && fallbackUrl && et===mpegts.ErrorTypes.NETWORK_ERROR){
         // Catchup path-based .ts failed → try query-string format via HLS.js
         alog('[MPEGTS] Catchup .ts failed — retrying with fallback URL via HLS.js','w');
