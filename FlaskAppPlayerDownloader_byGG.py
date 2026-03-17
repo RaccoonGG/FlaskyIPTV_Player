@@ -36,6 +36,7 @@ Added sub-menu option on channels/vods/series.
 Added open imdb page for vods/series in sub-menu of vods/series, it just does a search for imdb title.
 Added local M3U file parsing in M3U connect options.
 Added EPG layout to items tab.
+Added option to cast to DLNA, Chromecast or Airplay
 Varius UI fixes, and adjustments.
 """
 
@@ -63,6 +64,13 @@ import aiohttp
 import requests as _requests_lib
 
 from flask import Flask, request, jsonify, Response, render_template_string, stream_with_context
+try:
+    from cast_addon import register_cast_routes, get_cast_proxy
+    _CAST_AVAILABLE = True
+except ImportError:
+    _CAST_AVAILABLE = False
+    def register_cast_routes(*a, **kw): pass
+    def get_cast_proxy(): return None
 
 # ===================== OPTIONAL DEPS =====================
 
@@ -2753,7 +2761,8 @@ class AppState:
 
 
 state = AppState()
-
+if _CAST_AVAILABLE:
+    get_cast_proxy().start()
 
 # ===================== ASYNC HELPERS =====================
 
@@ -2924,6 +2933,8 @@ async def _connect_async():
 
 flask_app = Flask(__name__)
 flask_app.config["SECRET_KEY"] = os.urandom(24)
+if _CAST_AVAILABLE:
+    register_cast_routes(flask_app, state, run_async, _make_client)
 
 # NOTE: Do NOT use a shared requests.Session for /api/proxy.
 # HLS.js downloads multiple fragments in parallel — each hits Flask in its own
@@ -6455,6 +6466,10 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
       <button class="btn-ghost hdr-ico" id="stopbtn" onclick="doStop()" disabled title="Stop">⏹</button>
       <button class="btn-ghost hdr-ico" onclick="openWhatsOn()" title="What's on Now">📺</button>
       <button class="btn-ghost hdr-ico" onclick="openPL()" title="Saved Playlists">📋</button>
+      <button class="btn-ghost hdr-ico" id="cast-fab" title="Cast to TV / speaker" style="position:relative">
+        <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M1 18v3h3c0-1.66-1.34-3-3-3zm0-4v2c2.76 0 5 2.24 5 5h2c0-3.87-3.13-7-7-7zm18-7H5c-1.1 0-2 .9-2 2v3h2v-3h14v12h-5v2h5c1.1 0 2-.9 2-2V9c0-1.1-.9-2-2-2zm-18 3v2c4.97 0 9 4.03 9 9h2c0-6.08-4.93-11-11-11z"/></svg>
+        <span class="cast-badge" id="cast-nav-badge"></span>
+      </button>
       <button class="btn-ghost hdr-ico" onclick="toggleCP()" title="Settings">⚙</button>
     </div>
   </div>
@@ -6827,6 +6842,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
     <span class="nt-ico">⚡</span><span>Actions</span>
     <span class="fab-badge" id="act-tab-badge"></span>
   </button>
+
 </nav>
 
 <!-- ACTION DRAWER -->
@@ -10556,8 +10572,16 @@ function wonFindChannel(btn, idx){
     res.textContent = '✗ Request failed: ' + e;
   });
 }
-
 </script>
+<script>
+  // Hide Cast tab if cast_addon is not available (pychromecast etc. not installed)
+  fetch('/api/cast/status').then(r => {
+    if (!r.ok) document.getElementById('cast-fab').style.display = 'none';
+  }).catch(() => {
+    document.getElementById('cast-fab').style.display = 'none';
+  });
+</script>
+<script src="/api/cast/ui.js"></script>
 </body>
 </html>
 """
