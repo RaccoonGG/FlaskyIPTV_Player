@@ -7369,47 +7369,21 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
     </div>
     <!-- Collapsible player controls -->
     <div class="panel-divider-line"></div>
-        <div id="pctrl-hdr" onclick="togglePlayerControls()"
-             style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;
-             padding:5px 14px;background:var(--s2);user-select:none">
-
-          <div style="display:flex;align-items:center;gap:7px">
-            <span id="pctrl-arrow"
-              style="font-size:10px;color:var(--txt3);transition:transform .2s;display:inline-block">▲</span>
-
-            <h3 style="font-size:10px;font-weight:800;text-transform:uppercase;
-                letter-spacing:1.5px;color:var(--txt2);margin:0">
-                Player Controls
-            </h3>
-          </div>
-
-          <!-- RIGHT BUTTON GROUP -->
-          <div style="display:flex;align-items:center;gap:6px">
-
-            <button class="btn-ghost pnav" id="theaterbtn"
-              onclick="toggleTheater()"
-              title="Theater mode"
-              style="height:26px;width:32px;padding:0;display:flex;
-              align-items:center;justify-content:center">
-              <svg id="theater-icon" width="16" height="16" viewBox="0 0 16 16"
-                   fill="none" stroke="currentColor" stroke-width="1.8">
-                <polyline points="4,2 2,2 2,4"/>
-                <polyline points="12,2 14,2 14,4"/>
-                <polyline points="4,14 2,14 2,12"/>
-                <polyline points="12,14 14,14 14,12"/>
-              </svg>
-            </button>
-
-            <button id="mv-desktop-btn"
-              onclick="event.stopPropagation();mvToggle()"
-              title="Multi-View"
-              style="height:26px;padding:0 10px;font-size:12px;font-weight:700;
-              border-radius:var(--rss);background:var(--s4);color:var(--txt2);
-              border:1px solid var(--bdr2);letter-spacing:.5px;display:none">
-              ⊞ Multi-View
-            </button>
-
-          </div>
+    <div id="pctrl-panel" style="flex-shrink:0;border-top:1px solid var(--bdr)">
+      <div id="pctrl-hdr" onclick="togglePlayerControls()" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:5px 14px;background:var(--s2);user-select:none">
+        <div style="display:flex;align-items:center;gap:7px">
+          <span id="pctrl-arrow" style="font-size:10px;color:var(--txt3);transition:transform .2s;display:inline-block">▲</span>
+          <h3 style="font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1.5px;color:var(--txt2);margin:0">Player Controls</h3>
+        </div>
+        <button id="mv-desktop-btn" onclick="event.stopPropagation();mvToggle()" title="Multi-View"
+          style="height:26px;padding:0 10px;font-size:12px;font-weight:700;border-radius:var(--rss);
+                 background:var(--s4);color:var(--txt2);border:1px solid var(--bdr2);
+                 letter-spacing:.5px;display:none">⊞ Multi-View</button>
+      </div>
+      <div id="pctrl-body" style="overflow:hidden;transition:max-height .25s ease;max-height:0">
+        <div class="pinfo">
+          <div id="np">No stream loaded</div>
+          <div id="pu" onclick="cpyUrl()" title="Tap to copy stream URL">—</div>
         </div>
         <div class="pctrl">
           <div style="display:flex;flex-direction:column;gap:4px;align-self:flex-start;flex-shrink:0" class="pctrl-desktop-only">
@@ -7425,6 +7399,14 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
             <button class="btn-ghost pnav" id="epgbtn" onclick="showEPG()" title="EPG" style="font-size:14px;opacity:0.35">&#128197;</button>
             <button class="btn-ghost pnav" id="catchupbtn" onclick="showCatchup()" title="Catch-up TV" style="font-size:16px;opacity:0.35">&#8634;</button>
             <button class="btn-ghost pnav" id="subbtn" onclick="openSubSearch()" title="Subtitles" style="font-size:14px;opacity:0.35">&#128172;</button>
+            <button class="btn-ghost pnav" id="theaterbtn" onclick="toggleTheater()" title="Theater mode" style="display:none;padding:0;justify-content:center;align-items:center">
+              <svg id="theater-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:auto">
+                <polyline points="4,2 2,2 2,4"/>
+                <polyline points="12,2 14,2 14,4"/>
+                <polyline points="4,14 2,14 2,12"/>
+                <polyline points="12,14 14,14 14,12"/>
+              </svg>
+            </button>
           </div>
           <div style="min-height:12px;padding:0 4px">
             <span id="epg-now" style="font-size:11px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block"></span>
@@ -7947,6 +7929,7 @@ const CFG = {{ config | safe }};
 // ── STATE ──────────────────────────────────────────────────
 let CT='mac', mode='live', curCat=null;
 let allCats=[], catsCache={}, selCats=new Map();
+let categoryItemsCache = {};   // <-- add this (mode -> { key: items[] })
 let allItems=[], filtItems=[], navStack=[], selSet=new Set();
 let pUrl='', pName='', pIdx=-1;
 let isStalker=false;  // true when connected to a stalker_portal MAC portal
@@ -8562,6 +8545,7 @@ async function doConnect(){
         } catch(e){}
       }
       catsCache=d.categories||{};
+      categoryItemsCache = {}; 
       // Always land on Live categories after any connect
       mode='live';
       switchMode('live', catsCache['live']||[]);
@@ -8808,26 +8792,52 @@ async function dlSelCats(type){
 }
 
 // ── BROWSE ─────────────────────────────────────────────────
+// ── BROWSE ─────────────────────────────────────────────────
+function _categoryKey(m, cat){
+  // normalize category identity: prefer id, then category_id, then title
+  const id = (cat && (cat.id || cat.category_id || cat.title || '')).toString();
+  return String(m||'') + ':' + id;
+}
+
 function browseC(cj){
   const cat=(typeof cj==='string')?JSON.parse(cj):cj; curCat=cat;
-  // Close EPG grid if open so items from new category populate correctly
   if(_epgGridActive) _closeEpgGrid();
-  // Deactivate favs filter when manually browsing a category
   _favsFilterActive=false;
   document.querySelector('.mt[data-m="favs"]').classList.remove('on');
   navStack=[]; setBusy(true);
   _setLoadingHeader(cat.title);
   setStatus("Loading '"+cat.title+"'…");
   showSkels(12); showT('p-items','t-items');
+
+  const key = _categoryKey(mode, cat);
+  // ensure container for this mode exists
+  categoryItemsCache[mode] = categoryItemsCache[mode] || {};
+
+  // Serve from cache if present
+  if(categoryItemsCache[mode][key]){
+    allItems = categoryItemsCache[mode][key];
+    _setLoadingHeader(null);
+    setStatus("'"+cat.title+"' — "+allItems.length+' items (cached)');
+    showItems(cat.title, allItems);
+    setBusy(false);
+    return;
+  }
+
+  // Not cached -> fetch
   fetch('/api/items',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({mode, category:cat, browse:true})})
   .then(r=>r.json()).then(d=>{
     _setLoadingHeader(null);
-    if(d.error){toast(d.error,'err');setStatus('Error: '+d.error);return;}
-    allItems=d.items||[];
+    if(d.error){ toast(d.error,'err'); setStatus('Error: '+d.error); return; }
+    allItems = d.items || [];
+    // store into cache
+    categoryItemsCache[mode][key] = allItems;
     setStatus("'"+cat.title+"' — "+allItems.length+' items');
     showItems(cat.title, allItems);
-  }).catch(e=>{_setLoadingHeader(null);toast(e.message,'err');}).finally(()=>setBusy(false));
+  }).catch(e=>{
+    _setLoadingHeader(null);
+    toast(e.message,'err');
+  }).finally(()=> setBusy(false));
 }
 
 function showSkels(count=10, small=false){
@@ -12871,11 +12881,21 @@ async function _mvSelOpenCat(cat){
   _mvSelItems = [];
   document.getElementById('mv-sel-search').value = '';
 
-  // Show spinner immediately while fetching
+  // Show spinner immediately while fetching / rendering
   document.getElementById('mv-sel-list').innerHTML =
     '<div style="text-align:center;padding:24px;color:var(--txt3);font-size:12px">Loading…</div>';
   document.getElementById('mv-sel-title').textContent = cat.title || 'Channels';
   document.getElementById('mv-sel-back').style.display = '';
+
+  const key = _categoryKey('live', cat);
+  categoryItemsCache['live'] = categoryItemsCache['live'] || {};
+
+  // Serve from cache if present
+  if(categoryItemsCache['live'][key]){
+    _mvSelItems = categoryItemsCache['live'][key];
+    _mvRenderSel();
+    return;
+  }
 
   try {
     // Same endpoint as the main UI's browseC() function
@@ -12886,6 +12906,8 @@ async function _mvSelOpenCat(cat){
     });
     const d = await r.json();
     _mvSelItems = d.items || [];
+    // store in cache
+    categoryItemsCache['live'][key] = _mvSelItems;
   } catch(e){
     _mvSelItems = [];
     toast('Could not load category: ' + (cat.title||'?'), 'err');
