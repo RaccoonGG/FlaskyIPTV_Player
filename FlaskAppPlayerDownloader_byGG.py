@@ -7375,10 +7375,48 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <span id="pctrl-arrow" style="font-size:10px;color:var(--txt3);transition:transform .2s;display:inline-block">▲</span>
           <h3 style="font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1.5px;color:var(--txt2);margin:0">Player Controls</h3>
         </div>
-        <button id="mv-desktop-btn" onclick="event.stopPropagation();mvToggle()" title="Multi-View"
-          style="height:26px;padding:0 10px;font-size:12px;font-weight:700;border-radius:var(--rss);
-                 background:var(--s4);color:var(--txt2);border:1px solid var(--bdr2);
-                 letter-spacing:.5px;display:none">⊞ Multi-View</button>
+        <div id="pctrl-hdr" onclick="togglePlayerControls()"
+             style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;
+             padding:5px 14px;background:var(--s2);user-select:none">
+
+          <div style="display:flex;align-items:center;gap:7px">
+            <span id="pctrl-arrow"
+              style="font-size:10px;color:var(--txt3);transition:transform .2s;display:inline-block">▲</span>
+
+            <h3 style="font-size:10px;font-weight:800;text-transform:uppercase;
+                letter-spacing:1.5px;color:var(--txt2);margin:0">
+                Player Controls
+            </h3>
+          </div>
+
+          <!-- RIGHT BUTTON GROUP -->
+          <div style="display:flex;align-items:center;gap:6px">
+
+            <button class="btn-ghost pnav" id="theaterbtn"
+              onclick="toggleTheater()"
+              title="Theater mode"
+              style="height:26px;width:32px;padding:0;display:flex;
+              align-items:center;justify-content:center">
+              <svg id="theater-icon" width="16" height="16" viewBox="0 0 16 16"
+                   fill="none" stroke="currentColor" stroke-width="1.8">
+                <polyline points="4,2 2,2 2,4"/>
+                <polyline points="12,2 14,2 14,4"/>
+                <polyline points="4,14 2,14 2,12"/>
+                <polyline points="12,14 14,14 14,12"/>
+              </svg>
+            </button>
+
+            <button id="mv-desktop-btn"
+              onclick="event.stopPropagation();mvToggle()"
+              title="Multi-View"
+              style="height:26px;padding:0 10px;font-size:12px;font-weight:700;
+              border-radius:var(--rss);background:var(--s4);color:var(--txt2);
+              border:1px solid var(--bdr2);letter-spacing:.5px;display:none">
+              ⊞ Multi-View
+            </button>
+
+          </div>
+        </div>
       </div>
       <div id="pctrl-body" style="overflow:hidden;transition:max-height .25s ease;max-height:0">
         <div class="pinfo">
@@ -7399,14 +7437,6 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
             <button class="btn-ghost pnav" id="epgbtn" onclick="showEPG()" title="EPG" style="font-size:14px;opacity:0.35">&#128197;</button>
             <button class="btn-ghost pnav" id="catchupbtn" onclick="showCatchup()" title="Catch-up TV" style="font-size:16px;opacity:0.35">&#8634;</button>
             <button class="btn-ghost pnav" id="subbtn" onclick="openSubSearch()" title="Subtitles" style="font-size:14px;opacity:0.35">&#128172;</button>
-            <button class="btn-ghost pnav" id="theaterbtn" onclick="toggleTheater()" title="Theater mode" style="display:none;padding:0;justify-content:center;align-items:center">
-              <svg id="theater-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:auto">
-                <polyline points="4,2 2,2 2,4"/>
-                <polyline points="12,2 14,2 14,4"/>
-                <polyline points="4,14 2,14 2,12"/>
-                <polyline points="12,14 14,14 14,12"/>
-              </svg>
-            </button>
           </div>
           <div style="min-height:12px;padding:0 4px">
             <span id="epg-now" style="font-size:11px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block"></span>
