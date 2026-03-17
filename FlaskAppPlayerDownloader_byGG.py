@@ -3345,14 +3345,127 @@ def api_catchup():
             sid   = str(item.get("stream_id") or item.get("id") or "").strip()
             if not sid:
                 return {"error": "No stream_id for Xtream catch-up"}
-            from urllib.parse import urlparse as _up
-            p = _up(base)
-            start_dt  = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-            start_fmt = start_dt.strftime("%Y-%m-%d:%H-%M")
-            cu_url = (f"{p.scheme}://{p.netloc}/timeshift/{user}/{pwd}"
-                      f"/{duration_min}/{start_fmt}/{sid}.m3u8")
-            state.log(f"[CatchUp] Xtream timeshift: {cu_url}")
-            return {"url": cu_url, "label": f"{item.get('name','')} [Catch-Up]"}
+
+            from urllib.parse import urlparse as _up, quote as _q
+            _p = _up(base)
+            base_norm = f"{_p.scheme}://{_p.netloc}"
+            now_ts = datetime.now(timezone.utc).timestamp()
+
+            # ── Step 1: get_epg — full channel schedule including past entries ───
+            # get_epg returns the full EPG listing for the channel (past + future),
+            # sorted newest-first on most panels.  This is the correct endpoint for
+            # catchup because it includes historical programmes the user can rewind to.
+            # get_short_epg only returns a handful of current/next entries and never
+            # contains past programmes, so it is useless here.
+            epg_api_url = (f"{base_norm}/player_api.php"
+                           f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}"
+                           f"&action=get_epg&stream_id={sid}")
+            state.log(f"[CatchUp] Xtream get_epg stream_id={sid}")
+
+            results = []
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(epg_api_url,
+                                        timeout=aiohttp.ClientTimeout(total=12)) as r:
+                        payload = await safe_json(r)
+
+                parsed = _parse_xtream_short_epg(payload)
+                all_entries = parsed.get("schedule", [])
+                state.log(f"[CatchUp] Xtream EPG entries: {len(all_entries)} total")
+
+                # Include past entries (start < now) — these are the ones the user
+                # can rewind to via timeshift.
+                for ep in all_entries:
+                    ep_end   = ep.get("end", 0)
+                    ep_start = ep.get("start", 0)
+                    if ep_start and ep_end and ep_start < now_ts:
+                        results.append({
+                            "title":        ep.get("title") or "Unknown",
+                            "start":        ep_start,
+                            "stop":         ep_end,
+                            # Store stream_id in cmd/live_cmd so api_catchup/play
+                            # can build the timeshift URL without extra state.
+                            "cmd":          sid,
+                            "live_cmd":     sid,
+                            "mark_archive": "1",  # Xtream always supports timeshift
+                            "epg_id":       "",
+                            "id":           "",
+                            "ch_id":        "",
+                        })
+
+                # Sort newest first (same as MAC catchup)
+                results.sort(key=lambda x: x.get("start", 0), reverse=True)
+
+            except Exception as e:
+                state.log(f"[CatchUp] Xtream EPG fetch error: {e}")
+
+            # ── Step 2: fallback to portal XMLTV for past-3-days window ───────────
+            # _fetch_xmltv_epg is designed for current/next EPG (±1-3h window).
+            # For catchup we access the XMLTV index cache directly and apply a
+            # wider 3-day past window ourselves.  We also try channel name as
+            # lookup when no dedicated epg_channel_id is available.
+            if not results:
+                epg_ch_id = str(item.get("epg_channel_id") or "").strip()
+                tvg_name  = str(item.get("name") or "").strip()
+                lookup_id = epg_ch_id or tvg_name  # fall back to channel name
+                if lookup_id and base_norm not in state._xmltv_no_data:
+                    xmltv_url = (f"{base_norm}/xmltv.php"
+                                 f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}")
+                    state.log(f"[CatchUp] Xtream XMLTV fallback (lookup={lookup_id!r})")
+                    try:
+                        # Build / retrieve the per-portal XMLTV index (shared with EPG cache)
+                        ck = base_norm
+                        cached_xmltv = state._xmltv_cache.get(ck)
+                        if cached_xmltv:
+                            _, epg_dict, chan_names = cached_xmltv
+                        else:
+                            epg_dict, chan_names = await _build_xmltv_index(
+                                xmltv_url, state.log)
+                            state._xmltv_cache[ck] = (time.time(), epg_dict, chan_names)
+                            if not epg_dict:
+                                state._xmltv_no_data.add(ck)
+
+                        if epg_dict:
+                            lookup_lower = lookup_id.strip().lower()
+                            entries = epg_dict.get(lookup_lower)
+                            # Display-name fallback: match via <display-name> in XMLTV
+                            if not entries:
+                                for cid, names in chan_names.items():
+                                    if (lookup_lower in names
+                                            or any(lookup_lower in n or n in lookup_lower
+                                                   for n in names)):
+                                        entries = epg_dict.get(cid)
+                                        if entries:
+                                            state.log(f"[CatchUp] XMLTV name match:"
+                                                      f" {lookup_id!r} → {cid!r}")
+                                            break
+
+                            if entries:
+                                cutoff = now_ts - 86400 * 3   # look back up to 3 days
+                                for ep in entries:
+                                    ep_start = ep.get("start", 0)
+                                    ep_end   = ep.get("end",   0)
+                                    if ep_start and ep_end and cutoff <= ep_start < now_ts:
+                                        results.append({
+                                            "title":        ep.get("title") or "Unknown",
+                                            "start":        ep_start,
+                                            "stop":         ep_end,
+                                            "cmd":          sid,
+                                            "live_cmd":     sid,
+                                            "mark_archive": "1",
+                                            "epg_id":       "",
+                                            "id":           "",
+                                            "ch_id":        "",
+                                        })
+                                results.sort(key=lambda x: x.get("start", 0), reverse=True)
+                                state.log(f"[CatchUp] XMLTV gave {len(results)} past entries")
+                    except Exception as e:
+                        state.log(f"[CatchUp] Xtream XMLTV fallback error: {e}")
+
+            if not results:
+                return {"error": "No past EPG data found. Use the manual time picker below."}
+
+            return {"archive_listings": results, "label": item.get("name", "")}
 
         # ── Stalker / MAC portal — get_simple_data_table ──────────────────────
         # This is the correct API (same as SFVIP/TiviMate). Returns mark_archive
@@ -3500,6 +3613,35 @@ def api_catchup_play():
         stop_ts = start_ts + 3600
 
     async def _play():
+        # ── Xtream: build timeshift URL directly — no portal call needed ──────
+        _conn = state.conn_type
+        if _conn == "xtream" or (_conn == "m3u_url" and state.m3u_xtream_override):
+            # cmd_in / live_cmd carries the stream_id (set by api_catchup above)
+            sid = cmd_in or live_cmd
+            if not sid:
+                return {"error": "Missing stream_id for Xtream catch-up"}
+            creds = state.m3u_xtream_override if _conn == "m3u_url" else None
+            base  = (creds["base"] if creds else state.url).rstrip("/")
+            user  = creds["username"] if creds else state.username
+            pwd   = creds["password"] if creds else state.password
+            import math as _m
+            from urllib.parse import urlparse as _up, quote as _q2
+            _p = _up(base)
+            dur = max(1, _m.ceil((stop_ts - start_ts) / 60))
+            start_dt  = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+            # Format matches reference script exactly:
+            # {protocol}://{server}:{port}/streaming/timeshift.php
+            #   ?username=...&password=...&stream={stream_id}
+            #   &start={YYYY-MM-DD}:{HH-MM}&duration={minutes}
+            # date:time separator is colon; time uses dashes not colons.
+            start_fmt = start_dt.strftime("%Y-%m-%d:%H-%M")
+            cu_url = (f"{_p.scheme}://{_p.netloc}/streaming/timeshift.php"
+                      f"?username={_q2(user, safe='')}&password={_q2(pwd, safe='')}"
+                      f"&stream={sid}&start={start_fmt}&duration={dur}")
+            state.log(f"[CatchUp/Play] Xtream timeshift.php -> {cu_url}")
+            return {"url": cu_url}
+
+        # ── MAC / Stalker portal ──────────────────────────────────────────────
         start_dt_utc = datetime.fromtimestamp(start_ts, tz=timezone.utc)
         start_local  = start_dt_utc.astimezone()   # local tz, same as utc_to_local()
         start_str    = start_local.strftime("%Y-%m-%d:%H-%M")
