@@ -34,6 +34,7 @@ Fixed ffmpeg mkv download not working on specific hls vods/series, by adding mpe
 Added logos to channels/vods/series.
 Added sub-menu option on channels/vods/series.
 Added open imdb page for vods/series in sub-menu of vods/series, it just does a search for imdb title.
+Added local M3U file parsing in M3U connect options.
 Varius UI fixes, and adjustments.
 """
 
@@ -2681,6 +2682,7 @@ class AppState:
         self.is_stalker_portal = False  # True when URL contains 'stalker_portal'
         self.cats_cache: dict = {}
         self.m3u_cache = None
+        self.m3u_is_local = False
         self.m3u_xtream_override = None
         self.stop_flag = threading.Event()
         self.log_queue: queue.Queue = queue.Queue(maxsize=2000)
@@ -2827,6 +2829,26 @@ async def _connect_async():
 
     if conn == "m3u_url":
         m3u_url = state.m3u_url
+
+        # Local file: already parsed — build cats directly, no network
+        if state.m3u_is_local and state.m3u_cache:
+            type_map = {"live": {"live", ""}, "vod": {"movie", "vod"}, "series": {"series", "episode"}}
+            for m in ("live", "vod", "series"):
+                tf = type_map[m]
+                seen, cats = set(), []
+                for gname, items in state.m3u_cache.items():
+                    if any(it.get("tvg_type","") in tf or (m=="live" and it.get("tvg_type","")=="") for it in items):
+                        if gname not in seen:
+                            seen.add(gname)
+                            cats.append({"id": gname, "title": gname})
+                state.cats_cache[m] = cats
+                state.log(f"[CONNECT] {m.upper()}: {len(cats)} categories")
+            state.connected = True
+            fname = m3u_url or "local file"
+            state.set_status(f"Connected (local M3U): {fname}")
+            return {"success": True, "categories": state.cats_cache,
+                    "ident": "Local M3U", "exp": fname, "is_stalker": False}
+
         detected = extract_xtream_from_m3u_url(m3u_url)
         if detected:
             state.log(f"[CONNECT] Xtream credentials detected in M3U URL — trying Xtream API first")
@@ -2940,6 +2962,7 @@ def api_connect():
         )
         state.cats_cache = {}
         state.m3u_cache = None
+        state.m3u_is_local = False
         state.m3u_xtream_override = None
         state._epg_cache = {}
         state._xmltv_cache = {}
@@ -2948,6 +2971,19 @@ def api_connect():
         state._won_ch_cache = (0.0, [])
         state.connected = False
         state.stop_flag.clear()
+        # Local M3U file: pre-parse content, set flag so _connect_async skips network
+        m3u_content = data.get("m3u_content", "").strip()
+        if m3u_content and state.conn_type == "m3u_url":
+            try:
+                _tmp = M3UClient("local_file", state.log)
+                _tmp._parse_m3u(m3u_content)
+                state.m3u_cache = dict(_tmp._all_groups)
+                state.m3u_is_local = True
+                state.log(f"[CONNECT] Local M3U parsed — {len(state.m3u_cache)} groups")
+            except Exception as _e:
+                state.log(f"[CONNECT] Local M3U parse error: {_e}")
+                state.m3u_cache = None
+                state.m3u_is_local = False
 
     try:
         result = run_async(_connect_async())
@@ -5168,6 +5204,113 @@ def api_browse_dir():
     return jsonify({"path": path, "parent": parent, "dirs": dirs, "files": files})
 
 
+@flask_app.route("/api/get_tmdb_id", methods=["POST"])
+def api_get_tmdb_id():
+    """Fetch TMDB/IMDB metadata for an Xtream VOD or Series item."""
+    data = request.get_json(force=True)
+    stream_id = str(data.get("stream_id", "")).strip()
+    series_id = str(data.get("series_id", "")).strip()
+    if not (stream_id or series_id) or state.conn_type != "xtream":
+        return jsonify({"tmdb_id": "", "imdb_id": ""})
+    try:
+        async def fetch():
+            async with _make_client(do_handshake=True) as client:
+                if series_id:
+                    url = client._api("get_series_info", series_id=series_id)
+                    async with client.session.get(url) as r:
+                        d = await safe_json(r)
+                    state.log(f"[TMDB] get_series_info top keys: {list(d.keys()) if isinstance(d, dict) else type(d)}")
+                    info = (d.get("info") or d.get("movie_data") or d) if isinstance(d, dict) else {}
+                    tmdb_id = str(info.get("tmdb_id") or info.get("tmdb") or "").strip()
+                    imdb_id = str(info.get("imdb") or info.get("imdb_id") or "").strip()
+                    state.log(f"[TMDB] get_series_info info keys: {list(info.keys()) if isinstance(info, dict) else type(info)} tmdb={tmdb_id!r} imdb={imdb_id!r}")
+                else:
+                    url = client._api("get_vod_info", vod_id=stream_id)
+                    async with client.session.get(url) as r:
+                        d = await safe_json(r)
+                    info = (d.get("info") or d.get("movie_data") or d) if isinstance(d, dict) else {}
+                    tmdb_id = str(info.get("tmdb_id") or info.get("tmdb") or "").strip()
+                    imdb_id = str(info.get("imdb") or info.get("imdb_id") or "").strip()
+                    state.log(f"[TMDB] get_vod_info keys: {list(info.keys()) if isinstance(info, dict) else type(info)} tmdb={tmdb_id!r} imdb={imdb_id!r}")
+                return {"tmdb_id": tmdb_id, "imdb_id": imdb_id}
+        result = run_async(fetch())
+        return jsonify(result)
+    except Exception as e:
+        state.log(f"[TMDB] get_info error: {e}")
+        return jsonify({"tmdb_id": "", "imdb_id": ""})
+
+
+@flask_app.route("/api/browse_m3u", methods=["GET"])
+def api_browse_m3u():
+    """Desktop only: open a native OS file picker for M3U/M3U8 files."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.wm_attributes("-topmost", True)
+        path = filedialog.askopenfilename(
+            title="Select M3U / M3U8 Playlist File",
+            filetypes=[("M3U playlist files", "*.m3u *.m3u8"), ("All files", "*.*")],
+        )
+        root.destroy()
+        return jsonify({"path": path or ""})
+    except Exception as e:
+        return jsonify({"path": "", "error": str(e)})
+
+
+@flask_app.route("/api/browse_dir_m3u", methods=["POST"])
+def api_browse_dir_m3u():
+    """List directory contents for the mobile M3U file browser (.m3u/.m3u8 files only)."""
+    data = request.get_json(force=True)
+    path = (data.get("path") or "/sdcard/Download").rstrip("/") or "/"
+    try:
+        entries = os.listdir(path)
+    except PermissionError:
+        return jsonify({"error": "Permission denied", "path": path, "dirs": [], "files": []}), 403
+    except FileNotFoundError:
+        return jsonify({"error": "Directory not found", "path": path, "dirs": [], "files": []}), 404
+    except Exception as e:
+        return jsonify({"error": str(e), "path": path, "dirs": [], "files": []}), 500
+    m3u_exts = {".m3u", ".m3u8"}
+    dirs, files = [], []
+    for name in sorted(entries, key=lambda x: x.lower()):
+        full = os.path.join(path, name)
+        try:
+            if os.path.isdir(full):
+                dirs.append(name)
+            elif os.path.isfile(full) and os.path.splitext(name)[1].lower() in m3u_exts:
+                files.append(name)
+        except Exception:
+            pass
+    parent = str(os.path.dirname(path)) if path not in ("/", "") else None
+    return jsonify({"path": path, "parent": parent, "dirs": dirs, "files": files})
+
+
+@flask_app.route("/api/read_m3u_path", methods=["POST"])
+def api_read_m3u_path():
+    """Read an M3U file from an absolute server-side path and return its text content."""
+    data = request.get_json(force=True)
+    path = (data.get("path") or "").strip()
+    if not path:
+        return jsonify({"error": "No path provided"}), 400
+    if not os.path.isfile(path):
+        return jsonify({"error": f"File not found: {path}"}), 404
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".m3u", ".m3u8", ".txt"):
+        return jsonify({"error": f"Unsupported format: {ext}"}), 400
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            content = raw.decode("latin-1", errors="replace")
+        return jsonify({"content": content, "file_name": os.path.basename(path)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @flask_app.route("/api/resolve_url", methods=["POST"])
 def api_resolve_url():
     """Resolve item stream URL without launching anything — used by mobile intent flow."""
@@ -5768,8 +5911,9 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .pbig:hover:not(:disabled){box-shadow:0 6px 30px var(--glow);filter:brightness(1.1);
   transform:scale(1.06)!important}
 .pnav{width:42px;height:42px;border-radius:50%;font-size:16px;padding:0;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}
+.btn-vol-group{display:inline-flex;flex-direction:column;gap:0;align-self:center;}
 .vrow{display:flex;align-items:center;gap:9px}
-.vrow input[type=range]{width:140px;flex-shrink:0;flex:1;height:4px;accent-color:var(--acc)}
+.vrow input[type=range]{flex:1;min-width:0;height:4px;accent-color:var(--acc)}
 .vlbl{font-size:11px;color:var(--txt2);width:28px;text-align:right;flex-shrink:0}
 .recrow{display:flex;align-items:center;gap:8px}
 #rbtn{height:34px;padding:0 14px}
@@ -5875,6 +6019,19 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .adr-prog-footer{display:flex;align-items:center;justify-content:space-between;gap:6px}
 .adr-prog-count{font-size:11px;color:var(--txt3);font-weight:600}
 .adr-prog-speed{font-size:11px;color:var(--acc2);font-weight:700;text-align:right}
+/* Recording section in action drawer */
+#adr-rec-section{margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--bdr)}
+#adr-rec-btn{width:100%;height:42px;font-size:13px;font-weight:700;border-radius:var(--rsm);
+  display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:8px;
+  background:rgba(220,50,50,.15);border:1px solid rgba(220,50,50,.35);color:#f06060;cursor:pointer;transition:background .15s}
+#adr-rec-btn:hover{background:rgba(220,50,50,.3)}
+#adr-rec-btn.rec{background:rgba(220,50,50,.3);border-color:rgba(220,50,50,.7);animation:recpulse 1.2s ease-in-out infinite}
+@keyframes recpulse{0%,100%{box-shadow:0 0 0 0 rgba(220,50,50,.4)}50%{box-shadow:0 0 0 6px rgba(220,50,50,0)}}
+#adr-rec-info{display:none;flex-direction:column;gap:4px}
+#adr-rec-info.vis{display:flex}
+#adr-rec-fname{font-size:11px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#adr-rec-timer{font-size:13px;font-weight:700;color:#f06060;letter-spacing:1px}
+#adr-rec-open{width:100%;height:34px;font-size:12px;font-weight:600;margin-top:4px}
 /* FAB — floating action button to open drawer */
 .fab{position:absolute;bottom:70px;right:60px;z-index:50;
   width:48px;height:48px;border-radius:50%;padding:0;font-size:20px;
@@ -6127,9 +6284,46 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
           <label>Pass</label><input id="i-pw" type="password" placeholder="password" style="max-width:150px" autocomplete="new-password">
         </div>
       </div>
-      <div id="cr-m3u" class="cr hidden">
-        <label>URL</label><input id="i-m3u" type="text" inputmode="url" placeholder="http://example.com/list.m3u" autocomplete="new-password" autocorrect="off" spellcheck="false">
-        <label title="Optional: external XMLTV EPG URL. Leave blank to use tvg-url from M3U.">EPG</label><input id="i-m3u-epg" type="text" inputmode="url" placeholder="https://epg.best/xmltv.php?… (optional)" style="max-width:300px" autocomplete="new-password" autocorrect="off" spellcheck="false">
+      <div id="cr-m3u" class="cr hidden" style="flex-direction:column;align-items:stretch;gap:5px">
+        <!-- URL row -->
+        <div style="display:flex;gap:6px;align-items:center">
+          <label>URL</label>
+          <input id="i-m3u" type="text" inputmode="url" placeholder="http://example.com/list.m3u" autocomplete="new-password" autocorrect="off" spellcheck="false">
+        </div>
+        <!-- EPG row -->
+        <div style="display:flex;gap:6px;align-items:center">
+          <label title="Optional: external XMLTV EPG URL. Leave blank to use tvg-url from M3U.">EPG</label>
+          <input id="i-m3u-epg" type="text" inputmode="url" placeholder="https://epg.best/xmltv.php?… (optional)" style="max-width:300px" autocomplete="new-password" autocorrect="off" spellcheck="false">
+        </div>
+        <!-- File row — always visible -->
+        <div style="display:flex;gap:6px;align-items:center">
+          <label style="flex-shrink:0">File</label>
+          <span id="m3u-fp-fname" style="flex:1;font-size:12px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">No file chosen</span>
+          <button class="btn-ghost" onclick="m3uOpenPicker()" style="height:28px;padding:0 10px;font-size:12px;flex-shrink:0;white-space:nowrap">📂 Browse…</button>
+          <button class="btn-ghost" onclick="m3uForceFileBrowser()" title="Force mobile file browser" style="height:28px;padding:0 8px;font-size:12px;flex-shrink:0;white-space:nowrap">📁</button>
+          <button class="btn-ghost" id="m3u-clear-btn" onclick="m3uClearLocal()" style="height:28px;padding:0 8px;font-size:11px;flex-shrink:0;display:none">✕</button>
+          <input type="file" id="m3u-local-input" accept=".m3u,.m3u8,audio/x-mpegurl,application/x-mpegurl" style="display:none;position:absolute;width:0;height:0;opacity:0" onchange="m3uLoadLocalFile(this)">
+        </div>
+        <span id="m3u-fp-status" style="font-size:11px;color:var(--txt2);padding-left:2px"></span>
+        <!-- Mobile inline file browser (shown when Browse clicked on mobile) -->
+        <div id="m3u-fp-mobile" style="display:none;border:1px solid var(--bdr);border-radius:var(--rsm);background:var(--s3);padding:8px;margin-top:2px">
+          <div style="display:flex;gap:5px;margin-bottom:6px;align-items:center">
+            <button class="btn-ghost" id="m3u-fb-up" style="height:30px;padding:0 10px;font-size:16px;flex-shrink:0" onclick="m3uFbUp()" title="Up">&#x2191;</button>
+            <span id="m3u-fb-path" style="font-size:11px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;align-self:center">/sdcard/Download</span>
+            <button class="btn-ghost" onclick="document.getElementById('m3u-fp-mobile').style.display='none'" style="height:26px;padding:0 8px;font-size:11px;flex-shrink:0">✕</button>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px">
+            <button class="btn-ghost" style="font-size:10px;height:22px;padding:0 7px" onclick="m3uFbNav('/sdcard/Download')">📥 Download</button>
+            <button class="btn-ghost" style="font-size:10px;height:22px;padding:0 7px" onclick="m3uFbNav('/storage/emulated/0/Download')">📥 /0/Download</button>
+            <button class="btn-ghost" style="font-size:10px;height:22px;padding:0 7px" onclick="m3uFbNav('/sdcard')">📱 /sdcard</button>
+            <button class="btn-ghost" style="font-size:10px;height:22px;padding:0 7px" onclick="m3uFbNav('/storage/emulated/0')">📱 /storage/0</button>
+            <button class="btn-ghost" style="font-size:10px;height:22px;padding:0 7px" onclick="m3uFbNav('/data/data/com.termux/files/home')">🖥 Termux</button>
+          </div>
+          <div id="m3u-fb-list" style="max-height:180px;overflow-y:auto;border:1px solid var(--bdr);border-radius:var(--rsm);background:var(--s4)">
+            <div style="padding:10px;font-size:12px;color:var(--txt3)">Loading…</div>
+          </div>
+          <div id="m3u-fp-status-mob" style="font-size:11px;color:var(--txt2);margin-top:4px"></div>
+        </div>
       </div>
       <div class="cr-bot">
         <span id="portal-name-label" style="font-size:12px;font-weight:700;color:var(--acc);
@@ -6284,14 +6478,15 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
           <div id="pu" onclick="cpyUrl()" title="Tap to copy stream URL">—</div>
         </div>
         <div class="pctrl">
+          <div class="btn-vol-group">
           <div class="ctrl-r ctr">
-            <button class="btn-ghost pnav" onclick="playerPrev()" title="Prev">⏮</button>
-            <button class="pbig" id="ppbtn" onclick="playerPP()">▶</button>
-            <button class="btn-ghost pnav" onclick="playerStop()" title="Stop">⏹</button>
-            <button class="btn-ghost pnav" onclick="playerNext()" title="Next">⏭</button>
-            <button class="btn-ghost pnav" id="epgbtn" onclick="showEPG()" title="EPG" style="font-size:14px;opacity:0.35">📅</button>
-            <button class="btn-ghost pnav" id="catchupbtn" onclick="showCatchup()" title="Catch-up TV" style="font-size:16px;opacity:0.35">↺</button>
-            <button class="btn-ghost pnav" id="subbtn" onclick="openSubSearch()" title="Subtitles" style="font-size:14px;opacity:0.35">💬</button>
+            <button class="btn-ghost pnav" onclick="playerPrev()" title="Prev">&#9198;</button>
+            <button class="pbig" id="ppbtn" onclick="playerPP()">&#9654;</button>
+            <button class="btn-ghost pnav" onclick="playerStop()" title="Stop">&#9209;</button>
+            <button class="btn-ghost pnav" onclick="playerNext()" title="Next">&#9197;</button>
+            <button class="btn-ghost pnav" id="epgbtn" onclick="showEPG()" title="EPG" style="font-size:14px;opacity:0.35">&#128197;</button>
+            <button class="btn-ghost pnav" id="catchupbtn" onclick="showCatchup()" title="Catch-up TV" style="font-size:16px;opacity:0.35">&#8634;</button>
+            <button class="btn-ghost pnav" id="subbtn" onclick="openSubSearch()" title="Subtitles" style="font-size:14px;opacity:0.35">&#128172;</button>
             <button class="btn-ghost pnav" id="theaterbtn" onclick="toggleTheater()" title="Theater mode" style="display:none;padding:0;justify-content:center;align-items:center">
               <svg id="theater-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:auto">
                 <polyline points="4,2 2,2 2,4"/>
@@ -6305,10 +6500,11 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
             <span id="epg-now" style="font-size:11px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block"></span>
           </div>
           <div class="vrow">
-            <span style="font-size:15px">🔉</span>
+            <span style="font-size:15px">&#128265;</span>
             <input type="range" id="vol" min="0" max="100" value="80" oninput="setVol(this.value)">
             <span class="vlbl" id="vlbl">80</span>
-            <span style="font-size:15px">🔊</span>
+            <span style="font-size:15px">&#128266;</span>
+          </div>
           </div>
           <div class="recrow">
             <button class="btn-red" id="rbtn" onclick="togRec()">⏺ Record</button>
@@ -6401,7 +6597,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   <button class="imenu-btn" id="imenu-epg"      onclick="iMenuEPG()">     <span class="imenu-ico">📅</span>EPG / Programme Info</button>
   <button class="imenu-btn" id="imenu-catchup"  onclick="iMenuCatchup()"> <span class="imenu-ico">↺</span>Catch-up TV</button>
   <div class="imenu-sep" id="imenu-sep2"></div>
-  <button class="imenu-btn" id="imenu-imdb"     onclick="iMenuIMDB()">    <span class="imenu-ico">🎬</span>Open IMDB Page</button>
+  <button class="imenu-btn" id="imenu-imdb"     onclick="iMenuIMDB()">    <span class="imenu-ico">🎬</span>Open TMDB/IMDB</button>
   <button class="imenu-btn" id="imenu-rec"      onclick="iMenuRec()">     <span class="imenu-ico">⏺</span>Record</button>
   <button class="imenu-btn" id="imenu-mkv"      onclick="iMenuMKV()">     <span class="imenu-ico">⬇</span>Download MKV</button>
 </div>
@@ -6436,7 +6632,16 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
     <button class="btn-ghost" onclick="closeDrawer()" style="height:32px;padding:0 12px;font-size:13px">✕</button>
   </div>
   <div class="adr-body">
-    <!-- CATS mode -->
+    <!-- Recording section — always visible -->
+    <div id="adr-rec-section">
+      <div class="adr-section-title">⏺ Recording</div>
+      <button id="adr-rec-btn" onclick="togRec()">⏺ Record</button>
+      <div id="adr-rec-info">
+        <div id="adr-rec-timer">00:00:00</div>
+        <div id="adr-rec-fname"></div>
+        <button class="btn-ghost adr-rec-open" onclick="openDrawer();closeDrawer();" style="width:100%;height:34px;font-size:12px;font-weight:600;margin-top:4px" id="adr-rec-open">📂 Open player controls</button>
+      </div>
+    </div>
     <div id="adr-cats-content" class="hidden">
       <div class="adr-section">
         <div class="adr-section-title">Select Categories</div>
@@ -7268,6 +7473,15 @@ function closeCP(){
 
 function setCT(t){
   CT=t;
+  if(t !== 'm3u_url' && _m3uLocalContent){
+    _m3uLocalContent = '';
+    _m3uLocalName    = '';
+    document.getElementById('m3u-fp-fname').textContent    = 'No file chosen';
+    document.getElementById('m3u-fp-fname').style.color    = 'var(--txt2)';
+    document.getElementById('m3u-clear-btn').style.display = 'none';
+    document.getElementById('m3u-fp-status').textContent   = '';
+    document.getElementById('m3u-fp-mobile').style.display = 'none';
+  }
   document.querySelectorAll('.ct-btn').forEach(b=>
     b.className = b.dataset.t===t?'btn-acc ct-btn':'btn-ghost ct-btn');
   ['cr-mac','cr-xtream','cr-m3u'].forEach(id=>
@@ -7286,6 +7500,7 @@ async function doConnect(){
     username:document.getElementById('i-us').value.trim(),
     password:document.getElementById('i-pw').value.trim(),
     m3u_url:document.getElementById('i-m3u').value.trim(),
+    m3u_content: CT==='m3u_url' && !document.getElementById('i-m3u').value.trim() ? (_m3uLocalContent||'') : '',
     ext_epg_url:(CT==='xtream'
       ? document.getElementById('i-epg').value.trim()
       : CT==='mac'
@@ -7314,8 +7529,9 @@ async function doConnect(){
       document.getElementById('main').classList.remove('items-open');
       showT('p-cats','t-cats');
       toast('✓ Connected!','ok');
-      // Save to profiles if toggle was active
-      if(saveToProfile){
+      // Save to profiles if toggle was active — skip if no portal URL (local file connect)
+      const canSave = !!(payload.url || payload.m3u_url);
+      if(saveToProfile && canSave){
         const arr=plLoadAll();
         // Use hostname (same as portal-name-label) as auto-generated name
         const autoName = _portalHost
@@ -7339,6 +7555,10 @@ async function doConnect(){
         toast('✓ Connected & saved to profiles!','ok');
         // Reset save button
         saveBtn._on = true; // toggleSaveChk will flip it to false
+        toggleSaveChk(saveBtn);
+      } else if(saveToProfile && !canSave){
+        toast('Local file — nothing to save to profiles','wrn');
+        saveBtn._on = true;
         toggleSaveChk(saveBtn);
       }
     } else {
@@ -7730,9 +7950,202 @@ function iMenuIMDB(){
   closeItemMenu();
   const it = filtItems[_iMenuIdx];
   if(!it) return;
-  const name = it.name||it.o_name||it.fname||'Unknown';
-  const query = encodeURIComponent(name.trim());
-  window.open('https://www.imdb.com/find/?q='+query+'&s=tt', '_blank');
+  const idFields = ['tmdb_id','tmdb','imdb_id','imdb','kinopoisk_id','movie_id','series_id','stream_id','id'];
+  const found = {};
+  idFields.forEach(k=>{ if(it[k]!==undefined && it[k]!==null && it[k]!=='') found[k]=it[k]; });
+  console.log('[TMDB] item keys:', Object.keys(it));
+  console.log('[TMDB] ID fields:', found);
+  alog('🔍 Item ID fields: '+JSON.stringify(found), 'i');
+  _iMenuIMDBOpen(it);
+}
+
+async function _iMenuIMDBOpen(it){
+  const _tmdbFields = ['kinopoisk_id','external_id','movie_tmdb_id','series_tmdb_id','tmdb_id','tmdb'];
+  // Priority 1: scan ALL fields for tt-prefixed IMDB ID
+  let imdbId = it.imdb_id || it.imdb || '';
+  if(!imdbId){
+    for(const v of Object.values(it)){
+      if(typeof v === 'string' && /^tt\d+$/i.test(v.trim())){ imdbId = v.trim(); break; }
+    }
+  }
+  // Priority 2: whitelisted numeric TMDB field
+  let tmdbId = '';
+  for(const f of _tmdbFields){
+    const v = String(it[f]||'').trim();
+    if(v && /^\d+$/.test(v)){ tmdbId = v; break; }
+  }
+  // Priority 3: for Xtream VOD/Series, fetch info from portal to get tmdb_id
+  const needFetch = !imdbId && !tmdbId && (
+    (it.stream_id && mode === 'vod') ||
+    (it.series_id && mode === 'series')
+  );
+  if(needFetch){
+    try{
+      alog('🔍 Fetching TMDB ID from portal…', 'i');
+      const body = it.series_id ? {series_id: it.series_id} : {stream_id: it.stream_id};
+      const r = await fetch('/api/get_tmdb_id', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      imdbId = d.imdb_id || '';
+      tmdbId = d.tmdb_id || '';
+      alog('🔍 Fetched — tmdb_id: '+(tmdbId||'none')+' imdb_id: '+(imdbId||'none'), 'i');
+    } catch(e){ /* fall through to name search */ }
+  }
+  if(imdbId){
+    window.open('https://www.imdb.com/title/'+imdbId+'/', '_blank');
+  } else if(tmdbId){
+    const section = mode === 'series' ? 'tv' : 'movie';
+    window.open('https://www.themoviedb.org/'+section+'/'+tmdbId, '_blank');
+  } else {
+    const name = it.name||it.o_name||it.fname||'Unknown';
+    window.open('https://www.imdb.com/find/?q='+encodeURIComponent(name.trim())+'&s=tt', '_blank');
+  }
+}
+
+// ── M3U LOCAL FILE PICKER ─────────────────────────────────
+let _m3uLocalContent  = '';
+let _m3uLocalName     = '';
+let _m3uFbCurrentPath = '/sdcard/Download';
+
+// Single entry point: desktop → tkinter/file-input, mobile → inline browser
+function m3uOpenPicker(){
+  if(_isMobile){
+    const mob = document.getElementById('m3u-fp-mobile');
+    const opening = mob.style.display === 'none';
+    mob.style.display = opening ? '' : 'none';
+    if(opening) m3uFbNav(_m3uFbCurrentPath);
+  } else {
+    m3uBrowseDesktop();
+  }
+}
+
+function m3uForceFileBrowser(){
+  const mob = document.getElementById('m3u-fp-mobile');
+  mob.style.display = '';
+  m3uFbNav(_m3uFbCurrentPath);
+}
+
+function m3uClearLocal(){
+  _m3uLocalContent = '';
+  _m3uLocalName    = '';
+  document.getElementById('m3u-fp-fname').textContent    = 'No file chosen';
+  document.getElementById('m3u-fp-fname').style.color    = 'var(--txt2)';
+  document.getElementById('m3u-clear-btn').style.display = 'none';
+  document.getElementById('m3u-fp-status').textContent   = '';
+  document.getElementById('m3u-fp-mobile').style.display = 'none';
+  const inp = document.getElementById('m3u-local-input');
+  if(inp) inp.value = '';
+}
+
+async function m3uBrowseDesktop(){
+  const stEl = document.getElementById('m3u-fp-status');
+  stEl.style.color = 'var(--txt2)';
+  stEl.textContent = 'Opening file picker…';
+  try{
+    const r = await fetch('/api/browse_m3u');
+    const d = await r.json();
+    if(d.error || !d.path){ stEl.textContent = d.error ? '⚠ '+d.error : 'No file selected.'; return; }
+    stEl.textContent = 'Reading…';
+    await _m3uLoadFromServerPath(d.path, stEl);
+  } catch(e){
+    // tkinter not available — fall back to browser <input type=file>
+    stEl.textContent = '';
+    document.getElementById('m3u-local-input').click();
+  }
+}
+
+function m3uFbUp(){
+  const el = document.getElementById('m3u-fb-path');
+  const cur = (el && el.textContent) || _m3uFbCurrentPath;
+  m3uFbNav(cur.replace(/\/[^/]+$/, '') || '/');
+}
+
+async function m3uFbNav(path){
+  _m3uFbCurrentPath = path;
+  const listEl = document.getElementById('m3u-fb-list');
+  const pathEl = document.getElementById('m3u-fb-path');
+  const upBtn  = document.getElementById('m3u-fb-up');
+  if(pathEl) pathEl.textContent = path;
+  listEl.innerHTML = '<div style="padding:10px;font-size:12px;color:var(--txt3)">Loading…</div>';
+  try{
+    const r = await fetch('/api/browse_dir_m3u',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path}),
+    });
+    const d = await r.json();
+    if(upBtn) upBtn.disabled = !d.parent;
+    if(d.error && !d.dirs.length && !d.files.length){
+      listEl.innerHTML = `<div style="padding:10px;font-size:12px;color:#f87171">⚠ ${esc(d.error)}</div>`;
+      return;
+    }
+    const rows = [];
+    for(const name of d.dirs){
+      const fp = path.replace(/\/+$/,'') + '/' + name;
+      rows.push(`<div class="sub-fb-row sub-fb-dir" onclick="m3uFbNav('${esc(fp)}')">
+        <span class="sub-fb-icon">📁</span><span class="sub-fb-name">${esc(name)}</span><span class="sub-fb-arr">›</span>
+      </div>`);
+    }
+    for(const name of d.files){
+      const fp = path.replace(/\/+$/,'') + '/' + name;
+      rows.push(`<div class="sub-fb-row sub-fb-file" style="color:var(--acc)" onclick="m3uFbPickFile('${esc(fp)}','${esc(name)}')">
+        <span class="sub-fb-icon">📄</span><span class="sub-fb-name">${esc(name)}</span>
+      </div>`);
+    }
+    if(!rows.length) rows.push('<div style="padding:10px;font-size:12px;color:var(--txt3)">No M3U files here. Tap a folder to browse.</div>');
+    listEl.innerHTML = rows.join('');
+  } catch(e){
+    listEl.innerHTML = `<div style="padding:10px;font-size:12px;color:#f87171">⚠ ${esc(String(e))}</div>`;
+  }
+}
+
+async function m3uFbPickFile(fullPath, name){
+  const stEl = document.getElementById('m3u-fp-status-mob');
+  stEl.textContent = 'Reading ' + name + '…';
+  await _m3uLoadFromServerPath(fullPath, stEl);
+  document.getElementById('m3u-fp-mobile').style.display = 'none';
+}
+
+async function _m3uLoadFromServerPath(path, stEl){
+  try{
+    const r = await fetch('/api/read_m3u_path',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path}),
+    });
+    const d = await r.json();
+    if(d.error){ stEl.textContent = '⚠ '+d.error; toast(d.error,'err'); return; }
+    _m3uLocalContent = d.content;
+    _m3uLocalName    = d.file_name;
+    _m3uApplySelected(d.file_name, stEl);
+  } catch(e){ stEl.textContent = '⚠ Error: '+e; toast('Failed to read M3U file','err'); }
+}
+
+function m3uLoadLocalFile(input){
+  const file = input.files && input.files[0];
+  if(!file) return;
+  const stEl = document.getElementById('m3u-fp-status');
+  stEl.textContent = 'Reading file…';
+  const reader = new FileReader();
+  reader.onload = function(e){
+    const content = e.target.result;
+    if(!content){ stEl.textContent = '⚠ File appears empty.'; return; }
+    _m3uLocalContent = content;
+    _m3uLocalName    = file.name;
+    _m3uApplySelected(file.name, stEl);
+  };
+  reader.onerror = function(){ stEl.textContent = '⚠ Failed to read file.'; toast('Failed to read M3U file','err'); };
+  reader.readAsText(file, 'utf-8');
+}
+
+function _m3uApplySelected(fname, stEl){
+  const fnEl = document.getElementById('m3u-fp-fname');
+  fnEl.textContent  = '📄 ' + fname;
+  fnEl.style.color  = 'var(--green)';
+  document.getElementById('m3u-clear-btn').style.display = '';
+  stEl.style.color  = 'var(--green)';
+  stEl.textContent  = '✓ Ready — click Connect';
+  toast('M3U file loaded — click Connect', 'ok');
 }
 
 function filterItems(){
@@ -8637,6 +9050,8 @@ async function startRec(){
   isRec=true;
   _syncRecBtn(true);
   document.getElementById('rfname').textContent=d.filename||'';
+  const adrFname=document.getElementById('adr-rec-fname');
+  if(adrFname) adrFname.textContent=d.filename||'';
   toast('⏺ Recording: '+(d.filename||''),'ok');
   let s=0;
   recTmr=setInterval(()=>{
@@ -8644,10 +9059,15 @@ async function startRec(){
     const h=String(Math.floor(s/3600)).padStart(2,'0');
     const m2=String(Math.floor(s%3600/60)).padStart(2,'0');
     const sc=String(s%60).padStart(2,'0');
-    document.getElementById('rtimer').textContent=h+':'+m2+':'+sc;
+    const ts=h+':'+m2+':'+sc;
+    document.getElementById('rtimer').textContent=ts;
+    const adrTimer=document.getElementById('adr-rec-timer');
+    if(adrTimer) adrTimer.textContent=ts;
     // Keep button text in sync with elapsed time
     const btn=document.getElementById('rbtn');
-    if(btn) btn.textContent=`⏹ Stop Recording ${h}:${m2}:${sc}`;
+    if(btn) btn.textContent=`⏹ Stop Recording ${ts}`;
+    const adrBtn=document.getElementById('adr-rec-btn');
+    if(adrBtn) adrBtn.textContent=`⏹ Stop Recording ${ts}`;
   },1000);
 }
 
@@ -8659,22 +9079,39 @@ async function stopRec(){
   isRec=false;
   _syncRecBtn(false);
   document.getElementById('rfname').textContent='';
+  const adrFname=document.getElementById('adr-rec-fname');
+  if(adrFname) adrFname.textContent='';
+  const adrTimer=document.getElementById('adr-rec-timer');
+  if(adrTimer) adrTimer.textContent='00:00:00';
   if(recTmr){clearInterval(recTmr);recTmr=null;}
 }
 
 function _syncRecBtn(recording){
   const btn=document.getElementById('rbtn');
   const timer=document.getElementById('rtimer');
-  if(!btn) return;
-  if(recording){
-    btn.textContent='⏹ Stop Recording';
-    btn.classList.add('rec');
-    if(timer) timer.classList.add('vis');
-  } else {
-    btn.textContent='⏺ Record';
-    btn.classList.remove('rec');
-    if(timer){timer.classList.remove('vis'); timer.textContent='00:00:00';}
+  const adrBtn=document.getElementById('adr-rec-btn');
+  const adrInfo=document.getElementById('adr-rec-info');
+  if(btn){
+    if(recording){
+      btn.textContent='⏹ Stop Recording';
+      btn.classList.add('rec');
+      if(timer) timer.classList.add('vis');
+    } else {
+      btn.textContent='⏺ Record';
+      btn.classList.remove('rec');
+      if(timer){timer.classList.remove('vis'); timer.textContent='00:00:00';}
+    }
   }
+  if(adrBtn){
+    if(recording){
+      adrBtn.textContent='⏹ Stop Recording';
+      adrBtn.classList.add('rec');
+    } else {
+      adrBtn.textContent='⏺ Record';
+      adrBtn.classList.remove('rec');
+    }
+  }
+  if(adrInfo) adrInfo.classList.toggle('vis', !!recording);
 }
 
 // ── DOWNLOADS ──────────────────────────────────────────────
@@ -8895,6 +9332,8 @@ setInterval(async()=>{
     fetch('/api/record/status').then(r=>r.json()).then(rs=>{
       if(rs.recording){
         document.getElementById('rfname').textContent=rs.filename||'';
+        const adrFname=document.getElementById('adr-rec-fname');
+        if(adrFname) adrFname.textContent=rs.filename||'';
         // Restart timer from server elapsed
         if(recTmr){clearInterval(recTmr);recTmr=null;}
         const parts=(rs.elapsed||'00:00:00').split(':').map(Number);
@@ -8904,9 +9343,14 @@ setInterval(async()=>{
           const h=String(Math.floor(s/3600)).padStart(2,'0');
           const m2=String(Math.floor(s%3600/60)).padStart(2,'0');
           const sc=String(s%60).padStart(2,'0');
-          document.getElementById('rtimer').textContent=h+':'+m2+':'+sc;
+          const ts=h+':'+m2+':'+sc;
+          document.getElementById('rtimer').textContent=ts;
+          const adrTimer=document.getElementById('adr-rec-timer');
+          if(adrTimer) adrTimer.textContent=ts;
           const btn=document.getElementById('rbtn');
-          if(btn) btn.textContent=`⏹ Stop Recording ${h}:${m2}:${sc}`;
+          if(btn) btn.textContent=`⏹ Stop Recording ${ts}`;
+          const adrBtn=document.getElementById('adr-rec-btn');
+          if(adrBtn) adrBtn.textContent=`⏹ Stop Recording ${ts}`;
         },1000);
       }
     }).catch(()=>{});
