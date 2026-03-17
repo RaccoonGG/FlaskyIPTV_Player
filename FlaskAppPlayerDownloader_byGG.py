@@ -11,10 +11,10 @@ Run: python app.py  then open http://localhost:5000 in your WebView/browser.
 Updates:
 Added support for /stalker_portal/ type of MAC portals.
 Added support for EPG.
-Added support for CatchUp (where avialaible and supported by portal).
+Added support for Stalker Portal CatchUp (where avialaible and supported by portal).
 Added support for external EPG url, to cover channels where portal does not provide EPG.
 Added tag bar above categories.
-Added CatchUP support for Xtream portal (ones that support it)
+Added support for Xtream CatchUp (where supported and available by Xtream portal).
 Varius UI fixes.
 """
 
@@ -2632,6 +2632,12 @@ async def _connect_async():
 flask_app = Flask(__name__)
 flask_app.config["SECRET_KEY"] = os.urandom(24)
 
+# NOTE: Do NOT use a shared requests.Session for /api/proxy.
+# HLS.js downloads multiple fragments in parallel — each hits Flask in its own
+# thread. A shared Session is not thread-safe for concurrent use and causes
+# race conditions on the connection pool. Plain requests.get() (which creates
+# a disposable Session per call) is the correct choice here.
+
 
 @flask_app.route("/")
 def index():
@@ -3618,7 +3624,7 @@ def api_catchup_play():
         _conn = state.conn_type
         if _conn == "xtream" or (_conn == "m3u_url" and state.m3u_xtream_override):
             # cmd_in / live_cmd carries the stream_id (set by api_catchup above)
-            sid = cmd_in or live_cmd
+            sid = live_cmd or cmd_in
             if not sid:
                 return {"error": "Missing stream_id for Xtream catch-up"}
             creds = state.m3u_xtream_override if _conn == "m3u_url" else None
@@ -3633,19 +3639,19 @@ def api_catchup_play():
             # Format: YYYY-MM-DD:HH-MM  (date:time separator=colon, time uses dashes)
             start_fmt = start_dt.strftime("%Y-%m-%d:%H-%M")
 
-            # Primary: path-based format confirmed by Kodi PVR team (ends in .ts so
-            # doPlay routes it through mpegts.js automatically).
+            # Primary: path-based .ts format — routes through mpegts.js automatically.
             # Do NOT use quote() on credentials — raw values match what the server expects.
             cu_url = (f"{_p.scheme}://{_p.netloc}"
                       f"/timeshift/{user}/{pwd}/{dur}/{start_fmt}/{sid}.ts")
 
-            # Fallback: query-string format (returned to client so JS can retry on error)
+            # Fallback: query-string format for servers that don't support path-based format.
+            # timeshift.php returns m3u8 so it routes through HLS.js.
             cu_url_fallback = (f"{_p.scheme}://{_p.netloc}/streaming/timeshift.php"
                                f"?username={user}&password={pwd}"
                                f"&stream={sid}&start={start_fmt}&duration={dur}")
 
-            state.log(f"[CatchUp/Play] Xtream timeshift (path) -> {cu_url}")
-            state.log(f"[CatchUp/Play] Xtream timeshift (query fallback) -> {cu_url_fallback}")
+            state.log(f"[CatchUp/Play] Xtream timeshift (path/primary)   -> {cu_url}")
+            state.log(f"[CatchUp/Play] Xtream timeshift (query/fallback)  -> {cu_url_fallback}")
             return {"url": cu_url, "fallback_url": cu_url_fallback}
 
         # ── MAC / Stalker portal ──────────────────────────────────────────────
@@ -4065,7 +4071,10 @@ def api_proxy():
                    'mpegurl' in ct.lower() or 'x-mpegurl' in ct.lower())
         if is_m3u8:
             text = resp.text
-            rewritten = _rewrite_m3u8(text, url)
+            # Use resp.url (final URL after any redirects) as the base for resolving
+            # relative segment/chunklist URLs. Using the original `url` would produce
+            # wrong absolute URLs if the server redirected the manifest request.
+            rewritten = _rewrite_m3u8(text, resp.url)
             return Response(rewritten, content_type="application/vnd.apple.mpegurl", headers=cors)
         def _gen():
             for chunk in resp.iter_content(chunk_size=16384):
@@ -4235,7 +4244,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .cr{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 .cr label{font-size:11px;color:var(--txt2);flex-shrink:0;width:28px}
 .cr input{flex:1;min-width:120px;height:34px;font-size:12px}
-.cr-bot{display:flex;gap:7px;align-items:center}
+.cr-bot{display:flex;gap:7px;align-items:center;justify-content:space-between}
 
 /* ─── main panels ─────────────────────────────────────────────── */
 #main{flex:1;overflow:hidden;display:flex;min-height:0}
@@ -4381,7 +4390,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   border-bottom:1px solid var(--bdr);transition:var(--tr)}
 .psopt:last-child{border-bottom:none}
 .psopt:hover{background:var(--s4);color:var(--txt)}
-.ytrow{display:flex;align-items:center;gap:7px;padding:4px 0;font-size:12px;color:var(--txt2)}
+
 
 /* ─── player ─────────────────────────────────────────────────── */
 #p-player{background:#000}
@@ -4599,12 +4608,17 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
         <label title="Optional: external XMLTV EPG URL. Leave blank to use tvg-url from M3U.">EPG</label><input id="i-m3u-epg" type="url" placeholder="https://epg.best/xmltv.php?… (optional)" style="max-width:300px">
       </div>
       <div class="cr-bot">
-        <button class="btn-acc" id="cbtn" onclick="doConnect()" style="height:36px;min-width:120px">🔌 Connect</button>
-        <button id="save-profile-chk" onclick="toggleSaveChk(this)"
-          style="height:36px;padding:0 12px;font-size:12px;border-radius:var(--rss);
-                 border:1px solid var(--bdr2);background:var(--s3);color:var(--txt2);
-                 cursor:pointer;white-space:nowrap;transition:var(--tr)"
-          >💾 Save</button>
+        <span id="portal-name-label" style="font-size:12px;font-weight:700;color:var(--acc);
+              white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%;
+              opacity:0.85">—</span>
+        <div style="display:flex;gap:7px;align-items:center;flex-shrink:0">
+          <button class="btn-acc" id="cbtn" onclick="doConnect()" style="height:36px;min-width:120px">🔌 Connect</button>
+          <button id="save-profile-chk" onclick="toggleSaveChk(this)"
+            style="height:36px;padding:0 12px;font-size:12px;border-radius:var(--rss);
+                   border:1px solid var(--bdr2);background:var(--s3);color:var(--txt2);
+                   cursor:pointer;white-space:nowrap;transition:var(--tr)"
+            >💾 Save</button>
+        </div>
       </div>
       <!-- Output paths — always accessible from settings panel -->
       <div style="border-top:1px solid var(--bdr);padding-top:8px;display:flex;flex-direction:column;gap:6px">
@@ -4629,7 +4643,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
             <div class="psopt" onclick="pickP('dir','/data/data/com.termux/files/home/Downloads/')">Termux ~/Downloads/</div>
           </div>
         </div>
-        <div class="ytrow"><input type="checkbox" id="ytfb" checked> <span>yt-dlp fallback if ffmpeg fails</span></div>
+
       </div>
     </div>
   </div>
@@ -4993,6 +5007,9 @@ async function doConnect(){
     if(d.success){
       document.getElementById('cdot').classList.add('on');
       setStatus('Connected: '+d.ident+(d.exp&&d.exp!=='unknown'?' · exp '+d.exp:''));
+      const _rawUrl = payload.m3u_url || payload.url || '';
+      const _portalHost = _rawUrl ? (()=>{try{return new URL(_rawUrl).hostname;}catch(e){return _rawUrl.replace(/https?:\/\//,'').split('/')[0].split(':')[0];}})() : '';
+      document.getElementById('portal-name-label').textContent = _portalHost || '—';
       catsCache=d.categories||{};
       // Always land on Live categories after any connect
       mode='live';
@@ -5002,9 +5019,10 @@ async function doConnect(){
       // Save to profiles if toggle was active
       if(saveToProfile){
         const arr=plLoadAll();
-        // Auto-generate name from URL/ident
-        const autoName = d.ident && d.ident!=='unknown' ? d.ident
-          : (payload.url||payload.m3u_url||'').replace(/https?:\/\//,'').split('/')[0].split(':')[0];
+        // Use hostname (same as portal-name-label) as auto-generated name
+        const autoName = _portalHost
+          || (payload.url||payload.m3u_url||'').replace(/https?:\/\//,'').split('/')[0].split(':')[0]
+          || 'Profile '+arr.length;
         const entry={
           id: Date.now().toString(36),
           name: autoName || 'Profile '+arr.length,
@@ -5028,11 +5046,12 @@ async function doConnect(){
     } else {
       document.getElementById('cdot').classList.remove('on');
       setStatus('Error: '+(d.error||'Unknown'));
+      document.getElementById('portal-name-label').textContent = '—';
       toast(d.error||'Connection failed','err');
       alog('❌ '+(d.error||''),'e');
       toggleCP(); // re-open so user can fix credentials
     }
-  }catch(e){setStatus('Error: '+e.message);toast(e.message,'err');}
+  }catch(e){setStatus('Error: '+e.message);toast(e.message,'err');document.getElementById('portal-name-label').textContent='—';}
   finally{setBusy(false);}
 }
 
@@ -5601,8 +5620,8 @@ function closeEPG(){document.getElementById('epg-overlay').style.display='none';
 document.getElementById('epg-overlay').addEventListener('click',function(e){if(e.target===this)closeEPG();});
 
 // ── CATCH-UP TV ─────────────────────────────────────────────────────────────
-// Mirrors catchuptestv9.py exactly: uses /api/catchup (get_simple_data_table)
-// which returns mark_archive flag + direct cmd per entry.
+// Catchup: uses /api/catchup to fetch past programme listings (Xtream: get_epg/XMLTV;
+// MAC/Stalker: get_simple_data_table). Clicking a programme calls /api/catchup/play.
 
 function showCatchup(){
   if(!_epgItem){toast('Play a live channel first','wrn');return;}
@@ -5731,7 +5750,9 @@ function doWatchCatchupManual(){
   // the same call that clicking a programme row makes.
   const match=_cuListings.find(p=>p.start&&p.stop&&p.start<=startTs&&startTs<p.stop)
     ||_cuListings.find(p=>p.start&&Math.abs(p.start-startTs)<300);
-  const liveCmd=_epgItem?.cmd||'';
+  // For Xtream: stream_id is the correct cmd value for timeshift.
+  // _epgItem.cmd is the full stream URL (not useful here); prefer stream_id.
+  const liveCmd=_epgItem?.stream_id||_epgItem?.cmd||'';
   const cmd=encodeURIComponent(match?.cmd||liveCmd);
   const live_cmd=encodeURIComponent(match?.live_cmd||liveCmd);
   const epg_id=encodeURIComponent(match?.epg_id||match?.id||'');
@@ -5813,7 +5834,7 @@ async function dlMKV(){
   const r=await fetch('/api/download/mkv',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({items:[...selSet],category:curCat,mode,out_dir:od,
-      use_fallback:document.getElementById('ytfb').checked})});
+      use_fallback:true})});
   const d=await r.json();
   d.ok?(toast(d.message,'ok'),pollBusy()):(toast(d.error,'err'),setBusy(false));
 }
