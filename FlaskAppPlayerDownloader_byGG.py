@@ -19,6 +19,7 @@ Added Favourites and saving them across sessions in browser memory.
 Added Whats on TV Now button, it checks external EPG url (you have to set it) for current time, and lists you programs and channels that are playing it,
 Clicking on Search Icon will check currently active portal if your portal has channel that you requested. (experimental, needs testing and good external EPG)
 Fixed different channel url outputs not playing correctly, fixed hevc channels not going thru ffmpeg.
+Also on network error and parsing hls errors (altho this can happens when channel is offline too), we attempt ffmpeg play.
 Varius UI fixes.
 """
 
@@ -1150,7 +1151,7 @@ class PortalClient:
                         if not cmd:
                             continue
                         cmd = cmd.split()[-1]
-                        resolved = ""
+                        resolved = ""  # resolve normally""
                         if isinstance(cmd, str) and cmd.startswith(("http://", "https://", "rtsp://")):
                             if "localhost" in cmd:
                                 resolved = await self.resolve_localhost_url(cmd)
@@ -4512,10 +4513,26 @@ def api_hls_proxy():
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
     except Exception as e:
         return Response(f"ffmpeg error: {e}", status=502)
+
+    # Log ffmpeg stderr in background thread so we can see errors in the app log
+    mode_label = "transcode" if transcode else "remux"
+    def _log_stderr():
+        try:
+            for raw in proc.stderr:
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    # Only log errors/warnings, skip progress lines (fps= bitrate= etc.)
+                    low = line.lower()
+                    if any(k in low for k in ("error", "invalid", "failed", "no such", "unable", "could not", "permission", "fatal")):
+                        state.log(f"[ffmpeg/{mode_label}] {line}")
+        except Exception:
+            pass
+    threading.Thread(target=_log_stderr, daemon=True).start()
+    state.log(f"[ffmpeg/{mode_label}] Started: {url[:80]}")
 
     def _gen():
         try:
@@ -4527,111 +4544,11 @@ def api_hls_proxy():
         finally:
             proc.kill()
             proc.wait()
+            state.log(f"[ffmpeg/{mode_label}] Stopped")
 
     h = dict(cors)
     h["Content-Type"] = "video/mp2t"
     return Response(stream_with_context(_gen()), status=200, headers=h)
-
-
-@flask_app.route("/api/codec_probe")
-def api_codec_probe():
-    """Read first ~8 TS packets from a stream, parse PAT/PMT, return codec info.
-    stream_type 36 = HEVC/H.265. Used by the player to decide whether to transcode
-    before mpegts.js tries (and fails) to push HEVC into MSE.
-    Returns: {"hevc": bool, "video_codec": str, "audio_codec": str, "stream_types": [...]}
-    """
-    url = request.args.get("url", "").strip()
-    if not url or not url.startswith(("http://", "https://")):
-        return jsonify({"error": "invalid url"}), 400
-    try:
-        headers = {"User-Agent": "VLC/3.0.0 LibVLC/3.0.0", "Accept": "*/*"}
-        resp = _requests_lib.get(url, headers=headers, stream=True, timeout=8,
-                                 verify=False, proxies={"http": None, "https": None})
-        # Read enough bytes to find PAT + PMT (each 188 bytes, usually in first ~2KB)
-        raw = b""
-        for chunk in resp.iter_content(chunk_size=1880):
-            raw += chunk
-            if len(raw) >= 1880:
-                break
-        resp.close()
-
-        # Parse TS packets to find PMT and extract stream types
-        STREAM_TYPE_NAMES = {
-            0x01: "mpeg1_video", 0x02: "mpeg2_video", 0x1b: "h264",
-            0x24: "hevc", 0x42: "avs", 0x10: "mpeg4_video",
-            0x03: "mp3", 0x04: "mp3", 0x0f: "aac", 0x11: "aac",
-            0x81: "ac3", 0x83: "ac3", 0x06: "private",
-        }
-        pmt_pid = None
-        stream_types = []
-
-        i = 0
-        while i + 188 <= len(raw):
-            pkt = raw[i:i+188]
-            i += 188
-            if pkt[0] != 0x47:
-                continue
-            pid = ((pkt[1] & 0x1f) << 8) | pkt[2]
-            payload_start = bool(pkt[1] & 0x40)
-            has_adaptation = bool(pkt[3] & 0x20)
-            has_payload    = bool(pkt[3] & 0x10)
-            if not has_payload:
-                continue
-            offset = 4
-            if has_adaptation:
-                adapt_len = pkt[4]
-                offset = 5 + adapt_len
-            if offset >= 188:
-                continue
-            if payload_start:
-                offset += 1  # pointer field
-
-            # PAT: pid == 0
-            if pid == 0 and pmt_pid is None:
-                # PAT section: skip table_id(1) + section header(3) + transport_stream_id(2) + version(1) + section_number(2)
-                sec = pkt[offset:]
-                if len(sec) < 12:
-                    continue
-                # Find first program != 0
-                pos = offset + 8  # skip to program entries
-                while pos + 3 < 188:
-                    prog_num = (pkt[pos] << 8) | pkt[pos+1]
-                    prog_pid = ((pkt[pos+2] & 0x1f) << 8) | pkt[pos+3]
-                    pos += 4
-                    if prog_num != 0:
-                        pmt_pid = prog_pid
-                        break
-
-            # PMT
-            elif pmt_pid and pid == pmt_pid:
-                sec = pkt[offset:]
-                if len(sec) < 12:
-                    continue
-                # Skip table header: table_id(1)+section_length(2)+prog_num(2)+version(1)+sec_num(2)+last_sec(1)+pcr_pid(2)+program_info_len(2)
-                hdr_len = 12
-                prog_info_len = ((sec[10] & 0x0f) << 8) | sec[11]
-                pos = hdr_len + prog_info_len
-                while pos + 4 < len(sec) - 4:  # -4 for CRC
-                    stype = sec[pos]
-                    es_pid = ((sec[pos+1] & 0x1f) << 8) | sec[pos+2]
-                    es_info_len = ((sec[pos+3] & 0x0f) << 8) | sec[pos+4]
-                    stream_types.append(stype)
-                    pos += 5 + es_info_len
-                break  # got what we need
-
-        hevc = 0x24 in stream_types
-        video_st = next((s for s in stream_types if s in (0x01,0x02,0x1b,0x24,0x42,0x10)), None)
-        audio_st = next((s for s in stream_types if s in (0x03,0x04,0x0f,0x11,0x81,0x83,0x06)), None)
-
-        return jsonify({
-            "hevc":         hevc,
-            "video_codec":  STREAM_TYPE_NAMES.get(video_st, f"0x{video_st:02x}") if video_st else "unknown",
-            "audio_codec":  STREAM_TYPE_NAMES.get(audio_st, f"0x{audio_st:02x}") if audio_st else "unknown",
-            "stream_types": [f"0x{s:02x}" for s in stream_types],
-        })
-    except Exception as e:
-        state.log(f"[CODEC_PROBE] Error: {e}")
-        return jsonify({"error": str(e), "hevc": False}), 200
 
 
 # ===================== HTML TEMPLATE =====================
@@ -6005,7 +5922,7 @@ async function playItem(i){
 let _playerStopped = false;  // set true when user stops — blocks any pending retries
 
 function _destroyPlayers(){
-  _playerStopped = true;
+  // Note: does NOT set _playerStopped — caller (doPlay/playerStop) manages that
   if(hlsObj){hlsObj.destroy();hlsObj=null;}
   if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
   vid.pause(); vid.removeAttribute('src'); vid.load();
@@ -6017,6 +5934,9 @@ function doPlay(url, name, opts={}){
   window._mseTranscodeFired = false;             // reset MSE transcode guard
   if(window._ptRetries) window._ptRetries = {}; // reset play_token retry counter
   if(window._mpegRetries) window._mpegRetries = {}; // reset general retry counter
+  window._remuxFired = false;                        // reset remux fallback flag
+  window._hlsRemuxFired = false;                     // reset HLS remux fallback flag
+  if(window._hlsRetries) window._hlsRetries = {};    // reset HLS retry counter
   setNP('▶ '+pName);
   document.getElementById('pu').textContent=url;
   document.getElementById('ppbtn').textContent='⏸';
@@ -6074,24 +5994,92 @@ function doPlay(url, name, opts={}){
     hlsObj.attachMedia(vid);
     hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>vid.play().catch(()=>{}));
     hlsObj.on(Hls.Events.ERROR,(_,data)=>{
-      if(data.fatal){
-        alog('[HLS] '+data.type+': '+data.details,'e');
-        // 503/403/404 = channel offline — destroy and stop, never retry
-        const hc = data?.response?.code || 0;
-        if(hc===503 || hc===403 || hc===404){
-          alog('[HLS] Channel unavailable ('+hc+') — stopping','e');
-          setNP('✗ Channel unavailable ('+hc+')');
+      const _det=(data.details||'').toLowerCase();
+      const _isManifest=_det.includes('manifest');
+      // Log all fatal errors and manifest errors
+      if(data.fatal || _isManifest) alog('[HLS] '+data.type+': '+data.details+(data.fatal?' (fatal)':' (non-fatal)'),'e');
+      // 503/403/404 — hard stop immediately
+      const hc=data?.response?.code||0;
+      if(hc===503||hc===403||hc===404){
+        alog('[HLS] Channel unavailable ('+hc+') — stopping','e');
+        setNP('✗ Channel unavailable ('+hc+')');
+        document.getElementById('ppbtn').textContent='▶';
+        if(hlsObj){hlsObj.destroy();hlsObj=null;}
+        return;
+      }
+      // manifestParsingError: retrying same manifest is pointless, go straight to remux
+      if(_isManifest && !_playerStopped && !url.includes('hls_proxy') && !window._hlsRemuxFired){
+        window._hlsRemuxFired=true;
+        alog('[HLS] Manifest unparseable — trying ffmpeg remux…','w');
+        if(hlsObj){hlsObj.destroy();hlsObj=null;}
+        const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
+        setTimeout(()=>{
+          if(_playerStopped) return;
+          setNP('▶ '+name+' [remux]');
+          if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
+            _playerStopped=false;
+            mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{
+              enableWorker:false,liveBufferLatencyChasing:true,
+              liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3,
+            });
+            mpegtsObj.attachMediaElement(vid);
+            mpegtsObj.load();
+            vid.play().catch(()=>{});
+            mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
+              if(!_playerStopped){
+                alog('[HLS/remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
+                setNP('✗ Stream unavailable: '+name);
+                document.getElementById('ppbtn').textContent='▶';
+              }
+            });
+          } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
+        },0);
+        return;
+      }
+      if(!data.fatal) return;
+      // Fatal non-manifest errors
+      if(data.type===Hls.ErrorTypes.NETWORK_ERROR){
+        if(!window._hlsRetries) window._hlsRetries={};
+        const _hk=String(pIdx)+'|'+url.slice(-20);
+        window._hlsRetries[_hk]=(window._hlsRetries[_hk]||0)+1;
+        if(window._hlsRetries[_hk]<=3&&!_playerStopped){
+          setTimeout(()=>{if(hlsObj&&!_playerStopped)hlsObj.startLoad();},2500);
+        } else if(!_playerStopped&&!url.includes('hls_proxy')&&!window._hlsRemuxFired){
+          window._hlsRemuxFired=true;
+          alog('[HLS] Retries exhausted — trying ffmpeg remux…','w');
+          const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
+          if(hlsObj){hlsObj.destroy();hlsObj=null;}
+          setTimeout(()=>{
+            if(_playerStopped) return;
+            setNP('▶ '+name+' [remux]');
+            _playerStopped=false;
+            if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
+              mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{
+                enableWorker:false,liveBufferLatencyChasing:true,
+                liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3,
+              });
+              mpegtsObj.attachMediaElement(vid);
+              mpegtsObj.load();
+              vid.play().catch(()=>{});
+              mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
+                if(!_playerStopped){
+                  alog('[HLS/remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
+                  setNP('✗ Stream unavailable: '+name);
+                  document.getElementById('ppbtn').textContent='▶';
+                }
+              });
+            } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
+          },0);
+        } else if(!_playerStopped){
+          alog('[HLS] Stream failed — channel may be offline','e');
+          setNP('✗ Stream unavailable: '+name);
           document.getElementById('ppbtn').textContent='▶';
-          if(hlsObj){ hlsObj.destroy(); hlsObj=null; }
-          return;
+          if(hlsObj){hlsObj.destroy();hlsObj=null;}
         }
-        if(data.type===Hls.ErrorTypes.NETWORK_ERROR)
-          setTimeout(()=>{if(hlsObj && !_playerStopped)hlsObj.startLoad();},2500);
-        else if(data.type===Hls.ErrorTypes.MEDIA_ERROR)
-          hlsObj.recoverMediaError();
+      } else if(data.type===Hls.ErrorTypes.MEDIA_ERROR){
+        hlsObj.recoverMediaError();
       }
     });
-
   } else if(isHls && vid.canPlayType('application/vnd.apple.mpegurl')){
     // ── Native HLS (Safari / iOS WebView) ─────────────────────
     vid.src=url; vid.play().catch(()=>{});
@@ -6197,10 +6185,38 @@ function doPlay(url, name, opts={}){
         window._mpegRetries[_mk] = (window._mpegRetries[_mk]||0)+1;
         if(window._mpegRetries[_mk] <= 3 && !_playerStopped){
           setTimeout(()=>{ if(mpegtsObj && !_playerStopped){ mpegtsObj.unload(); mpegtsObj.load(); vid.play().catch(()=>{}); }},2000);
+        } else if(!_playerStopped && !url.includes('hls_proxy') && !window._remuxFired){
+          // All normal retries exhausted — try ffmpeg -c copy remux as last resort.
+          // Handles container/mux issues that mpegts.js can't parse but ffmpeg can.
+          // -c copy = no re-encode, near-zero CPU cost.
+          window._remuxFired = true;
+          alog('[MPEGTS] Retries exhausted \u2014 trying ffmpeg remux (-c copy)\u2026','w');
+          const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
+          setTimeout(()=>{
+            if(_playerStopped) return;
+            if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
+            vid.pause(); vid.removeAttribute('src'); vid.load();
+            _playerStopped=false;
+            setNP('\u25b6 '+name+' [remux]');
+            mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{
+              enableWorker:false,liveBufferLatencyChasing:true,
+              liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3,
+            });
+            mpegtsObj.attachMediaElement(vid);
+            mpegtsObj.load();
+            vid.play().catch(()=>{});
+            mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
+              if(!_playerStopped){
+                alog('[MPEGTS/remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
+                setNP('\u2717 Stream unavailable: '+name);
+                document.getElementById('ppbtn').textContent='\u25b6';
+              }
+            });
+          },0);
         } else if(!_playerStopped){
-          alog('[MPEGTS] Stream failed after retries — channel may be offline','e');
-          setNP('✗ Stream unavailable: '+name);
-          document.getElementById('ppbtn').textContent='▶';
+          alog('[MPEGTS] Stream failed after retries \u2014 channel may be offline','e');
+          setNP('\u2717 Stream unavailable: '+name);
+          document.getElementById('ppbtn').textContent='\u25b6';
           window._mpegRetries[_mk]=0;
         }
       } else if(!isLiveStream && fallbackUrl && et===mpegts.ErrorTypes.NETWORK_ERROR){
@@ -6242,6 +6258,7 @@ vid.addEventListener('canplay',()=>document.getElementById('vph').style.opacity=
 
 function playerPP(){vid.paused||vid.ended?vid.play().catch(()=>{}):vid.pause();}
 function playerStop(){
+  _playerStopped = true;
   _destroyPlayers();
   pUrl=''; setNP('⏹ Stopped'); document.getElementById('pu').textContent='—';
   document.getElementById('ppbtn').textContent='▶';
