@@ -25,8 +25,8 @@ Fixed EPG out of memory happening in large EPG lists (altho now large external E
 Fixed laggy input in search filed for Whats on Now tab and dekstop version of saved logins tab.
 Added button that opens external player of your choice (on dekstop select exe, on mobile you can pick VLC, MX, MX PRO, Just Player)
 Added option to add subtitles from opensubtitles.com via inscript serach (get free apikey from https://www.opensubtitles.com/en/consumers)
-Added option to add local subtitles file.
-Addedd Subtitles delay by 0.1 + / - for fixing sync.
+Added option to add local subtitles file for subtitles (.srt/.vtt/.ass/.ssa) via Local File tab in the subtitle modal.
+Subtitle delay +/- works the same for local files as for OpenSubtitles.
 Varius UI fixes.
 """
 
@@ -4861,6 +4861,86 @@ def api_browse_exe():
         return jsonify({"path": "", "error": str(e)})
 
 
+@flask_app.route("/api/browse_subtitle", methods=["GET"])
+def api_browse_subtitle():
+    """Desktop only: open a native OS file picker for subtitle files."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.wm_attributes("-topmost", True)
+        path = filedialog.askopenfilename(
+            title="Select Subtitle File",
+            filetypes=[
+                ("Subtitle files", "*.srt *.vtt *.ass *.ssa"),
+                ("All files", "*.*"),
+            ],
+        )
+        root.destroy()
+        return jsonify({"path": path or ""})
+    except Exception as e:
+        return jsonify({"path": "", "error": str(e)})
+
+
+@flask_app.route("/api/load_subtitle_path", methods=["POST"])
+def api_load_subtitle_path():
+    """Android/mobile: read a subtitle file from an absolute path on the server filesystem."""
+    data = request.get_json(force=True)
+    path = (data.get("path") or "").strip()
+    if not path:
+        return jsonify({"error": "No path provided"}), 400
+    if not os.path.isfile(path):
+        return jsonify({"error": f"File not found: {path}"}), 404
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".srt", ".vtt", ".ass", ".ssa", ".txt"):
+        return jsonify({"error": f"Unsupported subtitle format: {ext}"}), 400
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            content = raw.decode("latin-1", errors="replace")
+        mime_map = {".srt": "text/srt", ".vtt": "text/vtt",
+                    ".ass": "text/x-ssa", ".ssa": "text/x-ssa"}
+        mime = mime_map.get(ext, "text/srt")
+        fname = os.path.basename(path)
+        return jsonify({"content": content, "file_name": fname, "mime": mime})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route("/api/browse_dir", methods=["POST"])
+def api_browse_dir():
+    """List directory contents for the mobile subtitle file browser."""
+    data = request.get_json(force=True)
+    path = (data.get("path") or "/sdcard/Download").rstrip("/") or "/"
+    try:
+        entries = os.listdir(path)
+    except PermissionError:
+        return jsonify({"error": "Permission denied", "path": path, "dirs": [], "files": []}), 403
+    except FileNotFoundError:
+        return jsonify({"error": "Directory not found", "path": path, "dirs": [], "files": []}), 404
+    except Exception as e:
+        return jsonify({"error": str(e), "path": path, "dirs": [], "files": []}), 500
+
+    sub_exts = {".srt", ".vtt", ".ass", ".ssa"}
+    dirs, files = [], []
+    for name in sorted(entries, key=lambda x: x.lower()):
+        full = os.path.join(path, name)
+        try:
+            if os.path.isdir(full):
+                dirs.append(name)
+            elif os.path.isfile(full) and os.path.splitext(name)[1].lower() in sub_exts:
+                files.append(name)
+        except Exception:
+            pass
+
+    parent = str(os.path.dirname(path)) if path not in ("/", "") else None
+    return jsonify({"path": path, "parent": parent, "dirs": dirs, "files": files})
+
+
 @flask_app.route("/api/resolve_url", methods=["POST"])
 def api_resolve_url():
     """Resolve item stream URL without launching anything — used by mobile intent flow."""
@@ -5703,7 +5783,9 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .sub-empty span{font-size:36px;display:block;margin-bottom:8px;opacity:.3}
 .sub-status-bar{padding:8px 12px;border-top:1px solid var(--bdr);flex-shrink:0;
   display:flex;align-items:center;justify-content:space-between;gap:8px;
-  background:var(--s2);font-size:11px;color:var(--txt3)}
+  background:var(--s2);font-size:11px;color:var(--txt3);flex-wrap:wrap}
+#sub-status-msg{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sub-status-bar .btn-ghost{flex-shrink:0;white-space:nowrap}
 .sub-active-strip{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.2);
   border-radius:var(--rss);padding:4px 10px;font-size:11px;color:var(--green);
   display:flex;align-items:center;gap:6px}
@@ -5720,6 +5802,16 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   border:1px solid var(--bdr2);background:var(--s3);color:var(--txt2);cursor:pointer;transition:var(--tr)}
 .sub-tab-btn.active{background:var(--acc);border-color:var(--acc);color:#fff}
 .sub-tab-btn:hover:not(.active){background:var(--s4);color:var(--txt)}
+/* mobile subtitle file browser */
+.sub-fb-row{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--bdr);
+  cursor:pointer;transition:background .12s;font-size:13px}
+.sub-fb-row:last-child{border-bottom:none}
+.sub-fb-row:hover,.sub-fb-row:active{background:var(--s4)}
+.sub-fb-dir{color:var(--txt)}
+.sub-fb-file{color:var(--cyan)}
+.sub-fb-icon{flex-shrink:0;font-size:15px}
+.sub-fb-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sub-fb-arr{flex-shrink:0;color:var(--txt3);font-size:16px}
 @media(max-width:600px){
   #sub-modal{max-height:96vh;border-radius:0}
   #sub-overlay{padding:0;align-items:flex-end}
@@ -6211,19 +6303,39 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 
       <!-- LOCAL FILE PANEL -->
       <div id="sub-panel-local" style="display:none;padding:10px 0 4px 0">
-        <div style="margin-bottom:10px;font-size:12px;color:var(--txt2)">
-          Choose a local subtitle file (.srt, .vtt, .ass, .ssa). The delay controls work the same as with online subtitles.
+        <!-- DESKTOP: native file picker via tkinter -->
+        <div id="sub-local-desktop">
+          <div style="margin-bottom:8px;font-size:12px;color:var(--txt2);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px">
+            <span>Choose a local subtitle file (.srt, .vtt, .ass, .ssa).</span>
+            <button class="btn-ghost" style="font-size:10px;height:22px;padding:0 8px;opacity:0.7" onclick="subForceFileBrowser()" title="Switch to file browser (Android)">📁 File browser</button>
+          </div>
+          <div class="sub-search-row" style="align-items:center;gap:8px">
+            <button class="btn-ghost" style="height:32px;padding:0 14px;font-size:12px;display:inline-flex;align-items:center;gap:6px;flex-shrink:0"
+              onclick="subBrowseDesktop()">&#x1F4C2; Choose file&hellip;</button>
+            <input type="file" id="sub-local-input" accept=".srt,.vtt,.ass,.ssa,text/plain"
+              style="display:none;position:absolute;width:0;height:0;opacity:0" onchange="subLoadLocalFile(this)">
+            <span id="sub-local-filename" style="font-size:12px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">No file chosen</span>
+          </div>
         </div>
-        <div class="sub-search-row" style="align-items:center;gap:8px">
-          <button class="btn-ghost" style="height:32px;padding:0 14px;font-size:12px;display:inline-flex;align-items:center;gap:6px;flex-shrink:0" title="Choose subtitle file"
-            onclick="document.getElementById('sub-local-input').value=''; document.getElementById('sub-local-input').click()">
-            &#x1F4C2; Choose file&hellip;
-          </button>
-          <input type="file" id="sub-local-input" accept=".srt,.vtt,.ass,.ssa,text/plain"
-            style="display:none;position:absolute;width:0;height:0;opacity:0" onchange="subLoadLocalFile(this)">
-          <span id="sub-local-filename" style="font-size:12px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">No file chosen</span>
+        <!-- MOBILE: inline file browser -->
+        <div id="sub-local-mobile" style="display:none">
+          <div class="sub-search-row" style="gap:5px;margin-bottom:6px">
+            <button class="btn-ghost" id="sub-fb-up" style="height:30px;padding:0 10px;font-size:16px;flex-shrink:0" onclick="subFbUp()" title="Up">&#x2191;</button>
+            <span id="sub-fb-path" style="font-size:11px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;align-self:center">/sdcard/Download</span>
+          </div>
+          <!-- Quick-jump roots -->
+          <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px">
+            <button class="btn-ghost" style="font-size:10px;height:22px;padding:0 7px" onclick="subFbNav('/sdcard/Download')">📥 Download</button>
+            <button class="btn-ghost" style="font-size:10px;height:22px;padding:0 7px" onclick="subFbNav('/storage/emulated/0/Download')">📥 /0/Download</button>
+            <button class="btn-ghost" style="font-size:10px;height:22px;padding:0 7px" onclick="subFbNav('/sdcard')">📱 /sdcard</button>
+            <button class="btn-ghost" style="font-size:10px;height:22px;padding:0 7px" onclick="subFbNav('/storage/emulated/0')">📱 /storage/0</button>
+            <button class="btn-ghost" style="font-size:10px;height:22px;padding:0 7px" onclick="subFbNav('/data/data/com.termux/files/home')">🖥 Termux</button>
+          </div>
+          <div id="sub-fb-list" style="max-height:200px;overflow-y:auto;border:1px solid var(--bdr);border-radius:var(--rsm);background:var(--s3)">
+            <div style="padding:10px;font-size:12px;color:var(--txt3)">Loading…</div>
+          </div>
         </div>
-        <div id="sub-local-status" style="font-size:11px;color:var(--txt2);margin-top:8px;min-height:16px"></div>
+        <div id="sub-local-status" style="font-size:11px;color:var(--txt2);margin-top:4px"></div>
       </div>
     </div>
     <div class="sub-status-bar">
@@ -6460,6 +6572,12 @@ function clearSubtitle(){
 }
 
 // ── SUBTITLE TAB SWITCHER ──────────────────────────────────
+function subForceFileBrowser(){
+  document.getElementById('sub-local-desktop').style.display = 'none';
+  document.getElementById('sub-local-mobile').style.display  = '';
+  document.getElementById('sub-local-status').textContent = '';
+  subFbNav(_subFbCurrentPath);
+}
 function subSwitchTab(tab){
   const isOnline = tab === 'online';
   document.getElementById('sub-panel-online').style.display = isOnline ? '' : 'none';
@@ -6467,14 +6585,125 @@ function subSwitchTab(tab){
   document.getElementById('sub-tab-online').classList.toggle('active', isOnline);
   document.getElementById('sub-tab-local').classList.toggle('active', !isOnline);
   if(!isOnline){
-    const inp = document.getElementById('sub-local-input');
-    if(inp) inp.value = '';
-    document.getElementById('sub-local-filename').textContent = 'No file chosen';
+    document.getElementById('sub-local-desktop').style.display = _isMobile ? 'none' : '';
+    document.getElementById('sub-local-mobile').style.display  = _isMobile ? ''     : 'none';
     document.getElementById('sub-local-status').textContent = '';
+    if(_isMobile){
+      // Auto-load the browser starting at Download folder
+      subFbNav(_subFbCurrentPath);
+    } else {
+      const inp = document.getElementById('sub-local-input');
+      if(inp) inp.value = '';
+      document.getElementById('sub-local-filename').textContent = 'No file chosen';
+    }
   }
 }
 
-// ── LOAD LOCAL SUBTITLE FILE ───────────────────────────────
+// ── DESKTOP: tkinter file picker ───────────────────────────
+async function subBrowseDesktop(){
+  const stEl = document.getElementById('sub-local-status');
+  stEl.textContent = 'Opening file picker…';
+  try{
+    const r = await fetch('/api/browse_subtitle');
+    const d = await r.json();
+    if(d.error || !d.path){ stEl.textContent = d.error ? '⚠ '+d.error : 'No file selected.'; return; }
+    stEl.textContent = 'Loading…';
+    document.getElementById('sub-local-filename').textContent = d.path.split(/[\\/]/).pop();
+    await _subLoadFromServerPath(d.path, stEl);
+  } catch(e){
+    // tkinter not available (e.g. headless) — fall back to browser file picker
+    stEl.textContent = '';
+    document.getElementById('sub-local-input').value = '';
+    document.getElementById('sub-local-input').click();
+  }
+}
+
+// ── MOBILE: inline file browser ────────────────────────────
+let _subFbCurrentPath = '/sdcard/Download';
+
+function subFbUp(){
+  const el = document.getElementById('sub-fb-path');
+  const cur = (el && el.textContent) || _subFbCurrentPath;
+  const parent = cur.replace(/\/[^/]+$/, '') || '/';
+  subFbNav(parent);
+}
+
+async function subFbNav(path){
+  _subFbCurrentPath = path;
+  const listEl  = document.getElementById('sub-fb-list');
+  const pathEl  = document.getElementById('sub-fb-path');
+  const upBtn   = document.getElementById('sub-fb-up');
+  if(pathEl) pathEl.textContent = path;
+  listEl.innerHTML = '<div style="padding:10px;font-size:12px;color:var(--txt3)">Loading…</div>';
+
+  try{
+    const r = await fetch('/api/browse_dir',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path}),
+    });
+    const d = await r.json();
+    if(upBtn) upBtn.disabled = !d.parent;
+
+    if(d.error && !d.dirs.length && !d.files.length){
+      listEl.innerHTML = `<div style="padding:10px;font-size:12px;color:#f87171">⚠ ${esc(d.error)}</div>`;
+      return;
+    }
+
+    const rows = [];
+    // Dirs first
+    for(const name of d.dirs){
+      const fullPath = path.replace(/\/+$/,'') + '/' + name;
+      rows.push(`<div class="sub-fb-row sub-fb-dir" onclick="subFbNav('${esc(fullPath)}')">
+        <span class="sub-fb-icon">📁</span><span class="sub-fb-name">${esc(name)}</span><span class="sub-fb-arr">›</span>
+      </div>`);
+    }
+    // Subtitle files
+    for(const name of d.files){
+      const fullPath = path.replace(/\/+$/,'') + '/' + name;
+      rows.push(`<div class="sub-fb-row sub-fb-file" onclick="subFbPickFile('${esc(fullPath)}','${esc(name)}')">
+        <span class="sub-fb-icon">💬</span><span class="sub-fb-name">${esc(name)}</span>
+      </div>`);
+    }
+    if(!rows.length){
+      rows.push('<div style="padding:10px;font-size:12px;color:var(--txt3)">No subtitle files here. Tap a folder to browse.</div>');
+    }
+    listEl.innerHTML = rows.join('');
+  } catch(e){
+    listEl.innerHTML = `<div style="padding:10px;font-size:12px;color:#f87171">⚠ ${esc(String(e))}</div>`;
+  }
+}
+
+async function subFbPickFile(fullPath, name){
+  const stEl = document.getElementById('sub-local-status');
+  stEl.textContent = 'Loading ' + name + '…';
+  await _subLoadFromServerPath(fullPath, stEl);
+}
+
+async function _subLoadFromServerPath(path, stEl){
+  try{
+    const r = await fetch('/api/load_subtitle_path',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path}),
+    });
+    const d = await r.json();
+    if(d.error){ stEl.textContent = '⚠ '+d.error; toast(d.error,'err'); return; }
+    _subApplyToPlayer(d.content, d.file_name, d.mime);
+    _subActiveFile = {name: d.file_name};
+    document.getElementById('sub-active-name').textContent = d.file_name;
+    document.getElementById('sub-active-info').style.display = 'flex';
+    const subBtn = document.getElementById('subbtn');
+    if(subBtn) subBtn.style.opacity = '1';
+    stEl.style.color = 'var(--green)';
+    stEl.textContent = '✓ Loaded: ' + d.file_name;
+    document.getElementById('sub-status-msg').textContent = 'Ready';
+    toast('Subtitle loaded','ok');
+  } catch(e){
+    stEl.textContent = '⚠ Error: '+e;
+    toast('Failed to load subtitle','err');
+  }
+}
+
+// ── BROWSER FILE INPUT (desktop fallback / direct pick) ────
 function subLoadLocalFile(input){
   const file = input.files && input.files[0];
   if(!file){ return; }
@@ -6496,8 +6725,9 @@ function subLoadLocalFile(input){
     document.getElementById('sub-active-info').style.display = 'flex';
     const subBtn = document.getElementById('subbtn');
     if(subBtn) subBtn.style.opacity = '1';
+    stEl.style.color = 'var(--green)';
     stEl.textContent = '✓ Loaded: ' + file.name;
-    document.getElementById('sub-status-msg').textContent = 'Local: ' + file.name;
+    document.getElementById('sub-status-msg').textContent = 'Ready';
     toast('Subtitle loaded','ok');
   };
   reader.onerror = function(){ stEl.textContent = '⚠ Failed to read file.'; toast('Failed to read subtitle file','err'); };
@@ -8262,7 +8492,9 @@ async function browseExtPlayer(){
     }
   }catch(e){toast('Browse failed: '+e,'err');}
 }
-const _isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+const _isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+  || ('ontouchstart' in window)
+  || (navigator.maxTouchPoints > 1);
 
 async function openExternal(i){
   const it=filtItems[i]; if(!it) return;
