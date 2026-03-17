@@ -14,6 +14,7 @@ Added support for EPG.
 Added support for CatchUp (where avialaible and supported by portal).
 Added support for external EPG url, to cover channels where portal does not provide EPG.
 Added tag bar above categories.
+Added CatchUP support for Xtream portal (ones that support it)
 Varius UI fixes.
 """
 
@@ -3625,21 +3626,27 @@ def api_catchup_play():
             user  = creds["username"] if creds else state.username
             pwd   = creds["password"] if creds else state.password
             import math as _m
-            from urllib.parse import urlparse as _up, quote as _q2
+            from urllib.parse import urlparse as _up
             _p = _up(base)
             dur = max(1, _m.ceil((stop_ts - start_ts) / 60))
             start_dt  = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-            # Format matches reference script exactly:
-            # {protocol}://{server}:{port}/streaming/timeshift.php
-            #   ?username=...&password=...&stream={stream_id}
-            #   &start={YYYY-MM-DD}:{HH-MM}&duration={minutes}
-            # date:time separator is colon; time uses dashes not colons.
+            # Format: YYYY-MM-DD:HH-MM  (date:time separator=colon, time uses dashes)
             start_fmt = start_dt.strftime("%Y-%m-%d:%H-%M")
-            cu_url = (f"{_p.scheme}://{_p.netloc}/streaming/timeshift.php"
-                      f"?username={_q2(user, safe='')}&password={_q2(pwd, safe='')}"
-                      f"&stream={sid}&start={start_fmt}&duration={dur}")
-            state.log(f"[CatchUp/Play] Xtream timeshift.php -> {cu_url}")
-            return {"url": cu_url}
+
+            # Primary: path-based format confirmed by Kodi PVR team (ends in .ts so
+            # doPlay routes it through mpegts.js automatically).
+            # Do NOT use quote() on credentials — raw values match what the server expects.
+            cu_url = (f"{_p.scheme}://{_p.netloc}"
+                      f"/timeshift/{user}/{pwd}/{dur}/{start_fmt}/{sid}.ts")
+
+            # Fallback: query-string format (returned to client so JS can retry on error)
+            cu_url_fallback = (f"{_p.scheme}://{_p.netloc}/streaming/timeshift.php"
+                               f"?username={user}&password={pwd}"
+                               f"&stream={sid}&start={start_fmt}&duration={dur}")
+
+            state.log(f"[CatchUp/Play] Xtream timeshift (path) -> {cu_url}")
+            state.log(f"[CatchUp/Play] Xtream timeshift (query fallback) -> {cu_url_fallback}")
+            return {"url": cu_url, "fallback_url": cu_url_fallback}
 
         # ── MAC / Stalker portal ──────────────────────────────────────────────
         start_dt_utc = datetime.fromtimestamp(start_ts, tz=timezone.utc)
@@ -3747,10 +3754,13 @@ def _parse_xtream_short_epg(payload: dict) -> dict:
             return float(s)
         except ValueError:
             pass
-        # Formatted datetime strings
+        # Formatted datetime strings — Xtream sends these in the SERVER'S local time,
+        # NOT UTC. Treat them as naive (local) so they round-trip correctly.
+        # If the consumer needs UTC epoch, use the start_timestamp field instead.
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
             try:
-                return datetime.strptime(s[:19], fmt).replace(tzinfo=timezone.utc).timestamp()
+                # datetime.fromtimestamp(datetime.strptime(...).timestamp()) keeps local tz
+                return datetime.strptime(s[:19], fmt).timestamp()
             except ValueError:
                 continue
         return 0.0
@@ -5372,6 +5382,7 @@ function doPlay(url, name, opts={}){
   const px='/api/proxy?url='+encodeURIComponent(url);
   const u=url.toLowerCase().split('?')[0];
   const qs=url.toLowerCase();
+  const fallbackUrl=opts.fallbackUrl||null;
 
   // Stalker storage URLs (stalker_portal/storage/get.php) must NOT go through
   // /api/proxy — the proxy double-encodes their query string (?filename=...&token=...).
@@ -5380,6 +5391,7 @@ function doPlay(url, name, opts={}){
 
   const isHls  = u.endsWith('.m3u8') || u.endsWith('.m3u')
                || u.includes('/hls/')
+               || u.includes('timeshift.php')
                || qs.includes('extension=m3u8');
 
   const isMpegTs = !isStorageUrl && (u.endsWith('.ts')
@@ -5463,6 +5475,11 @@ function doPlay(url, name, opts={}){
       // retrying after 2s may result in an expired token playing live content
       if(isLiveStream && et===mpegts.ErrorTypes.NETWORK_ERROR){
         setTimeout(()=>{ if(mpegtsObj){ mpegtsObj.unload(); mpegtsObj.load(); vid.play().catch(()=>{}); }},2000);
+      } else if(!isLiveStream && fallbackUrl && et===mpegts.ErrorTypes.NETWORK_ERROR){
+        // Catchup path-based .ts failed → try query-string format via HLS.js
+        alog('[MPEGTS] Catchup .ts failed — retrying with fallback URL via HLS.js','w');
+        _destroyPlayers();
+        doPlay(fallbackUrl, name, {isLive:false});
       }
     });
     if(isLiveStream) vid.play().catch(()=>{});
@@ -5682,7 +5699,8 @@ function doPlayArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, en
       const label=(_epgItem?_epgItem.name:'')+' — '+title+' [↺]';
       // Pass raw URL — doPlay always wraps in /api/proxy itself
       // Catchup is VOD — isLive:false prevents mpegts.js SourceBuffer crash
-      doPlay(d.url, label, {isLive:false});
+      // d.fallback_url is the query-string format; used if path-based .ts fails
+      doPlay(d.url, label, {isLive:false, fallbackUrl:d.fallback_url||null});
       toast('↺ Playing catch-up: '+title,'ok');
     } else {
       if(status) status.textContent='❌ '+(d.error||'Not available');
