@@ -1,44 +1,46 @@
 #!/usr/bin/env python3
 """
 MAC/Xtream/M3U Portal Builder — Flask/Android WebView Edition by GG_Raccoon.
-Build on base of Mac2M3UMKV_LiveVodsSeriesGUIPlayer_byGGv5.pyw CustomTkinter by GG_Raccoon.
+Build on the base of Mac2M3UMKV_LiveVodsSeriesGUIPlayer_byGGv5.pyw CustomTkinter by GG_Raccoon.
 Adapted to Flask + HTML5/HLS.js by conversion script.
 
-Tested on Windows 10 with python 3.14 and Termux on Android 16.
+Tested on Windows 10 with Python 3.14 and Termux on Android 16.
 First run install_requirements_FlaskAppPlayerDownloader.py to make sure you have everything you need to run this script.
-Run: python app.py  then open http://localhost:5000 in your WebView/browser.
+Run: python app.py,  then open http://localhost:5000 in your WebView/browser.
 
 Updates:
 Added support for /stalker_portal/ type of MAC portals.
 Added support for EPG.
-Added support for Stalker Portal CatchUp (where avialaible and supported by portal).
-Added support for external EPG url, to cover channels where portal does not provide EPG.
+Added support for Stalker Portal CatchUp (where available and supported by the portal).
+Added support for external EPG URL to cover channels where the portal does not provide EPG.
 Added tag bar above categories.
-Added support for Xtream CatchUp (where supported and available by Xtream portal).
+Added support for Xtream CatchUp (where supported and available by the Xtream portal).
 Added Favourites and saving them across sessions in browser memory.
-Added Whats on TV Now button, it checks external EPG url (you have to set it) for current time, and lists you programs and channels that are playing it,
-Clicking on Search Icon will check currently active portal if your portal has channel that you requested. (experimental, needs testing and good external EPG)
-Fixed different channel url outputs not playing correctly, fixed hevc channels not going thru ffmpeg.
-Also on network error and parsing hls errors (altho this can happens when channel is offline too), we attempt ffmpeg play.
-Added progress bar with real kbs speed for downloading MKV, and items/totalitems for M3U saving.
-Fixed EPG out of memory happening in large EPG lists (altho now large external EPG list can use 2000 MB of ram, like 30k channels lists)
-Fixed laggy desktop input in search filed for Whats on Now tab and dekstop version of saved logins tab.
-Added button that opens external player of your choice (on dekstop select exe, on mobile you can pick VLC, MX, MX PRO, Just Player)
+Added Whats on TV Now button, which checks the external EPG URL (you have to set it) for the current time, and lists the programs and channels that are playing it.
+Clicking on the Search Icon will check the currently active portal to see if your portal has a channel that you requested. (experimental, needs testing, and good external EPG)
+Fixed different channel URL outputs not playing correctly, fixed HEVC channels not going through ffmpeg.
+Also, on network error and parsing HLS errors (although this can happen when the channel is offline too), we attempt to play with ffmpeg.
+Added progress bar with real kbs speed for downloading MKV, and items/total items for M3U saving.
+Fixed EPG out of memory happening in large EPG lists (although now large external EPG lists can use 2000 MB of ram, like 30k channel lists)
+Fixed laggy desktop input in the search field for Whats on Now tab and dekstop version of saved logins tab.
+Added button that opens external player of your choice (on desktop select exe, on mobile you can pick VLC, MX, MX PRO, Just Player)
 Added option to add subtitles from opensubtitles.com via inscript serach (get free apikey from https://www.opensubtitles.com/en/consumers)
 Added option to add local subtitles file for subtitles (.srt/.vtt/.ass/.ssa) via Local File tab in the subtitle modal.
 Subtitle delay +/- works the same for local files as for OpenSubtitles.
-Dekstop view optimizations, bigger player, now activity log is hidden by default, can expand, player controls can be hidden to expand player, theater mode button to fully expand player and hiding all tabs.
+Desktop view optimizations, bigger player, now activity log is hidden by default, can expand, player controls can be hidden to expand player, theater mode button to fully expand player and hiding all tabs.
 Added external play button inside Whats on Now tab after search and matching channel, and added also inside catchup tab.
-Fixed major bug with yt-dlp fallback not respecting stop button.
-Fixed ffmpeg mkv download not working on specific hls vods/series, by adding mpeg-ts format as fallback to mkv.
+Fixed a major bug with yt-dlp fallback not respecting the stop button.
+Fixed ffmpeg mkv download not working on specific HLS VODs/series, by adding mpeg-ts format as a fallback to mkv.
 Added logos to channels/vods/series.
 Added sub-menu option on channels/vods/series.
-Added open imdb page for vods/series in sub-menu of vods/series, it just does a search for imdb title.
+Added an open IMDb page for VODs/Series in the sub-menu of VODs/Series; it just does a search for IMDb title.
 Added local M3U file parsing in M3U connect options.
 Added EPG layout to items tab.
 Added cast to Chromecast, DLNA, Airplay feature.
-Added Multi-View feature that supports also external urls like youtube/twitch (does not work on age-gated content)
-Varius UI fixes, and adjustments.
+Added Multi-View feature that also supports external URLs like YouTube/Twitch (does not work on age-gated content)
+Fixed external EPG decompression blocking threads, added EPG caching per attempted channel while we wait external EPG download to finish.
+Improved button highlights and added a glossy style to all buttons.
+Varius UI fixes and adjustments.
 """
 
 import base64
@@ -388,8 +390,9 @@ class PortalClient:
             js = js[0]
         if not isinstance(js, dict):
             return ("unknown", "unknown")
-        mac = str(js.get("mac", "unknown"))
-        phone = str(js.get("phone", "unknown"))
+        mac = str(js.get("mac") or js.get("device_mac") or self.mac or "unknown")
+        phone = str(js.get("phone") or js.get("end_date") or js.get("expire_date")
+                    or js.get("expiry") or js.get("expired") or "unknown")
         self.log(f"[MAC] Account: MAC={mac}  expiry={phone}")
         return (mac, phone)
 
@@ -2735,15 +2738,20 @@ class AppState:
         # epg_dict: {channel_id_lower: [(title, start, end, desc), ...]}  ← compact tuples
         # TTL = 1 hour, same as reference app
         self._xmltv_cache: dict = {}
-        self._xmltv_cache_ttl = 1800  # 30 min — matches the -6h/+24h window; no benefit caching longer
+        self._xmltv_cache_ttl = 1800  # 30 min — matches the -4h/+20h window; no benefit caching longer
         # Portals whose xmltv.php has channel defs but zero programme entries —
         # marked after first download so we never re-download this session.
         self._xmltv_no_data: set = set()
-        # Per-URL threading locks — ensures only one thread downloads a given
-        # XMLTV feed at a time; all other callers block then use the cache.
-        # threading.Lock (not asyncio.Lock) because each EPG request runs in
-        # its own event loop via run_async(), making asyncio primitives unusable.
-        self._xmltv_dl_locks: dict = {}   # url → threading.Lock()
+        # Per-URL download state:
+        #   _xmltv_dl_locks: url → threading.Lock()  (one download at a time)
+        #   _xmltv_dl_events: url → threading.Event()  (set when download done)
+        #   _xmltv_downloading: set of urls currently being downloaded
+        # Callers acquire the event (wait with timeout) instead of the lock,
+        # so they never block the Flask worker — they retry after the event fires.
+        self._xmltv_dl_locks: dict = {}      # url → threading.Lock()
+        self._xmltv_dl_events: dict = {}     # url → threading.Event()
+        self._xmltv_downloading: set = set() # urls currently in-flight
+        self._xmltv_needs: set = set()       # cache_keys confirmed to need XMLTV (no portal data)
         # Persistent StalkerPortalClient — reused across requests to avoid
         # repeated handshake/profile calls that cause portal rate-limiting
         self._stalker_client: object = None
@@ -3018,6 +3026,9 @@ def api_connect():
         state._epg_cache = {}
         state._xmltv_cache = {}
         state._xmltv_dl_locks = {}
+        state._xmltv_dl_events = {}
+        state._xmltv_downloading = set()
+        state._xmltv_needs = set()
         state._short_epg_broken = set()
         state._xmltv_no_data = set()
         state._won_ch_cache = (0.0, [])
@@ -3781,7 +3792,6 @@ def api_epg():
     # stream_id for Xtream, ch_id for Stalker/MAC, tvg_id for M3U
     stream_id = str(item.get("stream_id") or item.get("id") or "").strip()
     tvg_id    = str(item.get("tvg_id") or item.get("epg_channel_id") or item.get("name") or "").strip()
-    state.log(f"[EPG] item keys={list(item.keys())} stream_id={stream_id!r} tvg_id={tvg_id!r} epg_channel_id={item.get('epg_channel_id')!r}")
 
     # Cache key: portal type + channel identifier
     cache_key = f"{state.conn_type}:{stream_id or tvg_id}"
@@ -3793,6 +3803,14 @@ def api_epg():
             return jsonify(result)
         else:
             del state._epg_cache[cache_key]
+
+    # Short-circuit: if this channel is confirmed to need XMLTV (no portal data)
+    # and XMLTV is still downloading, skip the entire portal chain immediately.
+    ext_url = state.ext_epg_url
+    if cache_key in state._xmltv_needs and ext_url and ext_url in state._xmltv_downloading:
+        _loading = {"current": None, "next": None,
+                    "error": "EPG loading… please try again in a moment"}
+        return jsonify(_loading)
 
     async def fetch_epg():
         conn = state.conn_type
@@ -3869,6 +3887,11 @@ def api_epg():
                                                         state.log, cache_key=state.ext_epg_url)
                     if ext_result.get("current") or ext_result.get("next"):
                         return ext_result
+                    # If still loading, mark channel and skip portal next time
+                    if "loading" in (ext_result.get("error") or "").lower():
+                        state._xmltv_needs.add(cache_key)
+                        return {"current": None, "next": None,
+                                "error": ext_result.get("error")}
                     state.log(f"[EPG] External EPG: no match for {lookup_id!r}")
                     return {"current": None, "next": None,
                             "error": "Channel not found in external EPG.",
@@ -3938,6 +3961,12 @@ def api_epg():
                                                         state.log, cache_key=state.ext_epg_url)
                     if ext_result.get("current") or ext_result.get("next"):
                         return ext_result
+                    # If XMLTV is still loading, mark channel so future requests
+                    # skip the portal chain entirely while download is in progress.
+                    if "loading" in (ext_result.get("error") or "").lower():
+                        state._xmltv_needs.add(cache_key)
+                        return {"current": None, "next": None,
+                                "error": ext_result.get("error")}
                     # XMLTV was consulted and definitively returned nothing — tag the
                     # result so the retry loop knows there's no point trying again.
                     err = "No EPG data from portal."
@@ -3979,6 +4008,9 @@ def api_epg():
             if result.get("_xmltv_checked"):
                 state.log(f"[EPG] XMLTV confirmed no data — skipping retries")
                 break
+            # Don't retry if EPG is loading in background — just return the loading msg
+            if "loading" in (result.get("error") or "").lower():
+                break
             state.log(f"[EPG] Attempt {_retry + 1} returned no data — retrying ({_retry + 2}/3)")
             result = run_async(fetch_epg())
 
@@ -3987,13 +4019,14 @@ def api_epg():
             state._epg_cache[cache_key] = (time.time(), result)
         elif result.get("_xmltv_checked"):
             # Confirmed-empty (XMLTV was tried and found nothing): cache for 5 min
-            # so we don't re-hammer the portal on every scroll, but still refresh
-            # more often in case the EPG source is updated.
             state.log(f"[EPG] Confirmed no EPG — caching for 5 min")
             _confirmed_empty = {k: v for k, v in result.items() if k != "_xmltv_checked"}
             state._epg_cache[cache_key] = (time.time() - (state._epg_cache_ttl - 300), _confirmed_empty)
-        # Transient failures (portal unreachable, no XMLTV set) are not cached
-        # so they get a fresh try on the next page load.
+        elif "loading" in (result.get("error") or "").lower():
+            # XMLTV download in progress — cache for 4s so rapid per-channel retries
+            # hit the cache instead of re-running the full portal EPG chain.
+            state._epg_cache[cache_key] = (time.time() - (state._epg_cache_ttl - 4), result)
+        # Other transient failures not cached so they get a fresh try on next load.
         return jsonify({k: v for k, v in result.items() if k != "_xmltv_checked"})
     except Exception as e:
         state.log(f"[EPG] Error: {type(e).__name__}: {e}")
@@ -4003,28 +4036,57 @@ def api_epg():
         return jsonify(err_result)
 
 
+@flask_app.route("/api/epg_status", methods=["GET"])
+def api_epg_status():
+    """Returns whether external EPG is currently downloading or ready."""
+    url = request.args.get("url", "").strip()
+    if not url:
+        return jsonify({"downloading": False, "ready": True})
+    downloading = url in state._xmltv_downloading
+    ready = url in state._xmltv_cache and url not in state._xmltv_downloading
+    return jsonify({"downloading": downloading, "ready": ready})
+
+
 @flask_app.route("/api/whats_on", methods=["GET"])
 def api_whats_on():
     """Return all currently airing programmes from cached XMLTV data.
-    If ext_epg_url is set but not yet cached, downloads it first (blocking).
+    If ext_epg_url is set but not yet cached, kicks off a background download
+    and returns a loading status — never blocks the request.
     """
     now = time.time()
 
-    # If ext_epg_url is configured but not yet in cache, try to load it now
-    if state.ext_epg_url and state.ext_epg_url not in state._xmltv_cache:
-        if state.ext_epg_url not in state._xmltv_no_data:
-            try:
-                state.log(f"[WHATS_ON] Loading EPG from {state.ext_epg_url}")
-                epg_dict, chan_names = run_async(
-                    _build_xmltv_index(state.ext_epg_url, state.log)
-                )
-                state._xmltv_cache[state.ext_epg_url] = (time.time(), epg_dict, chan_names)
-                if not epg_dict:
-                    state._xmltv_no_data.add(state.ext_epg_url)
-            except Exception as e:
-                state.log(f"[WHATS_ON] EPG load failed: {e}")
-                return jsonify({"programs": [], "count": 0, "status": "error",
-                                "message": f"Failed to load EPG: {e}"})
+    # If ext_epg_url is configured but not yet in cache, kick off background download
+    ek = state.ext_epg_url
+    if ek and ek not in state._xmltv_cache and ek not in state._xmltv_no_data:
+        if ek not in state._xmltv_downloading:
+            state._xmltv_downloading.add(ek)
+            state.log(f"[WHATS_ON] Launching background EPG download from {ek}")
+
+            def _bg():
+                try:
+                    bg_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(bg_loop)
+                    epg_d, ch_n = bg_loop.run_until_complete(
+                        _build_xmltv_index(ek, state.log))
+                    bg_loop.close()
+                    state._xmltv_cache[ek] = (time.time(), epg_d, ch_n)
+                    if not epg_d:
+                        state._xmltv_no_data.add(ek)
+                    state.log(f"[WHATS_ON] Background EPG download complete")
+                except Exception as e:
+                    state.log(f"[WHATS_ON] EPG load failed: {e}")
+                finally:
+                    state._xmltv_downloading.discard(ek)
+                    state._xmltv_needs.clear()
+                    stale = [k for k, v in list(state._epg_cache.items())
+                             if "loading" in (v[1].get("error") or "").lower()]
+                    for k in stale:
+                        state._epg_cache.pop(k, None)
+
+            threading.Thread(target=_bg, daemon=True, name="xmltv-whats-on").start()
+
+        return jsonify({"programs": [], "count": 0, "status": "loading",
+                        "message": "EPG loading in background — please try again in a moment"})
 
     if not state._xmltv_cache:
         msg = ("No EPG data loaded yet. Open any live channel first to trigger EPG load, "
@@ -4943,7 +5005,7 @@ def _parse_stalker_epg(payload: dict, ch_id: str) -> dict:
 
 
 async def _build_xmltv_index(xmltv_url: str, log_cb=None,
-                             win_back_h: int = 6, win_fwd_h: int = 24) -> dict:
+                             win_back_h: int = 4, win_fwd_h: int = 20) -> dict:
     """Download XMLTV and build a time-windowed channel→programmes index.
 
     Memory optimisations vs the naive approach:
@@ -5021,82 +5083,68 @@ async def _build_xmltv_index(xmltv_url: str, log_cb=None,
     if is_gz:
         _log(f"[EPG] Detected gzip — decompressing on-the-fly into parser (no second temp file)…")
 
-    # Open for iterparse — decompress on-the-fly for .gz so we never hold both
-    # the compressed AND decompressed content in memory simultaneously.
-    # gzip.open() reads lazily, feeding the parser chunk-by-chunk.
-    try:
+    # ── Parsing is synchronous CPU-bound work (gzip decompress + iterparse).
+    # Running it directly on the asyncio event loop blocks ALL other requests
+    # until the parse finishes (can take 10-30s on large feeds).
+    # Offload to a thread-pool executor so the event loop stays responsive.
+    def _sync_parse() -> tuple:
         fh = _gzip.open(tmp_path, "rb") if is_gz else open(tmp_path, "rb")
-
-        chan_names:  dict = {}
-        epg_dict:    dict = {}
-        root = None
-        total_seen   = 0
-        total_kept   = 0
-
+        chan_names_: dict = {}
+        epg_dict_:   dict = {}
+        root_ = None
+        total_seen_  = 0
+        total_kept_  = 0
         try:
             context = ET.iterparse(fh, events=("start", "end"))
             for event, elem in context:
-                if event == "start" and root is None:
-                    root = elem   # first event is the <tv> root
+                if event == "start" and root_ is None:
+                    root_ = elem
                     continue
                 if event != "end":
                     continue
-
                 tag = elem.tag
-
                 if tag == "channel":
                     cid = (elem.get("id") or "").strip().lower()
                     if cid:
                         names = [dn.text.strip().lower()
                                  for dn in elem.findall("display-name") if dn.text]
-                        chan_names[cid] = names
-
+                        chan_names_[cid] = names
                 elif tag == "programme":
-                    total_seen += 1
+                    total_seen_ += 1
                     cid = (elem.get("channel") or "").strip().lower()
                     if cid:
                         start = _ts(elem.get("start", ""))
                         end   = _ts(elem.get("stop",  ""))
-
-                        # ── Time-window filter: skip anything entirely outside the window ──
-                        # A programme overlaps the window if it ends after win_start
-                        # AND starts before win_end.  end==0 means unknown — keep it.
                         if end and end < win_start:
-                            # Programme already finished before our look-back — discard
-                            if root is not None and elem is not root:
+                            if root_ is not None and elem is not root_:
                                 with contextlib.suppress(ValueError):
-                                    root.remove(elem)
+                                    root_.remove(elem)
                             continue
                         if start > win_end:
-                            # Programme starts after our look-ahead — discard
-                            if root is not None and elem is not root:
+                            if root_ is not None and elem is not root_:
                                 with contextlib.suppress(ValueError):
-                                    root.remove(elem)
+                                    root_.remove(elem)
                             continue
-
                         title = (elem.findtext("title") or "").strip()
-                        # Truncate description to 200 chars — long descs waste RAM
-                        # and are never fully displayed in the EPG grid anyway.
                         desc  = (elem.findtext("desc")  or "").strip()[:200]
                         if title and start:
-                            if cid not in epg_dict:
-                                epg_dict[cid] = []
-                            # Store as compact tuple instead of dict:
-                            # (title, start, end, desc) — ~35% less overhead than dict
-                            epg_dict[cid].append((title, start, end, desc))
-                            total_kept += 1
-
-                # Detach processed top-level elements from root so Python's GC
-                # can actually reclaim them. elem.clear() alone is not enough —
-                # root still holds a list reference to each cleared element.
-                if root is not None and elem is not root:
+                            if cid not in epg_dict_:
+                                epg_dict_[cid] = []
+                            epg_dict_[cid].append((title, start, end, desc))
+                            total_kept_ += 1
+                if root_ is not None and elem is not root_:
                     try:
-                        root.remove(elem)
+                        root_.remove(elem)
                     except ValueError:
                         pass
         finally:
             fh.close()
+        return epg_dict_, chan_names_, total_seen_, total_kept_
 
+    try:
+        loop = asyncio.get_event_loop()
+        epg_dict, chan_names, total_seen, total_kept = await loop.run_in_executor(
+            None, _sync_parse)
     finally:
         # On Windows, os.remove can fail with PermissionError if the OS hasn't
         # fully released the file lock yet (even after fh.close()).
@@ -5129,6 +5177,8 @@ async def _fetch_xmltv_epg(xmltv_url: str, tvg_id: str, log_cb=None,
     """Look up EPG for tvg_id using cached XMLTV index.
     cache_key should be base_norm (e.g. 'http://host:port') to share the
     index across all channels on the same portal.
+    Never blocks the caller — if a download is in progress, returns immediately
+    with a 'loading' error so the caller can retry later.
     """
     out = {"current": None, "next": None, "schedule": []}
     if not tvg_id:
@@ -5144,7 +5194,7 @@ async def _fetch_xmltv_epg(xmltv_url: str, tvg_id: str, log_cb=None,
         out["error"] = "Provider XMLTV contains no programme data"
         return out
 
-    # ── Get or build the index ────────────────────────────────────────────────
+    # ── Cache hit ─────────────────────────────────────────────────────────────
     cached = state._xmltv_cache.get(ck)
     if cached:
         cached_ts, epg_dict, chan_names = cached
@@ -5155,38 +5205,49 @@ async def _fetch_xmltv_epg(xmltv_url: str, tvg_id: str, log_cb=None,
             cached = None
 
     if not cached:
-        # Ensure only one thread downloads this URL at a time.
-        # threading.Lock because each EPG request runs in its own event loop.
-        if ck not in state._xmltv_dl_locks:
-            state._xmltv_dl_locks[ck] = threading.Lock()
-        lock = state._xmltv_dl_locks[ck]
+        # ── Non-blocking download: kick off background thread if not running ──
+        # Do NOT acquire a lock that would block the Flask worker thread.
+        # Instead: if a download is already in progress, return immediately with
+        # a retryable error. The UI will retry on next EPG click.
+        if ck in state._xmltv_downloading:
+            _log(f"[EPG] XMLTV download in progress for {ck} — will retry")
+            out["error"] = "EPG loading… please try again in a moment"
+            return out
 
-        # Acquire the lock in a thread-pool executor so we don't block the
-        # event loop while waiting for another thread's download to finish.
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lock.acquire)
-        try:
-            # Re-check cache — another thread may have populated it.
-            cached = state._xmltv_cache.get(ck)
-            if cached and time.time() - cached[0] < state._xmltv_cache_ttl:
-                epg_dict, chan_names = cached[1], cached[2]
-            elif ck not in state._xmltv_no_data:
-                try:
-                    epg_dict, chan_names = await _build_xmltv_index(xmltv_url, _log)
-                    state._xmltv_cache[ck] = (time.time(), epg_dict, chan_names)
-                    if not epg_dict:
-                        state._xmltv_no_data.add(ck)
-                        out["error"] = "Provider XMLTV contains no programme data"
-                        return out
-                except Exception as e:
-                    _log(f"[EPG] XMLTV download/parse error: {e}")
-                    out["error"] = str(e)
-                    return out
-            else:
-                out["error"] = "Provider XMLTV contains no programme data"
-                return out
-        finally:
-            lock.release()
+        # Mark as downloading and spawn a background thread
+        state._xmltv_downloading.add(ck)
+        _log(f"[EPG] Launching background XMLTV download for {ck}")
+
+        def _bg_download():
+            try:
+                bg_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(bg_loop)
+                epg_d, ch_n = bg_loop.run_until_complete(
+                    _build_xmltv_index(xmltv_url, _log))
+                bg_loop.close()
+                state._xmltv_cache[ck] = (time.time(), epg_d, ch_n)
+                if not epg_d:
+                    state._xmltv_no_data.add(ck)
+                _log(f"[EPG] Background XMLTV download complete for {ck}")
+            except Exception as e:
+                _log(f"[EPG] Background XMLTV error for {ck}: {e}")
+            finally:
+                state._xmltv_downloading.discard(ck)
+                # Clear the "needs XMLTV" markers so all waiting channels get
+                # a fresh EPG lookup now that the data is available.
+                state._xmltv_needs.clear()
+                # Also clear the per-channel "loading" cache entries so they
+                # don't serve stale loading responses after the download finishes.
+                stale = [k for k, v in list(state._epg_cache.items())
+                         if "loading" in (v[1].get("error") or "").lower()]
+                for k in stale:
+                    state._epg_cache.pop(k, None)
+
+        t = threading.Thread(target=_bg_download, daemon=True,
+                             name=f"xmltv-dl-{ck[:30]}")
+        t.start()
+        out["error"] = "EPG loading… please try again in a moment"
+        return out
 
     # ── Resolve channel ID → programme list ───────────────────────────────────
     entries = epg_dict.get(lookup)
@@ -5810,62 +5871,101 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   --bg:#060612;--s1:#0b0b1a;--s2:#10101e;--s3:#161628;--s4:#1c1c33;--s5:#23233d;
   --bdr:rgba(255,255,255,.07);--bdr2:rgba(255,255,255,.13);
   --acc:#7c3aed;--acc2:#6d28d9;--acc3:#5b21b6;
-  --glow:rgba(124,58,237,.45);--glow2:rgba(124,58,237,.18);--glow3:rgba(124,58,237,.07);
+  --glow:rgba(124,58,237,.55);--glow2:rgba(124,58,237,.22);--glow3:rgba(124,58,237,.08);
   --cyan:#06b6d4;--green:#22c55e;--red:#ef4444;--orange:#f59e0b;--blue:#3b82f6;
   --txt:#e4e8f5;--txt2:#7d8a9e;--txt3:#3d4558;
   --r:12px;--rsm:8px;--rss:5px;
   --tr:all .2s cubic-bezier(.4,0,.2,1);
   --sh:0 8px 32px rgba(0,0,0,.7);
+  /* glow helpers */
+  --glow-acc: 0 0 20px rgba(124,58,237,.5), 0 0 50px rgba(124,58,237,.2);
+  --glow-cyan: 0 0 18px rgba(6,182,212,.5), 0 0 40px rgba(6,182,212,.2);
+  --glow-green: 0 0 18px rgba(34,197,94,.45);
+  --glow-red: 0 0 18px rgba(239,68,68,.45);
 }
 html,body{height:100dvh;overflow:hidden;background:var(--bg);color:var(--txt);
   font-family:'Segoe UI',-apple-system,system-ui,sans-serif;font-size:14px;line-height:1.5;
   -webkit-font-smoothing:antialiased}
+
+/* Scrollbar */
 ::-webkit-scrollbar{width:3px;height:3px}
 ::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--s5);border-radius:3px}
-::-webkit-scrollbar-thumb:hover{background:var(--acc2)}
+::-webkit-scrollbar-thumb{background:rgba(124,58,237,.35);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:rgba(124,58,237,.6)}
+::selection{background:rgba(124,58,237,.3);color:var(--acc)}
 
 /* ─── inputs ─────────────────────────────────────────────────── */
-input,textarea{background:var(--s3);color:var(--txt);border:1.5px solid var(--bdr);
+input,textarea{background:rgba(0,0,0,.55);color:var(--txt);border:1.5px solid rgba(255,255,255,.1);
   border-radius:var(--rsm);padding:9px 12px;font-size:13px;outline:none;width:100%;
-  transition:border-color .2s cubic-bezier(.4,0,.2,1),box-shadow .2s cubic-bezier(.4,0,.2,1);
-  -webkit-appearance:none}
-input:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--glow2)}
-input::placeholder{color:var(--txt3)}
+  transition:border-color .25s ease,box-shadow .25s ease,transform .2s ease;
+  -webkit-appearance:none;box-shadow:inset 0 2px 8px rgba(0,0,0,.35)}
+input:focus,textarea:focus{border-color:var(--acc);
+  box-shadow:inset 0 2px 10px rgba(0,0,0,.4), 0 0 0 3px var(--glow2), 0 0 20px rgba(124,58,237,.2);
+  transform:scale(1.005)}
+input::placeholder,textarea::placeholder{color:var(--txt3);font-style:italic}
 input[type=range]{background:transparent;border:none;box-shadow:none;padding:0;cursor:pointer;
-  -webkit-appearance:auto;appearance:auto}
-input[type=checkbox]{width:auto;height:auto;padding:0;accent-color:var(--acc)}
+  -webkit-appearance:auto;appearance:auto;transform:none}
+input[type=checkbox]{width:auto;height:auto;padding:0;accent-color:var(--acc);transform:none;box-shadow:none}
 
 /* ─── buttons ────────────────────────────────────────────────── */
 button{cursor:pointer;border:none;border-radius:var(--rsm);padding:9px 16px;font-size:13px;
   font-weight:600;transition:var(--tr);outline:none;white-space:nowrap;
   -webkit-tap-highlight-color:transparent;user-select:none;position:relative;overflow:hidden}
-button::after{content:'';position:absolute;inset:0;background:rgba(255,255,255,0);
-  transition:background .15s;pointer-events:none;border-radius:inherit}
-button:hover:not(:disabled)::after{background:rgba(255,255,255,.06)}
-button:active:not(:disabled){transform:scale(.95)}
-button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
+/* Shine sweep — animates left→right on hover only, resets instantly on release */
+button::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.18),transparent);
+  transition:none;pointer-events:none}
+button:hover:not(:disabled)::before{left:100%;transition:left .45s ease}
+/* Scale on active for regular buttons only — .nt tabs must not scale (breaks selection visual) */
+button:not(.nt):active:not(:disabled){transform:scale(.94)}
+button:disabled{opacity:.3;cursor:not-allowed}
+/* Nav buttons: isolate stacking context so sweep clips per-button */
+.nt{overflow:hidden!important;isolation:isolate}
 
 .btn-acc{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
-  box-shadow:0 3px 14px var(--glow2)}
-.btn-acc:hover:not(:disabled){box-shadow:0 5px 22px var(--glow);filter:brightness(1.1)}
-.btn-green{background:rgba(34,197,94,.1);color:var(--green);border:1px solid rgba(34,197,94,.22)}
-.btn-green:hover:not(:disabled){background:rgba(34,197,94,.2)}
-.btn-red{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.22)}
-.btn-red:hover:not(:disabled){background:rgba(239,68,68,.2)}
-.btn-blue{background:rgba(59,130,246,.1);color:var(--blue);border:1px solid rgba(59,130,246,.22)}
-.btn-blue:hover:not(:disabled){background:rgba(59,130,246,.22)}
-.btn-ghost{background:var(--s3);color:var(--txt2);border:1px solid var(--bdr)}
-.btn-ghost:hover:not(:disabled){background:var(--s4);color:var(--txt);border-color:var(--bdr2)}
+  box-shadow:0 3px 14px var(--glow2),inset 0 1px 0 rgba(255,255,255,.15)}
+.btn-acc:hover:not(:disabled){box-shadow:var(--glow-acc);filter:brightness(1.12);transform:translateY(-1px)}
+
+.btn-green{background:rgba(34,197,94,.1);color:var(--green);border:1px solid rgba(34,197,94,.3);
+  box-shadow:0 0 12px rgba(34,197,94,.1)}
+.btn-green:hover:not(:disabled){background:rgba(34,197,94,.18);border-color:rgba(34,197,94,.55);
+  box-shadow:var(--glow-green);transform:translateY(-1px)}
+
+.btn-red{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3);
+  box-shadow:0 0 12px rgba(239,68,68,.1)}
+.btn-red:hover:not(:disabled){background:rgba(239,68,68,.18);border-color:rgba(239,68,68,.55);
+  box-shadow:var(--glow-red);transform:translateY(-1px)}
+
+.btn-blue{background:rgba(59,130,246,.1);color:var(--blue);border:1px solid rgba(59,130,246,.3)}
+.btn-blue:hover:not(:disabled){background:rgba(59,130,246,.2);border-color:rgba(59,130,246,.55);
+  box-shadow:0 0 18px rgba(59,130,246,.4);transform:translateY(-1px)}
+
+.btn-ghost{background:rgba(255,255,255,.04);color:var(--txt2);border:1px solid var(--bdr);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}
+.btn-ghost:hover:not(:disabled){background:rgba(255,255,255,.09);color:var(--txt);
+  border-color:var(--bdr2);box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}
+
 .btn-sm{height:30px;padding:0 10px;font-size:12px;border-radius:var(--rss)}
 
 /* ─── layout ─────────────────────────────────────────────────── */
-#app{display:flex;flex-direction:column;height:100dvh}
+/* Ambient background glow — subtle, non-distracting */
+body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
+  background:
+    radial-gradient(ellipse at top left,  rgba(124,58,237,.07) 0%,transparent 50%),
+    radial-gradient(ellipse at top right, rgba(6,182,212,.05)  0%,transparent 50%),
+    radial-gradient(ellipse at bottom,    rgba(124,58,237,.04) 0%,transparent 55%)}
+#app{display:flex;flex-direction:column;height:100dvh;position:relative;z-index:1}
 
 /* ─── header ─────────────────────────────────────────────────── */
-#hdr{flex-shrink:0;z-index:200;
-  background:linear-gradient(180deg,rgba(11,11,26,.98) 0%,rgba(10,10,22,.95) 100%);
-  border-bottom:1px solid var(--bdr);box-shadow:0 2px 20px rgba(0,0,0,.5)}
+#hdr{flex-shrink:0;z-index:200;position:relative;overflow:hidden;
+  background:rgba(8,8,20,.94);backdrop-filter:blur(20px);
+  border-bottom:1px solid rgba(124,58,237,.25);
+  box-shadow:0 2px 20px rgba(0,0,0,.6),0 0 40px rgba(124,58,237,.06),inset 0 1px 0 rgba(255,255,255,.06)}
+/* animated gradient scan-line at bottom of header */
+#hdr::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,var(--acc),var(--cyan),var(--acc),transparent);
+  animation:hdrScan 4s ease-in-out infinite;opacity:.7}
+@keyframes hdrScan{0%,100%{opacity:.35;transform:scaleX(.6)}50%{opacity:.9;transform:scaleX(1)}}
 #hdr-bar{display:flex;align-items:center;gap:8px;padding:8px 12px;min-height:52px}
 #cdot{width:9px;height:9px;border-radius:50%;background:var(--txt3);flex-shrink:0;transition:var(--tr)}
 #cdot.on{background:var(--green);box-shadow:0 0 8px var(--green),0 0 20px rgba(34,197,94,.3);
@@ -5895,7 +5995,16 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 #main{flex:1;overflow:hidden;display:flex;min-height:0;transition:grid-template-columns .25s ease}
 .panel{display:none;flex-direction:column;overflow:hidden;min-width:0;min-height:0}
 .panel.active{display:flex!important;flex:1}
-/* pctrl: always open on mobile, collapsible on desktop */
+/* Mobile pctrl: stack vertically, record/mkv row below controls */
+@media(max-width:899px){
+  .pctrl{flex-direction:column;align-items:stretch;padding:8px 10px;gap:6px}
+  .btn-vol-group{flex:unset;width:100%}
+  .pctrl-desktop-only{display:none!important}
+  .pctrl-mobile-rec{display:flex!important}
+}
+@media(min-width:900px){
+  .pctrl-mobile-rec{display:none!important}
+}
 #pctrl-hdr{display:none}
 #pctrl-body{max-height:none!important;overflow:visible!important}
 @media(min-width:900px){
@@ -5929,47 +6038,68 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 }
 
 /* ─── panel header ───────────────────────────────────────────── */
-.ph{background:linear-gradient(90deg,var(--s1),var(--s2));border-bottom:1px solid var(--bdr);
-  padding:10px 14px;display:flex;align-items:center;gap:8px;flex-shrink:0}
+.ph{background:linear-gradient(90deg,rgba(11,11,26,.9),rgba(16,16,30,.9));
+  border-bottom:1px solid rgba(124,58,237,.15);backdrop-filter:blur(12px);
+  padding:10px 14px;display:flex;align-items:center;gap:8px;flex-shrink:0;position:relative}
+.ph::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(124,58,237,.3),rgba(6,182,212,.2),transparent)}
 .ph h3{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1.5px;
   color:var(--txt2);flex:1;min-width:0}
 
 /* ─── bottom nav ─────────────────────────────────────────────── */
-#botnav{display:flex;background:var(--s1);border-top:1px solid var(--bdr);
-  flex-shrink:0;z-index:100;padding-bottom:env(safe-area-inset-bottom)}
+#botnav{display:flex;background:rgba(8,8,20,.97);border-top:1px solid rgba(124,58,237,.2);
+  flex-shrink:0;z-index:100;padding-bottom:env(safe-area-inset-bottom);
+  backdrop-filter:blur(20px);box-shadow:0 -4px 20px rgba(0,0,0,.5),0 0 30px rgba(124,58,237,.05)}
 .nt{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
   padding:8px 4px 10px;gap:3px;border:none;background:none;color:var(--txt3);
   font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;
   transition:var(--tr);position:relative;border-radius:0;overflow:visible}
 .nt.on{color:var(--acc)}
-.nt.on::before{content:'';position:absolute;top:0;left:25%;right:25%;height:2.5px;
+/* Indicator bar uses ::after — ::before belongs to the shine sweep and must not be touched */
+.nt.on::after{content:'';position:absolute;top:0;left:25%;right:25%;height:2.5px;
   background:linear-gradient(90deg,var(--acc),var(--cyan));border-radius:0 0 4px 4px;
-  animation:pop-in .2s ease}
+  box-shadow:0 0 10px var(--acc),0 0 20px rgba(124,58,237,.4);animation:pop-in .2s ease;
+  pointer-events:none}
 .nt-ico{font-size:22px;transition:var(--tr)}
-.nt.on .nt-ico{transform:scale(1.12)}
+.nt.on .nt-ico{transform:scale(1.2);filter:drop-shadow(0 0 6px var(--acc))}
 .badge{position:absolute;top:4px;right:calc(50% - 22px);background:var(--acc);
   color:#fff;font-size:9px;font-weight:800;border-radius:10px;padding:1px 5px;
-  min-width:16px;text-align:center;display:none;line-height:1.4;animation:pop-in .15s ease}
+  min-width:16px;text-align:center;display:none;line-height:1.4;animation:pop-in .15s ease;
+  box-shadow:0 0 8px var(--acc)}
 .badge.vis{display:block}
 
 /* ─── mode tabs ─────────────────────────────────────────────── */
 .mtabs{display:flex;gap:4px}
 .mt{padding:5px 11px;font-size:12px;font-weight:700;border-radius:20px;
-  background:var(--s3);color:var(--txt2);border:1px solid var(--bdr);transition:var(--tr)}
+  background:rgba(255,255,255,.03);color:var(--txt2);border:1px solid var(--bdr);
+  transition:var(--tr);position:relative;overflow:hidden}
+.mt::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.1),transparent);
+  transition:left .4s ease;pointer-events:none}
+.mt:hover::before{left:100%}
+.mt:hover:not(.on){border-color:var(--bdr2);color:var(--txt);background:rgba(255,255,255,.06)}
 .mt.on{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
-  border-color:transparent;box-shadow:0 2px 12px var(--glow2)}
+  border-color:transparent;box-shadow:0 2px 14px var(--glow2),0 0 28px rgba(124,58,237,.2),
+  inset 0 1px 0 rgba(255,255,255,.2)}
 @media(min-width:900px){
-  .mtabs{gap:3px}
-  .mt{padding:5px 8px;font-size:11px}
-  .mt[data-m="favs"]{padding:5px 7px}
+  .mtabs{gap:3px}\n  .mt{padding:5px 8px;font-size:11px}\n  .mt[data-m=\"favs\"]{padding:5px 7px}\n}
+/* Desktop: show full labels with icons, nice spacing */
+@media(min-width:900px){
+  .mtabs{gap:6px;flex:1}
+  .mt{padding:6px 14px;font-size:12px;letter-spacing:.3px}
+  .mt[data-m="favs"]{padding:6px 10px}
+  .mt[data-m="live"]{margin-left:auto}
+  .mt-txt{display:inline}
+  .mt-ico{display:inline;margin-right:4px}
 }
 .tag-bar{display:flex;gap:5px;overflow-x:auto;padding:4px 10px 2px;flex-shrink:0;scrollbar-width:none}
 .tag-bar::-webkit-scrollbar{display:none}
 .tag-pill{padding:3px 10px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.4px;
-  cursor:pointer;white-space:nowrap;border:1px solid var(--bdr2);background:var(--s3);
+  cursor:pointer;white-space:nowrap;border:1px solid var(--bdr2);background:rgba(255,255,255,.03);
   color:var(--txt2);transition:all .15s;flex-shrink:0}
-.tag-pill:hover{border-color:var(--acc);color:var(--acc)}
-.tag-pill.on{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;border-color:transparent}
+.tag-pill:hover{border-color:var(--acc);color:var(--acc);box-shadow:0 0 10px rgba(124,58,237,.2)}
+.tag-pill.on{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
+  border-color:transparent;box-shadow:0 0 12px var(--glow2)}
 
 /* ─── search bar ─────────────────────────────────────────────── */
 .sbar{position:relative;flex-shrink:0}
@@ -5986,10 +6116,16 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .citem{display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:var(--rsm);
   cursor:pointer;margin-bottom:3px;transition:var(--tr);border:1px solid transparent;
   animation:fade-up var(--d,.3s) ease both;position:relative;overflow:hidden}
-.citem:hover{background:var(--s3);border-color:var(--bdr);transform:translateX(3px)}
+.citem:hover{background:rgba(124,58,237,.07);border-color:rgba(124,58,237,.25);
+  transform:translateX(3px);box-shadow:0 0 14px rgba(124,58,237,.1),inset 0 1px 0 rgba(255,255,255,.04)}
 .citem:active{transform:scale(.97) translateX(2px)}
+/* shine sweep */
+.citem::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.06),transparent);
+  transition:left .5s ease;pointer-events:none;z-index:0}
+.citem:hover::before{left:100%}
 .citem::after{content:'';position:absolute;inset:0;opacity:0;transition:opacity .2s;
-  background:linear-gradient(90deg,var(--glow3),transparent);pointer-events:none}
+  background:linear-gradient(90deg,rgba(124,58,237,.06),transparent);pointer-events:none}
 .citem:hover::after{opacity:1}
 .c-ico{font-size:16px;flex-shrink:0;z-index:1}
 .c-name{flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;z-index:1}
@@ -6025,11 +6161,16 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .bc-s{color:var(--txt2)}.bc-c{color:var(--acc);font-weight:600}.bc-x{font-size:9px}
 
 .irow{display:flex;align-items:center;gap:7px;padding:8px 10px;border-radius:var(--rsm);
-  margin-bottom:3px;background:var(--s2);border:1px solid transparent;
-  animation:fade-up var(--d,.25s) ease both;transition:var(--tr)}
-.irow:hover{background:var(--s3);border-color:var(--bdr)}
-.irow.now{background:linear-gradient(90deg,rgba(124,58,237,.12),var(--s2));
-  border-color:rgba(124,58,237,.35);box-shadow:inset 3px 0 0 var(--acc)}
+  margin-bottom:3px;background:rgba(255,255,255,.02);border:1px solid transparent;
+  animation:fade-up var(--d,.25s) ease both;transition:var(--tr);position:relative;overflow:hidden}
+.irow::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.05),transparent);
+  transition:left .45s ease;pointer-events:none}
+.irow:hover{background:rgba(124,58,237,.07);border-color:rgba(124,58,237,.22);
+  box-shadow:0 0 12px rgba(124,58,237,.08)}
+.irow:hover::before{left:100%}
+.irow.now{background:linear-gradient(90deg,rgba(124,58,237,.15),rgba(124,58,237,.04));
+  border-color:rgba(124,58,237,.4);box-shadow:inset 3px 0 0 var(--acc),0 0 18px rgba(124,58,237,.12)}
 .irow.now .iname{color:var(--acc)}
 .ichk{
   width:18px!important;height:18px!important;min-width:18px;flex-shrink:0;
@@ -6064,28 +6205,44 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 /* ─── EPG Grid layout ──────────────────────────────────────────────────────── */
 #epg-grid-wrap{display:none;flex:1;flex-direction:column;min-height:0;overflow:hidden}
 #epg-grid-wrap.active{display:flex}
+/* Two-panel layout: ch-col (fixed, scrolls vertically only) + tl-col (scrolls both) */
+#epg-grid-body{display:flex;flex:1;min-height:0;overflow:hidden}
+#epg-ch-col{width:110px;min-width:110px;flex-shrink:0;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column;
+  scrollbar-width:none;border-right:1px solid var(--bdr2)}
+#epg-ch-col::-webkit-scrollbar{display:none}
+#epg-tl-col{flex:1;overflow:auto;min-width:0}
 #epg-grid-scroll{flex:1;overflow:auto;position:relative;min-height:0}
+@media(min-width:900px){
+  #epg-tl-col{cursor:grab}
+  #epg-tl-col:active{cursor:grabbing}
+}
 .epg-grid{display:table;min-width:100%;border-collapse:collapse}
 .epg-time-header{display:flex;position:sticky;top:0;z-index:30;background:var(--s1);
   border-bottom:1px solid var(--bdr2);height:28px;flex-shrink:0}
-.epg-ch-cell{position:sticky;left:0;z-index:20;width:110px;min-width:110px;
-  background:var(--s1);border-right:1px solid var(--bdr2);flex-shrink:0;
+/* ch-cell lives in #epg-ch-col which is a separate non-scrolling panel — no sticky needed */
+.epg-ch-cell{width:110px;min-width:110px;height:62px;min-height:62px;
+  background:var(--s1);flex-shrink:0;
   display:flex;flex-direction:column;align-items:center;justify-content:center;
-  gap:3px;padding:4px 5px;cursor:pointer;transition:background .15s}
-.epg-ch-cell:hover{background:var(--s3)}
+  gap:3px;padding:4px 5px;cursor:pointer;transition:var(--tr);overflow:hidden;position:relative}
+.epg-ch-cell::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.15),transparent);
+  transition:left .45s ease;pointer-events:none}
+.epg-ch-cell:hover::before{left:100%}
+.epg-ch-cell:hover{background:rgba(124,58,237,.15)}
 .epg-ch-logo{width:48px;height:30px;object-fit:contain;border-radius:3px;flex-shrink:0}
 .epg-ch-logo-ph{width:48px;height:30px;background:var(--s3);border-radius:3px;
   display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
 .epg-ch-name{font-size:9px;font-weight:600;color:var(--txt2);text-align:center;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;line-height:1.2}
-.epg-row{display:flex;border-bottom:1px solid var(--bdr);min-height:62px}
-.epg-row:hover .epg-ch-cell{background:var(--s3)}
-.epg-timeline{position:relative;flex:1;overflow:hidden;min-width:0}
+/* epg-row is now only in the timeline column — just a height container */
+.epg-row{border-bottom:1px solid var(--bdr);height:62px;min-height:62px;max-height:62px;position:relative;overflow:hidden}
+.epg-timeline{position:relative;overflow:hidden;min-width:0;contain:paint;height:62px;min-height:62px;max-height:62px}
 .epg-prog{position:absolute;top:2px;bottom:2px;border-radius:5px;
   background:var(--s3);border:1px solid var(--bdr);
   padding:3px 6px;overflow:hidden;cursor:pointer;transition:.12s;
-  display:flex;flex-direction:column;justify-content:center;min-width:4px}
-.epg-prog:hover{background:var(--s4);border-color:var(--acc);z-index:5}
+  display:flex;flex-direction:column;justify-content:center;min-width:4px;z-index:1}
+.epg-prog:hover{background:var(--s4);border-color:var(--acc);z-index:3;
+  box-shadow:inset 0 0 0 1px var(--acc)}
 .epg-prog.now{background:rgba(139,92,246,.14);border-color:var(--acc)}
 .epg-prog-title{font-size:11px;font-weight:600;color:var(--txt1);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -6099,7 +6256,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .epg-time-tick-line{position:absolute;top:0;width:1px;height:100%;
   background:var(--bdr);opacity:.5}
 .epg-time-lbl{font-size:9px;color:var(--txt3);white-space:nowrap;font-weight:600}
-.epg-grid-hdr-corner{width:110px;min-width:110px;flex-shrink:0;position:sticky;
+.epg-grid-hdr-corner{width:110px;min-width:110px;height:28px;flex-shrink:0;position:sticky;
   left:0;z-index:40;background:var(--s1);border-right:1px solid var(--bdr2);
   border-bottom:1px solid var(--bdr2);display:flex;align-items:center;justify-content:center}
 .epg-grid-hdr-times{flex:1;position:relative;overflow:hidden;height:28px}
@@ -6150,23 +6307,41 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   white-space:nowrap;cursor:pointer;transition:var(--tr)}
 #pu:hover{color:var(--cyan)}
 
-.pctrl{background:var(--s2);padding:12px 14px;display:flex;flex-direction:column;
-  gap:10px;flex-shrink:0;border-bottom:1px solid var(--bdr)}
+.pctrl{background:var(--s2);padding:8px 14px;display:flex;flex-direction:row;
+  align-items:flex-start;gap:10px;flex-shrink:0;border-bottom:1px solid var(--bdr)}
 .ctrl-r{display:flex;align-items:center;gap:7px}
 .ctrl-r.ctr{justify-content:center}
 .pbig{width:54px;height:54px;font-size:22px;border-radius:50%;
-  background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
-  box-shadow:0 4px 22px var(--glow);flex-shrink:0}
-.pbig:hover:not(:disabled){box-shadow:0 6px 30px var(--glow);filter:brightness(1.1);
-  transform:scale(1.06)!important}
+  background:linear-gradient(135deg,
+    #a855f7 0%,#7c3aed 20%,#c084fc 40%,#6d28d9 55%,#a78bfa 70%,#7c3aed 85%,#4c1d95 100%);
+  background-size:200% 200%;
+  animation:metallicShift 3s ease-in-out infinite;
+  box-shadow:0 4px 22px var(--glow),0 0 0 1px rgba(168,85,247,.3),inset 0 1px 0 rgba(255,255,255,.25),inset 0 -2px 4px rgba(0,0,0,.4);
+  color:#fff;flex-shrink:0;position:relative}
+@keyframes metallicShift{0%,100%{background-position:0% 50%}50%{background-position:100% 50%}}
+.pbig::after{content:'';position:absolute;top:6px;left:10px;right:20px;height:8px;
+  background:linear-gradient(180deg,rgba(255,255,255,.35),transparent);
+  border-radius:50%;pointer-events:none}
+.pbig:hover:not(:disabled){box-shadow:0 6px 30px var(--glow),0 0 20px rgba(168,85,247,.5),inset 0 1px 0 rgba(255,255,255,.3);
+  filter:brightness(1.15);transform:scale(1.06)!important}
+/* Animated divider line between player bottom and activity log */
+#pctrl-panel{position:relative}
+#pctrl-panel::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,var(--acc),var(--cyan),var(--acc),transparent);
+  animation:hdrScan 3.5s ease-in-out infinite;opacity:.6;pointer-events:none}
+/* Animated line above player controls (below video area) */
+#p-player .panel-divider-line{height:1px;flex-shrink:0;position:relative;overflow:visible}
+#p-player .panel-divider-line::after{content:'';position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent,var(--cyan),var(--acc),var(--cyan),transparent);
+  animation:hdrScan 5s ease-in-out infinite 1s;opacity:.5}
 .pnav{width:42px;height:42px;border-radius:50%;font-size:16px;padding:0;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}
-.btn-vol-group{display:inline-flex;flex-direction:column;gap:0;align-self:center;}
+.btn-vol-group{display:flex;flex-direction:column;gap:4px;flex:1;align-items:center;}
 .vrow{display:flex;align-items:center;gap:9px}
 .vrow input[type=range]{flex:1;min-width:0;height:4px;accent-color:var(--acc)}
 .vlbl{font-size:11px;color:var(--txt2);width:28px;text-align:right;flex-shrink:0}
 .recrow{display:flex;align-items:center;gap:8px}
-#rbtn{height:34px;padding:0 14px}
-#rbtn.rec{animation:rec-glow 1.5s ease infinite;
+#rbtn,#rbtn-mob{height:34px;padding:0 14px}
+#rbtn.rec,#rbtn-mob.rec{animation:rec-glow 1.5s ease infinite;
   background:rgba(239,68,68,.18);color:var(--red);border:1px solid rgba(239,68,68,.4)}
 .rtimer{font-size:13px;color:var(--red);font-variant-numeric:tabular-nums;font-weight:700;
   display:none;letter-spacing:.5px}
@@ -6196,9 +6371,23 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .pl-empty{text-align:center;padding:32px 16px;color:var(--txt3);font-size:12px}
 .pl-empty span{font-size:40px;display:block;margin-bottom:8px;opacity:.2;animation:float 3s ease infinite}
 .pli{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:var(--rsm);
-  margin-bottom:5px;background:var(--s3);border:1px solid var(--bdr);transition:var(--tr);
-  animation:fade-up .2s ease both}
-.pli:hover{background:var(--s4);border-color:var(--bdr2)}
+  margin-bottom:5px;background:rgba(255,255,255,.025);border:1px solid var(--bdr);transition:var(--tr);
+  animation:fade-up .2s ease both;border-left:3px solid var(--pli-accent,var(--bdr));
+  position:relative;overflow:hidden;box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}
+.pli::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.06),transparent);
+  transition:left .5s ease;pointer-events:none}
+.pli:hover::before{left:100%}
+.pli:hover{background:rgba(255,255,255,.05);border-color:var(--bdr2);
+  box-shadow:0 0 12px rgba(var(--pli-accent,124,58,237),.08),inset 0 1px 0 rgba(255,255,255,.06)}
+.pli-type-badge{font-size:9px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;
+  padding:1px 5px;border-radius:3px;flex-shrink:0;opacity:.9}
+.pli-type-mac{background:rgba(59,130,246,.15);color:#3b82f6;border:1px solid rgba(59,130,246,.3);
+  box-shadow:0 0 8px rgba(59,130,246,.15)}
+.pli-type-xtream{background:rgba(34,197,94,.15);color:#22c55e;border:1px solid rgba(34,197,94,.3);
+  box-shadow:0 0 8px rgba(34,197,94,.15)}
+.pli-type-m3u{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3);
+  box-shadow:0 0 8px rgba(239,68,68,.15)}
 .pli-ico{font-size:20px;flex-shrink:0}
 .pli-info{flex:1;min-width:0}
 .pli-name{font-size:13px;font-weight:600;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -6258,9 +6447,15 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .adr-prog-dismiss:hover{background:rgba(120,120,140,.35);color:var(--txt)}
 .adr-prog-label{font-size:11px;color:var(--txt2);margin-bottom:7px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.adr-prog-bar-wrap{background:var(--s4);border-radius:8px;height:7px;overflow:hidden;margin-bottom:6px;position:relative}
+.adr-prog-bar-wrap{background:rgba(0,0,0,.5);border-radius:8px;height:7px;overflow:hidden;
+  margin-bottom:6px;position:relative;border:1px solid rgba(255,255,255,.05)}
 .adr-prog-bar{height:100%;border-radius:8px;width:0%;transition:width .35s ease;
-  background:linear-gradient(90deg,var(--acc),var(--acc2))}
+  background:linear-gradient(90deg,var(--acc2),var(--acc),var(--cyan));
+  box-shadow:0 0 10px rgba(124,58,237,.5);position:relative;overflow:hidden}
+.adr-prog-bar::after{content:'';position:absolute;top:0;left:-120%;width:100%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.45),transparent);
+  animation:progSweep 1.6s ease infinite}
+@keyframes progSweep{to{left:120%}}
 @keyframes adr-indeterminate{
   0%{transform:translateX(-110%)}
   100%{transform:translateX(200%)}
@@ -6292,17 +6487,28 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .fab-badge{position:absolute;top:-3px;right:-3px;background:var(--green);
   color:#fff;font-size:9px;font-weight:800;border-radius:10px;
   padding:1px 5px;min-width:16px;text-align:center;display:none;
-  border:1.5px solid var(--bg)}
+  border:1.5px solid var(--bg);box-shadow:0 0 6px rgba(34,197,94,.5)}
 .fab-badge.vis{display:block}
 @media(min-width:900px){.fab{display:none}}
+
+/* Actions tab */
+#t-act.act-open{color:var(--orange)}
+#t-act.act-open::after{content:'';position:absolute;top:0;left:25%;right:25%;height:2.5px;
+  background:linear-gradient(90deg,var(--orange),var(--acc));border-radius:0 0 4px 4px;
+  box-shadow:0 0 10px var(--orange),0 0 20px rgba(245,158,11,.35);pointer-events:none}
+#t-act.act-open .nt-ico{transform:scale(1.2);filter:drop-shadow(0 0 8px var(--orange))}
 
 /* Desktop Actions button — shown in panel header on desktop, hidden on mobile */
 .ph-act-btn{display:none;align-items:center;gap:5px;padding:5px 12px;
   font-size:12px;font-weight:700;border-radius:20px;position:relative;
   background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
-  border:none;cursor:pointer;flex-shrink:0;
-  box-shadow:0 2px 10px var(--glow2);transition:var(--tr)}
-.ph-act-btn:hover{filter:brightness(1.12);transform:scale(1.03)}
+  border:none;cursor:pointer;flex-shrink:0;overflow:hidden;
+  box-shadow:0 2px 10px var(--glow2),inset 0 1px 0 rgba(255,255,255,.15);transition:var(--tr)}
+.ph-act-btn::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.18),transparent);
+  transition:left .5s ease;pointer-events:none}
+.ph-act-btn:hover::before{left:100%}
+.ph-act-btn:hover{filter:brightness(1.12);transform:scale(1.03);box-shadow:var(--glow-acc)}
 .ph-act-btn:active{transform:scale(.96)}
 .ph-act-badge{background:var(--green);color:#fff;font-size:9px;font-weight:800;
   border-radius:10px;padding:1px 5px;min-width:16px;text-align:center;display:none;
@@ -6312,9 +6518,6 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   .ph-act-btn{display:flex;padding:4px 8px;font-size:11px;gap:3px}
   .ph h3{display:none}
   .ph{padding:8px 10px;gap:5px;justify-content:space-between}
-  .mt-txt{display:none}
-  .mt{padding:5px 8px}
-  .mtabs{gap:3px;flex-shrink:0}
 }
 
 /* ─── toasts ──────────────────────────────────────────────────── */
@@ -6322,12 +6525,17 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   z-index:9999;display:flex;flex-direction:column;gap:5px;pointer-events:none;width:min(90vw,300px)}
 @media(min-width:900px){ #toasts{bottom:18px}}
 .toast{padding:10px 18px;border-radius:24px;font-size:13px;font-weight:600;text-align:center;
-  box-shadow:var(--sh);border:1px solid rgba(255,255,255,.1);
-  animation:slide-up .3s cubic-bezier(.34,1.56,.64,1)}
-.tok2{background:rgba(34,197,94,.92);color:#fff}
-.terr2{background:rgba(239,68,68,.92);color:#fff}
-.tinfo{background:rgba(59,130,246,.92);color:#fff}
-.twrn2{background:rgba(245,158,11,.92);color:#fff}
+  backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.12);
+  animation:slide-up .3s cubic-bezier(.34,1.56,.64,1);
+  box-shadow:0 8px 32px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.1)}
+.tok2{background:rgba(16,48,24,.95);color:var(--green);
+  border-color:rgba(34,197,94,.4);box-shadow:0 0 20px rgba(34,197,94,.25),0 8px 32px rgba(0,0,0,.6)}
+.terr2{background:rgba(48,12,12,.95);color:#ff7070;
+  border-color:rgba(239,68,68,.4);box-shadow:0 0 20px rgba(239,68,68,.25),0 8px 32px rgba(0,0,0,.6)}
+.tinfo{background:rgba(10,22,48,.95);color:#7ab8ff;
+  border-color:rgba(59,130,246,.4);box-shadow:0 0 20px rgba(59,130,246,.2),0 8px 32px rgba(0,0,0,.6)}
+.twrn2{background:rgba(40,28,8,.95);color:var(--orange);
+  border-color:rgba(245,158,11,.4);box-shadow:0 0 20px rgba(245,158,11,.2),0 8px 32px rgba(0,0,0,.6)}
 
 /* ─── spinner ────────────────────────────────────────────────── */
 .spin{display:inline-block;width:16px;height:16px;border:2px solid var(--s5);
@@ -6365,15 +6573,23 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .won-search input:focus{border-color:var(--acc)}
 .won-list{flex:1;overflow-y:auto;padding:6px 8px}
 .won-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;
-  cursor:pointer;transition:background .15s}
-.won-item:hover{background:var(--s3)}
+  cursor:pointer;transition:var(--tr);border:1px solid transparent;
+  position:relative;overflow:hidden}
+.won-item::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.05),transparent);
+  transition:left .45s ease;pointer-events:none}
+.won-item:hover{background:rgba(124,58,237,.08);border-color:rgba(124,58,237,.2);
+  box-shadow:0 0 10px rgba(124,58,237,.07)}
+.won-item:hover::before{left:100%}
+.won-item:active{transform:scale(.98)}
 .won-item-info{flex:1;min-width:0}
 .won-item-title{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .won-item-ch{font-size:11px;color:var(--txt3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .won-item-times{font-size:10px;color:var(--txt3);margin-top:3px}
 .won-progress{width:48px;flex-shrink:0}
-.won-progress-bar{height:3px;background:var(--s4);border-radius:2px;overflow:hidden}
-.won-progress-fill{height:100%;background:var(--acc);border-radius:2px;transition:width .3s}
+.won-progress-bar{height:3px;background:rgba(255,255,255,.06);border-radius:2px;overflow:hidden}
+.won-progress-fill{height:100%;background:linear-gradient(90deg,var(--acc2),var(--acc));
+  border-radius:2px;transition:width .3s;box-shadow:0 0 5px rgba(124,58,237,.4)}
 .won-progress-pct{font-size:9px;color:var(--txt3);text-align:right;margin-top:2px}
 .won-find-btn{flex-shrink:0;width:30px;height:30px;border-radius:7px;border:1px solid var(--s5);
   background:var(--s3);color:var(--txt2);font-size:14px;cursor:pointer;display:flex;
@@ -6642,7 +6858,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 }
 /* Portal name + connection count badge shown beneath the channel title */
 .mv-hdr-portal{
-  font-size:9px;color:var(--txt3);white-space:nowrap;overflow:hidden;
+  font-size:9px;color:var(--red);white-space:nowrap;overflow:hidden;
   text-overflow:ellipsis;line-height:1.2;
 }
 .mv-hdr-portal:empty{display:none}
@@ -6718,10 +6934,40 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 #mv-sel-modal{
   background:var(--s2);border-radius:var(--r);
   border:1px solid var(--bdr2);
-  width:min(400px,94vw);max-height:80vh;
-  display:flex;flex-direction:column;
+  width:min(400px,94vw);max-height:min(80vh,560px);
+  display:flex;flex-direction:column;overflow:hidden;
   box-shadow:var(--sh);
 }
+/* Play-URL row inside multiview selector */
+.mv-sel-play-url-row{
+  display:flex;align-items:center;gap:6px;
+  margin:6px 8px 2px;padding:7px 8px;
+  background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.22);
+  border-radius:var(--rsm);cursor:pointer;flex-shrink:0;
+}
+.mv-sel-play-url-row:hover{background:rgba(239,68,68,.14)}
+.mv-sel-play-url-inp{
+  flex:1;height:26px;font-size:11px;padding:0 6px;border-radius:3px;
+  background:var(--s3);border:1px solid var(--bdr2);color:var(--txt);
+  outline:none;
+}
+.mv-sel-play-url-inp:focus{border-color:var(--red)}
+/* Seek bar overlaid at bottom of mv-body */
+.mv-seek-wrap{
+  position:absolute;bottom:0;left:0;right:0;z-index:5;
+  padding:0 4px 2px;background:linear-gradient(transparent,rgba(0,0,0,.55));
+  display:none;align-items:center;gap:4px;
+}
+.mv-seek-wrap.mv-seek-visible{display:flex}
+.mv-seek{flex:1;height:3px;cursor:pointer;accent-color:var(--acc);min-width:0}
+.mv-seek-time{font-size:9px;color:rgba(255,255,255,.75);white-space:nowrap;flex-shrink:0;font-variant-numeric:tabular-nums}
+/* Quality selector in ctrl area */
+.mv-quality-sel{
+  height:22px;font-size:10px;padding:0 2px;background:var(--s3);
+  border:1px solid var(--bdr2);border-radius:3px;color:var(--txt2);
+  cursor:pointer;flex-shrink:0;max-width:58px;
+}
+.mv-widget-content.mv-tiny .mv-quality-sel{display:none}
 .mv-sel-hdr{
   display:flex;align-items:center;justify-content:space-between;
   padding:12px 14px 10px;border-bottom:1px solid var(--bdr);flex-shrink:0;
@@ -6732,13 +6978,14 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   margin:8px 10px;height:32px;font-size:12px;
 }
 #mv-sel-list{
-  flex:1;overflow-y:auto;padding:4px 6px;
+  flex:1;overflow-y:auto;padding:4px 6px;min-height:0;
 }
 .mv-ch-row{
   display:flex;align-items:center;gap:8px;padding:6px 8px;
   border-radius:var(--rsm);cursor:pointer;transition:background .12s;
 }
-.mv-ch-row:hover{background:var(--s4)}
+.mv-ch-row:hover{background:rgba(124,58,237,.08);border-color:rgba(124,58,237,.2) !important;
+  box-shadow:0 0 8px rgba(124,58,237,.07)}
 .mv-ch-logo{width:32px;height:22px;object-fit:contain;border-radius:3px;
   background:var(--s3);flex-shrink:0}
 .mv-ch-name{font-size:12px;font-weight:600;color:var(--txt);
@@ -6949,9 +7196,9 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
       <h3>Categories</h3>
       <div class="mtabs">
         <button class="mt" data-m="favs" onclick="toggleFavsFilter()">⭐</button>
-        <button class="mt on" data-m="live" onclick="setMode('live')">📺<span class="mt-txt"> Live</span></button>
-        <button class="mt" data-m="vod" onclick="setMode('vod')">🎬<span class="mt-txt"> VOD</span></button>
-        <button class="mt" data-m="series" onclick="setMode('series')">📂<span class="mt-txt"> Series</span></button>
+        <button class="mt on" data-m="live" onclick="setMode('live')"><span class="mt-ico">📺</span><span class="mt-txt">Live</span></button>
+        <button class="mt" data-m="vod" onclick="setMode('vod')"><span class="mt-ico">🎬</span><span class="mt-txt">VOD</span></button>
+        <button class="mt" data-m="series" onclick="setMode('series')"><span class="mt-ico">📂</span><span class="mt-txt">Series</span></button>
       </div>
       <!-- Category-level actions accessible via FAB on mobile only -->
     </div>
@@ -6992,7 +7239,12 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
     <div style="flex:1;overflow-y:auto;padding:6px 10px 0;min-height:0" id="ilist"></div>
     <!-- EPG Grid container (replaces ilist when active) -->
     <div id="epg-grid-wrap">
-      <div id="epg-grid-scroll"></div>
+      <div id="epg-grid-body">
+        <div id="epg-ch-col">
+          <div id="epg-ch-header"></div>
+        </div>
+        <div id="epg-tl-col"></div>
+      </div>
     </div>
     <div style="padding:0 10px">
       <div class="icount" id="icount"></div>
@@ -7011,6 +7263,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
       </div>
     </div>
     <!-- Collapsible player controls -->
+    <div class="panel-divider-line"></div>
     <div id="pctrl-panel" style="flex-shrink:0;border-top:1px solid var(--bdr)">
       <div id="pctrl-hdr" onclick="togglePlayerControls()" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:5px 14px;background:var(--s2);user-select:none">
         <div style="display:flex;align-items:center;gap:7px">
@@ -7028,6 +7281,10 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
           <div id="pu" onclick="cpyUrl()" title="Tap to copy stream URL">—</div>
         </div>
         <div class="pctrl">
+          <div style="display:flex;flex-direction:column;gap:4px;align-self:flex-start;flex-shrink:0" class="pctrl-desktop-only">
+            <button class="btn-red" id="rbtn" onclick="togRec()" style="height:28px;padding:0 10px;font-size:12px">⏺ Record</button>
+            <button class="btn-ghost" id="dl-now-btn" onclick="dlNowMKV()" title="Download currently playing item as MKV" disabled style="flex-shrink:0;height:28px;padding:0 10px;font-size:12px">⬇ MKV</button>
+          </div>
           <div class="btn-vol-group">
           <div class="ctrl-r ctr">
             <button class="btn-ghost pnav" onclick="playerPrev()" title="Prev">&#9198;</button>
@@ -7046,22 +7303,27 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
               </svg>
             </button>
           </div>
-          <div style="min-height:16px;padding:0 4px">
+          <div style="min-height:12px;padding:0 4px">
             <span id="epg-now" style="font-size:11px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block"></span>
           </div>
           <div class="vrow">
-            <span style="font-size:15px">&#128265;</span>
+            <span style="font-size:15px;cursor:pointer;user-select:none" title="Mute" onclick="setVol(0);document.getElementById('vol').value=0">&#128265;</span>
             <input type="range" id="vol" min="0" max="100" value="80" oninput="setVol(this.value)">
             <span class="vlbl" id="vlbl">80</span>
-            <span style="font-size:15px">&#128266;</span>
+            <span style="font-size:15px;cursor:pointer;user-select:none" title="Max volume" onclick="setVol(100);document.getElementById('vol').value=100">&#128266;</span>
           </div>
           </div>
-          <div class="recrow">
-            <button class="btn-red" id="rbtn" onclick="togRec()">⏺ Record</button>
-            <span class="rtimer" id="rtimer">00:00:00</span>
+          <div style="display:flex;flex-direction:column;gap:4px;align-self:flex-start;flex-shrink:0;min-width:80px" class="pctrl-desktop-only">
+            <span class="rtimer" id="rtimer" style="font-size:11px;color:var(--txt3);text-align:center">00:00:00</span>
             <span class="rfname" id="rfname"></span>
-            <button class="btn-ghost" id="dl-now-btn" onclick="dlNowMKV()" title="Download currently playing item as MKV" disabled style="flex-shrink:0;height:34px;padding:0 10px;font-size:13px">⬇ MKV</button>
           </div>
+        </div>
+        <!-- Mobile-only: Record and MKV row shown below controls on small screens -->
+        <div class="pctrl-mobile-rec recrow" style="display:none;padding:0 0 4px 0">
+          <button class="btn-red" onclick="togRec()" id="rbtn-mob" style="height:28px;padding:0 12px;font-size:12px">⏺ Record</button>
+          <span class="rtimer" id="rtimer-mob"></span>
+          <span class="rfname" id="rfname-mob"></span>
+          <button class="btn-ghost" onclick="window._mobMkvClick()" title="Download MKV" disabled id="dl-now-btn-mob" style="height:28px;padding:0 10px;font-size:12px">⬇ MKV</button>
         </div>
       </div>
     </div>
@@ -7261,6 +7523,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   <button class="nt" id="t-act" onclick="openActTab()">
     <span class="nt-ico">⚡</span><span>Actions</span>
     <span class="fab-badge" id="act-tab-badge"></span>
+    <span class="act-ind" id="act-ind"></span>
   </button>
 
 </nav>
@@ -8226,7 +8489,14 @@ async function doConnect(){
   finally{setBusy(false);}
 }
 
-// ── MODES ──────────────────────────────────────────────────
+// ── PLAY DIRECT URL ────────────────────────────────────────
+function playDirectUrl(){
+  const url = (document.getElementById('play-url-inp').value||'').trim();
+  if(!url){ toast('Enter a URL first','wrn'); return; }
+  const name = (()=>{ try{ return new URL(url).hostname; }catch(e){ return url.slice(0,40); } })();
+  doPlay(url, name, {isLive:true});
+  document.getElementById('play-url-inp').value='';
+}
 function setMode(m){
   _favsFilterActive=false;
   document.querySelector('.mt[data-m="favs"]').classList.remove('on');
@@ -8417,6 +8687,8 @@ async function dlSelCats(type){
 // ── BROWSE ─────────────────────────────────────────────────
 function browseC(cj){
   const cat=(typeof cj==='string')?JSON.parse(cj):cj; curCat=cat;
+  // Close EPG grid if open so items from new category populate correctly
+  if(_epgGridActive) _closeEpgGrid();
   // Deactivate favs filter when manually browsing a category
   _favsFilterActive=false;
   document.querySelector('.mt[data-m="favs"]').classList.remove('on');
@@ -8477,6 +8749,9 @@ function mkBcrum(label){
   }).join('');
 }
 
+const _ITEMS_BATCH = 75;
+let _renderToken = 0;
+
 function renderItems(items){
   const el=document.getElementById('ilist');
   document.getElementById('icount').textContent=items.length+' item'+(items.length!==1?'s':'');
@@ -8484,31 +8759,28 @@ function renderItems(items){
     el.innerHTML='<div style="text-align:center;padding:20px;color:var(--txt3);font-size:12px">No items found</div>';
     refreshBtns(); return;
   }
+  const token = ++_renderToken;
   const isSeries=mode==='series'||mode==='vod';
-  el.innerHTML=items.map((it,i)=>{
+
+  function buildRow(it, i){
     const name=it.name||it.o_name||it.fname||'Unknown';
     const grp=!!it._is_series_group;
     const epN=grp?(it._episodes||[]).length:0;
     const show=!!it._is_show_item;
     const playing=i===pIdx;
     const playable=!grp&&!show;
-    // Resolve logo: check all known fields; for series groups fall back to first episode's logo
     const eps=grp?(it._episodes||[]):[];
     const ep0=eps.length?eps[0]:{};
     const epLogo=grp&&!it.logo&&!it.stream_icon&&!it.cover
       ?(ep0.logo||ep0.stream_icon||ep0.cover||ep0.screenshot_uri||ep0.pic||''):'';
     const logo=it.logo||it.stream_icon||it.cover||it.screenshot_uri||it.pic||epLogo||'';
-    // Route all external logo URLs through /api/proxy.
-    // Stalker portal servers typically do NOT send CORS headers for static image files,
-    // so a direct <img src="http://portal-host/..."> will be blocked by the browser and
-    // silently hidden by onerror. Proxying through Flask serves the image same-origin.
     const logoSrc = logo && (logo.startsWith('http://') || logo.startsWith('https://'))
       ? '/api/proxy?url='+encodeURIComponent(logo) : logo;
-    return '<div class="irow'+(playing?' now':'')+'" style="--d:'+(Math.min(i,50)*.016)+'s">'
+    return '<div class="irow'+(playing?' now':'')+'" style="--d:'+(Math.min(i,20)*.016)+'s">'
       +'<input class="ichk" type="checkbox" data-i="'+i+'" onchange="onChk('+i+',this.checked)">'
-      +(logoSrc?'<img class="ilogo" src="'+esc(logoSrc)+'" onerror="this.style.display=\'none\'">'+'':'<span style="width:36px;height:24px;flex-shrink:0;display:inline-block"></span>')
+      +(logoSrc?'<img class="ilogo" loading="lazy" src="'+esc(logoSrc)+'" onerror="this.style.display=\'none\'">'+'':'<span style="width:36px;height:24px;flex-shrink:0;display:inline-block"></span>')
       +'<button onclick="toggleFav('+i+')" title="Favourite"'
-      +' style="background:none;border:none;cursor:pointer;font-size:15px;padding:0 2px;line-height:1;flex-shrink:0;color:'+(isFav(it)?'#f5c518':'rgba(255,255,255,0.25)')+'">★</button>'
+      +' style="background:none;border:none;cursor:pointer;font-size:15px;padding:0 2px;line-height:1;flex-shrink:0;color:'+(isFav(it)?'#f5c518':'rgba(255,255,255,0.25)')+'" >★</button>'
       +'<span class="iname" title="'+esc(name)+'">'+esc(name)+'</span>'
       +'<div class="ibtns">'
         +(grp?'<button class="btn-ghost" onclick="drillGrp('+i+')">'+epN+' eps</button>':'')
@@ -8517,11 +8789,28 @@ function renderItems(items){
         +(playable?'<button class="btn-blue" onclick="playItem('+i+')">▶</button>':'')
         +'<button class="btn-ghost imenu-trigger" onclick="event.stopPropagation();openItemMenu('+i+',this)" title="More options" style="padding:0 6px;font-size:18px;line-height:1;letter-spacing:0">⋮</button>'
       +'</div></div>';
-  }).join('');
+  }
+
+  el.innerHTML = items.slice(0, _ITEMS_BATCH).map(buildRow).join('');
   refreshBtns();
   _updateEpgGridBtn();
 
+  if(items.length <= _ITEMS_BATCH) return;
+
+  let offset = _ITEMS_BATCH;
+  function appendBatch(){
+    if(_renderToken !== token) return;
+    if(offset >= items.length) return;
+    const end = Math.min(offset + _ITEMS_BATCH, items.length);
+    const tmp = document.createElement('div');
+    tmp.innerHTML = items.slice(offset, end).map((it,j) => buildRow(it, offset+j)).join('');
+    while(tmp.firstChild) el.appendChild(tmp.firstChild);
+    offset = end;
+    if(offset < items.length) requestAnimationFrame(appendBatch);
+  }
+  requestAnimationFrame(appendBatch);
 }
+
 
 // ── ITEM CONTEXT MENU ─────────────────────────────────────
 let _iMenuIdx = -1;
@@ -8804,7 +9093,12 @@ function _m3uApplySelected(fname, stEl){
   toast('M3U file loaded — click Connect', 'ok');
 }
 
+let _filterDebounceTimer = null;
 function filterItems(){
+  clearTimeout(_filterDebounceTimer);
+  _filterDebounceTimer = setTimeout(_doFilterItems, 150);
+}
+function _doFilterItems(){
   const q=document.getElementById('isrch').value.toLowerCase();
   const base=_favsFilterActive
     ? loadFavs(mode).filter(f=>!allItems.length||allItems.some(it=>(it.name||it.o_name||it.fname||'')===(f.name||f.o_name||f.fname||'')))
@@ -8944,6 +9238,7 @@ function _destroyPlayers(){
 function doPlay(url, name, opts={}){
   pUrl=url; pName=name||url;
   const dlb=document.getElementById('dl-now-btn'); if(dlb) dlb.disabled=false;
+  const dlbm=document.getElementById('dl-now-btn-mob'); if(dlbm) dlbm.disabled=false;
   _playerStopped = false;                        // new play — clear stop flag
   window._mseTranscodeFired = false;             // reset MSE transcode guard
   if(window._mpegRetries) window._mpegRetries = {}; // reset general retry counter
@@ -9406,6 +9701,7 @@ function playerStop(){
   document.getElementById('ppbtn').textContent='▶';
   document.getElementById('vph').style.opacity='1';
   const dlb=document.getElementById('dl-now-btn'); if(dlb) dlb.disabled=true;
+  const dlbm=document.getElementById('dl-now-btn-mob'); if(dlbm) dlbm.disabled=true;
 }
 function playerPrev(){if(!filtItems.length)return; playItem(pIdx<=0?filtItems.length-1:pIdx-1);}
 function playerNext(){if(!filtItems.length)return; playItem(pIdx<0||pIdx>=filtItems.length-1?0:pIdx+1);}
@@ -9553,16 +9849,81 @@ function _openEpgGrid(){
   document.getElementById('icount').style.display        = 'none';
   document.getElementById('items-sbar').style.display    = 'none';
   _buildEpgGrid(filtItems);
+
+  // ── Click-drag scroll on desktop (on the timeline column) ────────────────
+  const wrap = document.getElementById('epg-tl-col');
+  const chCol2 = document.getElementById('epg-ch-col');
+  if(wrap && !wrap._dragScrollAttached){
+    // Sync vertical scroll between timeline col and ch col
+    const onTlScroll = () => { if(chCol2) chCol2.scrollTop = wrap.scrollTop; };
+    wrap.addEventListener('scroll', onTlScroll);
+    wrap._syncScrollCleanup = () => wrap.removeEventListener('scroll', onTlScroll);
+
+    let _isDown = false, _startX = 0, _startY = 0, _scrollLeft = 0, _scrollTop = 0, _dragged = false;
+    const onDown = e => {
+      if(e.button !== 0) return;
+      _isDown = true;
+      _dragged = false;
+      _startX = e.pageX - wrap.offsetLeft;
+      _startY = e.pageY - wrap.offsetTop;
+      _scrollLeft = wrap.scrollLeft;
+      _scrollTop  = wrap.scrollTop;
+      wrap.style.cursor = 'grabbing';
+      wrap.style.userSelect = 'none';
+    };
+    const onUp = () => {
+      _isDown = false;
+      wrap.style.cursor = '';
+      wrap.style.userSelect = '';
+    };
+    const onMove = e => {
+      if(!_isDown) return;
+      e.preventDefault();
+      const x = e.pageX - wrap.offsetLeft;
+      const y = e.pageY - wrap.offsetTop;
+      const dx = x - _startX, dy = y - _startY;
+      if(Math.abs(dx) > 3 || Math.abs(dy) > 3) _dragged = true;
+      wrap.scrollLeft = _scrollLeft - dx;
+      wrap.scrollTop  = _scrollTop  - dy;
+    };
+    // Suppress click on ch-cell if drag occurred
+    const onClickCapture = e => {
+      if(_dragged){ e.stopPropagation(); e.preventDefault(); _dragged = false; }
+    };
+    wrap.addEventListener('mousedown', onDown);
+    wrap.addEventListener('mouseup',   onUp);
+    wrap.addEventListener('mouseleave',onUp);
+    wrap.addEventListener('mousemove', onMove);
+    wrap.addEventListener('click', onClickCapture, true);
+    wrap._dragScrollAttached = true;
+    wrap._dragScrollCleanup = () => {
+      wrap.removeEventListener('mousedown', onDown);
+      wrap.removeEventListener('mouseup',   onUp);
+      wrap.removeEventListener('mouseleave',onUp);
+      wrap.removeEventListener('mousemove', onMove);
+      wrap.removeEventListener('click', onClickCapture, true);
+      if(wrap._syncScrollCleanup) wrap._syncScrollCleanup();
+      wrap._dragScrollAttached = false;
+    };
+  }
 }
 
 function _closeEpgGrid(){
   _epgGridActive = false;
   if(_epgGridObs){ _epgGridObs.disconnect(); _epgGridObs = null; }
+  // Cancel any pending XMLTV poller and clear waiting list
+  if(_epgXmltvPollTimer){ clearTimeout(_epgXmltvPollTimer); _epgXmltvPollTimer = null; }
+  _epgXmltvWaiting = [];
   // Remove scroll listener from the grid container
-  const wrap = document.getElementById('epg-grid-scroll');
+  const wrap = document.getElementById('epg-tl-col');
   if(wrap && wrap._epgScrollHandler){
     wrap.removeEventListener('scroll', wrap._epgScrollHandler);
     wrap._epgScrollHandler = null;
+  }
+  // Remove drag-scroll listeners
+  if(wrap && wrap._dragScrollCleanup){
+    wrap._dragScrollCleanup();
+    wrap._dragScrollCleanup = null;
   }
   document.getElementById('ilist').style.display         = '';
   document.getElementById('epg-grid-wrap').classList.remove('active');
@@ -9573,7 +9934,9 @@ function _closeEpgGrid(){
 }
 
 function _buildEpgGrid(channels){
-  const wrap = document.getElementById('epg-grid-scroll');
+  const chCol  = document.getElementById('epg-ch-col');
+  const chHdr  = document.getElementById('epg-ch-header');
+  const tlCol  = document.getElementById('epg-tl-col');
   const totalW = _epgTotalW();
   const nowX   = _epgNowX();
   const nowSec = Date.now() / 1000;
@@ -9592,86 +9955,140 @@ function _buildEpgGrid(channels){
     </div>`;
   }
 
-  // Time header row
-  const headerHtml = `<div class="epg-time-header" style="width:${EPG_CH_W + totalW}px">
-    <div class="epg-grid-hdr-corner">
-      <span style="font-size:9px;color:var(--txt3);font-weight:700;text-transform:uppercase;letter-spacing:.8px">Channels</span>
-    </div>
-    <div class="epg-grid-hdr-times" style="width:${totalW}px;position:relative;flex-shrink:0">
-      ${ticksHtml}
-      <div class="epg-now-line" style="left:${nowX}px"><div class="epg-now-dot"></div></div>
-    </div>
+  // Corner header (sticky, sits above ch-col)
+  chHdr.innerHTML = `<div class="epg-grid-hdr-corner">
+    <span style="font-size:9px;color:var(--txt3);font-weight:700;text-transform:uppercase;letter-spacing:.8px">Channels</span>
   </div>`;
 
-  // Channel rows
-  const rowsHtml = channels.map((ch, i) => {
+  // Channel column cells
+  const chCells = channels.map((ch, i) => {
     const name    = ch.name || ch.o_name || ch.fname || 'Unknown';
     const logo    = ch.logo || ch.stream_icon || ch.cover || ch.screenshot_uri || ch.pic || '';
     const logoSrc = logo && (logo.startsWith('http://') || logo.startsWith('https://'))
       ? '/api/proxy?url=' + encodeURIComponent(logo) : logo;
     const logoEl  = logoSrc
-      ? `<img class="epg-ch-logo" src="${esc(logoSrc)}" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
-        + `<div class="epg-ch-logo-ph" style="display:none">📺</div>`
+      ? `<img class="epg-ch-logo" src="${esc(logoSrc)}" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+         <div class="epg-ch-logo-ph" style="display:none">📺</div>`
       : `<div class="epg-ch-logo-ph">📺</div>`;
+    return `<div class="epg-ch-cell" id="epg-ch-${i}" onclick="playItem(${i})" title="Play ${esc(name)}">
+      ${logoEl}
+      <div class="epg-ch-name">${esc(name)}</div>
+    </div>`;
+  }).join('');
+  const cornerHtml = `<div id="epg-ch-header" class="epg-grid-hdr-corner">
+    <span style="font-size:9px;color:var(--txt3);font-weight:700;text-transform:uppercase;letter-spacing:.8px">Channels</span>
+  </div>`;
+  chCol.innerHTML = cornerHtml + `<div>${chCells}</div>`;
 
+  // Timeline column — header sticky inside, rows below
+  const timeHeader = `<div class="epg-grid-hdr-times" style="width:${totalW}px;position:sticky;top:0;z-index:30;background:var(--s1);height:28px;flex-shrink:0">
+    ${ticksHtml}
+    <div class="epg-now-line" style="left:${nowX}px"><div class="epg-now-dot"></div></div>
+  </div>`;
+
+  const rows = channels.map((ch, i) => {
     return `<div class="epg-row" id="epg-row-${i}">
-      <div class="epg-ch-cell" onclick="playItem(${i})" title="Play ${esc(name)}">
-        ${logoEl}
-        <div class="epg-ch-name">${esc(name)}</div>
-      </div>
       <div class="epg-timeline" style="width:${totalW}px;min-width:${totalW}px;position:relative" id="epg-tl-${i}" data-ch-idx="${i}">
         <div class="epg-now-line" style="left:${nowX}px"></div>
         <div class="epg-prog-loading" id="epg-loading-${i}"></div>
       </div>
     </div>`;
   }).join('');
+  tlCol.innerHTML = `<div style="min-width:${totalW}px">${timeHeader}${rows}</div>`;
 
-  wrap.innerHTML = `<div style="min-width:${EPG_CH_W + totalW}px">
-    ${headerHtml}
-    ${rowsHtml}
-  </div>`;
-
-  // Scroll so "now - 10 min" is near left edge
+  // Scroll timeline to "now - 10 min"
   requestAnimationFrame(() => {
-    const scrollTarget = EPG_CH_W + nowX - 80;
-    wrap.scrollLeft = Math.max(0, scrollTarget);
+    tlCol.scrollLeft = Math.max(0, nowX - 80);
   });
 
-  // ── Scroll-based batch loader (replaces IntersectionObserver) ──────────────
-  // Fires all unloaded rows that are currently visible (+ 3-row buffer) in
-  // parallel. Reliable with 2D scroll containers where IO can miss entries.
+  // ── Scroll-based batch loader ──────────────────────────────────────────────
   const _epgLoaded = new Set();
-  const ROW_H = 62; // matches .epg-row min-height
+  const ROW_H = 62;
 
   function _epgLoadVisible(){
-    const scrollTop  = wrap.scrollTop;
-    const viewH      = wrap.clientHeight;
-    // subtract 28px for the sticky time header
-    const visTop    = scrollTop + 28;
+    const scrollTop  = tlCol.scrollTop;
+    const viewH      = tlCol.clientHeight;
+    const visTop    = scrollTop;
     const visBottom = scrollTop + viewH;
     const buffer    = ROW_H * 3;
-
-    const firstRow = Math.max(0, Math.floor((visTop - buffer) / ROW_H));
+    // rows start at y=28 (after the sticky time header)
+    const firstRow = Math.max(0, Math.floor((visTop - 28 - buffer) / ROW_H));
     const lastRow  = Math.min(channels.length - 1,
-                              Math.ceil((visBottom + buffer) / ROW_H));
+                              Math.ceil((visBottom - 28 + buffer) / ROW_H));
 
     for(let i = firstRow; i <= lastRow; i++){
       if(!_epgLoaded.has(i)){
         _epgLoaded.add(i);
-        _loadEpgRow(channels[i], i);   // fire-and-forget, all in parallel
+        _loadEpgRow(channels[i], i);
       }
     }
   }
 
-  // Disconnect any old observer
   if(_epgGridObs){ _epgGridObs.disconnect(); _epgGridObs = null; }
-  // Store cleanup ref so _closeEpgGrid can remove the listener
-  if(wrap._epgScrollHandler) wrap.removeEventListener('scroll', wrap._epgScrollHandler);
-  wrap._epgScrollHandler = _epgLoadVisible;
-  wrap.addEventListener('scroll', _epgLoadVisible, {passive: true});
+  if(tlCol._epgScrollHandler) tlCol.removeEventListener('scroll', tlCol._epgScrollHandler);
+  tlCol._epgScrollHandler = _epgLoadVisible;
+  tlCol.addEventListener('scroll', _epgLoadVisible, {passive: true});
 
-  // Load the initial visible set immediately (after DOM paint)
   requestAnimationFrame(() => { requestAnimationFrame(_epgLoadVisible); });
+}
+
+// ── Shared XMLTV download poller ──────────────────────────────────────────────
+// Instead of each EPG row retrying independently every 5s (hammering the portal),
+// all "loading" rows register here. A single poller polls /api/epg_status every 5s.
+// When the download is ready, ALL waiting rows reload simultaneously — one pass.
+let _epgXmltvWaiting = [];   // [{ch, idx}, ...]
+let _epgXmltvPollTimer = null;
+let _epgXmltvUrl = '';
+
+function _epgRegisterWaiting(ch, idx){
+  // Determine the EPG URL being downloaded (from settings or ext_epg_url)
+  if(!_epgXmltvUrl){
+    // Try to get it from the connect state; fall back to a flag
+    _epgXmltvUrl = '__downloading__';
+  }
+  // Avoid duplicate registrations
+  if(!_epgXmltvWaiting.find(w => w.idx === idx)){
+    _epgXmltvWaiting.push({ch, idx});
+  }
+  if(!_epgXmltvPollTimer){
+    _epgXmltvPollTimer = setTimeout(_epgXmltvPoll, 6000);
+  }
+}
+
+async function _epgXmltvPoll(){
+  _epgXmltvPollTimer = null;
+  if(!_epgXmltvWaiting.length) return;
+
+  // Check if any channel's EPG now returns real data (XMLTV ready)
+  // We use a lightweight probe: re-fetch the first waiting row's EPG.
+  // If it no longer returns "loading", the download is done → reload all rows.
+  const probe = _epgXmltvWaiting[0];
+  try {
+    const r = await fetch('/api/epg', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({item: probe.ch})
+    });
+    const d = await r.json();
+    if(d.error && d.error.toLowerCase().includes('loading')){
+      // Still downloading — keep waiting, poll again
+      _epgXmltvPollTimer = setTimeout(_epgXmltvPoll, 6000);
+      return;
+    }
+  } catch(e){
+    _epgXmltvPollTimer = setTimeout(_epgXmltvPoll, 6000);
+    return;
+  }
+
+  // Download complete — reload all waiting rows
+  const toReload = _epgXmltvWaiting.slice();
+  _epgXmltvWaiting = [];
+  _epgXmltvUrl = '';
+  for(const {ch, idx} of toReload){
+    const el = document.getElementById(`epg-loading-${idx}`);
+    if(el) el.textContent = '⏳ Loading EPG…';
+    _loadEpgRow(ch, idx);
+  }
 }
 
 async function _loadEpgRow(ch, idx){
@@ -9704,9 +10121,25 @@ async function _loadEpgRow(ch, idx){
     clearTimeout(hintId);
     clearTimeout(slowHintId);
     const d = await r.json();
+
+    // EPG download in progress — register row for batch refresh when XMLTV is ready
+    if(d.error && d.error.toLowerCase().includes('loading')){
+      const el = document.getElementById(`epg-loading-${idx}`);
+      if(el){
+        el._hinted = true;
+        el.style.cssText += ';display:flex;align-items:center;padding-left:8px;font-size:10px;color:var(--t2);animation:none;background:var(--s4)';
+        el.textContent = '⏳ EPG downloading…';
+      }
+      // Register this row in the shared waiting list — the single _epgXmltvPoller
+      // will reload all waiting rows at once when the download completes.
+      _epgRegisterWaiting(ch, idx);
+      return;
+    }
+    // Reset retry counter on success
+    if(_loadEpgRow._attempts){ const key = ch.stream_id || ch.id || idx; delete _loadEpgRow._attempts[key]; }
+
     const loadingEl = document.getElementById(`epg-loading-${idx}`);
     if(loadingEl) loadingEl.remove();
-
     const schedule = d.schedule || [];
     if(!schedule.length && (d.current || d.next)){
       // Only now/next available — show them as blocks
@@ -9731,7 +10164,7 @@ async function _loadEpgRow(ch, idx){
       // Clamp to visible window
       if(pEnd < winStart || pStart > winEnd) return;
 
-      const x1 = Math.max(0, _epgTsToX(pStart));
+      const x1 = Math.max(1, _epgTsToX(pStart));
       const x2 = Math.min(_epgTotalW(), _epgTsToX(pEnd));
       const w  = x2 - x1;
       if(w < 2) return;
@@ -9971,6 +10404,7 @@ async function startRec(){
   isRec=true;
   _syncRecBtn(true);
   document.getElementById('rfname').textContent=d.filename||'';
+  const rfmob=document.getElementById('rfname-mob'); if(rfmob) rfmob.textContent=d.filename||'';
   const adrFname=document.getElementById('adr-rec-fname');
   if(adrFname) adrFname.textContent=d.filename||'';
   toast('⏺ Recording: '+(d.filename||''),'ok');
@@ -9982,6 +10416,8 @@ async function startRec(){
     const sc=String(s%60).padStart(2,'0');
     const ts=h+':'+m2+':'+sc;
     document.getElementById('rtimer').textContent=ts;
+    const rtmob=document.getElementById('rtimer-mob');
+    if(rtmob) rtmob.textContent=ts;
     const adrTimer=document.getElementById('adr-rec-timer');
     if(adrTimer) adrTimer.textContent=ts;
     // Keep button text in sync with elapsed time
@@ -10000,6 +10436,7 @@ async function stopRec(){
   isRec=false;
   _syncRecBtn(false);
   document.getElementById('rfname').textContent='';
+  const rfmob2=document.getElementById('rfname-mob'); if(rfmob2) rfmob2.textContent='';
   const adrFname=document.getElementById('adr-rec-fname');
   if(adrFname) adrFname.textContent='';
   const adrTimer=document.getElementById('adr-rec-timer');
@@ -10009,7 +10446,9 @@ async function stopRec(){
 
 function _syncRecBtn(recording){
   const btn=document.getElementById('rbtn');
+  const btnMob=document.getElementById('rbtn-mob');
   const timer=document.getElementById('rtimer');
+  const timerMob=document.getElementById('rtimer-mob');
   const adrBtn=document.getElementById('adr-rec-btn');
   const adrInfo=document.getElementById('adr-rec-info');
   if(btn){
@@ -10021,6 +10460,17 @@ function _syncRecBtn(recording){
       btn.textContent='⏺ Record';
       btn.classList.remove('rec');
       if(timer){timer.classList.remove('vis'); timer.textContent='00:00:00';}
+    }
+  }
+  if(btnMob){
+    if(recording){
+      btnMob.textContent='⏹ Stop';
+      btnMob.classList.add('rec');
+      if(timerMob) timerMob.classList.add('vis');
+    } else {
+      btnMob.textContent='⏺ Record';
+      btnMob.classList.remove('rec');
+      if(timerMob){timerMob.classList.remove('vis'); timerMob.textContent='00:00:00';}
     }
   }
   if(adrBtn){
@@ -10071,6 +10521,13 @@ async function dlM3U(){
   const d=await r.json();
   d.ok?(toast(d.message,'ok'),pollBusy()):(toast(d.error,'err'),setBusy(false),dismissProgress('items'));
 }
+
+// Mobile MKV button — opens Actions drawer if download in progress, else downloads
+window._mobMkvClick = function(){
+  const stopBtn = document.getElementById('stopbtn');
+  if(stopBtn && !stopBtn.disabled) openActTab();  // busy = stopbtn enabled
+  else dlNowMKV();
+};
 
 async function dlNowMKV(){
   if(!pUrl){toast('No stream playing','wrn');return;}
@@ -10394,6 +10851,26 @@ function _refreshDlButtons(){
     }
   }
 
+  // ── dl-now-btn-mob (mobile Player controls bar) ───────────
+  const dnBtnMob = document.getElementById('dl-now-btn-mob');
+  if(dnBtnMob){
+    if(mkvRunning){
+      dnBtnMob.innerHTML = '⏹ Stop';
+      dnBtnMob.title     = 'Stop current MKV download';
+      dnBtnMob.onclick   = ()=>doStop();
+      dnBtnMob.disabled  = false;
+      dnBtnMob.style.color       = 'var(--acc,#f87171)';
+      dnBtnMob.style.borderColor = 'var(--acc,#f87171)';
+    } else {
+      dnBtnMob.innerHTML = '⬇ MKV';
+      dnBtnMob.title     = 'Download currently playing item as MKV';
+      dnBtnMob.onclick   = ()=>dlNowMKV();
+      dnBtnMob.disabled  = !pUrl;
+      dnBtnMob.style.color       = '';
+      dnBtnMob.style.borderColor = '';
+    }
+  }
+
   // ── imenu-mkv (item context menu) ────────────────────────
   const imBtn = document.getElementById('imenu-mkv');
   if(!imBtn) return;
@@ -10627,10 +11104,14 @@ function openDrawer(ctx){
     ? '⚡ Category Actions' : '⚡ Item Actions';
   document.getElementById('act-overlay').classList.add('open');
   document.getElementById('act-drawer').classList.add('open');
+  const tact = document.getElementById('t-act');
+  if(tact) tact.classList.add('act-open');
 }
 function closeDrawer(){
   document.getElementById('act-overlay').classList.remove('open');
   document.getElementById('act-drawer').classList.remove('open');
+  const tact = document.getElementById('t-act');
+  if(tact) tact.classList.remove('act-open');
 }
 
 // ── SAVED PLAYLISTS ────────────────────────────────────────
@@ -10669,14 +11150,22 @@ function renderPLList(){
     return;
   }
   const icons={mac:'🔌',xtream:'📡',m3u_url:'📄'};
+  const typeAccent={mac:'#3b82f6',xtream:'#22c55e',m3u_url:'#ef4444'};
+  const typeLbl={mac:'MAC',xtream:'XTREAM',m3u_url:'M3U'};
+  const typeCls={mac:'pli-type-mac',xtream:'pli-type-xtream',m3u_url:'pli-type-m3u'};
   el.innerHTML=arr.map((p,i)=>{
-    const ico=icons[p.type]||'📡';
-    const sub=p.type==='mac'?p.url+' • '+p.mac
-      :p.type==='xtream'?p.url+' • '+p.username
+    const t=p.type||'mac';
+    const ico=icons[t]||'📡';
+    const accent=typeAccent[t]||'var(--bdr)';
+    const sub=t==='mac'?p.url+' • '+p.mac
+      :t==='xtream'?p.url+' • '+p.username
       :p.m3u_url||p.url||'';
-    return '<div class="pli" style="--delay:'+(i*.04)+'s">'
+    return '<div class="pli" style="--delay:'+(i*.04)+'s;--pli-accent:'+accent+'">'
       +'<span class="pli-ico">'+ico+'</span>'
-      +'<div class="pli-info"><div class="pli-name">'+esc(p.name||'Untitled')+'</div>'
+      +'<div class="pli-info"><div class="pli-name" style="display:flex;align-items:center;gap:6px">'
+      +'<span>'+esc(p.name||'Untitled')+'</span>'
+      +'<span class="pli-type-badge '+(typeCls[t]||'pli-type-mac')+'">'+typeLbl[t]+'</span>'
+      +'</div>'
       +'<div class="pli-sub">'+esc(sub)+'</div></div>'
       +'<div class="pli-acts">'
       +'<button class="btn-acc" onclick="plConnect('+i+')" style="height:28px;padding:0 10px;font-size:11px">▶ Load</button>'
@@ -10802,9 +11291,29 @@ function openWhatsOn(){
     '<div class="won-loading"><span class="spin"></span> Loading EPG data…</div>';
   document.getElementById('won-count').textContent = '…';
   Object.keys(_wonMatches).forEach(k => delete _wonMatches[k]);
+  _wonFetch(0);
+  setTimeout(()=>document.getElementById('won-srch').focus(), 200);
+}
+
+function _wonFetch(attempt){
   fetch('/api/whats_on')
     .then(r => r.json())
     .then(data => {
+      // EPG download in progress — auto-retry up to ~90s
+      if(data.status === 'loading'){
+        if(attempt < 18){
+          const secs = 5;
+          document.getElementById('won-list').innerHTML =
+            `<div class="won-loading"><span class="spin"></span> EPG downloading… retrying in ${secs}s</div>`;
+          document.getElementById('won-count').textContent = '…';
+          _wonRetryTimer = setTimeout(()=>_wonFetch(attempt+1), secs * 1000);
+        } else {
+          document.getElementById('won-list').innerHTML =
+            '<div class="won-empty"><span>⏳</span>EPG is taking a while. Try reopening in a moment.</div>';
+          document.getElementById('won-count').textContent = '0';
+        }
+        return;
+      }
       if(data.status === 'no_epg' || data.status === 'error'){
         document.getElementById('won-list').innerHTML =
           `<div class="won-empty"><span>📡</span>${esc(data.message||'No EPG data available.')}</div>`;
@@ -10818,10 +11327,11 @@ function openWhatsOn(){
       document.getElementById('won-list').innerHTML =
         `<div class="won-empty"><span>⚠️</span>Failed to load: ${esc(String(e))}</div>`;
     });
-  setTimeout(()=>document.getElementById('won-srch').focus(), 200);
 }
 
+let _wonRetryTimer = null;
 function closeWhatsOn(){
+  if(_wonRetryTimer){ clearTimeout(_wonRetryTimer); _wonRetryTimer = null; }
   document.getElementById('won-overlay').classList.remove('open');
 }
 
@@ -11055,6 +11565,7 @@ const mvUrls       = new Map();   // widgetId → original channel URL
 let mvActiveId     = null;
 // multiview.js: let channelSelectorCallback = null;
 let mvSelCallback  = null;
+let _mvSelWidgetCtx = null;   // { wid, cEl } of the widget that opened the selector
 // multiview.js: let grid;
 let mvGrid         = null;
 // multiview.js: const MAX_PLAYERS = 9;
@@ -11063,6 +11574,9 @@ const MV_MAX       = 9;
 // Portal tracking — maps widgetId → { portalKey, portalName, maxConn }
 // portalKey = hostname:port extracted from the resolved stream URL
 const mvPortalMeta  = new Map();
+// Track which widgets are playing an external/direct URL (not a portal channel)
+// — these don't count toward or display portal connection limits.
+const mvExternalUrlWidgets = new Set();
 
 // Optional override: populate window._mvPortalMaxConns[portalKey] = N
 // when you connect to a portal that exposes its max-connection limit
@@ -11106,10 +11620,11 @@ function _mvPortalKeyFromUrl(url){
 // Recount active connections per portal and refresh all widget portal badges.
 // Called whenever a player starts or stops.
 function _mvUpdatePortalBadges(){
-  // Tally connections per portalKey
+  // Tally connections per portalKey — exclude external/custom-URL widgets
   const counts = {};
-  for(const meta of mvPortalMeta.values()){
+  for(const [wid, meta] of mvPortalMeta.entries()){
     if(!meta || !meta.portalKey) continue;
+    if(mvExternalUrlWidgets.has(wid)) continue;  // external URL — not a portal connection
     counts[meta.portalKey] = (counts[meta.portalKey] || 0) + 1;
   }
 
@@ -11119,6 +11634,13 @@ function _mvUpdatePortalBadges(){
     if(!cEl || !meta) continue;
     const badge = cEl.querySelector('.mv-hdr-portal');
     if(!badge) continue;
+
+    // External URL widgets: show just the hostname, no connection count
+    if(mvExternalUrlWidgets.has(wid)){
+      badge.textContent = meta.portalName || '';
+      badge.classList.remove('mv-conn-warn','mv-conn-full');
+      continue;
+    }
 
     const count   = counts[meta.portalKey] || 1;
     const maxConn = window._mvPortalMaxConns[meta.portalKey] || 0;
@@ -11151,11 +11673,19 @@ async function _mvPlayFromUrl(wid, rawUrl, cEl){
   rawUrl = (rawUrl||'').trim();
   if(!rawUrl){ toast('Enter a URL first', 'wrn'); return; }
 
+  // Persist raw URL so quality changes can re-resolve with new quality
+  cEl._mvRawUrl = rawUrl;
+
   const titleEl = cEl ? cEl.querySelector('.mv-hdr-title') : null;
   if(titleEl) titleEl.textContent = 'Resolving…';
 
+  // Read quality from the widget's selector (default 'best')
+  const qualSel = cEl.querySelector('.mv-quality-sel');
+  const quality = (qualSel ? qualSel.value : null) || 'best';
+
   let finalUrl    = rawUrl;
   let channelName = '';
+  let isLive      = true;   // assumed live unless yt-dlp says otherwise
 
   if(_mvNeedsResolve(rawUrl)){
     // Ask the server to resolve via yt-dlp
@@ -11163,7 +11693,7 @@ async function _mvPlayFromUrl(wid, rawUrl, cEl){
       const r = await fetch('/api/multiview/resolve_url', {
         method:  'POST',
         headers: {'Content-Type':'application/json'},
-        body:    JSON.stringify({url: rawUrl})
+        body:    JSON.stringify({url: rawUrl, quality})
       });
       const d = await r.json();
       if(d.error){
@@ -11173,6 +11703,7 @@ async function _mvPlayFromUrl(wid, rawUrl, cEl){
       }
       finalUrl    = d.url;
       channelName = d.title || '';
+      isLive      = d.is_live !== false;   // false = VOD → enable seek bar
     } catch(e){
       toast('Could not resolve URL: ' + e, 'err');
       if(titleEl) titleEl.textContent = 'No Channel';
@@ -11194,9 +11725,11 @@ async function _mvPlayFromUrl(wid, rawUrl, cEl){
     name:             channelName,
     _direct_url:      finalUrl,   // skips the /api/resolve call in _mvPlayChannel
     id:               'custom-url-' + Date.now(),
-    _portal_override: { key: _synthKey, name: _synthName }
+    _portal_override: { key: _synthKey, name: _synthName },
+    _is_live:         isLive,     // passed to mpegts isLive flag for VOD seek support
   };
 
+  mvExternalUrlWidgets.add(wid);
   await _mvPlayChannel(wid, synth, cEl);
 }
 
@@ -11321,7 +11854,7 @@ function mvOpen(){
   _mvSyncDesktopBtn();
 
   // mirrors multiview.js initMultiView()
-  if(mvGrid){ _mvTbInit(); _mvLoadLayouts(); return; }
+  if(mvGrid){ _mvTbInit(); _mvLoadLayouts().then(_mvAutoRestoreLayout); return; }
 
   // First time — initialise grid
   mvGrid = GridStack.init({
@@ -11375,7 +11908,7 @@ async function mvClose(){
   document.getElementById('mv-confirm-overlay').classList.remove('open');
   document.getElementById('mv-sel-overlay').classList.remove('open');
   document.getElementById('mv-save-overlay').classList.remove('open');
-  mvSelCallback = null; _mvSelMode = 'cats'; _mvSelCat = null; _mvSelItems = [];
+  mvSelCallback = null; _mvSelWidgetCtx = null; _mvSelMode = 'cats'; _mvSelCat = null; _mvSelItems = [];
 
   _mvSyncDesktopBtn();
 
@@ -11389,6 +11922,23 @@ async function mvClose(){
   }
 
   if(!mvGrid) return;
+
+  // ── Snapshot current grid layout to localStorage before teardown ──────────
+  // This allows re-open to restore the exact widget arrangement even if no
+  // named layout was ever explicitly loaded.
+  try {
+    const items = mvGrid.getGridItems();
+    if(items.length){
+      const snapshot = items.map(item=>{
+        const node = item.gridstackNode;
+        const ph   = item.querySelector('.mv-placeholder');
+        return { x:node.x, y:node.y, w:node.w, h:node.h,
+                 id: ph?.id || node.id,
+                 channelId: ph?.dataset.channelId || null };
+      });
+      localStorage.setItem('mv_session_layout', JSON.stringify(snapshot));
+    }
+  } catch(e){}
 
   const stops = Array.from(mvPlayers.keys()).map(id => _mvStopCleanup(id, true));
   await Promise.all(stops);
@@ -11467,6 +12017,13 @@ function _mvAddWidget(channel, layout){
           <button class="mv-pp-btn"   title="Play/Pause">⏸</button>
           <button class="mv-mute-btn" title="Mute">🔊</button>
           <input  type="range" class="mv-vol" min="0" max="1" step="0.05" value="0.5"/>
+          <select class="mv-quality-sel" title="Quality">
+            <option value="best">Auto</option>
+            <option value="1080">1080p</option>
+            <option value="720">720p</option>
+            <option value="480">480p</option>
+            <option value="360">360p</option>
+          </select>
           <button class="mv-fs-btn"   title="Fullscreen">⛶</button>
           <button class="mv-stop-btn" title="Stop">⏹</button>
           <button class="mv-rm-btn"   title="Remove player">✕</button>
@@ -11483,6 +12040,10 @@ function _mvAddWidget(channel, layout){
           <span>📺 Select IPTV channel &nbsp;|&nbsp; 🔗 Play URL</span>
         </div>
         <video class="mv-video mv-hidden" muted playsinline></video>
+        <div class="mv-seek-wrap">
+          <input type="range" class="mv-seek" min="0" max="100" step="0.1" value="0">
+          <span class="mv-seek-time">0:00</span>
+        </div>
       </div>
     </div>`;
 
@@ -11521,6 +12082,7 @@ function _mvAttachListeners(cEl, wid){
   // Open channel selector — mirrors openSelector in multiview.js
   const openSel = ()=>{
     mvSelCallback = (ch)=> _mvPlayChannel(wid, ch, cEl);
+    _mvSelWidgetCtx = { wid, cEl };   // stored so "Play URL" row can fire _mvPlayFromUrl
     _mvPopulateSelector();
     document.getElementById('mv-sel-overlay').classList.add('open');
   };
@@ -11600,6 +12162,79 @@ function _mvAttachListeners(cEl, wid){
     if(videoEl.requestFullscreen) videoEl.requestFullscreen();
     else if(videoEl.webkitRequestFullscreen) videoEl.webkitRequestFullscreen();
   });
+
+  // ── Seek bar ─────────────────────────────────────────────────────────────
+  const seekWrap = cEl.querySelector('.mv-seek-wrap');
+  const seekBar  = cEl.querySelector('.mv-seek');
+  const seekTime = cEl.querySelector('.mv-seek-time');
+
+  const _fmtTime = s => {
+    if(!isFinite(s)||s<0) s=0;
+    const m=Math.floor(s/60), ss=Math.floor(s%60);
+    return m+':'+(ss<10?'0':'')+ss;
+  };
+  const _syncSeek = () => {
+    if(!isFinite(videoEl.duration)||videoEl.duration<=0){
+      // Live — show indicator, hide the range (no seekable range)
+      seekBar.style.display = 'none';
+      seekTime.textContent  = '🔴 LIVE';
+      return;
+    }
+    seekBar.style.display = '';
+    seekBar.value = (videoEl.currentTime/videoEl.duration)*100;
+    seekTime.textContent = _fmtTime(videoEl.currentTime)+' / '+_fmtTime(videoEl.duration);
+  };
+  const _tryShowSeek = () => {
+    // External URL widgets: always show (LIVE indicator or VOD seek)
+    // Portal channels: only show for VOD (finite duration)
+    const isExt = mvExternalUrlWidgets.has(wid);
+    const hasVod = isFinite(videoEl.duration) && videoEl.duration > 0 && videoEl.duration < 86400;
+    if(isExt || hasVod){
+      seekWrap.classList.add('mv-seek-visible');
+      _syncSeek();
+    }
+  };
+
+  // Show immediately if already external (e.g. re-play after quality change)
+  if(mvExternalUrlWidgets.has(wid)){
+    seekWrap.classList.add('mv-seek-visible');
+    seekBar.style.display = 'none';
+    seekTime.textContent  = '🔴 LIVE';
+  }
+
+  videoEl.addEventListener('loadedmetadata', _tryShowSeek);
+  videoEl.addEventListener('durationchange', _tryShowSeek);
+  videoEl.addEventListener('timeupdate', () => {
+    _tryShowSeek();
+    if(seekWrap.classList.contains('mv-seek-visible')) _syncSeek();
+  });
+  videoEl.addEventListener('emptied', () => {
+    if(!mvExternalUrlWidgets.has(wid)) seekWrap.classList.remove('mv-seek-visible');
+    seekBar.style.display = '';
+  });
+
+  seekBar.addEventListener('click', e => e.stopPropagation());
+  seekBar.addEventListener('mousedown', e => e.stopPropagation());
+  seekBar.addEventListener('touchstart', e => e.stopPropagation(), {passive:true});
+  seekBar.addEventListener('input', e => {
+    e.stopPropagation();
+    if(isFinite(videoEl.duration) && videoEl.duration>0)
+      videoEl.currentTime = (parseFloat(e.target.value)/100) * videoEl.duration;
+    _syncSeek();
+  });
+
+  // ── Quality selector ──────────────────────────────────────────────────────
+  const qualSel = cEl.querySelector('.mv-quality-sel');
+  if(qualSel){
+    qualSel.addEventListener('click',  e => e.stopPropagation());
+    qualSel.addEventListener('change', e => {
+      e.stopPropagation();
+      const rawUrl = cEl._mvRawUrl;
+      if(!rawUrl){ toast('Quality only applies to YouTube/external URLs','wrn'); return; }
+      // Re-resolve and re-play with the new quality
+      _mvPlayFromUrl(wid, rawUrl, cEl);
+    });
+  }
 
   // Click anywhere on widget → make it the active player
   cEl.addEventListener('click', ()=> _mvSetActive(wid));
@@ -11695,9 +12330,12 @@ async function _mvPlayChannel(wid, channel, cEl){
   }
 
   // mirrors multiview.js mpegtsConfig
+  // Use isLive=false for VOD content (e.g. YouTube VOD) so mpegts exposes
+  // a finite duration and the seek bar works correctly.
+  const _mpIsLive = channel._is_live !== false;  // default true for IPTV; false for VOD
   const player = mpegts.createPlayer({
     type:   'mse',
-    isLive: true,
+    isLive: _mpIsLive,
     url:    proxyUrl
   }, {
     enableStashBuffer: true,
@@ -11721,6 +12359,18 @@ async function _mvPlayChannel(wid, channel, cEl){
 
   try {
     await player.play();
+    // Unmute automatically when this is the only/first active player.
+    // Browsers require `muted` on the <video> element for autoplay to work,
+    // so we unmute here after playback has started. Subsequent widgets stay
+    // muted to avoid audio clashing; the user can unmute them manually.
+    const muteBtn = cEl.querySelector('.mv-mute-btn');
+    if(mvPlayers.size === 1){
+      videoEl.muted = false;
+      if(muteBtn) muteBtn.textContent = '🔊';
+    } else {
+      // Make sure btn reflects actual state
+      if(muteBtn) muteBtn.textContent = videoEl.muted ? '🔇' : '🔊';
+    }
     _mvSetActive(wid);
   } catch(e){
     // mirrors multiview.js: if(err.name !== 'AbortError')
@@ -11764,6 +12414,10 @@ async function _mvStopCleanup(wid, resetUI){
   }
 
   // 2. Clear portal metadata and refresh connection-count badges.
+  // Only remove the external-URL flag when the user explicitly stops/removes
+  // the widget (resetUI=true). Internal cleanup (resetUI=false, called before
+  // re-playing) must preserve the flag so the badge stays correct.
+  if(resetUI) mvExternalUrlWidgets.delete(wid);
   if(mvPortalMeta.has(wid)){
     mvPortalMeta.delete(wid);
     _mvUpdatePortalBadges();
@@ -11901,7 +12555,6 @@ function _mvApplyPreset(name){
 
     if(name==='auto'){
       let cols, rows;
-      // mirrors multiview.js auto-layout calculation exactly
       if(numPlayers<=1){cols=1;rows=1;}
       else if(numPlayers===2){cols=2;rows=1;}
       else if(numPlayers===3){cols=3;rows=1;}
@@ -11909,22 +12562,17 @@ function _mvApplyPreset(name){
       else if(numPlayers<=6){cols=3;rows=2;}
       else{cols=3;rows=3;}
       const ww = Math.floor(12/cols);
-      const wh = Math.floor(9/rows);
+      const wh = Math.floor(10/rows);  // match 1+1/1+2 which use h:10
       for(let i=0;i<numPlayers;i++){
         layout.push({x:(i%cols)*ww, y:Math.floor(i/cols)*wh, w:ww, h:wh});
       }
     } else if(name==='1+1'){
-      // Two equal players.
-      // Desktop: side by side full height.
-      // Mobile: stacked vertically, each half the grid height.
       if(window.innerWidth < 900){
         layout = [{x:0,y:0,w:12,h:5},{x:0,y:5,w:12,h:5}];
       } else {
         layout = [{x:0,y:0,w:6,h:10},{x:6,y:0,w:6,h:10}];
       }
     } else if(name==='1+2'){
-      // Large player on the left, two smaller ones stacked on the right.
-      // Same on desktop and mobile.
       layout = [{x:0,y:0,w:8,h:10},
                 {x:8,y:0,w:4,h:5},{x:8,y:5,w:4,h:5}];
     }
@@ -11986,6 +12634,40 @@ function _mvRenderSel(){
     backBtn.style.display = 'none';
     document.getElementById('mv-sel-search').placeholder = 'Search categories…';
 
+    // ── Play URL row (always at top) ─────────────────────────────────────
+    const playUrlRowId = 'mv-sel-play-url-row';
+    let playUrlRow = document.getElementById(playUrlRowId);
+    if(!playUrlRow){
+      playUrlRow = document.createElement('div');
+      playUrlRow.id = playUrlRowId;
+      playUrlRow.className = 'mv-sel-play-url-row';
+      playUrlRow.innerHTML =
+        '<span style="font-size:14px;flex-shrink:0">🔗</span>'
+        +'<input id="mv-sel-play-url-inp" class="mv-sel-play-url-inp" type="text" inputmode="url"'
+        +' placeholder="Paste URL to play directly…" autocomplete="off" autocorrect="off" spellcheck="false">'
+        +'<button id="mv-sel-play-url-btn" style="height:26px;padding:0 9px;font-size:11px;white-space:nowrap;'
+        +'flex-shrink:0;background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.35);'
+        +'border-radius:3px;cursor:pointer">▶ Play</button>';
+      // Insert above the list
+      listEl.parentElement.insertBefore(playUrlRow, listEl);
+
+      const inp = playUrlRow.querySelector('#mv-sel-play-url-inp');
+      const doMvPlayUrl = async ()=>{
+        const url = (inp.value||'').trim();
+        if(!url){ toast('Enter a URL','wrn'); return; }
+        inp.value='';
+        document.getElementById('mv-sel-overlay').classList.remove('open');
+        const ctx = _mvSelWidgetCtx;
+        mvSelCallback = null; _mvSelWidgetCtx = null;
+        if(ctx) await _mvPlayFromUrl(ctx.wid, url, ctx.cEl);
+      };
+      playUrlRow.querySelector('#mv-sel-play-url-btn').addEventListener('click', e=>{ e.stopPropagation(); doMvPlayUrl(); });
+      inp.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.stopPropagation(); doMvPlayUrl(); }});
+      inp.addEventListener('click', e=> e.stopPropagation());
+    }
+    // Always ensure row is visible in cats mode (may have been hidden in items mode)
+    playUrlRow.style.display = '';
+
     // Use catsCache['live'] populated during connect — same source as main UI
     const cats = (catsCache && catsCache['live']) ? catsCache['live'] : allCats;
     if(!cats || !cats.length){
@@ -12014,7 +12696,9 @@ function _mvRenderSel(){
     });
 
   } else {
-    // Items mode
+    // Items mode — hide Play URL row
+    const _pRow = document.getElementById('mv-sel-play-url-row');
+    if(_pRow) _pRow.style.display = 'none';
     titleEl.textContent   = _mvSelCat ? (_mvSelCat.title||'Channels') : 'Channels';
     backBtn.style.display = '';
     document.getElementById('mv-sel-search').placeholder = 'Search channels…';
@@ -12101,6 +12785,43 @@ async function _mvLoadLayouts(){
   } catch(e){ console.warn('[MV] loadLayouts error', e); }
 }
 
+// Auto-restore the last grid layout after re-opening multiview.
+// Primary source: session snapshot saved by mvClose() to localStorage.
+// Fallback: last explicitly loaded named layout (mv_last_layout_id).
+async function _mvAutoRestoreLayout(){
+  try {
+    // Try session snapshot first — this always reflects the exact layout
+    // the user had when they closed, even if they never saved a named layout.
+    const raw = localStorage.getItem('mv_session_layout');
+    if(raw){
+      const snapshot = JSON.parse(raw);
+      if(Array.isArray(snapshot) && snapshot.length){
+        // Clear any existing widgets before restoring to avoid duplicates
+        mvGrid.removeAll();
+        const toRestore = snapshot.slice(0, MV_MAX); // cap to max
+        mvGrid.batchUpdate();
+        try { toRestore.forEach(ld => _mvAddWidget(null, ld)); }
+        finally { mvGrid.commit(); setTimeout(_mvFitCellHeight, 50); }
+        _mvTbCollapseIfMobile();
+        return;
+      }
+    }
+    // Fallback: last manually loaded named layout
+    const lastId = parseInt(localStorage.getItem('mv_last_layout_id') || '0');
+    if(!lastId) return;
+    const layout = (window._mvLayouts||[]).find(l=> l.id === lastId);
+    if(!layout) return;
+    mvGrid.removeAll();
+    const toRestore = (layout.layout_data||[]).slice(0, MV_MAX);
+    mvGrid.batchUpdate();
+    try { toRestore.forEach(ld => _mvAddWidget(null, ld)); }
+    finally { mvGrid.commit(); setTimeout(_mvFitCellHeight, 50); }
+    const sel = document.getElementById('mv-layouts-sel');
+    if(sel) sel.value = lastId;
+    _mvTbCollapseIfMobile();
+  } catch(e){ console.warn('[MV] autoRestoreLayout error', e); }
+}
+
 // mirrors multiview.js saveLayout()
 async function _mvSaveLayout(){
   const name = document.getElementById('mv-save-name').value.trim();
@@ -12153,6 +12874,8 @@ function _mvLoadSelected(){
       mvGrid.batchUpdate();
       try { layout.layout_data.forEach(ld => _mvAddWidget(null, ld)); }
       finally { mvGrid.commit(); setTimeout(_mvFitCellHeight, 50); }
+      // Remember this layout so it auto-restores on next open
+      try { localStorage.setItem('mv_last_layout_id', layout.id); } catch(e){}
       _mvTbCollapseIfMobile();
     }
   );
@@ -12167,7 +12890,12 @@ async function _mvDeleteSelected(){
   _mvConfirm('Delete Layout?', 'Are you sure you want to delete this layout?', async ()=>{
     try {
       const r = await fetch('/api/multiview/layouts/' + id, {method:'DELETE'});
-      if(r.ok){ toast('Layout deleted', 'ok'); _mvLoadLayouts(); }
+      if(r.ok){
+        toast('Layout deleted', 'ok');
+        // Clear auto-restore pointer if this was the last used layout
+        try { if(parseInt(localStorage.getItem('mv_last_layout_id')||'0')===id) localStorage.removeItem('mv_last_layout_id'); } catch(e){}
+        _mvLoadLayouts();
+      }
     } catch(e){ toast('Delete failed: ' + e, 'err'); }
   });
 }
@@ -12198,6 +12926,8 @@ function _mvSetupListeners(){
     _mvSelCat   = null;
     _mvSelItems = [];
     document.getElementById('mv-sel-search').value = '';
+    const _pRow = document.getElementById('mv-sel-play-url-row');
+    if(_pRow) _pRow.style.display = '';
     _mvRenderSel();
   });
   document.getElementById('mv-sel-close').addEventListener('click', ()=>{
