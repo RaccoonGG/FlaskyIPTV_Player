@@ -21,6 +21,7 @@ Clicking on Search Icon will check currently active portal if your portal has ch
 Varius UI fixes.
 """
 
+
 import base64
 import hashlib
 import json
@@ -377,7 +378,7 @@ class PortalClient:
             return ""
         try:
             url = f"{self.base}/portal.php?type=vod&action=create_link&cmd={quote(cmd)}"
-            self.log(f"[VOD] create_link → {url[:80]}")
+            self.log(f"[VOD] create_link → {url[:120]}")
             async with self.session.get(url, headers=self.headers,
                                         timeout=aiohttp.ClientTimeout(total=10)) as r:
                 self.log(f"[VOD] create_link HTTP {r.status}")
@@ -477,7 +478,7 @@ class PortalClient:
                     self.log(f"[MAC] create_link HTTP {r.status} ({ptype})")
                     candidate = await _try_url_and_extract(r)
                     if candidate:
-                        self.log(f"[MAC] create_link resolved → {candidate[:80]}")
+                        self.log(f"[MAC] create_link resolved → {candidate[:120]}")
                         return candidate
             except Exception as e:
                 self.log(f"[MAC] create_link encoded error: {e}")
@@ -489,7 +490,7 @@ class PortalClient:
                     self.log(f"[MAC] create_link retry HTTP {r2.status} ({ptype})")
                     candidate2 = await _try_url_and_extract(r2)
                     if candidate2:
-                        self.log(f"[MAC] create_link retry resolved → {candidate2[:80]}")
+                        self.log(f"[MAC] create_link retry resolved → {candidate2[:120]}")
                         return candidate2
             except Exception as e:
                 self.log(f"[MAC] create_link raw error: {e}")
@@ -558,7 +559,7 @@ class PortalClient:
             if re.match(r'https?://[:/]', cmd_value):
                 path_part = re.sub(r'^https?://[^/]*', '', cmd_value)
                 cmd_value = self.base.rstrip('/') + path_part
-                self.log(f"[MAC] Fixed hostless URL → {cmd_value[:80]}")
+                self.log(f"[MAC] Fixed hostless URL → {cmd_value[:120]}")
             if cmd_value.startswith(("http://", "https://", "rtsp://")):
                 if "localhost" in cmd_value:
                     return await self.resolve_localhost_url(cmd_value)
@@ -627,7 +628,7 @@ class PortalClient:
                         resolved = resolved.split(" ", 1)[1]
                     resolved = resolved.replace("\\/", "/").strip()
                     if resolved.startswith(("http://", "https://", "rtsp://")):
-                        self.log(f"[LOCALHOST FIX] Resolved ch={cid} → {resolved[:80]}")
+                        self.log(f"[LOCALHOST FIX] Resolved ch={cid} → {resolved[:120]}")
                         return resolved
         except Exception as e:
             self.log(f"[LOCALHOST FIX] Failed to resolve {stub_url}: {e}")
@@ -1509,7 +1510,7 @@ class StalkerPortalClient:
             resolved = resolved.split(" ", 1)[1].strip()
         resolved = resolved.replace("\\/", "/")
         if resolved.startswith(("http://", "https://", "rtsp://")):
-            self.log(f"[STALKER] Resolved ch={cid} → {resolved[:80]}")
+            self.log(f"[STALKER] Resolved ch={cid} → {resolved[:120]}")
             return resolved
         extracted = _extract_url_from_text(resolved)
         if extracted:
@@ -1580,7 +1581,7 @@ class StalkerPortalClient:
         if re.match(r'https?://[:/]', cmd_value):
             path_part = re.sub(r'^https?://[^/]*', '', cmd_value)
             cmd_value = self.base.rstrip('/') + path_part
-            self.log(f"[STALKER] Fixed hostless URL → {cmd_value[:80]}")
+            self.log(f"[STALKER] Fixed hostless URL → {cmd_value[:120]}")
 
         # Detect a null/failed tv_archive storage response.
         # When the portal can't find a recording it returns a storage URL like:
@@ -5853,7 +5854,9 @@ function doPlay(url, name, opts={}){
                || u.includes('timeshift.php')
                || qs.includes('extension=m3u8');
 
-  const isMpegTs = !isStorageUrl && (u.endsWith('.ts')
+  const isMpegTs = !isStorageUrl && (
+               qs.includes('play_token=')   // MAC portals: short-lived token = raw MPEG-TS stream
+               || u.endsWith('.ts')
                || u.endsWith('.mpg')
                || u.endsWith('/mpegts')
                || u.includes('/mpegts?')
@@ -5930,9 +5933,12 @@ function doPlay(url, name, opts={}){
     mpegtsObj.on(mpegts.Events.ERROR,(et,ed)=>{
       const msg=(ed?.msg||JSON.stringify(ed));
       alog('[MPEGTS] '+et+': '+msg,'e');
-      // Only auto-retry for live streams — catchup tokens are time-sensitive,
-      // retrying after 2s may result in an expired token playing live content
-      if(isLiveStream && et===mpegts.ErrorTypes.NETWORK_ERROR){
+      const hasPlayToken = url.toLowerCase().includes('play_token=');
+      // play_token URLs: token is short-lived — re-resolve rather than replay stale URL
+      if(isLiveStream && et===mpegts.ErrorTypes.NETWORK_ERROR && hasPlayToken){
+        alog('[MPEGTS] play_token stream failed — re-resolving for fresh token…','w');
+        if(pIdx>=0) setTimeout(()=>playItem(pIdx), 500);
+      } else if(isLiveStream && et===mpegts.ErrorTypes.NETWORK_ERROR){
         setTimeout(()=>{ if(mpegtsObj){ mpegtsObj.unload(); mpegtsObj.load(); vid.play().catch(()=>{}); }},2000);
       } else if(!isLiveStream && fallbackUrl && et===mpegts.ErrorTypes.NETWORK_ERROR){
         // Catchup path-based .ts failed → try query-string format via HLS.js
