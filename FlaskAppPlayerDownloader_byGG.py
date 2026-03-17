@@ -29,7 +29,7 @@ import threading
 import time
 import queue
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlparse, quote, quote_plus, unquote, parse_qs
 import asyncio
 import aiohttp
@@ -3216,15 +3216,14 @@ def api_catchup():
     Stalker portals.  Falls back to Xtream timeshift URL for Xtream portals.
     """
     import math as _math
-    from datetime import datetime as _dt, timezone as _tz
     data      = request.get_json(force=True)
     item      = data.get("item", {})
     start_ts  = int(data.get("start", 0))
     end_ts    = int(data.get("end",   0))
     if not start_ts:
-        start_ts = int(_dt.now(_tz.utc).timestamp()) - 86400 * 3
+        start_ts = int(datetime.now(timezone.utc).timestamp()) - 86400 * 3
     if not end_ts:
-        end_ts = int(_dt.now(_tz.utc).timestamp())
+        end_ts = int(datetime.now(timezone.utc).timestamp())
     duration_min = max(1, _math.ceil((end_ts - start_ts) / 60))
 
     conn = state.conn_type
@@ -3241,7 +3240,7 @@ def api_catchup():
                 return {"error": "No stream_id for Xtream catch-up"}
             from urllib.parse import urlparse as _up
             p = _up(base)
-            start_dt  = _dt.fromtimestamp(start_ts, tz=_tz.utc)
+            start_dt  = datetime.fromtimestamp(start_ts, tz=timezone.utc)
             start_fmt = start_dt.strftime("%Y-%m-%d:%H-%M")
             cu_url = (f"{p.scheme}://{p.netloc}/timeshift/{user}/{pwd}"
                       f"/{duration_min}/{start_fmt}/{sid}.m3u8")
@@ -3271,7 +3270,7 @@ def api_catchup():
                 if not v: return 0
                 try: return int(v)
                 except: pass
-                try: return int(_dt.strptime(str(v), "%Y-%m-%d %H:%M:%S").replace(tzinfo=_tz.utc).timestamp())
+                try: return int(datetime.strptime(str(v), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp())
                 except: return 0
 
             results = []
@@ -3280,8 +3279,8 @@ def api_catchup():
                 hdrs = client._headers(include_auth=True) if state.is_stalker_portal else client.headers
 
                 for day_offset in range(4):
-                    day_ts   = int(_dt.now(_tz.utc).timestamp()) - day_offset * 86400
-                    date_str = _dt.fromtimestamp(day_ts, tz=_tz.utc).strftime("%Y-%m-%d")
+                    day_ts   = int(datetime.now(timezone.utc).timestamp()) - day_offset * 86400
+                    date_str = datetime.fromtimestamp(day_ts, tz=timezone.utc).strftime("%Y-%m-%d")
                     page = 1
                     while True:
                         epg_url = (f"{base_url}{php}?type=epg&action=get_simple_data_table"
@@ -3370,7 +3369,6 @@ def api_catchup_play():
     an archive-specific cmd from EPG entries.
     """
     import re as _re
-    from datetime import datetime as _dt, timezone as _tz
     data     = request.get_json(force=True)
     cmd_in   = str(data.get("cmd")      or "").strip()
     live_cmd = str(data.get("live_cmd") or "").strip()
@@ -3397,7 +3395,7 @@ def api_catchup_play():
         stop_ts = start_ts + 3600
 
     async def _play():
-        start_dt_utc = _dt.fromtimestamp(start_ts, tz=_tz.utc)
+        start_dt_utc = datetime.fromtimestamp(start_ts, tz=timezone.utc)
         start_local  = start_dt_utc.astimezone()   # local tz, same as utc_to_local()
         start_str    = start_local.strftime("%Y-%m-%d:%H-%M")
         duration_min = max(1, (stop_ts - start_ts) // 60)
@@ -3461,145 +3459,12 @@ def api_catchup_play():
         return jsonify({"error": str(e)})
 
 
-def _parse_xtream_epg(listings: list) -> dict:
-    """Parse Xtream get_short_epg response into current/next/schedule."""
-    import base64 as _b64
-    from datetime import datetime as _dt, timezone as _tz
-
-    def _safe_b64(s):
-        """Decode base64 only if result is valid UTF-8 printable text, else return original."""
-        if not s:
-            return s
-        try:
-            decoded = _b64.b64decode(s + "==").decode("utf-8")
-            # Sanity check: decoded should be printable, not binary garbage
-            if decoded.isprintable() and len(decoded) > 1:
-                return decoded
-        except Exception:
-            pass
-        return s
-
-    out = {"current": None, "next": None, "schedule": []}
-    now = _dt.now(_tz.utc).timestamp()
-    parsed = []
-    for ep in listings:
-        try:
-            start = int(ep.get("start_timestamp") or ep.get("start") or 0)
-            end   = int(ep.get("stop_timestamp")  or ep.get("end")   or 0)
-            title = _safe_b64(ep.get("title") or ep.get("name") or "").strip()
-            desc  = _safe_b64(ep.get("description") or ep.get("plot") or "").strip()
-            if not title:
-                continue
-            parsed.append({"title": title, "start": start, "end": end, "desc": desc})
-        except Exception:
-            continue
-    parsed.sort(key=lambda x: x["start"])
-    out["schedule"] = parsed
-    for ep in parsed:
-        if ep["start"] <= now < ep["end"]:
-            out["current"] = ep
-        elif ep["start"] > now and out["next"] is None:
-            out["next"] = ep
-    return out
-
-
-def _parse_stalker_epg_all_channels(payload: dict, target_ch_id: str) -> list:
-    """Deep-search a get_epg_info response for programmes matching target_ch_id.
-    Many portals return EPG for a group of channels (ignoring the ch_id query param),
-    so we search every channel bucket for entries whose ch_id field matches ours,
-    or collect all entries if the matching bucket is found by dict key.
-    Returns a flat list of {title, start, end, desc} dicts.
-    """
-    from datetime import datetime as _dt, timezone as _tz
-
-    def _to_ts(val):
-        if not val:
-            return 0
-        if isinstance(val, (int, float)):
-            return float(val)
-        s = str(val).strip()
-        try:
-            return float(s)
-        except ValueError:
-            pass
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d.%m.%Y %H:%M"):
-            try:
-                return _dt.strptime(s[:19], fmt).replace(tzinfo=_tz.utc).timestamp()
-            except ValueError:
-                continue
-        return 0
-
-    if not isinstance(payload, dict):
-        return []
-
-    js = payload.get("js", {})
-    if isinstance(js, list) and js:
-        js = js[0]
-
-    # Unwrap data layer
-    if isinstance(js, dict):
-        inner = js.get("data") or js
-    else:
-        return []
-
-    results = []
-
-    if isinstance(inner, dict):
-        # Check if our ch_id is a direct key (exact match)
-        bucket = inner.get(str(target_ch_id)) or inner.get(target_ch_id)
-        if bucket and isinstance(bucket, list):
-            # Found our channel's bucket directly — use it
-            for ep in bucket:
-                if not isinstance(ep, dict):
-                    continue
-                start = _to_ts(ep.get("time") or ep.get("start_timestamp") or ep.get("start"))
-                end   = _to_ts(ep.get("time_to") or ep.get("stop_timestamp") or ep.get("stop") or ep.get("end"))
-                title = str(ep.get("name") or ep.get("title") or "").strip()
-                desc  = str(ep.get("descr") or ep.get("description") or ep.get("desc") or "").strip()
-                if title and start:
-                    results.append({"title": title, "start": start, "end": end, "desc": desc})
-        else:
-            # ch_id not a dict key — deep-search all buckets for matching ch_id field
-            for _key, bucket_items in inner.items():
-                if not isinstance(bucket_items, list):
-                    continue
-                for ep in bucket_items:
-                    if not isinstance(ep, dict):
-                        continue
-                    ep_ch = str(ep.get("ch_id", "")).strip()
-                    if ep_ch and ep_ch != str(target_ch_id):
-                        continue  # skip entries for other channels
-                    start = _to_ts(ep.get("time") or ep.get("start_timestamp") or ep.get("start"))
-                    end   = _to_ts(ep.get("time_to") or ep.get("stop_timestamp") or ep.get("stop") or ep.get("end"))
-                    title = str(ep.get("name") or ep.get("title") or "").strip()
-                    desc  = str(ep.get("descr") or ep.get("description") or ep.get("desc") or "").strip()
-                    if title and start:
-                        results.append({"title": title, "start": start, "end": end, "desc": desc})
-
-    elif isinstance(inner, list):
-        for ep in inner:
-            if not isinstance(ep, dict):
-                continue
-            ep_ch = str(ep.get("ch_id", "")).strip()
-            if ep_ch and ep_ch != str(target_ch_id):
-                continue
-            start = _to_ts(ep.get("time") or ep.get("start_timestamp") or ep.get("start"))
-            end   = _to_ts(ep.get("time_to") or ep.get("stop_timestamp") or ep.get("stop") or ep.get("end"))
-            title = str(ep.get("name") or ep.get("title") or "").strip()
-            desc  = str(ep.get("descr") or ep.get("description") or ep.get("desc") or "").strip()
-            if title and start:
-                results.append({"title": title, "start": start, "end": end, "desc": desc})
-
-    return results
-
-
 def _parse_stalker_epg(payload: dict, ch_id: str) -> dict:
     """Parse Stalker/MAC get_epg_info / get_short_epg response."""
-    from datetime import datetime as _dt, timezone as _tz
     out = {"current": None, "next": None, "schedule": []}
     if not isinstance(payload, dict):
         return out
-    now = _dt.now(_tz.utc).timestamp()
+    now = datetime.now(timezone.utc).timestamp()
 
     def _to_ts(val):
         """Convert value to UTC unix timestamp. Handles int or 'YYYY-MM-DD HH:MM:SS' string."""
@@ -3614,7 +3479,7 @@ def _parse_stalker_epg(payload: dict, ch_id: str) -> dict:
             pass
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d.%m.%Y %H:%M"):
             try:
-                return _dt.strptime(s[:19], fmt).replace(tzinfo=_tz.utc).timestamp()
+                return datetime.strptime(s[:19], fmt).replace(tzinfo=timezone.utc).timestamp()
             except ValueError:
                 continue
         return 0
@@ -3664,24 +3529,23 @@ def _parse_stalker_epg(payload: dict, ch_id: str) -> dict:
 async def _fetch_xmltv_epg(xmltv_url: str, tvg_id: str, log_cb=None) -> dict:
     """Fetch XMLTV and find schedule for tvg_id."""
     import xml.etree.ElementTree as ET
-    from datetime import datetime as _dt, timezone as _tz
     out = {"current": None, "next": None, "schedule": []}
     if not tvg_id:
         return out
     _log = log_cb or (lambda x: None)
-    now = _dt.now(_tz.utc).timestamp()
+    now = datetime.now(timezone.utc).timestamp()
 
     def _ts(s):
         s = s.strip()
         try:
-            dt = _dt.strptime(s[:14], "%Y%m%d%H%M%S")
+            dt = datetime.strptime(s[:14], "%Y%m%d%H%M%S")
             if len(s) > 14:
                 tz = s[14:].strip()
                 sign = 1 if tz.startswith("+") else -1
                 h, m = int(tz[1:3]), int(tz[3:5])
                 offset = sign * (h * 3600 + m * 60)
-                return dt.replace(tzinfo=_tz.utc).timestamp() - offset
-            return dt.replace(tzinfo=_tz.utc).timestamp()
+                return dt.replace(tzinfo=timezone.utc).timestamp() - offset
+            return dt.replace(tzinfo=timezone.utc).timestamp()
         except Exception:
             return 0
 
@@ -5250,8 +5114,10 @@ async function _loadCatchupEPG(){
   }
 }
 
+let _cuListings = [];
 function _renderArchiveListings(listings){
   // Show all programmes; highlight archived ones. Non-archived are dimmed.
+  _cuListings = listings;
   let lastDate='';
   const rows=listings.map(p=>{
     const hasArchive=(p.mark_archive==='1'||p.mark_archive===1);
@@ -5321,30 +5187,24 @@ function _cuManualForm(){
     +`</div>`;
 }
 
-async function doWatchCatchupManual(){
+function doWatchCatchupManual(){
   const s=document.getElementById('cu-start')?.value;
   const e=document.getElementById('cu-end')?.value;
   if(!s||!e){toast('Set start and end time','wrn');return;}
   const startTs=Math.floor(new Date(s).getTime()/1000);
   const endTs=Math.floor(new Date(e).getTime()/1000);
   if(endTs<=startTs){toast('End must be after start','wrn');return;}
-  const status=document.getElementById('catchup-status');
-  if(status) status.textContent='Resolving…';
-  const cmd=_epgItem?.cmd||'';
-  try{
-    const r=await fetch('/api/catchup/play',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({cmd, live_cmd:cmd, start:startTs, stop:endTs})});
-    const d=await r.json();
-    if(d.url){
-      closeCatchup();
-      // Pass raw URL — doPlay always wraps in /api/proxy itself
-      doPlay(d.url, (_epgItem?.name||'Catch-up')+' [↺]', {isLive:false});
-      toast('↺ Playing catch-up','ok');
-    } else {
-      if(status) status.textContent='❌ '+(d.error||'Not available');
-    }
-  }catch(e){if(status) status.textContent='❌ '+e.message;}
+  // Find the matching programme and delegate to doPlayArchiveCmd — exactly
+  // the same call that clicking a programme row makes.
+  const match=_cuListings.find(p=>p.start&&p.stop&&p.start<=startTs&&startTs<p.stop)
+    ||_cuListings.find(p=>p.start&&Math.abs(p.start-startTs)<300);
+  const liveCmd=_epgItem?.cmd||'';
+  const cmd=encodeURIComponent(match?.cmd||liveCmd);
+  const live_cmd=encodeURIComponent(match?.live_cmd||liveCmd);
+  const epg_id=encodeURIComponent(match?.epg_id||match?.id||'');
+  const title=match?.title||'';
+  const useStop=match?.stop||endTs;
+  doPlayArchiveCmd(cmd, startTs, useStop, title, live_cmd, epg_id);
 }
 
 
