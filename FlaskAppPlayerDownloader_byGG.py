@@ -40,7 +40,7 @@ Added cast to Chromecast, DLNA, Airplay feature.
 Added Multi-View feature that also supports external URLs like YouTube/Twitch (does not work on age-gated content)
 Fixed external EPG decompression blocking threads, added EPG caching per attempted channel while we wait external EPG download to finish.
 Improved button highlights and added a glossy style to all buttons.
-Varius UI fixes and adjustments.
+Varius UI fixes, adjustments and overall script optimizations.
 """
 
 import base64
@@ -3197,7 +3197,10 @@ def _probe_hevc(url: str) -> bool:
 def api_resolve():
     data = request.get_json(force=True)
     item = data.get("item", {})
-    mode = data.get("mode", "live"); mode = mode if mode in ("live","vod","series") else "live"
+    mode = data.get("mode", "live")
+    # Validate and sanitize
+    if mode not in ("live", "vod", "series"):
+        mode = "live"
     cat = data.get("category", {})
 
     try:
@@ -3206,25 +3209,91 @@ def api_resolve():
                 return await client.resolve_item_url(mode, item, cat)
 
         url = run_async(resolve())
-        # Probe for HEVC on live streams only — if detected, serve via transcode proxy
-        # so the browser never sees HEVC which it can't decode via MSE
         is_multiview = request.args.get('mv') == '1'
-        if url and isinstance(url, str) and 'play_token=' in url:
-            try:
-                probe = _probe_hevc(url)
-                if probe:
-                    if is_multiview:
-                        # For multiview: return the raw URL + hevc=True flag.
-                        # multiview_addon.py will transcode inside its own ffmpeg
-                        # process — no proxy chain needed.
-                        state.log(f"[RESOLVE] HEVC detected — multiview will transcode internally")
-                        return jsonify({"url": url, "hevc": True})
-                    else:
-                        state.log(f"[RESOLVE] HEVC detected — routing to transcode proxy")
-                        transcode_url = f"/api/hls_proxy?transcode=1&url={quote(url, safe='')}"
-                        return jsonify({"url": transcode_url, "hevc": True})
-            except Exception as pe:
-                state.log(f"[RESOLVE] HEVC probe failed: {pe}")
+        
+        if url and isinstance(url, str):
+            needs_transcode = False
+            detected_codec = None
+            transcode_reason = None
+            is_vod = mode in ('vod', 'series')  # VOD needs different handling than live
+            
+            url_lower = url.lower().split('?')[0]
+            
+            # ==== SMART CONTAINER DETECTION ====
+            needs_codec_check = (
+                url_lower.endswith('.mp4') or 
+                url_lower.endswith('.mkv') or
+                '.mp4?' in url_lower or
+                '.mkv?' in url_lower or
+                any(ext in url_lower for ext in ['.hevc', '.265', '.h265'])
+            )
+            
+            # Quick extension-based HEVC hint
+            if any(ext in url_lower for ext in ['.hevc', '.265', '.h265']):
+                needs_transcode = True
+                transcode_reason = "hevc by extension"
+                state.log(f"[RESOLVE] HEVC suspected by extension: {url_lower[-20:]}")
+            
+            # For MP4/MKV containers, check BOTH video AND audio codecs
+            elif needs_codec_check:
+                codecs = probe_stream_codecs(url, timeout=6)
+                
+                if codecs:
+                    # Check video codec
+                    if codecs.get("video"):
+                        vcodec = codecs["video"][0].lower() if codecs["video"] else ""
+                        detected_codec = vcodec
+                        
+                        hevc_codecs = ("hevc", "h265", "h.265", "hev1", "hvc1", "x265")
+                        if vcodec in hevc_codecs or any(h in vcodec for h in hevc_codecs):
+                            needs_transcode = True
+                            transcode_reason = f"hevc video ({vcodec})"
+                            state.log(f"[RESOLVE] HEVC video detected: {vcodec}")
+                    
+                    # Check audio codec - browsers only support AAC, MP3, Opus, Vorbis
+                    if not needs_transcode and codecs.get("audio"):
+                        acodec = codecs["audio"][0].lower() if codecs["audio"] else ""
+                        
+                        # Browser-supported audio codecs
+                        safe_audio = ("aac", "mp3", "mp2", "opus", "vorbis", "flac")
+                        
+                        # Common problematic codecs in MKV
+                        bad_audio = ("ac3", "eac3", "dts", "dca", "truehd", "mlp", "pcm")
+                        
+                        if acodec not in safe_audio and (acodec in bad_audio or 
+                            any(b in acodec for b in bad_audio)):
+                            needs_transcode = True
+                            transcode_reason = f"incompatible audio ({acodec})"
+                            state.log(f"[RESOLVE] Audio codec needs transcode: {acodec}")
+                        else:
+                            state.log(f"[RESOLVE] Audio codec OK: {acodec}")
+                    
+                    if not needs_transcode:
+                        state.log(f"[RESOLVE] All codecs playable: v={detected_codec}, a={codecs.get('audio', ['?'])[0] if codecs.get('audio') else 'none'}")
+                else:
+                    state.log(f"[RESOLVE] ffprobe failed, attempting direct play")
+            
+            # Legacy MPEG-TS probe for live streams
+            if not needs_transcode and 'play_token=' in url:
+                try:
+                    if _probe_hevc(url):
+                        needs_transcode = True
+                        transcode_reason = "hevc (ts probe)"
+                        is_vod = False  # play_token indicates live
+                except Exception as pe:
+                    state.log(f"[RESOLVE] HEVC TS probe failed: {pe}")
+            
+            # Apply transcode if needed
+            if needs_transcode:
+                if is_multiview:
+                    return jsonify({"url": url, "hevc": True})
+                else:
+                    state.log(f"[RESOLVE] Routing to transcode proxy: {transcode_reason}")
+                    # Pass vod flag for better handling
+                    vod_flag = "1" if is_vod else "0"
+                    transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}&url={quote(url, safe='')}"
+                    return jsonify({"url": transcode_url, "hevc": True})
+                    
         return jsonify({"url": url})
     except Exception as e:
         state.log(f"[RESOLVE] Error: {type(e).__name__}: {e}")
@@ -5622,46 +5691,60 @@ def api_open_external():
 
 @flask_app.route("/api/hls_proxy")
 def api_hls_proxy():
-    """Remux any MPEG-TS/MPG stream to HLS on-the-fly via ffmpeg.
-    Used as fallback when the browser cannot play MPEG-TS natively via MSE.
-    Returns a chunked MPEG-TS stream wrapped as HLS-compatible for mpegts.js,
-    OR if ?hls=1 is requested, pipes through ffmpeg → fmp4/HLS for native <video>.
-    """
+    """Transcode/remux stream for browser compatibility."""
     url = request.args.get("url", "").strip()
     if not url or not url.startswith(("http://", "https://", "rtsp://")):
         return Response("Invalid URL", status=400)
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return Response("ffmpeg not available", status=503)
+    
+    transcode = request.args.get("transcode", "0") == "1"
+    is_vod = request.args.get("vod", "0") == "1"
+    
     cors = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
         "Access-Control-Allow-Headers": "*",
     }
-    transcode = request.args.get("transcode", "0") == "1"
+
+    # Build ffmpeg command
     if transcode:
-        # Re-encode HEVC/unsupported video → H.264, keep audio as AAC
-        # Used as fallback when browser MSE rejects the native codec (e.g. HEVC)
+        # Full transcode: H.264 video + AAC audio (maximum compatibility)
         cmd = [
             ffmpeg, "-hide_banner", "-nostdin",
-            "-user_agent", "Mozilla/5.0",
+            "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "-referer", url.rsplit('/', 1)[0] + "/",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "10",
+            "-fflags", "+genpts+igndts+discardcorrupt",
             "-i", url,
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-            "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            "-f", "mpegts",
-            "pipe:1",
         ]
+        
+        # Video: force H.264 if needed, or copy if already compatible
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23"]
+        
+        # Audio: always convert to AAC for compatibility
+        cmd += ["-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000"]
+        
+        # Output format
+        cmd += ["-f", "mpegts", "-"]
+        
+        mode_str = "transcode"
     else:
-        # Remux to MPEG-TS via ffmpeg — copy streams, no re-encode
+        # Remux only (copy streams)
         cmd = [
             ffmpeg, "-hide_banner", "-nostdin",
             "-user_agent", "Mozilla/5.0",
             "-i", url,
             "-c", "copy",
-            "-f", "mpegts",
-            "pipe:1",
+            "-f", "mpegts", "-"
         ]
+        mode_str = "remux"
+
+    state.log(f"[ffmpeg/{mode_str}] Command: {' '.join(cmd[:10])}... [url redacted]")
+    
     try:
         proc = subprocess.Popen(
             cmd,
@@ -5669,40 +5752,61 @@ def api_hls_proxy():
             stderr=subprocess.PIPE,
         )
     except Exception as e:
-        return Response(f"ffmpeg error: {e}", status=502)
+        state.log(f"[ffmpeg/{mode_str}] Failed to start: {e}")
+        return Response(f"ffmpeg start error: {e}", status=502)
 
-    # Log ffmpeg stderr in background thread so we can see errors in the app log
-    mode_label = "transcode" if transcode else "remux"
+    # Capture stderr for debugging
+    stderr_lines = []
     def _log_stderr():
         try:
             for raw in proc.stderr:
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 if line:
-                    # Only log errors/warnings, skip progress lines (fps= bitrate= etc.)
+                    stderr_lines.append(line)
+                    # Log errors and important info
                     low = line.lower()
-                    if any(k in low for k in ("error", "invalid", "failed", "no such", "unable", "could not", "permission", "fatal")):
-                        state.log(f"[ffmpeg/{mode_label}] {line}")
-        except Exception:
-            pass
+                    if any(k in low for k in ("error", "invalid", "failed", "unable", "fatal", "unknown")):
+                        state.log(f"[ffmpeg/{mode_str}] ERR: {line[:120]}")
+                    elif "stream #" in low and "video" in low:
+                        state.log(f"[ffmpeg/{mode_str}] INFO: {line[:120]}")
+                    elif "conversion failed" in low or "cannot" in low:
+                        state.log(f"[ffmpeg/{mode_str}] FAIL: {line[:120]}")
+        except Exception as e:
+            state.log(f"[ffmpeg/{mode_str}] stderr thread error: {e}")
+    
     threading.Thread(target=_log_stderr, daemon=True).start()
-    state.log(f"[ffmpeg/{mode_label}] Started: {url[:80]}")
+    state.log(f"[ffmpeg/{mode_str}] Started PID {proc.pid}: {url[:60]}...")
 
     def _gen():
+        chunk_count = 0
         try:
             while True:
-                chunk = proc.stdout.read(16384)
+                chunk = proc.stdout.read(8192)
                 if not chunk:
+                    # Check if process died early
+                    if chunk_count == 0:
+                        time.sleep(0.5)  # Give stderr time to capture error
+                        if stderr_lines:
+                            state.log(f"[ffmpeg/{mode_str}] No output. Last error: {stderr_lines[-1][:100]}")
                     break
+                chunk_count += 1
                 yield chunk
+        except GeneratorExit:
+            pass  # Client disconnected
+        except Exception as e:
+            state.log(f"[ffmpeg/{mode_str}] Generator error: {e}")
         finally:
             proc.kill()
             proc.wait()
-            state.log(f"[ffmpeg/{mode_label}] Stopped")
+            state.log(f"[ffmpeg/{mode_str}] Stopped after {chunk_count} chunks, exit code {proc.returncode}")
 
     h = dict(cors)
     h["Content-Type"] = "video/mp2t"
+    # Add cache-busting headers for VOD
+    h["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    h["Pragma"] = "no-cache"
+    
     return Response(stream_with_context(_gen()), status=200, headers=h)
-
 
 # ===================== OPENSUBTITLES API =====================
 
