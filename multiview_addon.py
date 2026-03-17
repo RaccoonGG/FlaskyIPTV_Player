@@ -151,10 +151,12 @@ class StreamBroadcaster:
     """
 
     def __init__(self, stream_key: str, channel_url: str,
-                 user_agent: str = 'Mozilla/5.0') -> None:
+                 user_agent: str = 'Mozilla/5.0',
+                 transcode: bool = False) -> None:
         self.stream_key:  str   = stream_key
         self.channel_url: str   = channel_url
         self.user_agent:  str   = user_agent
+        self.transcode:   bool  = transcode
         self.references:  int   = 0
         self.last_access: float = time.time()
         self._stopped:    bool  = False
@@ -188,30 +190,36 @@ class StreamBroadcaster:
         """
         Spawn ffmpeg with reconnect flags, outputting raw MPEG-TS to stdout.
 
-        Command mirrors server.js stream profiles for live channels:
-            -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5
-            -c copy -f mpegts pipe:1
+        When self.transcode is True (HEVC streams), re-encode video to H.264
+        so the browser's MSE can decode it via mpegts.js. Audio is kept as
+        AAC. Uses ultrafast + zerolatency presets for minimal latency.
 
-        We always use stream-copy (no transcode) for multiview — the browser
-        handles decoding via mpegts.js, same as the Node.js multiview.
-        The Flask app's existing /api/hls_proxy handles transcoding for
-        individual-channel playback; multiview is separate.
+        When self.transcode is False, stream-copy at zero cost.
         """
         ffmpeg = _get_ffmpeg()
+
+        if self.transcode:
+            # HEVC → H.264 transcode: mirrors /api/hls_proxy?transcode=1 logic
+            codec_args = [
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency',
+                '-c:a', 'aac',
+            ]
+            LOG.info('[MV] Spawning ffmpeg with HEVC→H.264 transcode  key=%s', self.stream_key)
+        else:
+            codec_args = ['-c', 'copy']
+
         cmd = [
             ffmpeg,
             '-hide_banner',
             '-loglevel', 'error',
-            # Pass the configured user-agent so IPTV portals that check it don't
-            # block the connection — same reason server.js passes userAgent
             '-user_agent', self.user_agent,
-            # Reconnect flags match server.js ffmpeg-default / ffmpeg-nvidia profiles
             '-reconnect', '1',
             '-reconnect_streamed', '1',
             '-reconnect_delay_max', '5',
             '-i', self.channel_url,
-            # Stream copy = zero transcoding overhead; mpegts.js handles decode
-            '-c', 'copy',
+        ] + codec_args + [
             '-f', 'mpegts',
             'pipe:1',
         ]
@@ -399,7 +407,8 @@ def _build_stream_key(client_id: str, channel_url: str) -> str:
 
 
 def _get_or_create_broadcaster(stream_key: str, channel_url: str,
-                                user_agent: str) -> Optional[StreamBroadcaster]:
+                                user_agent: str,
+                                transcode: bool = False) -> Optional[StreamBroadcaster]:
     """
     Return existing broadcaster for stream_key (if alive) or create a new one.
 
@@ -430,7 +439,8 @@ def _get_or_create_broadcaster(stream_key: str, channel_url: str,
             del _mv_streams[stream_key]
 
         # No existing broadcaster — spawn a new ffmpeg process
-        broadcaster = StreamBroadcaster(stream_key, channel_url, user_agent)
+        broadcaster = StreamBroadcaster(stream_key, channel_url, user_agent,
+                                        transcode=transcode)
         if broadcaster.process:
             _mv_streams[stream_key] = broadcaster
             return broadcaster
@@ -611,22 +621,28 @@ def register_multiview_routes(app) -> None:
     #   url       — the raw IPTV stream URL  (required)
     #   client_id — UUID from browser localStorage  (required for dedup)
     #   ua        — User-Agent string to pass to ffmpeg  (optional)
+    #   transcode — '1' to re-encode HEVC→H.264 (for HEVC-only channels)
     #
     @app.route('/api/multiview/stream')
     def multiview_stream():
         channel_url = request.args.get('url', '').strip()
         client_id   = request.args.get('client_id', '').strip()
         user_agent  = request.args.get('ua', 'Mozilla/5.0').strip()
+        transcode   = request.args.get('transcode', '0') == '1'
 
         if not channel_url:
             return 'url parameter is required', 400
         if not client_id:
             return 'client_id parameter is required', 400
 
-        # Stream key mirrors server.js: `${userId}::${streamUrl}::${profileId}`
+        # Include transcode flag in the stream key so a transcoded and
+        # non-transcoded stream of the same URL are treated as distinct.
         stream_key = _build_stream_key(client_id, channel_url)
+        if transcode:
+            stream_key += '::transcode'
 
-        broadcaster = _get_or_create_broadcaster(stream_key, channel_url, user_agent)
+        broadcaster = _get_or_create_broadcaster(stream_key, channel_url, user_agent,
+                                                 transcode=transcode)
         if not broadcaster:
             return 'Failed to start ffmpeg stream process', 500
 
@@ -811,9 +827,29 @@ def register_multiview_routes(app) -> None:
     def multiview_resolve_url():
         data    = request.get_json(silent=True) or {}
         raw_url = (data.get('url') or '').strip()
+        # quality: 'best' | '1080' | '720' | '480' | '360'
+        quality = (data.get('quality') or 'best').strip()
 
         if not raw_url:
             return jsonify({'error': 'url is required'}), 400
+
+        # ── Build yt-dlp format selector from quality hint ────────────────────
+        def _fmt_selector(q: str) -> str:
+            """Translate a simple quality label to a yt-dlp format string."""
+            if q in ('best', '', None):
+                return 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio/best'
+            # Numeric height — pick the closest available without going over
+            try:
+                h = int(q)
+            except ValueError:
+                return 'best[ext=mp4]/best'
+            # e.g. "best[height<=720][ext=mp4]/best[height<=720]/best"
+            return (
+                f'best[height<={h}][ext=mp4]'
+                f'/best[height<={h}]'
+                f'/bestvideo[height<={h}]+bestaudio'
+                f'/best'
+            )
 
         # ── Attempt yt-dlp resolution ─────────────────────────────────────────
         try:
@@ -833,10 +869,9 @@ def register_multiview_routes(app) -> None:
                 'quiet':            True,
                 'no_warnings':      True,
                 'skip_download':    True,
-                # Single-file format selectors — avoids DASH merge which leaves
-                # info['url']=None and forces reliance on formats[-1] fallback.
+                # Format selector respects user's quality choice.
                 # For live streams the HLS lookup below takes precedence anyway.
-                'format':           'best[ext=mp4]/bestvideo[ext=mp4]/best',
+                'format':           _fmt_selector(quality),
                 # Hard timeout so the endpoint never hangs indefinitely
                 'socket_timeout':   15,
             }
@@ -855,26 +890,52 @@ def register_multiview_routes(app) -> None:
             formats  = info.get('formats') or []
 
             if is_live:
-                # Look for HLS manifest first
-                hls = next(
-                    (f.get('url') for f in reversed(formats)
-                     if f.get('protocol') in ('m3u8', 'm3u8_native')
-                     and f.get('url')),
-                    None
+                # For live streams, select an HLS manifest that matches the
+                # requested height. yt-dlp exposes per-quality HLS URLs in
+                # the formats list — iterate highest-first and pick the best
+                # one that fits within the requested height cap.
+                try:
+                    h_cap = int(quality) if quality not in ('best', '', None) else 99999
+                except (ValueError, TypeError):
+                    h_cap = 99999
+
+                def _hls_formats(fmts):
+                    """All HLS formats sorted best (highest height) first."""
+                    return sorted(
+                        [f for f in fmts
+                         if f.get('protocol') in ('m3u8', 'm3u8_native') and f.get('url')],
+                        key=lambda f: f.get('height') or 0,
+                        reverse=True,
+                    )
+
+                hls_fmts = _hls_formats(formats)
+                # Pick the best HLS that fits within h_cap
+                hls_picked = next(
+                    (f for f in hls_fmts if (f.get('height') or 99999) <= h_cap),
+                    hls_fmts[0] if hls_fmts else None,   # fallback: best available
                 )
+                hls = hls_picked.get('url') if hls_picked else None
+
+                # Last resort: info.get('url') may itself be an HLS manifest
                 resolved = hls or info.get('url') or (formats[-1].get('url') if formats else None)
+                actual_h = hls_picked.get('height') if hls_picked else None
             else:
-                # For VOD prefer the best single-file URL
+                # For VOD: prefer the resolved single-file URL yt-dlp chose
+                # (already filtered by format selector), then fall back.
                 resolved = info.get('url') or (formats[-1].get('url') if formats else None)
+                actual_h = info.get('height') or (formats[-1].get('height') if formats else None)
 
             if not resolved:
                 return jsonify({'error': 'yt-dlp could not extract a stream URL'}), 502
 
-            LOG.info('[MV][resolve_url] resolved  title=%r  live=%s  via=yt-dlp', title, is_live)
+            LOG.info('[MV][resolve_url] resolved  title=%r  live=%s  quality=%s  height=%s  via=yt-dlp',
+                     title, is_live, quality, actual_h)
             return jsonify({
                 'url':     resolved,
                 'title':   title,
                 'is_live': is_live,
+                'quality': quality,
+                'height':  actual_h,
                 'via':     'yt-dlp',
             })
 
