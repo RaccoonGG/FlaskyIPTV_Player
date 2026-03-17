@@ -5004,6 +5004,7 @@ def _os_headers(api_key: str = ""):
         "Api-Key": api_key.strip(),
         "User-Agent": OPENSUBTITLES_UA,
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
 
@@ -5014,6 +5015,7 @@ def api_subtitles_search():
     lang       = (data.get("lang") or "en").strip()
     season     = data.get("season")
     episode    = data.get("episode")
+    sub_type   = (data.get("type") or "").strip()   # "movie" or "episode"
     max_results = int(data.get("max_results") or 20)
     api_key    = (data.get("api_key") or "").strip()
 
@@ -5023,6 +5025,8 @@ def api_subtitles_search():
         return jsonify({"error": "No OpenSubtitles API key set — add it in ⚙ Settings.", "results": []}), 400
 
     params = {"query": query, "languages": lang, "per_page": min(max_results, 40)}
+    if sub_type in ("movie", "episode"):
+        params["type"] = sub_type
     if season:
         params["season_number"] = int(season)
     if episode:
@@ -5068,8 +5072,7 @@ def api_subtitles_search():
 
 @flask_app.route("/api/subtitles/download", methods=["POST"])
 def api_subtitles_download():
-    """Fetch subtitle file from OpenSubtitles and return its content.
-    The client receives the raw subtitle text and creates a Blob URL for <track>."""
+    """Fetch subtitle file from OpenSubtitles and return its content."""
     data    = request.get_json(force=True)
     file_id = data.get("file_id")
     api_key = (data.get("api_key") or "").strip()
@@ -5081,9 +5084,31 @@ def api_subtitles_download():
         r = _requests_lib.post(
             f"{OPENSUBTITLES_BASE}/download",
             headers=_os_headers(api_key),
-            json={"file_id": file_id},
+            json={"file_id": int(file_id)},
             timeout=15,
         )
+
+        # 406 = daily download quota exhausted — read body for reset time
+        if r.status_code == 406:
+            try:
+                info = r.json()
+                remaining  = info.get("remaining", 0)
+                reset_time = info.get("reset_time", "")
+                reset_str  = f"  Resets: {reset_time}" if reset_time else ""
+                requests_  = info.get("requests", "?")
+            except Exception:
+                remaining, reset_str, requests_ = 0, "", "?"
+            return jsonify({
+                "error": (
+                    f"Daily download quota reached ({requests_} used, {remaining} remaining).{reset_str}  "
+                    f"Free accounts get 5 downloads/day — register at opensubtitles.com for 20/day."
+                )
+            }), 429
+
+        # 401/403 = bad API key
+        if r.status_code in (401, 403):
+            return jsonify({"error": "Invalid OpenSubtitles API key — check your key in ⚙ Settings."}), 401
+
         r.raise_for_status()
         info   = r.json()
         dl_url = info.get("link")
@@ -5095,7 +5120,6 @@ def api_subtitles_download():
 
         # Detect encoding and decode
         content_bytes = sub.content
-        # Try UTF-8 first, fall back to latin-1
         try:
             content_text = content_bytes.decode("utf-8")
         except UnicodeDecodeError:
@@ -5690,6 +5714,12 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .sub-delay-row button:hover{background:var(--s4);border-color:var(--acc)}
 #sub-delay-val{min-width:52px;text-align:center;font-weight:700;color:var(--acc);font-size:12px;
   font-variant-numeric:tabular-nums}
+/* subtitle tab row */
+.sub-tab-row{display:flex;gap:6px;flex-shrink:0;border-bottom:1px solid var(--bdr);padding-bottom:8px;margin-bottom:2px}
+.sub-tab-btn{height:30px;padding:0 14px;font-size:12px;font-weight:700;border-radius:var(--rss);
+  border:1px solid var(--bdr2);background:var(--s3);color:var(--txt2);cursor:pointer;transition:var(--tr)}
+.sub-tab-btn.active{background:var(--acc);border-color:var(--acc);color:#fff}
+.sub-tab-btn:hover:not(.active){background:var(--s4);color:var(--txt)}
 @media(max-width:600px){
   #sub-modal{max-height:96vh;border-radius:0}
   #sub-overlay{padding:0;align-items:flex-end}
@@ -6130,6 +6160,14 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
       <button class="btn-ghost" onclick="closeSubSearch()" style="height:28px;padding:0 10px;font-size:12px;margin-left:6px">&#x2715;</button>
     </div>
     <div class="sub-body">
+      <!-- Tab switcher: Online Search vs Local File -->
+      <div class="sub-tab-row" id="sub-tab-row">
+        <button class="sub-tab-btn active" id="sub-tab-online" onclick="subSwitchTab('online')">&#x1F50D; Online Search</button>
+        <button class="sub-tab-btn" id="sub-tab-local" onclick="subSwitchTab('local')">&#x1F4C2; Local File</button>
+      </div>
+
+      <!-- ONLINE SEARCH PANEL -->
+      <div id="sub-panel-online">
       <div class="sub-search-row">
         <input id="sub-query" type="search" placeholder="Title (auto-filled from player)&hellip;"
           autocomplete="new-password" autocorrect="off" spellcheck="false"
@@ -6168,6 +6206,24 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
           <span>&#x1F4AC;</span>
           Search for subtitles &mdash; title is auto-filled from what&apos;s playing.
         </div>
+      </div>
+      </div><!-- /sub-panel-online -->
+
+      <!-- LOCAL FILE PANEL -->
+      <div id="sub-panel-local" style="display:none;padding:10px 0 4px 0">
+        <div style="margin-bottom:10px;font-size:12px;color:var(--txt2)">
+          Choose a local subtitle file (.srt, .vtt, .ass, .ssa). The delay controls work the same as with online subtitles.
+        </div>
+        <div class="sub-search-row" style="align-items:center;gap:8px">
+          <button class="btn-ghost" style="height:32px;padding:0 14px;font-size:12px;display:inline-flex;align-items:center;gap:6px;flex-shrink:0" title="Choose subtitle file"
+            onclick="document.getElementById('sub-local-input').value=''; document.getElementById('sub-local-input').click()">
+            &#x1F4C2; Choose file&hellip;
+          </button>
+          <input type="file" id="sub-local-input" accept=".srt,.vtt,.ass,.ssa,text/plain"
+            style="display:none;position:absolute;width:0;height:0;opacity:0" onchange="subLoadLocalFile(this)">
+          <span id="sub-local-filename" style="font-size:12px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">No file chosen</span>
+        </div>
+        <div id="sub-local-status" style="font-size:11px;color:var(--txt2);margin-top:8px;min-height:16px"></div>
       </div>
     </div>
     <div class="sub-status-bar">
@@ -6254,10 +6310,201 @@ const SUB_LANGS = [
   {code:'ja',label:'Japanese'},{code:'ko',label:'Korean'},
 ];
 
-let _subActiveFile = null;   // {name, content}
-let _subTrackEl    = null;
-let _subVttOriginal = null;  // original VTT string before any delay shift
-let subDelayMs = 0;          // current delay in milliseconds
+let _subActiveFile  = null;
+let _subCuesBase    = [];     // [{startMs, endMs, text}] — never mutated after parse
+let subDelayMs      = 0;
+let _subTrackObj    = null;   // single TextTrack added via addTextTrack() — reused, never removed
+
+// ── Native TextTrack helpers ────────────────────────────────
+// We use vid.addTextTrack() + VTTCue instead of <track> DOM elements.
+// HLS.js's SubtitleTrackController is disabled in the Hls() config, so
+// it never reacts to textTrack changes — no stream reloads, no crashes.
+
+function _subGetOrCreateTrack(){
+  if(_subTrackObj) return _subTrackObj;
+  _subTrackObj = vid.addTextTrack('subtitles', 'Subtitle', 'und');
+  return _subTrackObj;
+}
+
+function _subClearNativeTrack(){
+  if(!_subTrackObj) return;
+  const list = _subTrackObj.cues;
+  while(list && list.length){ try{ _subTrackObj.removeCue(list[0]); }catch(e){ break; } }
+  _subTrackObj.mode = 'disabled';
+}
+
+function _subLoadCuesToTrack(cues){
+  const track = _subGetOrCreateTrack();
+  // Clear previous cues
+  const list = track.cues;
+  while(list && list.length){ try{ track.removeCue(list[0]); }catch(e){ break; } }
+  // Add new cues
+  const offsetSec = subDelayMs / 1000;
+  for(const c of cues){
+    const startSec = Math.max(0, c.startMs/1000 + offsetSec);
+    const endSec   = Math.max(startSec + 0.001, c.endMs/1000 + offsetSec);
+    try{ track.addCue(new VTTCue(startSec, endSec, c.text)); }catch(e){}
+  }
+  track.mode = 'showing';
+}
+
+// ── Parse any format into cues ──────────────────────────────
+function _subParseCues(content, mime, fileName){
+  const lower = (fileName||'').toLowerCase();
+  if(lower.endsWith('.ass') || lower.endsWith('.ssa')) return _parseAssCues(content);
+  if(lower.endsWith('.vtt') || mime === 'text/vtt')    return _parseVttCues(content);
+  return _parseSrtCues(content);
+}
+
+function _tsToMs(ts){
+  ts = ts.trim().replace(',','.');
+  const parts = ts.split(':');
+  if(parts.length < 3) return 0;
+  const [h, m, s] = parts;
+  return (parseInt(h)*3600 + parseInt(m)*60 + parseFloat(s)) * 1000;
+}
+
+function _parseSrtCues(srt){
+  const cues = [];
+  const blocks = srt.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split(/\n\s*\n/);
+  for(const block of blocks){
+    const lines = block.trim().split('\n');
+    if(lines.length < 2) continue;
+    let tsLine = -1;
+    for(let i=0;i<lines.length;i++){ if(lines[i].includes('-->')){tsLine=i;break;} }
+    if(tsLine < 0) continue;
+    const m = lines[tsLine].match(/(\d[\d:,\.]+)\s*-->\s*(\d[\d:,\.]+)/);
+    if(!m) continue;
+    const text = lines.slice(tsLine+1).join('\n').replace(/<\/?[^>]+>/g,'').trim();
+    if(!text) continue;
+    cues.push({startMs: _tsToMs(m[1]), endMs: _tsToMs(m[2]), text});
+  }
+  return cues;
+}
+
+function _parseVttCues(vtt){
+  const cues = [];
+  const blocks = vtt.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split(/\n\s*\n/);
+  for(const block of blocks){
+    const lines = block.trim().split('\n');
+    let tsLine = -1;
+    for(let i=0;i<lines.length;i++){ if(lines[i].includes('-->')){tsLine=i;break;} }
+    if(tsLine < 0) continue;
+    const m = lines[tsLine].match(/(\d[\d:\.]+)\s*-->\s*(\d[\d:\.]+)/);
+    if(!m) continue;
+    const text = lines.slice(tsLine+1).join('\n').replace(/<\/?[^>]+>/g,'').trim();
+    if(!text) continue;
+    cues.push({startMs: _tsToMs(m[1]), endMs: _tsToMs(m[2]), text});
+  }
+  return cues;
+}
+
+function _parseAssCues(ass){
+  const cues = [];
+  const lines = ass.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n');
+  for(const line of lines){
+    const m = line.match(/^Dialogue:\s*\d+,(\d+:\d{2}:\d{2}\.\d{2}),(\d+:\d{2}:\d{2}\.\d{2}),[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,(.*)$/);
+    if(!m) continue;
+    const _assTs = t => { const [h,min,sec]=t.split(':'); const [s,cs]=sec.split('.'); return (parseInt(h)*3600+parseInt(min)*60+parseFloat(s+'.'+cs))*1000; };
+    const text = m[3].replace(/\{[^}]*\}/g,'').replace(/\\N/gi,'\n').replace(/\\n/gi,'\n').trim();
+    if(!text) continue;
+    cues.push({startMs: _assTs(m[1]), endMs: _assTs(m[2]), text});
+  }
+  return cues;
+}
+
+// ── Apply subtitle (called from both online + local paths) ──
+function _subApplyToPlayer(content, fileName, mime){
+  _subCuesBase = _subParseCues(content, mime, fileName);
+  subDelayMs   = 0;
+  _subLoadCuesToTrack(_subCuesBase);
+
+  const _dv = document.getElementById('sub-delay-val');
+  if(_dv) _dv.textContent = '0.0s';
+  const _dr = document.getElementById('sub-delay-row');
+  if(_dr) _dr.style.display = 'flex';
+  const _tb = document.getElementById('sub-toggle-btn');
+  if(_tb) _tb.innerHTML = '&#x1F441; On';
+}
+
+function subAdjustDelay(deltaSec){
+  if(!_subCuesBase.length){ toast('No subtitle loaded','w'); return; }
+  subDelayMs += Math.round(deltaSec * 1000);
+  // Re-load all cues with new offset applied directly during load
+  _subLoadCuesToTrack(_subCuesBase);
+  const dv = document.getElementById('sub-delay-val');
+  if(dv) dv.textContent = (subDelayMs>=0?'+':'') + (subDelayMs/1000).toFixed(1) + 's';
+}
+
+function subToggleVisible(){
+  if(!_subTrackObj) return;
+  const nowShowing = _subTrackObj.mode === 'showing';
+  _subTrackObj.mode = nowShowing ? 'hidden' : 'showing';
+  const btn = document.getElementById('sub-toggle-btn');
+  if(btn) btn.innerHTML = !nowShowing ? '&#x1F441; On' : '&#x1F648; Off';
+}
+
+function clearSubtitle(){
+  _subClearNativeTrack();
+  _subCuesBase = []; subDelayMs = 0;
+  _subActiveFile = null;
+  const info = document.getElementById('sub-active-info');
+  if(info) info.style.display='none';
+  const subBtn = document.getElementById('subbtn');
+  if(subBtn) subBtn.style.opacity='0.35';
+  const _dr = document.getElementById('sub-delay-row');
+  if(_dr) _dr.style.display = 'none';
+  const _tb = document.getElementById('sub-toggle-btn');
+  if(_tb) _tb.innerHTML = '&#x1F441; On';
+  toast('Subtitle removed','info');
+}
+
+// ── SUBTITLE TAB SWITCHER ──────────────────────────────────
+function subSwitchTab(tab){
+  const isOnline = tab === 'online';
+  document.getElementById('sub-panel-online').style.display = isOnline ? '' : 'none';
+  document.getElementById('sub-panel-local').style.display  = isOnline ? 'none' : '';
+  document.getElementById('sub-tab-online').classList.toggle('active', isOnline);
+  document.getElementById('sub-tab-local').classList.toggle('active', !isOnline);
+  if(!isOnline){
+    const inp = document.getElementById('sub-local-input');
+    if(inp) inp.value = '';
+    document.getElementById('sub-local-filename').textContent = 'No file chosen';
+    document.getElementById('sub-local-status').textContent = '';
+  }
+}
+
+// ── LOAD LOCAL SUBTITLE FILE ───────────────────────────────
+function subLoadLocalFile(input){
+  const file = input.files && input.files[0];
+  if(!file){ return; }
+  const fnEl = document.getElementById('sub-local-filename');
+  const stEl = document.getElementById('sub-local-status');
+  fnEl.textContent = file.name;
+  stEl.textContent = 'Reading file…';
+  const reader = new FileReader();
+  reader.onload = function(e){
+    const content = e.target.result;
+    if(!content){ stEl.textContent = '⚠ File appears empty.'; return; }
+    const lower = file.name.toLowerCase();
+    let mime = 'text/vtt';
+    if(lower.endsWith('.srt')) mime = 'text/srt';
+    else if(lower.endsWith('.ass') || lower.endsWith('.ssa')) mime = 'text/x-ssa';
+    _subApplyToPlayer(content, file.name, mime);
+    _subActiveFile = {name: file.name};
+    document.getElementById('sub-active-name').textContent = file.name;
+    document.getElementById('sub-active-info').style.display = 'flex';
+    const subBtn = document.getElementById('subbtn');
+    if(subBtn) subBtn.style.opacity = '1';
+    stEl.textContent = '✓ Loaded: ' + file.name;
+    document.getElementById('sub-status-msg').textContent = 'Local: ' + file.name;
+    toast('Subtitle loaded','ok');
+  };
+  reader.onerror = function(){ stEl.textContent = '⚠ Failed to read file.'; toast('Failed to read subtitle file','err'); };
+  reader.readAsText(file, 'utf-8');
+}
+
+
 
 function _subInitLangGrid(){
   const grid = document.getElementById('sub-lang-grid');
@@ -6348,7 +6595,7 @@ async function subSearch(){
     const r = await fetch('/api/subtitles/search',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({query, lang, season, episode, max_results: parseInt(maxR), api_key: _getSubKey()}),
+      body: JSON.stringify({query, lang, season, episode, type: isSeries ? 'episode' : 'movie', max_results: parseInt(maxR), api_key: _getSubKey()}),
     });
     const d = await r.json();
     if(d.error){ toast('Search error: '+d.error,'err'); wrap.innerHTML=_subEmpty('Search failed: '+esc(d.error)); return; }
@@ -6430,153 +6677,6 @@ async function subLoadSubtitle(fileId, fileName, btnIdx){
     toast('Error: '+e,'err');
     if(btn){ btn.disabled=false; btn.textContent='▶ Load'; }
   }
-}
-
-function _subApplyToPlayer(content, fileName, mime){
-  // Remove existing track
-  if(_subTrackEl){ try{_subTrackEl.remove();}catch(e){} _subTrackEl=null; }
-
-  // Convert SRT/SSA/ASS → VTT if needed (browser only natively supports VTT)
-  let vttContent = content;
-  const lower = (fileName||'').toLowerCase();
-  if(lower.endsWith('.srt') || mime==='text/srt'){
-    vttContent = _srtToVtt(content);
-  } else if(lower.endsWith('.ass') || lower.endsWith('.ssa')){
-    vttContent = _assToVtt(content);
-  }
-
-  // Store original for delay re-apply
-  _subVttOriginal = vttContent;
-  subDelayMs = 0;
-  const _dv = document.getElementById('sub-delay-val');
-  if(_dv) _dv.textContent = '0.0s';
-  const _dr = document.getElementById('sub-delay-row');
-  if(_dr) _dr.style.display = 'flex';
-  const _tb2=document.getElementById('sub-toggle-btn'); if(_tb2) _tb2.innerHTML='&#x1F441; On';
-
-  const blob = new Blob([vttContent], {type:'text/vtt'});
-  const url  = URL.createObjectURL(blob);
-
-  const track  = document.createElement('track');
-  track.kind   = 'subtitles';
-  track.label  = fileName || 'Subtitle';
-  track.srclang = 'und';
-  track.src    = url;
-  track.default = true;
-  vid.appendChild(track);
-  _subTrackEl = track;
-
-  // Force the browser to show it
-  // textTracks are activated after a tiny delay once added to video
-  setTimeout(()=>{
-    try{
-      for(let i=0;i<vid.textTracks.length;i++){
-        vid.textTracks[i].mode = i===vid.textTracks.length-1 ? 'showing' : 'disabled';
-      }
-    } catch(e){}
-  }, 200);
-}
-
-function _vttShiftTimestamps(vtt, deltaMs){
-  // Shift all VTT timestamp lines by deltaMs (can be negative)
-  return vtt.replace(
-    /(\d{2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{3})/g,
-    (_,s,e)=>{
-      const _p=t=>{
-        const [h,m,rest]=t.replace(',','.').split(':');
-        return ((+h*3600)+(+m*60)+parseFloat(rest))*1000;
-      };
-      const _f=ms=>{
-        ms=Math.max(0,ms);
-        const h=Math.floor(ms/3600000); ms-=h*3600000;
-        const m=Math.floor(ms/60000);   ms-=m*60000;
-        const sc=Math.floor(ms/1000);   ms-=sc*1000;
-        return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sc).padStart(2,'0')}.${String(ms).padStart(3,'0')}`;
-      };
-      return _f(_p(s)+deltaMs)+' --> '+_f(_p(e)+deltaMs);
-    }
-  );
-}
-
-function subAdjustDelay(deltaSec){
-  if(!_subVttOriginal){ toast('No subtitle loaded','w'); return; }
-  subDelayMs += Math.round(deltaSec * 1000);
-  const shifted = _vttShiftTimestamps(_subVttOriginal, subDelayMs);
-  // Re-apply shifted VTT
-  if(_subTrackEl){ try{_subTrackEl.remove();}catch(e){} _subTrackEl=null; }
-  const blob = new Blob([shifted],{type:'text/vtt'});
-  const url = URL.createObjectURL(blob);
-  const track = document.createElement('track');
-  track.kind='subtitles'; track.srclang='und';
-  track.label=(_subActiveFile?.name||'Subtitle')+' ['+(subDelayMs>=0?'+':'')+subDelayMs+'ms]';
-  track.src=url; track.default=true;
-  vid.appendChild(track);
-  _subTrackEl=track;
-  setTimeout(()=>{
-    try{ for(let i=0;i<vid.textTracks.length;i++)
-      vid.textTracks[i].mode=i===vid.textTracks.length-1?'showing':'disabled';
-    }catch(e){}
-  },200);
-  const dv=document.getElementById('sub-delay-val');
-  if(dv) dv.textContent=(subDelayMs>=0?'+':'')+( subDelayMs/1000).toFixed(1)+'s';
-}
-
-function subToggleVisible(){
-  if(!_subTrackEl) return;
-  const isShowing = [...(vid.textTracks||[])].some(t=>t.mode==='showing');
-  const newMode = isShowing ? 'hidden' : 'showing';
-  try{ for(let i=0;i<vid.textTracks.length;i++) vid.textTracks[i].mode=newMode; } catch(e){}
-  const btn = document.getElementById('sub-toggle-btn');
-  if(btn) btn.innerHTML = newMode==='showing' ? '&#x1F441; On' : '&#x1F648; Off';
-}
-
-function clearSubtitle(){
-  if(_subTrackEl){ try{_subTrackEl.remove();}catch(e){} _subTrackEl=null; }
-  _subActiveFile = null;
-  const info = document.getElementById('sub-active-info');
-  if(info) info.style.display='none';
-  const subBtn = document.getElementById('subbtn');
-  if(subBtn) subBtn.style.opacity='0.35';
-  _subVttOriginal = null; subDelayMs = 0;
-  const _dr = document.getElementById('sub-delay-row');
-  if(_dr) _dr.style.display = 'none';
-  const _tb=document.getElementById('sub-toggle-btn'); if(_tb) _tb.innerHTML='&#x1F441; On';
-  toast('Subtitle removed','info');
-}
-
-// ── SRT → VTT converter ────────────────────────────────────
-function _srtToVtt(srt){
-  let vtt = 'WEBVTT\n\n';
-  // Normalise CRLF
-  vtt += srt.replace(/\r\n/g,'\n').replace(/\r/g,'\n')
-    // Replace SRT timestamp separator (comma for ms) with VTT dot
-    .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2')
-    // Strip HTML-like tags that VTT doesn't handle
-    .replace(/<\/?[^>]+(>|$)/g,'');
-  return vtt;
-}
-
-// ── Basic ASS/SSA → VTT converter ─────────────────────────
-function _assToVtt(ass){
-  let vtt = 'WEBVTT\n\n';
-  const lines = ass.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n');
-  let idx = 1;
-  for(const line of lines){
-    // Dialogue: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-    const m = line.match(/^Dialogue:\s*\d+,(\d+:\d{2}:\d{2}\.\d{2}),(\d+:\d{2}:\d{2}\.\d{2}),[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,(.*)$/);
-    if(!m) continue;
-    // ASS time: H:MM:SS.cs  → convert centiseconds to milliseconds
-    const _ts = t => {
-      const [h,min,sec] = t.split(':');
-      const [s,cs] = sec.split('.');
-      return `${h.padStart(2,'0')}:${min}:${s}.${(parseInt(cs)*10).toString().padStart(3,'0')}`;
-    };
-    // Strip ASS override tags like {\an8}
-    const text = m[3].replace(/\{[^}]*\}/g,'').replace(/\\N/g,'\n').replace(/\\n/g,'\n').trim();
-    if(!text) continue;
-    vtt += `${idx++}\n${_ts(m[1])} --> ${_ts(m[2])}\n${text}\n\n`;
-  }
-  return vtt;
 }
 
 // ── FAVOURITES ─────────────────────────────────────────────
@@ -7144,7 +7244,11 @@ function doPlay(url, name, opts={}){
       maxBufferLength:60, maxMaxBufferLength:180,
       fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
       levelLoadingTimeOut:20000,
-      xhrSetup(xhr){xhr.withCredentials=false;}
+      xhrSetup(xhr){xhr.withCredentials=false;},
+      // Disable HLS.js subtitle track management with full no-op stubs
+      // so our own addTextTrack() cues are never touched by HLS internals
+      subtitleStreamController: class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  onAudioTrackSwitching(){}  onSubtitleFragProcessed(){}  onBufferFlushing(){}  on(){}  off(){} },
+      subtitleTrackController:  class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  on(){}  off(){} },
     });
     hlsObj.loadSource(px);
     hlsObj.attachMedia(vid);
@@ -7354,7 +7458,9 @@ function doPlay(url, name, opts={}){
                 maxBufferLength:60, maxMaxBufferLength:180,
                 fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
                 levelLoadingTimeOut:20000,
-                xhrSetup(xhr){xhr.withCredentials=false;}
+                xhrSetup(xhr){xhr.withCredentials=false;},
+                subtitleStreamController: class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  onAudioTrackSwitching(){}  onSubtitleFragProcessed(){}  onBufferFlushing(){}  on(){}  off(){} },
+                subtitleTrackController:  class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  on(){}  off(){} },
               });
               hlsObj.loadSource(pxUrl);
               hlsObj.attachMedia(vid);
