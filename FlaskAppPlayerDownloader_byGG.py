@@ -23,6 +23,7 @@ Also on network error and parsing hls errors (altho this can happens when channe
 Added progress bar with real kbs speed for downloading MKV, and items/totalitems for M3U saving.
 Fixed EPG out of memory happening in large EPG lists (altho now large external EPG list can use 2000 MB of ram, like 30k channels lists)
 Fixed laggy input in search filed for Whats on Now tab and dekstop version of saved logins tab.
+Added button that opens external player of your choice (on dekstop select exe, on mobile you can pick VLC, MX, MX PRO, Just Player)
 Varius UI fixes.
 """
 
@@ -40,7 +41,9 @@ import tempfile
 import threading
 import time
 import queue
-import sys
+import math
+import xml.etree.ElementTree as ET
+import gzip as _gzip
 from datetime import datetime, timezone
 from urllib.parse import urlparse, quote, quote_plus, unquote, parse_qs
 import asyncio
@@ -3965,7 +3968,7 @@ def api_catchup():
     mark_archive flag and direct cmd per entry — the correct EPG source for
     Stalker portals.  Falls back to Xtream timeshift URL for Xtream portals.
     """
-    import math as _math
+
     data      = request.get_json(force=True)
     item      = data.get("item", {})
     start_ts  = int(data.get("start", 0))
@@ -3974,7 +3977,7 @@ def api_catchup():
         start_ts = int(datetime.now(timezone.utc).timestamp()) - 86400 * 3
     if not end_ts:
         end_ts = int(datetime.now(timezone.utc).timestamp())
-    duration_min = max(1, _math.ceil((end_ts - start_ts) / 60))
+    duration_min = max(1, math.ceil((end_ts - start_ts) / 60))
 
     conn = state.conn_type
 
@@ -4267,10 +4270,8 @@ def api_catchup_play():
             base  = (creds["base"] if creds else state.url).rstrip("/")
             user  = creds["username"] if creds else state.username
             pwd   = creds["password"] if creds else state.password
-            import math as _m
-            from urllib.parse import urlparse as _up
-            _p = _up(base)
-            dur = max(1, _m.ceil((stop_ts - start_ts) / 60))
+            _p = urlparse(base)
+            dur = max(1, math.ceil((stop_ts - start_ts) / 60))
             start_dt  = datetime.fromtimestamp(start_ts, tz=timezone.utc)
             # Format: YYYY-MM-DD:HH-MM  (date:time separator=colon, time uses dashes)
             start_fmt = start_dt.strftime("%Y-%m-%d:%H-%M")
@@ -4315,9 +4316,8 @@ def api_catchup_play():
 
         # Flussonic CDN: portal returns live token URL even for archive requests.
         # Detect /stream/mpegts?token=XYZ and rewrite to /stream/archive-{ts}-{dur}.m3u8?token=XYZ
-        from urllib.parse import urlparse as _up, parse_qs as _pqs
-        _pu   = _up(url)
-        _qs   = _pqs(_pu.query)
+        _pu   = urlparse(url)
+        _qs   = parse_qs(_pu.query)
         _tok  = (_qs.get("token") or [None])[0]
         _path = _pu.path
         # Strip any live-manifest filename to get the stream base path.
@@ -4531,8 +4531,6 @@ async def _build_xmltv_index(xmltv_url: str, log_cb=None) -> dict:
       epg_dict   = {channel_id_lower: [{"title","start","end","desc"}, ...]}
       chan_names  = {channel_id_lower: [display_name_lower, ...]}
     """
-    import xml.etree.ElementTree as ET
-    import tempfile, gzip as _gzip
     _log = log_cb or (lambda x: None)
 
     def _ts(s: str) -> float:
@@ -4779,6 +4777,78 @@ def api_proxy_options():
         "Access-Control-Allow-Headers": "*",
     })
 
+
+
+
+@flask_app.route("/api/browse_exe", methods=["GET"])
+def api_browse_exe():
+    """Open a native OS file picker and return the selected executable path."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.wm_attributes("-topmost", True)
+        path = filedialog.askopenfilename(
+            title="Select External Player Executable",
+            filetypes=[
+                ("Executable files", "*.exe *.bat *.cmd" if os.name == "nt" else "*"),
+                ("All files", "*.*"),
+            ],
+        )
+        root.destroy()
+        return jsonify({"path": path or ""})
+    except Exception as e:
+        return jsonify({"path": "", "error": str(e)})
+
+
+@flask_app.route("/api/resolve_url", methods=["POST"])
+def api_resolve_url():
+    """Resolve item stream URL without launching anything — used by mobile intent flow."""
+    data = request.get_json(force=True)
+    item = data.get("item", {})
+    mode = data.get("mode", "live")
+    cat  = data.get("category", {})
+    try:
+        async def _resolve():
+            async with _make_client() as client:
+                return await client.resolve_item_url(mode, item, cat)
+        url = run_async(_resolve())
+        if not url:
+            return jsonify({"error": "Could not resolve stream URL"}), 400
+        return jsonify({"url": url})
+    except Exception as e:
+        state.log(f"[EXT] Resolve error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route("/api/open_external", methods=["POST"])
+def api_open_external():
+    """Resolve item URL then launch it in the configured external player."""
+    data = request.get_json(force=True)
+    exe  = (data.get("exe") or "").strip()
+    item = data.get("item", {})
+    mode = data.get("mode", "live")
+    cat  = data.get("category", {})
+
+    if not exe:
+        return jsonify({"error": "No external player configured"}), 400
+    if not os.path.isfile(exe):
+        return jsonify({"error": f"Player not found: {exe}"}), 400
+
+    try:
+        async def _resolve():
+            async with _make_client() as client:
+                return await client.resolve_item_url(mode, item, cat)
+        url = run_async(_resolve())
+        if not url:
+            return jsonify({"error": "Could not resolve stream URL"}), 400
+        state.log(f"[EXT] Launching {os.path.basename(exe)} with stream URL")
+        subprocess.Popen([exe, url], close_fds=True)
+        return jsonify({"ok": True})
+    except Exception as e:
+        state.log(f"[EXT] Error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @flask_app.route("/api/hls_proxy")
 def api_hls_proxy():
@@ -5447,6 +5517,26 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
             <div class="psopt" onclick="pickP('dir','/storage/emulated/0/Download/')">/storage/emulated/0/Download/</div>
             <div class="psopt" onclick="pickP('dir','/data/data/com.termux/files/home/Downloads/')">Termux ~/Downloads/</div>
           </div>
+        </div>
+        <div class="prow" style="position:relative" id="extplayer-row-desktop">
+          <span class="plbl">Player:</span>
+          <input id="o-extplayer" type="text" placeholder="C:\\Program Files\\VLC\\vlc.exe"
+            autocomplete="new-password" autocorrect="off" spellcheck="false"
+            oninput="saveExtPlayer()" style="height:30px;font-size:12px"
+            title="Path to external player executable (e.g. VLC, mpv)">
+          <button class="btn-ghost psug-btn" onclick="browseExtPlayer()" title="Browse for player exe" style="font-size:13px">📂</button>
+        </div>
+        <div id="extplayer-row-mobile" style="display:none;gap:6px;align-items:center">
+          <span class="plbl">Player:</span>
+          <select id="o-mobile-player" onchange="saveMobilePlayer()" style="flex:1;height:30px;font-size:12px;background:var(--s3);color:var(--txt);border:1.5px solid var(--bdr);border-radius:var(--rsm);padding:0 8px">
+            <option value="ask">Ask every time</option>
+            <option value="org.videolan.vlc">VLC</option>
+            <option value="com.mxtech.videoplayer.ad">MX Player</option>
+            <option value="com.mxtech.videoplayer.pro">MX Player Pro</option>
+            <option value="com.brouken.player">Just Player</option>
+            <option value="com.husudosu.mpvremote">mpv</option>
+            <option value="copy">Copy URL</option>
+          </select>
         </div>
 
       </div>
@@ -6169,15 +6259,17 @@ function renderItems(items){
     const epN=grp?(it._episodes||[]).length:0;
     const show=!!it._is_show_item;
     const playing=i===pIdx;
+    const showExt=!grp;
     return '<div class="irow'+(playing?' now':'')+'" style="--d:'+(Math.min(i,50)*.016)+'s">'
       +'<input class="ichk" type="checkbox" data-i="'+i+'" onchange="onChk('+i+',this.checked)">'
-      +(logo?'<img class="ilogo" src="'+esc(logo)+'" onerror="this.style.display=\'none\'">':'<span style="width:32px;height:21px;flex-shrink:0"></span>')
+      +'<button onclick="toggleFav('+i+')" title="Favourite"'
+      +' style="background:none;border:none;cursor:pointer;font-size:15px;padding:0 2px;line-height:1;flex-shrink:0;color:'+(isFav(it)?'#f5c518':'rgba(255,255,255,0.25)')+'">★</button>'
+      +(logo?'<img class="ilogo" src="'+esc(logo)+'" onerror="this.style.display=\'none\'">'+'':'<span style="width:32px;height:21px;flex-shrink:0"></span>')
       +'<span class="iname" title="'+esc(name)+'">'+esc(name)+'</span>'
       +'<div class="ibtns">'
         +(grp?'<button class="btn-ghost" onclick="drillGrp('+i+')">'+epN+' eps</button>':'')
         +(show&&isSeries?'<button class="btn-ghost" onclick="drillShow('+i+')">Eps</button>':'')
-        +'<button onclick="toggleFav('+i+')" title="Favourite"'
-        +' style="background:none;border:none;cursor:pointer;font-size:15px;padding:0 3px;line-height:1;flex-shrink:0;color:'+(isFav(it)?'#f5c518':'rgba(255,255,255,0.35)')+'">★</button>'
+        +(showExt?'<button class="btn-ghost" onclick="openExternal('+i+')" title="Play in external player" style="padding:0 5px;font-size:13px">🎬</button>':'')
         +(!grp?'<button class="btn-blue" onclick="playItem('+i+')">▶</button>':'')
       +'</div></div>';
   }).join('');
@@ -7240,6 +7332,67 @@ function saveFP(){
   try{localStorage.setItem('mkv_folder',document.getElementById('o-dir').value);}catch(e){}
   try{localStorage.setItem('m3u_path',document.getElementById('o-m3u').value);}catch(e){}
 }
+function saveExtPlayer(){
+  try{localStorage.setItem('ext_player',document.getElementById('o-extplayer').value);}catch(e){}
+}
+function saveMobilePlayer(){
+  try{localStorage.setItem('mobile_player',document.getElementById('o-mobile-player').value);}catch(e){}
+}
+async function browseExtPlayer(){
+  try{
+    const r=await fetch('/api/browse_exe'); const d=await r.json();
+    if(d.path){
+      document.getElementById('o-extplayer').value=d.path;
+      saveExtPlayer();
+      toast('External player set: '+d.path.split(/[\\/]/).pop(),'ok');
+    }
+  }catch(e){toast('Browse failed: '+e,'err');}
+}
+const _isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+async function openExternal(i){
+  const it=filtItems[i]; if(!it) return;
+  const name=it.name||it.o_name||'?';
+
+  if(_isMobile){
+    toast('Resolving stream…','info');
+    try{
+      const r=await fetch('/api/resolve_url',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({item:it,mode,category:curCat||{}})});
+      const d=await r.json();
+      if(d.error){toast('Error: '+d.error,'err');return;}
+      const url=d.url;
+      const player=localStorage.getItem('mobile_player')||'ask';
+      if(player==='copy'){
+        try{await navigator.clipboard.writeText(url);toast('Stream URL copied!','ok');}
+        catch(e){prompt('Copy stream URL:',url);}
+        return;
+      }
+      if(player==='ask'){
+        // No package → Android shows only installed handlers
+        // S.browser_fallback_url=about:blank prevents Play Store from opening
+        window.location.href=`intent:${url}#Intent;type=video/*;S.browser_fallback_url=about:blank;end`;
+      } else {
+        // Direct to specific app — S.browser_fallback_url=about:blank prevents Play Store if not installed
+        window.location.href=`intent:${url}#Intent;package=${player};type=video/*;S.browser_fallback_url=about:blank;end`;
+      }
+    }catch(e){toast('Failed: '+e,'err');}
+    return;
+  }
+
+  // Desktop — original subprocess path
+  const exe=(localStorage.getItem('ext_player')||'').trim();
+  if(!exe){toast('Set external player path in ⚙ settings first','wrn');return;}
+  toast('Opening in external player…','info');
+  try{
+    const r=await fetch('/api/open_external',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({exe,item:it,mode,category:curCat||{}})});
+    const d=await r.json();
+    if(d.error) toast('Error: '+d.error,'err');
+    else toast('Launched: '+name,'ok');
+  }catch(e){toast('Failed: '+e,'err');}
+}
+
 function esc(s){
   return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
     .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -7402,6 +7555,14 @@ document.addEventListener('DOMContentLoaded',()=>{
   try{const sm=localStorage.getItem('m3u_path');
     if(sm) document.getElementById('o-m3u').value=sm;
     else document.getElementById('o-m3u').value='/sdcard/Download/playlist.m3u';}catch(e){}
+  try{const se=localStorage.getItem('ext_player');
+    if(se) document.getElementById('o-extplayer').value=se;}catch(e){}
+  if(_isMobile){
+    document.getElementById('extplayer-row-desktop').style.display='none';
+    document.getElementById('extplayer-row-mobile').style.display='flex';
+    try{const mp=localStorage.getItem('mobile_player');
+      if(mp) document.getElementById('o-mobile-player').value=mp;}catch(e){}
+  }
   startLog();
   alog('IPTV Portal Builder ready.','k');
   alog('Tap ⚙ in the header to enter credentials and connect.','i');
