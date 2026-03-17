@@ -27,7 +27,6 @@ Added button that opens external player of your choice (on dekstop select exe, o
 Added option to add subtitles from opensubtitles.com via inscript serach (get free apikey from https://www.opensubtitles.com/en/consumers)
 Added option to add local subtitles file for subtitles (.srt/.vtt/.ass/.ssa) via Local File tab in the subtitle modal.
 Subtitle delay +/- works the same for local files as for OpenSubtitles.
-Dekstop view optimizations, bigger player, now activity log is hidden by default, can expand, player controls can be hidden to expand player, theater mode button to fully expand player and hiding all tabs.
 Varius UI fixes.
 """
 
@@ -5464,11 +5463,25 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   accent-color:var(--acc);cursor:pointer;
   -webkit-appearance:checkbox!important;appearance:checkbox!important;
   border:none;box-shadow:none;padding:0;background:none}
-.ilogo{width:32px;height:21px;object-fit:contain;border-radius:3px;flex-shrink:0;
+.ilogo{width:36px;height:24px;object-fit:contain;border-radius:3px;flex-shrink:0;
   background:var(--s4)}
 .iname{flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ibtns{display:flex;gap:3px;flex-shrink:0}
 .ibtns button{height:27px;padding:0 9px;font-size:11px;border-radius:var(--rss)}
+/* ── item context menu ── */
+#item-menu{position:fixed;z-index:800;background:var(--s3);border:1px solid var(--bdr);
+  border-radius:10px;box-shadow:0 8px 32px rgba(0,0,0,.55);min-width:180px;
+  overflow:hidden;display:none;flex-direction:column;animation:fade-up .15s ease both}
+#item-menu.open{display:flex}
+#item-menu-hdr{padding:8px 12px 6px;font-size:10px;font-weight:800;text-transform:uppercase;
+  letter-spacing:1.2px;color:var(--txt3);border-bottom:1px solid var(--bdr);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
+.imenu-btn{display:flex;align-items:center;gap:9px;padding:9px 14px;
+  font-size:12px;font-weight:600;color:var(--txt);background:none;border:none;
+  cursor:pointer;text-align:left;transition:background .12s;width:100%}
+.imenu-btn:hover{background:var(--s4)}
+.imenu-btn .imenu-ico{font-size:14px;width:18px;text-align:center;flex-shrink:0}
+.imenu-sep{height:1px;background:var(--bdr);margin:3px 0}
 
 .ibottom{display:flex;flex-wrap:wrap;gap:5px;padding:8px 0 4px;
   border-top:1px solid var(--bdr);flex-shrink:0}
@@ -5986,9 +5999,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
         <div style="font-size:13px">Connect to load categories</div>
       </div>
     </div>
-    <button class="fab" onclick="openDrawer('cats')" title="Actions">
-      ⚡<span class="fab-badge" id="fab-cat-badge"></span>
-    </button>
+
   </div>
 
   <!-- BROWSE -->
@@ -6012,9 +6023,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
     <div style="padding:0 10px">
       <div class="icount" id="icount"></div>
     </div>
-    <button class="fab" onclick="openDrawer('items')" title="Actions">
-      ⚡<span class="fab-badge" id="fab-item-badge"></span>
-    </button>
+
   </div>
 
   <!-- PLAYER -->
@@ -6071,11 +6080,13 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
             <button class="btn-red" id="rbtn" onclick="togRec()">⏺ Record</button>
             <span class="rtimer" id="rtimer">00:00:00</span>
             <span class="rfname" id="rfname"></span>
+            <button class="btn-ghost" id="dl-now-btn" onclick="dlNowMKV()" title="Download currently playing item as MKV" disabled style="flex-shrink:0;height:34px;padding:0 10px;font-size:13px">⬇ MKV</button>
           </div>
         </div>
       </div>
     </div>
     </div><!-- end flex:1 player content wrapper -->
+
     <!-- Desktop-only inline log (hidden on mobile via CSS) -->
     <div id="desktop-log" style="display:none;flex-direction:column;flex-shrink:0;border-top:1px solid var(--bdr)">
       <div id="desktop-log-hdr" onclick="toggleDesktopLog()" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:5px 14px;background:var(--s2);user-select:none">
@@ -6149,6 +6160,18 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 
 </main>
 
+<!-- ITEM CONTEXT MENU -->
+<div id="item-menu">
+  <div id="item-menu-hdr">Options</div>
+  <div class="imenu-sep" id="imenu-sep1"></div>
+  <button class="imenu-btn" id="imenu-epg"      onclick="iMenuEPG()">     <span class="imenu-ico">📅</span>EPG / Programme Info</button>
+  <button class="imenu-btn" id="imenu-catchup"  onclick="iMenuCatchup()"> <span class="imenu-ico">↺</span>Catch-up TV</button>
+  <div class="imenu-sep" id="imenu-sep2"></div>
+  <button class="imenu-btn" id="imenu-rec"      onclick="iMenuRec()">     <span class="imenu-ico">⏺</span>Record</button>
+  <button class="imenu-btn" id="imenu-mkv"      onclick="iMenuMKV()">     <span class="imenu-ico">⬇</span>Download MKV</button>
+</div>
+<div id="item-menu-bg" onclick="closeItemMenu()" style="display:none;position:fixed;inset:0;z-index:799"></div>
+
 <!-- BOTTOM NAV -->
 <nav id="botnav">
   <button class="nt on" id="t-cats" onclick="showT('p-cats','t-cats')">
@@ -6163,6 +6186,10 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   </button>
   <button class="nt" id="t-log" onclick="showT('p-log','t-log')">
     <span class="nt-ico">📜</span><span>Log</span>
+  </button>
+  <button class="nt" id="t-act" onclick="openActTab()">
+    <span class="nt-ico">⚡</span><span>Actions</span>
+    <span class="fab-badge" id="act-tab-badge"></span>
   </button>
 </nav>
 
@@ -7214,7 +7241,7 @@ function refreshCatBtns(){
   const cnt=document.getElementById('adr-cat-count');
   if(cnt) cnt.textContent=n+' selected';
   // FAB badge (mobile) + desktop header badge
-  const b=document.getElementById('fab-cat-badge');
+  const b=document.getElementById('act-tab-badge');
   if(b){b.textContent=n>99?'99+':n; b.classList.toggle('vis',n>0);}
   const pb=document.getElementById('ph-cat-badge');
   if(pb){pb.textContent=n>99?'99+':n; pb.classList.toggle('vis',n>0);}
@@ -7310,27 +7337,110 @@ function renderItems(items){
   const isSeries=mode==='series'||mode==='vod';
   el.innerHTML=items.map((it,i)=>{
     const name=it.name||it.o_name||it.fname||'Unknown';
-    const logo=it.logo||it.stream_icon||it.cover||'';
     const grp=!!it._is_series_group;
     const epN=grp?(it._episodes||[]).length:0;
     const show=!!it._is_show_item;
     const playing=i===pIdx;
-    const showExt=!grp;
+    const playable=!grp&&!show;
+    // Resolve logo: check all known fields; for series groups fall back to first episode's logo
+    const eps=grp?(it._episodes||[]):[];
+    const ep0=eps.length?eps[0]:{};
+    const epLogo=grp&&!it.logo&&!it.stream_icon&&!it.cover
+      ?(ep0.logo||ep0.stream_icon||ep0.cover||ep0.screenshot_uri||ep0.pic||''):'';
+    const logo=it.logo||it.stream_icon||it.cover||it.screenshot_uri||it.pic||epLogo||'';
     return '<div class="irow'+(playing?' now':'')+'" style="--d:'+(Math.min(i,50)*.016)+'s">'
       +'<input class="ichk" type="checkbox" data-i="'+i+'" onchange="onChk('+i+',this.checked)">'
+      +(logo?'<img class="ilogo" src="'+esc(logo)+'" onerror="this.style.display=\'none\'">'+'':'<span style="width:36px;height:24px;flex-shrink:0;display:inline-block"></span>')
       +'<button onclick="toggleFav('+i+')" title="Favourite"'
       +' style="background:none;border:none;cursor:pointer;font-size:15px;padding:0 2px;line-height:1;flex-shrink:0;color:'+(isFav(it)?'#f5c518':'rgba(255,255,255,0.25)')+'">★</button>'
-      +(logo?'<img class="ilogo" src="'+esc(logo)+'" onerror="this.style.display=\'none\'">'+'':'<span style="width:32px;height:21px;flex-shrink:0"></span>')
       +'<span class="iname" title="'+esc(name)+'">'+esc(name)+'</span>'
       +'<div class="ibtns">'
         +(grp?'<button class="btn-ghost" onclick="drillGrp('+i+')">'+epN+' eps</button>':'')
         +(show&&isSeries?'<button class="btn-ghost" onclick="drillShow('+i+')">Eps</button>':'')
-        +(showExt?'<button class="btn-ghost" onclick="openExternal('+i+')" title="Play in external player" style="padding:0 5px;font-size:13px">🎬</button>':'')
-        +(!grp?'<button class="btn-blue" onclick="playItem('+i+')">▶</button>':'')
+        +(playable?'<button class="btn-ghost" onclick="openExternal('+i+')" title="Play in external player" style="padding:0 5px;font-size:13px">🎬</button>':'')
+        +(playable?'<button class="btn-blue" onclick="playItem('+i+')">▶</button>':'')
+        +'<button class="btn-ghost imenu-trigger" onclick="event.stopPropagation();openItemMenu('+i+',this)" title="More options" style="padding:0 6px;font-size:18px;line-height:1;letter-spacing:0">⋮</button>'
       +'</div></div>';
   }).join('');
   refreshBtns();
 
+}
+
+// ── ITEM CONTEXT MENU ─────────────────────────────────────
+let _iMenuIdx = -1;
+
+function openItemMenu(i, btn){
+  _iMenuIdx = i;
+  const it = filtItems[i];
+  if(!it) return;
+  const isLive = (mode==='live') || (mode==='favs' && (it._fav_mode||'live')==='live');
+  const grp  = !!it._is_series_group;
+  const show = !!it._is_show_item;
+  const name = it.name||it.o_name||it.fname||'Unknown';
+
+  // Header
+  document.getElementById('item-menu-hdr').textContent = name;
+
+  // Show/hide buttons based on context
+  document.getElementById('imenu-sep1').style.display     = isLive&&!grp?'block':'none';
+  document.getElementById('imenu-epg').style.display      = isLive&&!grp?'flex':'none';
+  document.getElementById('imenu-catchup').style.display  = isLive&&!grp?'flex':'none';
+  document.getElementById('imenu-sep2').style.display     = !grp?'block':'none';
+  document.getElementById('imenu-rec').style.display      = !grp&&!show?'flex':'none';
+  document.getElementById('imenu-mkv').style.display      = !grp?'flex':'none';
+
+  // Position menu near button
+  const menu = document.getElementById('item-menu');
+  menu.classList.add('open');
+  const r = btn.getBoundingClientRect();
+  const mw = 210, mh = menu.offsetHeight||200;
+  let left = r.right - mw;
+  let top  = r.bottom + 4;
+  if(left < 8) left = 8;
+  if(top + mh > window.innerHeight - 8) top = r.top - mh - 4;
+  menu.style.left = left + 'px';
+  menu.style.top  = top  + 'px';
+  document.getElementById('item-menu-bg').style.display = 'block';
+}
+
+function closeItemMenu(){
+  document.getElementById('item-menu').classList.remove('open');
+  document.getElementById('item-menu-bg').style.display = 'none';
+}
+
+function iMenuEPG(){
+  closeItemMenu();
+  const it = filtItems[_iMenuIdx];
+  if(!it) return;
+  _epgItem = it;
+  showEPG();
+}
+
+function iMenuCatchup(){
+  closeItemMenu();
+  const it = filtItems[_iMenuIdx];
+  if(!it) return;
+  _epgItem = it;
+  showCatchup();
+}
+
+async function iMenuRec(){
+  closeItemMenu();
+  await playItem(_iMenuIdx);
+  setTimeout(()=>{ if(!isRec) startRec(); }, 800);
+}
+
+function iMenuMKV(){
+  closeItemMenu();
+  const it = filtItems[_iMenuIdx];
+  if(!it) return;
+  // Select just this item and download
+  selSet.clear();
+  selSet.add(it);
+  // Uncheck all, check this one
+  document.querySelectorAll('.ichk').forEach((c,ci)=>{ c.checked = (ci===_iMenuIdx); });
+  refreshBtns();
+  dlMKV();
 }
 
 function filterItems(){
@@ -7367,8 +7477,9 @@ function refreshBtns(){
   const catSub=document.getElementById('adr-cat-all-sub');
   if(catSub) catSub.textContent=curCat?curCat.title:'';
   // FAB badge (mobile) + desktop header badge
-  const b=document.getElementById('fab-item-badge');
+  const b=document.getElementById('act-tab-badge');
   if(b){b.textContent=n>99?'99+':n; b.classList.toggle('vis',n>0);}
+
   const pb=document.getElementById('ph-item-badge');
   if(pb){pb.textContent=n>99?'99+':n; pb.classList.toggle('vis',n>0);}
 }
@@ -7450,6 +7561,7 @@ function _destroyPlayers(){
 
 function doPlay(url, name, opts={}){
   pUrl=url; pName=name||url;
+  const dlb=document.getElementById('dl-now-btn'); if(dlb) dlb.disabled=false;
   _playerStopped = false;                        // new play — clear stop flag
   window._mseTranscodeFired = false;             // reset MSE transcode guard
   if(window._mpegRetries) window._mpegRetries = {}; // reset general retry counter
@@ -7911,6 +8023,7 @@ function playerStop(){
   pUrl=''; setNP('⏹ Stopped'); document.getElementById('pu').textContent='—';
   document.getElementById('ppbtn').textContent='▶';
   document.getElementById('vph').style.opacity='1';
+  const dlb=document.getElementById('dl-now-btn'); if(dlb) dlb.disabled=true;
 }
 function playerPrev(){if(!filtItems.length)return; playItem(pIdx<=0?filtItems.length-1:pIdx-1);}
 function playerNext(){if(!filtItems.length)return; playItem(pIdx<0||pIdx>=filtItems.length-1?0:pIdx+1);}
@@ -8282,6 +8395,21 @@ async function dlM3U(){
   const r=await fetch('/api/download/m3u',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({items:[...selSet],category:curCat,mode,out_path:op,total_hint:selSet.size})});
+  const d=await r.json();
+  d.ok?(toast(d.message,'ok'),pollBusy()):(toast(d.error,'err'),setBusy(false),dismissProgress('items'));
+}
+
+async function dlNowMKV(){
+  if(!pUrl){toast('No stream playing','wrn');return;}
+  const od=document.getElementById('o-dir').value.trim();
+  if(!od){toast('Set output folder first','wrn');return;}
+  // Build a minimal item from the currently playing stream
+  const nowItem = (pIdx>=0 && filtItems[pIdx]) ? filtItems[pIdx] : {name:pName, _direct_url:pUrl};
+  setBusy(true);
+  _showProgressNow('items','⬇ Downloading MKV…', nowItem.name||pName, 1);
+  const r=await fetch('/api/download/mkv',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({items:[nowItem],category:curCat,mode,out_dir:od,use_fallback:true})});
   const d=await r.json();
   d.ok?(toast(d.message,'ok'),pollBusy()):(toast(d.error,'err'),setBusy(false),dismissProgress('items'));
 }
@@ -8666,6 +8794,13 @@ function esc(s){
 
 // ── ACTION DRAWER ──────────────────────────────────────────
 let drawerCtx = 'cats';
+function openActTab(){
+  // Detect context from active panel
+  const active = document.querySelector('.panel.active');
+  const pid = active ? active.id : 'p-cats';
+  const ctx = pid==='p-items'||pid==='p-player' ? 'items' : 'cats';
+  openDrawer(ctx);
+}
 function openDrawer(ctx){
   drawerCtx = ctx||'cats';
   document.getElementById('adr-cats-content').classList.toggle('hidden', drawerCtx!=='cats');
