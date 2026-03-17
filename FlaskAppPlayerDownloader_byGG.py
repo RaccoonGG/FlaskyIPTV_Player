@@ -35,6 +35,7 @@ Added logos to channels/vods/series.
 Added sub-menu option on channels/vods/series.
 Added open imdb page for vods/series in sub-menu of vods/series, it just does a search for imdb title.
 Added local M3U file parsing in M3U connect options.
+Added EPG layout to items tab.
 Varius UI fixes, and adjustments.
 """
 
@@ -2702,18 +2703,23 @@ class AppState:
         self.mkv_fallback = True
         # EPG cache: key → (timestamp, result_dict), TTL = 30 minutes
         self._epg_cache: dict = {}
-        self._epg_cache_ttl = 1800  # seconds
+        self._epg_cache_ttl = 1200  # seconds (20 min)
         # Per-portal flag: set of base_urls where get_short_epg always returns empty.
         # After one confirmed empty response we skip straight to XMLTV for that portal.
         self._short_epg_broken: set = set()
         # XMLTV cache: key=base_norm → (fetched_ts, epg_dict, chan_names)
-        # epg_dict: {channel_id_lower: [{"title","start","end","desc"}, ...]}
+        # epg_dict: {channel_id_lower: [(title, start, end, desc), ...]}  ← compact tuples
         # TTL = 1 hour, same as reference app
         self._xmltv_cache: dict = {}
-        self._xmltv_cache_ttl = 3600
+        self._xmltv_cache_ttl = 1800  # 30 min — matches the -6h/+24h window; no benefit caching longer
         # Portals whose xmltv.php has channel defs but zero programme entries —
         # marked after first download so we never re-download this session.
         self._xmltv_no_data: set = set()
+        # Per-URL threading locks — ensures only one thread downloads a given
+        # XMLTV feed at a time; all other callers block then use the cache.
+        # threading.Lock (not asyncio.Lock) because each EPG request runs in
+        # its own event loop via run_async(), making asyncio primitives unusable.
+        self._xmltv_dl_locks: dict = {}   # url → threading.Lock()
         # Persistent StalkerPortalClient — reused across requests to avoid
         # repeated handshake/profile calls that cause portal rate-limiting
         self._stalker_client: object = None
@@ -2966,6 +2972,7 @@ def api_connect():
         state.m3u_xtream_override = None
         state._epg_cache = {}
         state._xmltv_cache = {}
+        state._xmltv_dl_locks = {}
         state._short_epg_broken = set()
         state._xmltv_no_data = set()
         state._won_ch_cache = (0.0, [])
@@ -3810,6 +3817,9 @@ def api_epg():
                     if ext_result.get("current") or ext_result.get("next"):
                         return ext_result
                     state.log(f"[EPG] External EPG: no match for {lookup_id!r}")
+                    return {"current": None, "next": None,
+                            "error": "Channel not found in external EPG.",
+                            "_xmltv_checked": True}
 
             # Nothing worked
             err = "No EPG data found."
@@ -3875,6 +3885,11 @@ def api_epg():
                                                         state.log, cache_key=state.ext_epg_url)
                     if ext_result.get("current") or ext_result.get("next"):
                         return ext_result
+                    # XMLTV was consulted and definitively returned nothing — tag the
+                    # result so the retry loop knows there's no point trying again.
+                    err = "No EPG data from portal."
+                    err += " Channel not found in external EPG either."
+                    return {"current": None, "next": None, "error": err, "_xmltv_checked": True}
 
             err = "No EPG data from portal."
             if state.ext_epg_url:
@@ -3902,13 +3917,37 @@ def api_epg():
 
     try:
         result = run_async(fetch_epg())
-        # Cache successful results (even empty ones to avoid hammering unavailable portals)
-        if not result.get("error"):
+        # Retry up to 2 more times (3 total attempts) before giving up.
+        # BUT: if XMLTV was already consulted and confirmed nothing (_xmltv_checked),
+        # the outcome is deterministic — skip further retries immediately.
+        for _retry in range(2):
+            if result.get("current") or result.get("next") or result.get("schedule"):
+                break
+            if result.get("_xmltv_checked"):
+                state.log(f"[EPG] XMLTV confirmed no data — skipping retries")
+                break
+            state.log(f"[EPG] Attempt {_retry + 1} returned no data — retrying ({_retry + 2}/3)")
+            result = run_async(fetch_epg())
+
+        if result.get("current") or result.get("next") or result.get("schedule"):
+            # Full 20-minute cache for successful results
             state._epg_cache[cache_key] = (time.time(), result)
-        return jsonify(result)
+        elif result.get("_xmltv_checked"):
+            # Confirmed-empty (XMLTV was tried and found nothing): cache for 5 min
+            # so we don't re-hammer the portal on every scroll, but still refresh
+            # more often in case the EPG source is updated.
+            state.log(f"[EPG] Confirmed no EPG — caching for 5 min")
+            _confirmed_empty = {k: v for k, v in result.items() if k != "_xmltv_checked"}
+            state._epg_cache[cache_key] = (time.time() - (state._epg_cache_ttl - 300), _confirmed_empty)
+        # Transient failures (portal unreachable, no XMLTV set) are not cached
+        # so they get a fresh try on the next page load.
+        return jsonify({k: v for k, v in result.items() if k != "_xmltv_checked"})
     except Exception as e:
         state.log(f"[EPG] Error: {type(e).__name__}: {e}")
-        return jsonify({"current": None, "next": None, "error": str(e)})
+        err_result = {"current": None, "next": None, "error": str(e)}
+        # Cache errors too so a broken channel doesn't retry every single request
+        state._epg_cache[cache_key] = (time.time(), err_result)
+        return jsonify(err_result)
 
 
 @flask_app.route("/api/whats_on", methods=["GET"])
@@ -3948,21 +3987,26 @@ def api_whats_on():
             names = chan_names.get(channel_id, [])
             display_name = names[0].title() if names else channel_id
             for prog in programmes:
-                if prog["start"] <= now < prog["end"]:
-                    key = (prog["title"].lower(), channel_id)
+                # Support both tuple (title,start,end,desc) and legacy dict entries
+                if isinstance(prog, tuple):
+                    p_title, p_start, p_end, p_desc = prog[0], prog[1], prog[2], prog[3] if len(prog) > 3 else ""
+                else:
+                    p_title, p_start, p_end, p_desc = prog["title"], prog["start"], prog["end"], prog.get("desc", "")
+                if p_start <= now < p_end:
+                    key = (p_title.lower(), channel_id)
                     if key not in seen:
                         seen.add(key)
                         # Calculate progress percentage through the show
-                        duration = prog["end"] - prog["start"]
-                        elapsed = now - prog["start"]
+                        duration = p_end - p_start
+                        elapsed = now - p_start
                         progress = int((elapsed / duration * 100)) if duration > 0 else 0
                         results.append({
-                            "title": prog["title"],
+                            "title": p_title,
                             "channel_id": channel_id,
                             "channel_name": display_name,
-                            "start": prog["start"],
-                            "end": prog["end"],
-                            "desc": prog.get("desc", ""),
+                            "start": p_start,
+                            "end": p_end,
+                            "desc": p_desc,
                             "progress": progress,
                         })
 
@@ -4406,11 +4450,16 @@ def api_catchup():
                             if entries:
                                 cutoff = now_ts - 86400 * 3   # look back up to 3 days
                                 for ep in entries:
-                                    ep_start = ep.get("start", 0)
-                                    ep_end   = ep.get("end",   0)
+                                    # Support both tuple (title,start,end,desc) and legacy dict
+                                    if isinstance(ep, tuple):
+                                        ep_title, ep_start, ep_end = ep[0], ep[1], ep[2]
+                                    else:
+                                        ep_title  = ep.get("title") or "Unknown"
+                                        ep_start  = ep.get("start", 0)
+                                        ep_end    = ep.get("end",   0)
                                     if ep_start and ep_end and cutoff <= ep_start < now_ts:
                                         results.append({
-                                            "title":        ep.get("title") or "Unknown",
+                                            "title":        ep_title or "Unknown",
                                             "start":        ep_start,
                                             "stop":         ep_end,
                                             "cmd":          sid,
@@ -4840,12 +4889,28 @@ def _parse_stalker_epg(payload: dict, ch_id: str) -> dict:
     return out
 
 
-async def _build_xmltv_index(xmltv_url: str, log_cb=None) -> dict:
-    """Download XMLTV and build full channel→programmes index.
-    Streams the download to a temp file and uses iterparse so large files
-    (100MB+) never cause an out-of-memory error.
+async def _build_xmltv_index(xmltv_url: str, log_cb=None,
+                             win_back_h: int = 6, win_fwd_h: int = 24) -> dict:
+    """Download XMLTV and build a time-windowed channel→programmes index.
+
+    Memory optimisations vs the naive approach:
+      1. Time-window filter at parse time — only programmes that overlap
+         [now - win_back_h .. now + win_fwd_h] are kept.  A 7-day feed for
+         22k channels produces ~1.36M entries; a 30h window cuts that to
+         ~115k — roughly a 12× reduction before any other tricks.
+      2. Compact tuple storage — each programme is stored as a plain tuple
+         (title, start, end, desc) instead of a dict.  A 4-item tuple costs
+         ~88 bytes of overhead vs ~240 bytes for a dict, saving another ~35%.
+      3. Description truncation — descs are capped at 200 chars; the full
+         text is rarely displayed and can be extremely long in some feeds.
+
+    Net effect: ~1500 MB → ~100 MB for a 185 MB / 22k-channel feed.
+
+    Programme tuples are converted back to dicts by _fetch_xmltv_epg at
+    lookup time (one channel at a time, negligible cost).
+
     Returns: (epg_dict, chan_names)
-      epg_dict   = {channel_id_lower: [{"title","start","end","desc"}, ...]}
+      epg_dict   = {channel_id_lower: [(title, start, end, desc), ...]}
       chan_names  = {channel_id_lower: [display_name_lower, ...]}
     """
     _log = log_cb or (lambda x: None)
@@ -4864,7 +4929,14 @@ async def _build_xmltv_index(xmltv_url: str, log_cb=None) -> dict:
         except Exception:
             return 0.0
 
+    # Time window: only keep programmes that overlap [win_start .. win_end].
+    # A programme is included if it ends after win_start AND starts before win_end.
+    now_ts    = datetime.now(timezone.utc).timestamp()
+    win_start = now_ts - win_back_h * 3600   # e.g. 6 h ago
+    win_end   = now_ts + win_fwd_h  * 3600   # e.g. 24 h from now
+
     _log(f"[EPG] Downloading XMLTV from {xmltv_url}")
+    _log(f"[EPG] Time window: -{win_back_h}h / +{win_fwd_h}h (discarding rest at parse time)")
 
     # Stream the response into a temp file to avoid OOM on large feeds
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xmltv") as tmp:
@@ -4902,9 +4974,11 @@ async def _build_xmltv_index(xmltv_url: str, log_cb=None) -> dict:
     try:
         fh = _gzip.open(tmp_path, "rb") if is_gz else open(tmp_path, "rb")
 
-        chan_names: dict = {}
-        epg_dict:   dict = {}
+        chan_names:  dict = {}
+        epg_dict:    dict = {}
         root = None
+        total_seen   = 0
+        total_kept   = 0
 
         try:
             context = ET.iterparse(fh, events=("start", "end"))
@@ -4925,17 +4999,39 @@ async def _build_xmltv_index(xmltv_url: str, log_cb=None) -> dict:
                         chan_names[cid] = names
 
                 elif tag == "programme":
+                    total_seen += 1
                     cid = (elem.get("channel") or "").strip().lower()
                     if cid:
                         start = _ts(elem.get("start", ""))
                         end   = _ts(elem.get("stop",  ""))
+
+                        # ── Time-window filter: skip anything entirely outside the window ──
+                        # A programme overlaps the window if it ends after win_start
+                        # AND starts before win_end.  end==0 means unknown — keep it.
+                        if end and end < win_start:
+                            # Programme already finished before our look-back — discard
+                            if root is not None and elem is not root:
+                                with contextlib.suppress(ValueError):
+                                    root.remove(elem)
+                            continue
+                        if start > win_end:
+                            # Programme starts after our look-ahead — discard
+                            if root is not None and elem is not root:
+                                with contextlib.suppress(ValueError):
+                                    root.remove(elem)
+                            continue
+
                         title = (elem.findtext("title") or "").strip()
-                        desc  = (elem.findtext("desc")  or "").strip()
+                        # Truncate description to 200 chars — long descs waste RAM
+                        # and are never fully displayed in the EPG grid anyway.
+                        desc  = (elem.findtext("desc")  or "").strip()[:200]
                         if title and start:
                             if cid not in epg_dict:
                                 epg_dict[cid] = []
-                            epg_dict[cid].append({"title": title, "start": start,
-                                                  "end": end, "desc": desc})
+                            # Store as compact tuple instead of dict:
+                            # (title, start, end, desc) — ~35% less overhead than dict
+                            epg_dict[cid].append((title, start, end, desc))
+                            total_kept += 1
 
                 # Detach processed top-level elements from root so Python's GC
                 # can actually reclaim them. elem.clear() alone is not enough —
@@ -4949,11 +5045,27 @@ async def _build_xmltv_index(xmltv_url: str, log_cb=None) -> dict:
             fh.close()
 
     finally:
-        with contextlib.suppress(Exception):
-            os.remove(tmp_path)
+        # On Windows, os.remove can fail with PermissionError if the OS hasn't
+        # fully released the file lock yet (even after fh.close()).
+        # contextlib.suppress would silently eat that error and leave the file
+        # behind, filling %TEMP% over time.  Retry a few times with short sleeps.
+        for _attempt in range(5):
+            try:
+                os.remove(tmp_path)
+                break
+            except FileNotFoundError:
+                break  # already gone — fine
+            except Exception:
+                if _attempt < 4:
+                    time.sleep(0.1 * (2 ** _attempt))  # 0.1s, 0.2s, 0.4s, 0.8s
 
+    # Estimated RAM: each kept entry ≈ 88 (tuple) + 80 (title) + 200 (desc) + 56 (2×float) bytes
+    est_mb = (total_kept * 424) // (1024 * 1024)
+    pct_kept = (total_kept / total_seen * 100) if total_seen else 0
     _log(f"[EPG] XMLTV index built: {len(epg_dict)} channels with programmes "
          f"(out of {len(chan_names)} channel defs)")
+    _log(f"[EPG] Kept {total_kept:,} / {total_seen:,} programmes ({pct_kept:.0f}%) "
+         f"in -{win_back_h}h/+{win_fwd_h}h window — est. RAM ~{est_mb} MB")
     if not epg_dict:
         _log(f"[EPG] XMLTV has channel defs but NO programme data — portal serves stub XMLTV")
     return epg_dict, chan_names
@@ -4990,17 +5102,38 @@ async def _fetch_xmltv_epg(xmltv_url: str, tvg_id: str, log_cb=None,
             cached = None
 
     if not cached:
+        # Ensure only one thread downloads this URL at a time.
+        # threading.Lock because each EPG request runs in its own event loop.
+        if ck not in state._xmltv_dl_locks:
+            state._xmltv_dl_locks[ck] = threading.Lock()
+        lock = state._xmltv_dl_locks[ck]
+
+        # Acquire the lock in a thread-pool executor so we don't block the
+        # event loop while waiting for another thread's download to finish.
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lock.acquire)
         try:
-            epg_dict, chan_names = await _build_xmltv_index(xmltv_url, _log)
-            state._xmltv_cache[ck] = (time.time(), epg_dict, chan_names)
-            if not epg_dict:
-                state._xmltv_no_data.add(ck)
+            # Re-check cache — another thread may have populated it.
+            cached = state._xmltv_cache.get(ck)
+            if cached and time.time() - cached[0] < state._xmltv_cache_ttl:
+                epg_dict, chan_names = cached[1], cached[2]
+            elif ck not in state._xmltv_no_data:
+                try:
+                    epg_dict, chan_names = await _build_xmltv_index(xmltv_url, _log)
+                    state._xmltv_cache[ck] = (time.time(), epg_dict, chan_names)
+                    if not epg_dict:
+                        state._xmltv_no_data.add(ck)
+                        out["error"] = "Provider XMLTV contains no programme data"
+                        return out
+                except Exception as e:
+                    _log(f"[EPG] XMLTV download/parse error: {e}")
+                    out["error"] = str(e)
+                    return out
+            else:
                 out["error"] = "Provider XMLTV contains no programme data"
                 return out
-        except Exception as e:
-            _log(f"[EPG] XMLTV download/parse error: {e}")
-            out["error"] = str(e)
-            return out
+        finally:
+            lock.release()
 
     # ── Resolve channel ID → programme list ───────────────────────────────────
     entries = epg_dict.get(lookup)
@@ -5020,6 +5153,16 @@ async def _fetch_xmltv_epg(xmltv_url: str, tvg_id: str, log_cb=None,
         return out
 
     _log(f"[EPG] XMLTV: {len(entries)} programmes for {tvg_id!r}")
+
+    # Convert compact tuples (title, start, end, desc) back to dicts.
+    # This happens once per lookup on one channel — negligible cost.
+    def _to_dict(e):
+        if isinstance(e, dict):
+            return e
+        # tuple: (title, start, end, desc)
+        return {"title": e[0], "start": e[1], "end": e[2], "desc": e[3] if len(e) > 3 else ""}
+
+    entries = [_to_dict(e) for e in entries]
 
     # Filter to window around now (keep past 1h and next 3h)
     window = [e for e in entries if e["end"] >= now - 3600 and e["start"] <= now + 10800]
@@ -5865,6 +6008,59 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .ibottom button{flex:1;min-width:68px;height:34px;font-size:12px}
 .icount{font-size:11px;color:var(--txt3);padding:3px 0;text-align:center;flex-shrink:0}
 
+/* ─── EPG Grid layout ──────────────────────────────────────────────────────── */
+#epg-grid-wrap{display:none;flex:1;flex-direction:column;min-height:0;overflow:hidden}
+#epg-grid-wrap.active{display:flex}
+#epg-grid-scroll{flex:1;overflow:auto;position:relative;min-height:0}
+.epg-grid{display:table;min-width:100%;border-collapse:collapse}
+.epg-time-header{display:flex;position:sticky;top:0;z-index:30;background:var(--s1);
+  border-bottom:1px solid var(--bdr2);height:28px;flex-shrink:0}
+.epg-ch-cell{position:sticky;left:0;z-index:20;width:110px;min-width:110px;
+  background:var(--s1);border-right:1px solid var(--bdr2);flex-shrink:0;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:3px;padding:4px 5px;cursor:pointer;transition:background .15s}
+.epg-ch-cell:hover{background:var(--s3)}
+.epg-ch-logo{width:48px;height:30px;object-fit:contain;border-radius:3px;flex-shrink:0}
+.epg-ch-logo-ph{width:48px;height:30px;background:var(--s3);border-radius:3px;
+  display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+.epg-ch-name{font-size:9px;font-weight:600;color:var(--txt2);text-align:center;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;line-height:1.2}
+.epg-row{display:flex;border-bottom:1px solid var(--bdr);min-height:62px}
+.epg-row:hover .epg-ch-cell{background:var(--s3)}
+.epg-timeline{position:relative;flex:1;overflow:hidden;min-width:0}
+.epg-prog{position:absolute;top:2px;bottom:2px;border-radius:5px;
+  background:var(--s3);border:1px solid var(--bdr);
+  padding:3px 6px;overflow:hidden;cursor:pointer;transition:.12s;
+  display:flex;flex-direction:column;justify-content:center;min-width:4px}
+.epg-prog:hover{background:var(--s4);border-color:var(--acc);z-index:5}
+.epg-prog.now{background:rgba(139,92,246,.14);border-color:var(--acc)}
+.epg-prog-title{font-size:11px;font-weight:600;color:var(--txt1);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.epg-prog-time{font-size:9px;color:var(--txt3);white-space:nowrap}
+.epg-now-line{position:absolute;top:0;bottom:0;width:2px;background:var(--acc);
+  z-index:10;pointer-events:none;opacity:.8}
+.epg-now-dot{position:absolute;top:-4px;left:-4px;width:10px;height:10px;
+  border-radius:50%;background:var(--acc)}
+.epg-time-tick{position:absolute;top:0;bottom:0;display:flex;flex-direction:column;
+  justify-content:flex-end;padding-bottom:4px}
+.epg-time-tick-line{position:absolute;top:0;width:1px;height:100%;
+  background:var(--bdr);opacity:.5}
+.epg-time-lbl{font-size:9px;color:var(--txt3);white-space:nowrap;font-weight:600}
+.epg-grid-hdr-corner{width:110px;min-width:110px;flex-shrink:0;position:sticky;
+  left:0;z-index:40;background:var(--s1);border-right:1px solid var(--bdr2);
+  border-bottom:1px solid var(--bdr2);display:flex;align-items:center;justify-content:center}
+.epg-grid-hdr-times{flex:1;position:relative;overflow:hidden;height:28px}
+.epg-prog-loading{position:absolute;inset:2px;border-radius:5px;
+  background:var(--s3);animation:shimmer 1.4s infinite linear;background-size:200% 100%;
+  background-image:linear-gradient(90deg,var(--s3) 25%,var(--s4) 50%,var(--s3) 75%)}
+.epg-layout-btn{display:flex;align-items:center;gap:4px;padding:4px 9px;
+  font-size:11px;font-weight:700;border-radius:14px;border:1.5px solid var(--bdr2);
+  background:var(--s2);color:var(--txt2);cursor:pointer;transition:var(--tr);flex-shrink:0;
+  white-space:nowrap}
+.epg-layout-btn:hover{border-color:var(--acc);color:var(--acc)}
+.epg-layout-btn.active{background:rgba(139,92,246,.15);border-color:var(--acc);color:var(--acc)}
+@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+
 /* ─── paths area ─────────────────────────────────────────────── */
 #paths{padding:8px 0 4px;border-top:1px solid var(--bdr);flex-shrink:0;display:none}
 .prow{display:flex;align-items:center;gap:5px;margin-bottom:5px;position:relative}
@@ -6138,6 +6334,10 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .won-find-result.ok:active{background:rgba(34,197,94,.45)}
 .won-find-result.fail{background:rgba(239,68,68,.13);color:#f87171;display:block}
 .won-find-result.playing{background:rgba(59,130,246,.18);color:#60a5fa;display:block;cursor:default}
+.won-ext-btn{display:block;font-size:10px;margin-top:0;padding:3px 6px;border-radius:4px;
+  background:rgba(139,92,246,.18);color:#a78bfa;cursor:pointer;transition:background .15s}
+.won-ext-btn:hover{background:rgba(139,92,246,.32)}
+.won-ext-btn:active{background:rgba(139,92,246,.45)}
 .won-empty{text-align:center;padding:48px 20px;color:var(--txt3);font-size:13px}
 .won-empty span{font-size:40px;display:block;margin-bottom:10px;opacity:.3}
 .won-loading{display:flex;align-items:center;justify-content:center;gap:10px;
@@ -6439,15 +6639,20 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
     <div style="padding:10px 10px 0;display:flex;flex-direction:column;gap:6px;flex-shrink:0">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
         <div class="bcrum" id="bcrum" style="flex:1;min-width:0"><span class="bc-s">Categories</span></div>
+        <button class="epg-layout-btn" id="epg-grid-btn" onclick="toggleEpgGrid()" title="EPG Grid view" style="display:none">📅 EPG</button>
         <button class="ph-act-btn" onclick="openDrawer('items')" title="Download / Actions" id="ph-items-act-btn">
           ⚡ Actions<span class="ph-act-badge" id="ph-item-badge"></span>
         </button>
       </div>
-      <div class="sbar"><span class="sico">🔍</span>
+      <div class="sbar" id="items-sbar"><span class="sico">🔍</span>
         <input id="isrch" type="search" placeholder="Search items…" oninput="filterItems()">
       </div>
     </div>
     <div style="flex:1;overflow-y:auto;padding:6px 10px 0;min-height:0" id="ilist"></div>
+    <!-- EPG Grid container (replaces ilist when active) -->
+    <div id="epg-grid-wrap">
+      <div id="epg-grid-scroll"></div>
+    </div>
     <div style="padding:0 10px">
       <div class="icount" id="icount"></div>
     </div>
@@ -7579,6 +7784,8 @@ function setMode(m){
   document.querySelector('.mt[data-m="favs"]').classList.remove('on');
   mode=m; navStack=[]; allItems=[]; filtItems=[]; curCat=null;
   selSet.clear(); selCats.clear(); refreshCatBtns();
+  if(_epgGridActive) _closeEpgGrid();
+  document.getElementById('epg-grid-btn').style.display='none';
   switchMode(m, catsCache[m]||[]);
   document.getElementById('main').classList.remove('items-open');
   showT('p-cats','t-cats');
@@ -7864,6 +8071,7 @@ function renderItems(items){
       +'</div></div>';
   }).join('');
   refreshBtns();
+  _updateEpgGridBtn();
 
 }
 
@@ -8855,6 +9063,271 @@ function closeEPG(){document.getElementById('epg-overlay').style.display='none';
 // Close on backdrop click
 document.getElementById('epg-overlay').addEventListener('click',function(e){if(e.target===this)closeEPG();});
 
+// ══════════════════════════════════════════════════════════════════════════════
+// EPG GRID VIEW  — TV Guide-style layout across all channels in items tab
+// ══════════════════════════════════════════════════════════════════════════════
+const EPG_PX_MIN   = 3;          // pixels per minute
+const EPG_WIN_BACK = 60;         // minutes before now to show
+const EPG_WIN_FWD  = 5 * 60;     // minutes after now to show
+const EPG_CH_W     = 110;        // px — fixed left channel column
+
+let _epgGridActive = false;
+let _epgGridObs    = null;       // IntersectionObserver for lazy row loading
+
+function _epgNowX(){
+  // X-pixel offset of "now" inside the timeline area (relative to timeline start)
+  return EPG_WIN_BACK * EPG_PX_MIN;
+}
+
+function _epgTsToX(ts){
+  const nowSec = Date.now() / 1000;
+  const diffMin = (ts - nowSec) / 60;
+  return _epgNowX() + diffMin * EPG_PX_MIN;
+}
+
+function _epgTotalW(){
+  return (EPG_WIN_BACK + EPG_WIN_FWD) * EPG_PX_MIN;
+}
+
+function toggleEpgGrid(){
+  if(!_epgGridActive) _openEpgGrid();
+  else                _closeEpgGrid();
+}
+
+function _openEpgGrid(){
+  if(mode !== 'live'){ toast('EPG grid only available for Live channels','wrn'); return; }
+  if(!filtItems.length){ toast('No channels to show','wrn'); return; }
+  _epgGridActive = true;
+  document.getElementById('ilist').style.display         = 'none';
+  document.getElementById('epg-grid-wrap').classList.add('active');
+  document.getElementById('epg-grid-btn').classList.add('active');
+  document.getElementById('epg-grid-btn').textContent    = '✕ List';
+  document.getElementById('icount').style.display        = 'none';
+  document.getElementById('items-sbar').style.display    = 'none';
+  _buildEpgGrid(filtItems);
+}
+
+function _closeEpgGrid(){
+  _epgGridActive = false;
+  if(_epgGridObs){ _epgGridObs.disconnect(); _epgGridObs = null; }
+  // Remove scroll listener from the grid container
+  const wrap = document.getElementById('epg-grid-scroll');
+  if(wrap && wrap._epgScrollHandler){
+    wrap.removeEventListener('scroll', wrap._epgScrollHandler);
+    wrap._epgScrollHandler = null;
+  }
+  document.getElementById('ilist').style.display         = '';
+  document.getElementById('epg-grid-wrap').classList.remove('active');
+  document.getElementById('epg-grid-btn').classList.remove('active');
+  document.getElementById('epg-grid-btn').textContent    = '📅 EPG';
+  document.getElementById('icount').style.display        = '';
+  document.getElementById('items-sbar').style.display    = '';
+}
+
+function _buildEpgGrid(channels){
+  const wrap = document.getElementById('epg-grid-scroll');
+  const totalW = _epgTotalW();
+  const nowX   = _epgNowX();
+  const nowSec = Date.now() / 1000;
+
+  // Build time header ticks (every 30 min)
+  let ticksHtml = '';
+  const stepMin = 30;
+  const startSec = nowSec - EPG_WIN_BACK * 60;
+  for(let m = 0; m <= EPG_WIN_BACK + EPG_WIN_FWD; m += stepMin){
+    const x   = m * EPG_PX_MIN;
+    const ts  = startSec + m * 60;
+    const lbl = new Date(ts * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+    ticksHtml += `<div class="epg-time-tick" style="left:${x}px">
+      <div class="epg-time-tick-line"></div>
+      <span class="epg-time-lbl" style="padding-left:3px">${lbl}</span>
+    </div>`;
+  }
+
+  // Time header row
+  const headerHtml = `<div class="epg-time-header" style="width:${EPG_CH_W + totalW}px">
+    <div class="epg-grid-hdr-corner">
+      <span style="font-size:9px;color:var(--txt3);font-weight:700;text-transform:uppercase;letter-spacing:.8px">Channels</span>
+    </div>
+    <div class="epg-grid-hdr-times" style="width:${totalW}px;position:relative;flex-shrink:0">
+      ${ticksHtml}
+      <div class="epg-now-line" style="left:${nowX}px"><div class="epg-now-dot"></div></div>
+    </div>
+  </div>`;
+
+  // Channel rows
+  const rowsHtml = channels.map((ch, i) => {
+    const name    = ch.name || ch.o_name || ch.fname || 'Unknown';
+    const logo    = ch.logo || ch.stream_icon || ch.cover || ch.screenshot_uri || ch.pic || '';
+    const logoSrc = logo && (logo.startsWith('http://') || logo.startsWith('https://'))
+      ? '/api/proxy?url=' + encodeURIComponent(logo) : logo;
+    const logoEl  = logoSrc
+      ? `<img class="epg-ch-logo" src="${esc(logoSrc)}" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
+        + `<div class="epg-ch-logo-ph" style="display:none">📺</div>`
+      : `<div class="epg-ch-logo-ph">📺</div>`;
+
+    return `<div class="epg-row" id="epg-row-${i}">
+      <div class="epg-ch-cell" onclick="playItem(${i})" title="Play ${esc(name)}">
+        ${logoEl}
+        <div class="epg-ch-name">${esc(name)}</div>
+      </div>
+      <div class="epg-timeline" style="width:${totalW}px;min-width:${totalW}px;position:relative" id="epg-tl-${i}" data-ch-idx="${i}">
+        <div class="epg-now-line" style="left:${nowX}px"></div>
+        <div class="epg-prog-loading" id="epg-loading-${i}"></div>
+      </div>
+    </div>`;
+  }).join('');
+
+  wrap.innerHTML = `<div style="min-width:${EPG_CH_W + totalW}px">
+    ${headerHtml}
+    ${rowsHtml}
+  </div>`;
+
+  // Scroll so "now - 10 min" is near left edge
+  requestAnimationFrame(() => {
+    const scrollTarget = EPG_CH_W + nowX - 80;
+    wrap.scrollLeft = Math.max(0, scrollTarget);
+  });
+
+  // ── Scroll-based batch loader (replaces IntersectionObserver) ──────────────
+  // Fires all unloaded rows that are currently visible (+ 3-row buffer) in
+  // parallel. Reliable with 2D scroll containers where IO can miss entries.
+  const _epgLoaded = new Set();
+  const ROW_H = 62; // matches .epg-row min-height
+
+  function _epgLoadVisible(){
+    const scrollTop  = wrap.scrollTop;
+    const viewH      = wrap.clientHeight;
+    // subtract 28px for the sticky time header
+    const visTop    = scrollTop + 28;
+    const visBottom = scrollTop + viewH;
+    const buffer    = ROW_H * 3;
+
+    const firstRow = Math.max(0, Math.floor((visTop - buffer) / ROW_H));
+    const lastRow  = Math.min(channels.length - 1,
+                              Math.ceil((visBottom + buffer) / ROW_H));
+
+    for(let i = firstRow; i <= lastRow; i++){
+      if(!_epgLoaded.has(i)){
+        _epgLoaded.add(i);
+        _loadEpgRow(channels[i], i);   // fire-and-forget, all in parallel
+      }
+    }
+  }
+
+  // Disconnect any old observer
+  if(_epgGridObs){ _epgGridObs.disconnect(); _epgGridObs = null; }
+  // Store cleanup ref so _closeEpgGrid can remove the listener
+  if(wrap._epgScrollHandler) wrap.removeEventListener('scroll', wrap._epgScrollHandler);
+  wrap._epgScrollHandler = _epgLoadVisible;
+  wrap.addEventListener('scroll', _epgLoadVisible, {passive: true});
+
+  // Load the initial visible set immediately (after DOM paint)
+  requestAnimationFrame(() => { requestAnimationFrame(_epgLoadVisible); });
+}
+
+async function _loadEpgRow(ch, idx){
+  const tl = document.getElementById(`epg-tl-${idx}`);
+  if(!tl) return;
+  const ctrl    = new AbortController();
+  const timeoutId = setTimeout(() => ctrl.abort(), 180000); // 180 s — covers first-time XMLTV downloads (backend allows 120 s + parse time)
+  // After 5 s inject a visible "fetching…" label so the user knows it's working
+  const hintId = setTimeout(() => {
+    const el = document.getElementById(`epg-loading-${idx}`);
+    if(el && !el._hinted){
+      el._hinted = true;
+      el.style.cssText += ';display:flex;align-items:center;padding-left:8px;font-size:10px;color:var(--t2);animation:none;background:var(--s4)';
+      el.textContent = '⏳ Fetching EPG…';
+    }
+  }, 5000);
+  // After 30 s update hint to indicate a large guide file may be downloading
+  const slowHintId = setTimeout(() => {
+    const el = document.getElementById(`epg-loading-${idx}`);
+    if(el && el._hinted){ el.textContent = '⏳ Downloading guide data…'; }
+  }, 30000);
+  try {
+    const r = await fetch('/api/epg', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({item: ch}),
+      signal: ctrl.signal
+    });
+    clearTimeout(timeoutId);
+    clearTimeout(hintId);
+    clearTimeout(slowHintId);
+    const d = await r.json();
+    const loadingEl = document.getElementById(`epg-loading-${idx}`);
+    if(loadingEl) loadingEl.remove();
+
+    const schedule = d.schedule || [];
+    if(!schedule.length && (d.current || d.next)){
+      // Only now/next available — show them as blocks
+      if(d.current) schedule.push(d.current);
+      if(d.next)    schedule.push(d.next);
+    }
+    if(!schedule.length){
+      tl.insertAdjacentHTML('beforeend',
+        `<div style="position:absolute;inset:0;display:flex;align-items:center;padding-left:8px">
+          <span style="font-size:10px;color:var(--txt3);opacity:.6">No EPG data</span>
+        </div>`);
+      return;
+    }
+
+    const nowSec = Date.now() / 1000;
+    const winStart = nowSec - EPG_WIN_BACK * 60;
+    const winEnd   = nowSec + EPG_WIN_FWD  * 60;
+
+    schedule.forEach(prog => {
+      const pStart = prog.start || 0;
+      const pEnd   = prog.end   || (pStart + 3600);
+      // Clamp to visible window
+      if(pEnd < winStart || pStart > winEnd) return;
+
+      const x1 = Math.max(0, _epgTsToX(pStart));
+      const x2 = Math.min(_epgTotalW(), _epgTsToX(pEnd));
+      const w  = x2 - x1;
+      if(w < 2) return;
+
+      const isCurrent = pStart <= nowSec && nowSec < pEnd;
+      const startLbl  = _fmtEpgTime(pStart);
+      const endLbl    = _fmtEpgTime(pEnd);
+      const progTitle = esc(prog.title || '—');
+
+      const el = document.createElement('div');
+      el.className = 'epg-prog' + (isCurrent ? ' now' : '');
+      el.style.left  = x1 + 'px';
+      el.style.width = w  + 'px';
+      el.title = `${prog.title||'—'}\n${startLbl} – ${endLbl}${prog.desc ? '\n'+prog.desc : ''}`;
+      el.onclick = (e) => { e.stopPropagation(); playItem(idx); };
+      el.innerHTML = w > 30
+        ? `<div class="epg-prog-title">${progTitle}</div>`
+          + (w > 70 ? `<div class="epg-prog-time">${startLbl}–${endLbl}</div>` : '')
+        : '';
+      tl.appendChild(el);
+    });
+  } catch(e){
+    clearTimeout(timeoutId);
+    clearTimeout(hintId);
+    clearTimeout(slowHintId);
+    const loadingEl = document.getElementById(`epg-loading-${idx}`);
+    if(loadingEl) loadingEl.remove();
+    const msg = e.name === 'AbortError' ? 'EPG timeout' : 'EPG error';
+    tl.insertAdjacentHTML('beforeend',
+      `<div style="position:absolute;inset:0;display:flex;align-items:center;padding-left:8px">
+        <span style="font-size:10px;color:var(--txt3);opacity:.5">${msg}</span>
+      </div>`);
+  }
+}
+
+// Show/hide EPG grid button based on mode and whether items are loaded
+function _updateEpgGridBtn(){
+  const btn = document.getElementById('epg-grid-btn');
+  if(!btn) return;
+  btn.style.display = (mode === 'live' && filtItems.length > 0) ? '' : 'none';
+  // If grid is open but mode changed away from live, close it
+  if(_epgGridActive && mode !== 'live') _closeEpgGrid();
+}
+
 // ── CATCH-UP TV ─────────────────────────────────────────────────────────────
 // Catchup: uses /api/catchup to fetch past programme listings (Xtream: get_epg/XMLTV;
 // MAC/Stalker: get_simple_data_table). Clicking a programme calls /api/catchup/play.
@@ -9486,6 +9959,8 @@ function _refreshDlButtons(){
     imBtn.style.color = '';
   }
 }
+// Stub overwritten by orientation manager on mobile
+window._orientOnTabSwitch = function(){};
 function showT(pid,tid){
   if(window.innerWidth>=900) return;
   _switchTab(pid,tid);
@@ -9502,6 +9977,7 @@ function _switchTab(pid,tid){
   document.querySelectorAll('.nt').forEach(b=>b.classList.remove('on'));
   const tab=document.getElementById(tid);
   if(tab) tab.classList.add('on');
+  _orientOnTabSwitch(pid);
 }
 function toast(msg,type){
   const el=document.createElement('div');
@@ -9556,6 +10032,87 @@ async function browseExtPlayer(){
 const _isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
   || ('ontouchstart' in window)
   || (navigator.maxTouchPoints > 1);
+
+/* ─── Orientation manager (mobile only) ──────────────────────────────────────
+   • On player tab  : unlock orientation; auto-fullscreen on landscape rotation.
+   • On other tabs  : lock to portrait so rotation is disabled.
+   • Exiting fullscreen (back button / swipe down) while landscape → lock portrait
+     so the device doesn't immediately re-trigger fullscreen.
+────────────────────────────────────────────────────────────────────────────── */
+(function(){
+  if(!_isMobile) return;                          // desktop — do nothing
+  const SO = window.screen && screen.orientation; // ScreenOrientation API
+  if(!SO) return;                                 // very old WebView — bail
+
+  let _onPlayerTab = false;
+
+  function _isLandscape(){
+    const t = SO.type || '';
+    if(t) return t.startsWith('landscape');
+    // fallback: compare dimensions
+    return window.innerWidth > window.innerHeight;
+  }
+
+  function _lockPortrait(){
+    try{ SO.lock('portrait').catch(()=>{}); }catch(e){}
+  }
+
+  function _unlock(){
+    try{ SO.unlock(); }catch(e){}
+  }
+
+  function _enterFullscreen(){
+    const el = document.getElementById('vid') || document.querySelector('video');
+    if(!el) return;
+    const req = el.requestFullscreen || el.webkitRequestFullscreen
+              || el.mozRequestFullScreen || el.msRequestFullscreen;
+    if(req) req.call(el).catch(()=>{});
+  }
+
+  function _exitFullscreen(){
+    const exit = document.exitFullscreen || document.webkitExitFullscreen
+               || document.mozCancelFullScreen || document.msExitFullscreen;
+    const inFS  = document.fullscreenElement || document.webkitFullscreenElement;
+    if(exit && inFS) exit.call(document).catch(()=>{});
+  }
+
+  // Called by _switchTab on every tab change
+  window._orientOnTabSwitch = function(pid){
+    _onPlayerTab = (pid === 'p-player');
+    if(_onPlayerTab){
+      _unlock();
+      // If already landscape when arriving on player tab → go fullscreen
+      if(_isLandscape()) _enterFullscreen();
+    } else {
+      _exitFullscreen();
+      _lockPortrait();
+    }
+  };
+
+  // Fires whenever the physical device rotates
+  SO.addEventListener('change', function(){
+    if(!_onPlayerTab){ _lockPortrait(); return; }
+    if(_isLandscape()){
+      _enterFullscreen();
+    } else {
+      _exitFullscreen();
+    }
+  });
+
+  // User manually exits fullscreen (back button / swipe-down) while landscape
+  // → lock portrait so it doesn't immediately bounce back into fullscreen
+  document.addEventListener('fullscreenchange', function(){
+    const inFS = document.fullscreenElement || document.webkitFullscreenElement;
+    if(!inFS && _onPlayerTab && _isLandscape()){
+      _lockPortrait();
+      // Give the OS a moment to settle orientation before we unlock again
+      setTimeout(()=>{ if(_onPlayerTab) _unlock(); }, 1200);
+    }
+  });
+
+  // Lock portrait on startup until the player tab is explicitly opened
+  _lockPortrait();
+})();
 
 async function openExternal(i){
   const it=filtItems[i]; if(!it) return;
@@ -9859,7 +10416,7 @@ function wonRender(list){
         <div class="won-item-times">${start} – ${end}</div>
         <div class="won-find-result" id="won-res-${i}"></div>
         <div id="won-ext-${i}" style="display:none;margin-top:3px">
-          <span style="font-size:10px;padding:3px 7px;border-radius:4px;background:rgba(139,92,246,.18);color:#a78bfa;cursor:pointer"
+          <span class="won-ext-btn"
             onclick="wonOpenExternal(${i})">🎬 external player</span>
         </div>
       </div>
