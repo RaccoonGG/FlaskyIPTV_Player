@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-MAC/Xtream/M3U Portal Builder — Flask/Android WebView Edition
-Original CustomTkinter GUI by GG_Raccoon.
+MAC/Xtream/M3U Portal Builder — Flask/Android WebView Edition by GG_Raccoon.
+Build on base of Mac2M3UMKV_LiveVodsSeriesGUIPlayer_byGGv5.pyw CustomTkinter by GG_Raccoon.
 Adapted to Flask + HTML5/HLS.js by conversion script.
-Run: python app.py  then open http://localhost:5000 in your WebView/browser.
+
 Tested on Windows 10 with python 3.14 and Termux on Android 16.
+First run install_requirements_FlaskAppPlayerDownloader.py to make sure you have everything you need to run this script.
+Run: python app.py  then open http://localhost:5000 in your WebView/browser.
+
+Updates:
+Added support for /stalker_portal/ type of MAC portals.
+Added support for EPG.
+Added support for CatchUp (where avialaible and supported by portal).
 """
 
 import base64
@@ -482,6 +489,77 @@ class PortalClient:
             return ""
         except Exception as e:
             self.log(f"[create_link] unexpected error: {e}")
+            return ""
+
+    async def create_catchup_link(self, cmd: str, start_str: str, duration_min: int,
+                                  archive_cmd: str = "") -> str:
+        """Resolve a catchup/timeshift link for a past programme via MAC portal.
+
+        If archive_cmd is supplied (e.g. 'auto /media/537163805.mpg' from
+        get_simple_data_table), the request is sent as type=tv_archive — exactly
+        what SFVip/TiviMate send and what Stalker portals actually honour.
+        Without archive_cmd we fall back to type=itv + start/duration.
+
+        start_str: 'YYYY-MM-DD:HH-MM' (local time)
+        duration_min: programme duration in minutes
+        """
+        assert self.session is not None
+        from urllib.parse import quote as _q
+
+        effective_cmd = archive_cmd.strip() if archive_cmd.strip() else cmd
+
+        if archive_cmd.strip():
+            # SFVip-style: type=tv_archive with the per-entry archive cmd.
+            # Use %20 (not +) for spaces — do NOT pre-quote then urlencode (double-encode).
+            params_str = (
+                f"type=tv_archive&action=create_link"
+                f"&cmd={_q(effective_cmd, safe='')}"
+                f"&series=&forced_storage=0&disable_ad=0&download=0"
+                f"&force_ch_link_check=0&JsHttpRequest=1-xml"
+            )
+        else:
+            # providers.py resolve_catchup exact params: type=itv, series=1, start, duration
+            params_str = (
+                f"type=itv&action=create_link"
+                f"&cmd={_q(effective_cmd, safe='')}"
+                f"&JsHttpRequest=1-xml"
+                f"&download=0&save=0&series=1&forced_storage=0"
+                f"&start={_q(start_str, safe='-:')}&duration={duration_min}"
+            )
+        url = f"{self.base}/portal.php?{params_str}"
+        self.log(f"[MAC] create_catchup_link start={start_str} dur={duration_min}m")
+        try:
+            async with self.session.get(url, headers=self.headers,
+                                        timeout=aiohttp.ClientTimeout(total=15)) as r:
+                self.log(f"[MAC] catchup_link HTTP {r.status}")
+                payload = await safe_json(r)
+            if not isinstance(payload, dict):
+                return ""
+            js = payload.get("js", {})
+            if isinstance(js, list) and js:
+                js = js[0]
+            if not isinstance(js, dict):
+                return ""
+            cmd_value = js.get("cmd") or js.get("url") or ""
+            if not cmd_value:
+                return ""
+            cmd_value = cmd_value.strip().replace("\\/", "/")
+            for prefix in ("ffmpeg ", "auto "):
+                if cmd_value.lower().startswith(prefix):
+                    cmd_value = cmd_value[len(prefix):].strip()
+            # Fix hostless URLs: http://:/... or http:///...
+            if re.match(r'https?://[:/]', cmd_value):
+                path_part = re.sub(r'^https?://[^/]*', '', cmd_value)
+                cmd_value = self.base.rstrip('/') + path_part
+                self.log(f"[MAC] Fixed hostless URL → {cmd_value[:80]}")
+            if cmd_value.startswith(("http://", "https://", "rtsp://")):
+                if "localhost" in cmd_value:
+                    return await self.resolve_localhost_url(cmd_value)
+                return cmd_value
+            extracted = self._extract_url_from_text(cmd_value)
+            return extracted or ""
+        except Exception as e:
+            self.log(f"[MAC] create_catchup_link error: {e}")
             return ""
 
     def _join_path_and_file(self, path, file):
@@ -1430,6 +1508,95 @@ class StalkerPortalClient:
         if extracted:
             return extracted
         return stub
+
+    async def create_catchup_link(self, cmd: str, start_str: str, duration_min: int,
+                                  archive_cmd: str = "") -> str:
+        """Resolve a catchup/timeshift link for a past programme.
+
+        If archive_cmd is supplied (e.g. 'auto /media/537163805.mpg' from
+        get_simple_data_table), the request is sent as type=tv_archive — exactly
+        what SFVip/TiviMate send and what Stalker portals actually honour.
+        Without archive_cmd we fall back to type=itv + start/duration (providers.py
+        style) which works on some portals but not all.
+
+        start_str: 'YYYY-MM-DD:HH-MM' (local time)
+        duration_min: programme duration in minutes
+        """
+        assert self.session is not None
+        from urllib.parse import quote as _q
+
+        effective_cmd = archive_cmd.strip() if archive_cmd.strip() else cmd
+
+        if archive_cmd.strip():
+            # SFVip-style: type=tv_archive with the per-entry archive cmd.
+            # Use %20 (not +) for spaces — Stalker portals require it in cmd.
+            params_str = (
+                f"type=tv_archive&action=create_link"
+                f"&cmd={_q(effective_cmd, safe='')}"
+                f"&series=&forced_storage=0&disable_ad=0&download=0"
+                f"&force_ch_link_check=0&JsHttpRequest=1-xml"
+            )
+        else:
+            # providers.py resolve_catchup exact params: type=itv, series=1, start, duration
+            params_str = (
+                f"type=itv&action=create_link"
+                f"&cmd={_q(effective_cmd, safe='')}"
+                f"&JsHttpRequest=1-xml"
+                f"&download=0&save=0&series=1&forced_storage=0"
+                f"&start={_q(start_str, safe='-:')}&duration={duration_min}"
+            )
+        url = f"{self.base}{self.LOAD_PHP}?{params_str}"
+        headers = self._headers(include_auth=True)
+        self.log(f"[STALKER] create_catchup_link cmd={cmd[:40]} start={start_str} dur={duration_min}m")
+        async with self.session.get(url, headers=headers) as r:
+            self.log(f"[STALKER] catchup_link HTTP {r.status}")
+            payload = await safe_json(r)
+        if not isinstance(payload, dict):
+            return ""
+        js = payload.get("js", {})
+        if isinstance(js, list) and js:
+            js = js[0]
+        if not isinstance(js, dict):
+            return ""
+        cmd_value = js.get("cmd") or js.get("url") or ""
+        if not cmd_value:
+            return ""
+        cmd_value = cmd_value.strip()
+        if cmd_value.lower().startswith("ffmpeg "):
+            cmd_value = cmd_value.split(" ", 1)[1].strip()
+        if cmd_value.lower().startswith("auto "):
+            cmd_value = cmd_value.split(" ", 1)[1].strip()
+        cmd_value = cmd_value.replace("\\/", "/")
+        # Fix hostless URLs the portal sometimes returns:
+        #   http://:/stalker_portal/...  or  http:///stalker_portal/...
+        # Prepend the base host so the URL is valid.
+        if re.match(r'https?://[:/]', cmd_value):
+            path_part = re.sub(r'^https?://[^/]*', '', cmd_value)
+            cmd_value = self.base.rstrip('/') + path_part
+            self.log(f"[STALKER] Fixed hostless URL → {cmd_value[:80]}")
+
+        # Detect a null/failed tv_archive storage response.
+        # When the portal can't find a recording it returns a storage URL like:
+        #   .../storage/get.php?filename=19691231-19.mpg&start=0&duration=0&real_id=
+        # (filename date is Unix epoch 0).  Treat this as a failure so the caller
+        # can fall back to type=itv + start/duration.
+        if ('storage/get.php' in cmd_value and
+                ('filename=1969' in cmd_value or
+                 'start=0&duration=0' in cmd_value or
+                 'real_id=' in cmd_value.split('real_id=')[-1][:1] + ' ')):
+            # Check specifically for epoch date or empty real_id
+            _is_null = (
+                'filename=1969' in cmd_value or
+                ('real_id=' in cmd_value and cmd_value.split('real_id=')[1].split('&')[0] == '')
+            )
+            if _is_null:
+                self.log(f"[STALKER] tv_archive returned null storage response — will fallback")
+                return ""
+
+        if cmd_value.startswith(("http://", "https://", "rtsp://")):
+            return cmd_value
+        extracted = _extract_url_from_text(cmd_value)
+        return extracted or ""
 
     async def create_stream_link(self, cmd: str, ptype: str = "itv") -> str:
         assert self.session is not None
@@ -3041,6 +3208,259 @@ def api_epg():
         return jsonify({"current": None, "next": None, "error": str(e)})
 
 
+@flask_app.route("/api/catchup", methods=["POST"])
+def api_catchup():
+    """Fetch past archived programmes for a live channel.
+    Uses get_simple_data_table (same as catchuptestv9 / SFVIP) which returns
+    mark_archive flag and direct cmd per entry — the correct EPG source for
+    Stalker portals.  Falls back to Xtream timeshift URL for Xtream portals.
+    """
+    import math as _math
+    from datetime import datetime as _dt, timezone as _tz
+    data      = request.get_json(force=True)
+    item      = data.get("item", {})
+    start_ts  = int(data.get("start", 0))
+    end_ts    = int(data.get("end",   0))
+    if not start_ts:
+        start_ts = int(_dt.now(_tz.utc).timestamp()) - 86400 * 3
+    if not end_ts:
+        end_ts = int(_dt.now(_tz.utc).timestamp())
+    duration_min = max(1, _math.ceil((end_ts - start_ts) / 60))
+
+    conn = state.conn_type
+
+    async def _resolve():
+        # ── Xtream timeshift ──────────────────────────────────────────────────
+        if conn == "xtream" or (conn == "m3u_url" and state.m3u_xtream_override):
+            creds = state.m3u_xtream_override if conn == "m3u_url" else None
+            base  = (creds["base"] if creds else state.url).rstrip("/")
+            user  = creds["username"] if creds else state.username
+            pwd   = creds["password"] if creds else state.password
+            sid   = str(item.get("stream_id") or item.get("id") or "").strip()
+            if not sid:
+                return {"error": "No stream_id for Xtream catch-up"}
+            from urllib.parse import urlparse as _up
+            p = _up(base)
+            start_dt  = _dt.fromtimestamp(start_ts, tz=_tz.utc)
+            start_fmt = start_dt.strftime("%Y-%m-%d:%H-%M")
+            cu_url = (f"{p.scheme}://{p.netloc}/timeshift/{user}/{pwd}"
+                      f"/{duration_min}/{start_fmt}/{sid}.m3u8")
+            state.log(f"[CatchUp] Xtream timeshift: {cu_url}")
+            return {"url": cu_url, "label": f"{item.get('name','')} [Catch-Up]"}
+
+        # ── Stalker / MAC portal — get_simple_data_table ──────────────────────
+        # This is the correct API (same as SFVIP/TiviMate). Returns mark_archive
+        # flag per entry plus direct archive cmd. get_epg_info only returns today's
+        # upcoming schedule and does NOT have mark_archive.
+        if conn == "mac":
+            import re as _re
+            cmd_field  = str(item.get("cmd") or "").strip()
+            item_ch_id = str(item.get("ch_id") or item.get("id") or "").strip()
+            m          = _re.search(r'/ch/(\d+)', cmd_field)
+            cmd_ch_id  = m.group(1) if m else None
+            ch_id      = item_ch_id or cmd_ch_id
+            state.log(f"[CatchUp] ch_id={ch_id}")
+            if not ch_id:
+                return {"error": "No channel ID for catch-up"}
+
+            php        = "/stalker_portal/server/load.php" if state.is_stalker_portal else "/portal.php"
+            base_url   = normalize_base_url(state.url)
+            client_cls = StalkerPortalClient if state.is_stalker_portal else PortalClient
+
+            def _to_ts(v):
+                if not v: return 0
+                try: return int(v)
+                except: pass
+                try: return int(_dt.strptime(str(v), "%Y-%m-%d %H:%M:%S").replace(tzinfo=_tz.utc).timestamp())
+                except: return 0
+
+            results = []
+            async with client_cls(state.url, state.mac, state.log) as client:
+                await client.handshake()
+                hdrs = client._headers(include_auth=True) if state.is_stalker_portal else client.headers
+
+                for day_offset in range(4):
+                    day_ts   = int(_dt.now(_tz.utc).timestamp()) - day_offset * 86400
+                    date_str = _dt.fromtimestamp(day_ts, tz=_tz.utc).strftime("%Y-%m-%d")
+                    page = 1
+                    while True:
+                        epg_url = (f"{base_url}{php}?type=epg&action=get_simple_data_table"
+                                   f"&ch_id={ch_id}&date={date_str}&p={page}&JsHttpRequest=1-xml")
+                        state.log(f"[CatchUp] get_simple_data_table ch={ch_id} date={date_str} p={page}")
+                        try:
+                            async with client.session.get(epg_url, headers=hdrs,
+                                                          timeout=aiohttp.ClientTimeout(total=10)) as r:
+                                payload = await safe_json(r)
+                        except Exception as e:
+                            state.log(f"[CatchUp] fetch error: {e}")
+                            break
+                        js   = payload.get("js", {}) if isinstance(payload, dict) else {}
+                        rows = (js.get("data") or []) if isinstance(js, dict) else (js if isinstance(js, list) else [])
+                        if not rows:
+                            break
+                        state.log(f"[CatchUp] date={date_str} p={page} → {len(rows)} entries")
+                        first_logged = False
+                        for ep in rows:
+                            if not isinstance(ep, dict):
+                                continue
+                            if not first_logged:
+                                state.log(f"[CatchUp] fields: {list(ep.keys())}")
+                                first_logged = True
+                            mark_archive = str(ep.get("mark_archive", 0))
+                            archive_cmd  = str(ep.get("cmd") or "").strip()
+                            raw_real_id  = str(ep.get("real_id") or "").strip()
+                            # The EPG entry 'id' is the sequential archive recording ID
+                            # (e.g. '537163805') — this is what SFVip uses to build
+                            # cmd='auto /media/{id}.mpg' for type=tv_archive.
+                            # 'real_id' is a portal-internal field and is NOT used.
+                            epg_id = str(ep.get("id") or "").strip()
+                            valid_epg_id = (
+                                epg_id
+                                if (re.match(r'^\d+$', epg_id) and epg_id not in ('0', ''))
+                                else ""
+                            )
+                            st = _to_ts(ep.get("start_timestamp") or ep.get("time"))
+                            sp = _to_ts(ep.get("stop_timestamp")  or ep.get("time_to"))
+                            if not st:
+                                continue
+                            state.log(
+                                f"[CatchUp] '{ep.get('name','?')}' mark_archive={mark_archive}"
+                                f" id={epg_id!r} real_id={raw_real_id!r}"
+                            )
+                            results.append({
+                                "title":        ep.get("name") or ep.get("o_name") or "Unknown",
+                                "start":        st,
+                                "stop":         sp,
+                                "cmd":          archive_cmd,
+                                "live_cmd":     cmd_field,
+                                "mark_archive": mark_archive,
+                                "ch_id":        ep.get("ch_id") or "",
+                                # epg_id is the sequential archive file ID used by SFVip:
+                                # cmd = 'auto /media/{epg_id}.mpg' → type=tv_archive
+                                "epg_id":       valid_epg_id,
+                                "id":           valid_epg_id,
+                            })
+                        total = js.get("total_items", 0) if isinstance(js, dict) else 0
+                        if not total or page * 14 >= int(total):
+                            break
+                        page += 1
+
+            if not results:
+                return {"error": "No EPG data found for this channel"}
+            results.sort(key=lambda x: x["start"], reverse=True)
+            return {"archive_listings": results, "label": item.get("name", "")}
+
+        return {"error": "Catch-up not supported for this connection type"}
+
+    try:
+        return jsonify(run_async(_resolve()))
+    except Exception as e:
+        state.log(f"[CatchUp] Error: {e}")
+        return jsonify({"error": str(e)})
+
+
+@flask_app.route("/api/catchup/play", methods=["POST"])
+def api_catchup_play():
+    """Resolve a Stalker/MAC archive entry to a playable URL.
+    Uses create_catchup_link (same params as providers.py resolve_catchup):
+      type=itv, action=create_link, cmd=<live_cmd>, start=<local YYYY-MM-DD:HH-MM>,
+      duration=<minutes>, series=1, forced_storage=0
+    series=1 is REQUIRED — without it the portal returns the live stream.
+    cmd must be the original live-channel stub (ffmpeg http:///ch/NNNN_), NOT
+    an archive-specific cmd from EPG entries.
+    """
+    import re as _re
+    from datetime import datetime as _dt, timezone as _tz
+    data     = request.get_json(force=True)
+    cmd_in   = str(data.get("cmd")      or "").strip()
+    live_cmd = str(data.get("live_cmd") or "").strip()
+    epg_id   = str(data.get("epg_id")   or data.get("real_id") or "").strip()
+    start_ts = int(data.get("start") or 0)
+    stop_ts  = int(data.get("stop")  or 0)
+
+    # Two-stage approach matching SFVip + providers.py:
+    #
+    # Stage 1 (SFVip sniff): type=tv_archive, cmd='auto /media/{epg_id}.mpg'
+    #   — epg_id is the EPG entry's 'id' field (sequential archive recording ID).
+    #   — series='' (empty), no start/duration params.
+    #   — Returns a direct storage URL if the recording exists.
+    #
+    # Stage 2 (providers.py resolve_catchup): type=itv, cmd=<live_cmd>,
+    #   series=1, start=YYYY-MM-DD:HH-MM, duration=<minutes>
+    #   — Used when tv_archive fails (no recording / Flussonic-only portal).
+    #   — Flussonic portals return a live token URL → rewrite to archive-{ts}-{dur}.m3u8.
+    archive_cmd   = f"auto /media/{epg_id}.mpg" if epg_id else ""
+    effective_cmd = live_cmd or cmd_in
+    if not effective_cmd or not start_ts:
+        return jsonify({"error": "Missing cmd or start timestamp"})
+    if not stop_ts or stop_ts <= start_ts:
+        stop_ts = start_ts + 3600
+
+    async def _play():
+        start_dt_utc = _dt.fromtimestamp(start_ts, tz=_tz.utc)
+        start_local  = start_dt_utc.astimezone()   # local tz, same as utc_to_local()
+        start_str    = start_local.strftime("%Y-%m-%d:%H-%M")
+        duration_min = max(1, (stop_ts - start_ts) // 60)
+
+        state.log(f"[CatchUp/Play] cmd={effective_cmd[:50]} archive_cmd={archive_cmd[:50] if archive_cmd else '(none)'} start={start_str} dur={duration_min}m")
+
+        client_cls = StalkerPortalClient if state.is_stalker_portal else PortalClient
+        async with client_cls(state.url, state.mac, state.log) as client:
+            await client.handshake()
+            url = await client.create_catchup_link(effective_cmd, start_str, duration_min,
+                                                   archive_cmd=archive_cmd)
+            # If tv_archive returned nothing (null storage response), fall back to
+            # type=itv + start/duration which works on Flussonic-backed portals.
+            if not url and archive_cmd:
+                state.log(f"[CatchUp/Play] tv_archive failed — retrying with type=itv fallback")
+                url = await client.create_catchup_link(effective_cmd, start_str, duration_min,
+                                                       archive_cmd="")
+
+        if not url:
+            return {"error": "Portal returned no catch-up URL"}
+
+        # Flussonic CDN: portal returns live token URL even for archive requests.
+        # Detect /stream/mpegts?token=XYZ and rewrite to /stream/archive-{ts}-{dur}.m3u8?token=XYZ
+        from urllib.parse import urlparse as _up, parse_qs as _pqs
+        _pu   = _up(url)
+        _qs   = _pqs(_pu.query)
+        _tok  = (_qs.get("token") or [None])[0]
+        _path = _pu.path
+        # Strip any live-manifest filename to get the stream base path.
+        # Flussonic serves live via: mpegts, index.m3u8, mono.m3u8, playlist.m3u8, chunklist*, manifest*
+        _live_manifest_re = r'/(mpegts|index\.m3u8|mono\.m3u8|playlist\.m3u8|chunklist[^/]*|manifest[^/]*)$'
+        _stream_base = _re.sub(_live_manifest_re, '', _path, flags=_re.IGNORECASE)
+        # A URL is a Flussonic live token URL if:
+        #   - it has a token query param
+        #   - its path ends with a known live-manifest name (NOT already an archive URL)
+        _is_flussonic = (
+            _tok and
+            _re.search(_live_manifest_re, _path, _re.IGNORECASE) and
+            not _re.search(r'archive|timeshift', _path, _re.IGNORECASE)
+        )
+        if _is_flussonic and _stream_base:
+            dur_secs    = stop_ts - start_ts
+            # Preserve any extra query params beyond 'token' (some CDNs need them)
+            _extra_qs = '&'.join(
+                f"{k}={v[0]}" for k, v in _pqs(_pu.query).items() if k != 'token'
+            )
+            archive_url = (f"{_pu.scheme}://{_pu.netloc}"
+                           f"{_stream_base}/archive-{start_ts}-{dur_secs}.m3u8"
+                           f"?token={_tok}"
+                           + (f"&{_extra_qs}" if _extra_qs else ""))
+            state.log(f"[CatchUp/Play] Flussonic → {archive_url}")
+            return {"url": archive_url}
+
+        state.log(f"[CatchUp/Play] Resolved → {url}")
+        return {"url": url}
+
+    try:
+        return jsonify(run_async(_play()))
+    except Exception as e:
+        state.log(f"[CatchUp/Play] Error: {e}")
+        return jsonify({"error": str(e)})
+
+
 def _parse_xtream_epg(listings: list) -> dict:
     """Parse Xtream get_short_epg response into current/next/schedule."""
     import base64 as _b64
@@ -3081,6 +3501,96 @@ def _parse_xtream_epg(listings: list) -> dict:
         elif ep["start"] > now and out["next"] is None:
             out["next"] = ep
     return out
+
+
+def _parse_stalker_epg_all_channels(payload: dict, target_ch_id: str) -> list:
+    """Deep-search a get_epg_info response for programmes matching target_ch_id.
+    Many portals return EPG for a group of channels (ignoring the ch_id query param),
+    so we search every channel bucket for entries whose ch_id field matches ours,
+    or collect all entries if the matching bucket is found by dict key.
+    Returns a flat list of {title, start, end, desc} dicts.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    def _to_ts(val):
+        if not val:
+            return 0
+        if isinstance(val, (int, float)):
+            return float(val)
+        s = str(val).strip()
+        try:
+            return float(s)
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d.%m.%Y %H:%M"):
+            try:
+                return _dt.strptime(s[:19], fmt).replace(tzinfo=_tz.utc).timestamp()
+            except ValueError:
+                continue
+        return 0
+
+    if not isinstance(payload, dict):
+        return []
+
+    js = payload.get("js", {})
+    if isinstance(js, list) and js:
+        js = js[0]
+
+    # Unwrap data layer
+    if isinstance(js, dict):
+        inner = js.get("data") or js
+    else:
+        return []
+
+    results = []
+
+    if isinstance(inner, dict):
+        # Check if our ch_id is a direct key (exact match)
+        bucket = inner.get(str(target_ch_id)) or inner.get(target_ch_id)
+        if bucket and isinstance(bucket, list):
+            # Found our channel's bucket directly — use it
+            for ep in bucket:
+                if not isinstance(ep, dict):
+                    continue
+                start = _to_ts(ep.get("time") or ep.get("start_timestamp") or ep.get("start"))
+                end   = _to_ts(ep.get("time_to") or ep.get("stop_timestamp") or ep.get("stop") or ep.get("end"))
+                title = str(ep.get("name") or ep.get("title") or "").strip()
+                desc  = str(ep.get("descr") or ep.get("description") or ep.get("desc") or "").strip()
+                if title and start:
+                    results.append({"title": title, "start": start, "end": end, "desc": desc})
+        else:
+            # ch_id not a dict key — deep-search all buckets for matching ch_id field
+            for _key, bucket_items in inner.items():
+                if not isinstance(bucket_items, list):
+                    continue
+                for ep in bucket_items:
+                    if not isinstance(ep, dict):
+                        continue
+                    ep_ch = str(ep.get("ch_id", "")).strip()
+                    if ep_ch and ep_ch != str(target_ch_id):
+                        continue  # skip entries for other channels
+                    start = _to_ts(ep.get("time") or ep.get("start_timestamp") or ep.get("start"))
+                    end   = _to_ts(ep.get("time_to") or ep.get("stop_timestamp") or ep.get("stop") or ep.get("end"))
+                    title = str(ep.get("name") or ep.get("title") or "").strip()
+                    desc  = str(ep.get("descr") or ep.get("description") or ep.get("desc") or "").strip()
+                    if title and start:
+                        results.append({"title": title, "start": start, "end": end, "desc": desc})
+
+    elif isinstance(inner, list):
+        for ep in inner:
+            if not isinstance(ep, dict):
+                continue
+            ep_ch = str(ep.get("ch_id", "")).strip()
+            if ep_ch and ep_ch != str(target_ch_id):
+                continue
+            start = _to_ts(ep.get("time") or ep.get("start_timestamp") or ep.get("start"))
+            end   = _to_ts(ep.get("time_to") or ep.get("stop_timestamp") or ep.get("stop") or ep.get("end"))
+            title = str(ep.get("name") or ep.get("title") or "").strip()
+            desc  = str(ep.get("descr") or ep.get("description") or ep.get("desc") or "").strip()
+            if title and start:
+                results.append({"title": title, "start": start, "end": end, "desc": desc})
+
+    return results
 
 
 def _parse_stalker_epg(payload: dict, ch_id: str) -> dict:
@@ -3684,6 +4194,20 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .fab-badge.vis{display:block}
 @media(min-width:900px){.fab{display:none}}
 
+/* Desktop Actions button — shown in panel header on desktop, hidden on mobile */
+.ph-act-btn{display:none;align-items:center;gap:5px;padding:5px 12px;
+  font-size:12px;font-weight:700;border-radius:20px;position:relative;
+  background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
+  border:none;cursor:pointer;flex-shrink:0;
+  box-shadow:0 2px 10px var(--glow2);transition:var(--tr)}
+.ph-act-btn:hover{filter:brightness(1.12);transform:scale(1.03)}
+.ph-act-btn:active{transform:scale(.96)}
+.ph-act-badge{background:var(--green);color:#fff;font-size:9px;font-weight:800;
+  border-radius:10px;padding:1px 5px;min-width:16px;text-align:center;display:none;
+  margin-left:3px;border:1.5px solid var(--bg)}
+.ph-act-badge.vis{display:inline-block}
+@media(min-width:900px){.ph-act-btn{display:flex}}
+
 /* ─── toasts ──────────────────────────────────────────────────── */
 #toasts{position:fixed;bottom:72px;left:50%;transform:translateX(-50%);
   z-index:9999;display:flex;flex-direction:column;gap:5px;pointer-events:none;width:min(90vw,300px)}
@@ -3799,6 +4323,9 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
         <button class="mt" data-m="vod" onclick="setMode('vod')">🎬 VOD</button>
         <button class="mt" data-m="series" onclick="setMode('series')">📂 Series</button>
       </div>
+      <button class="ph-act-btn" onclick="openDrawer('cats')" title="Download / Actions">
+        ⚡ Actions<span class="ph-act-badge" id="ph-cat-badge"></span>
+      </button>
     </div>
     <div style="padding:8px 10px 0;flex-shrink:0;display:flex;flex-direction:column;gap:6px">
       <div class="sbar"><span class="sico">🔍</span>
@@ -3822,6 +4349,9 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
     <div class="ph">
       <h3 id="ittitle">Browse</h3>
       <button class="btn-ghost btn-sm" id="backbtn" onclick="goBack()" disabled>◀ Back</button>
+      <button class="ph-act-btn" onclick="openDrawer('items')" title="Download / Actions">
+        ⚡ Actions<span class="ph-act-badge" id="ph-item-badge"></span>
+      </button>
     </div>
     <div style="padding:10px 10px 0;display:flex;flex-direction:column;gap:6px;flex-shrink:0">
       <div class="bcrum" id="bcrum"><span class="bc-s">Categories</span></div>
@@ -3858,6 +4388,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
         <button class="btn-ghost pnav" onclick="playerStop()" title="Stop">⏹</button>
         <button class="btn-ghost pnav" onclick="playerNext()" title="Next">⏭</button>
         <button class="btn-ghost pnav" id="epgbtn" onclick="showEPG()" title="EPG" style="font-size:14px;opacity:0.35">📅</button>
+        <button class="btn-ghost pnav" id="catchupbtn" onclick="showCatchup()" title="Catch-up TV" style="font-size:16px;opacity:0.35">↺</button>
       </div>
       <div style="min-height:16px;padding:0 4px">
         <span id="epg-now" style="font-size:11px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block"></span>
@@ -3901,6 +4432,27 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
           style="height:28px;width:28px;padding:0;font-size:14px;border-radius:var(--rss)">✕</button>
       </div>
       <div id="epg-body">
+        <div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Loading…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- CATCHUP OVERLAY -->
+  <div id="catchup-overlay" style="display:none;position:fixed;inset:0;z-index:900;
+    background:rgba(0,0,0,.7);align-items:flex-end;justify-content:center">
+    <div style="background:var(--s2);border-radius:var(--rs) var(--rs) 0 0;
+      width:100%;max-width:600px;padding:16px;box-shadow:var(--sh);
+      border-top:1px solid var(--bdr2);max-height:70vh;overflow-y:auto">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+        <div>
+          <span style="font-size:13px;font-weight:700;color:var(--txt1)" id="catchup-ch-name">↺ Catch-up TV</span>
+          <div style="font-size:11px;color:var(--txt3);margin-top:2px">Select a past programme to watch</div>
+        </div>
+        <button class="btn-ghost" onclick="closeCatchup()"
+          style="height:28px;width:28px;padding:0;font-size:14px;border-radius:var(--rss)">✕</button>
+      </div>
+      <div id="catchup-status" style="font-size:11px;color:var(--txt3);min-height:14px;margin-bottom:4px"></div>
+      <div id="catchup-body" style="margin-top:4px">
         <div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Loading…</div>
       </div>
     </div>
@@ -4221,9 +4773,11 @@ function refreshCatBtns(){
   if(mkvSub) mkvSub.textContent=sub;
   const cnt=document.getElementById('adr-cat-count');
   if(cnt) cnt.textContent=n+' selected';
-  // FAB badge
+  // FAB badge (mobile) + desktop header badge
   const b=document.getElementById('fab-cat-badge');
   if(b){b.textContent=n>99?'99+':n; b.classList.toggle('vis',n>0);}
+  const pb=document.getElementById('ph-cat-badge');
+  if(pb){pb.textContent=n>99?'99+':n; pb.classList.toggle('vis',n>0);}
 }
 async function dlSelCats(type){
   const cats=[...selCats.values()];
@@ -4354,9 +4908,11 @@ function refreshBtns(){
   // Show current category name on whole-cat button
   const catSub=document.getElementById('adr-cat-all-sub');
   if(catSub) catSub.textContent=curCat?curCat.title:'';
-  // FAB badge
+  // FAB badge (mobile) + desktop header badge
   const b=document.getElementById('fab-item-badge');
   if(b){b.textContent=n>99?'99+':n; b.classList.toggle('vis',n>0);}
+  const pb=document.getElementById('ph-item-badge');
+  if(pb){pb.textContent=n>99?'99+':n; pb.classList.toggle('vis',n>0);}
 }
 
 // ── SERIES DRILL ───────────────────────────────────────────
@@ -4403,6 +4959,7 @@ async function playItem(i){
   _epgItem = (mode==='live') ? it : null;
   document.getElementById('epg-now').textContent='';
   document.getElementById('epgbtn').style.opacity=(mode==='live')?'1':'0.35';
+  document.getElementById('catchupbtn').style.opacity=(mode==='live')?'1':'0.35';
   const name=it.name||it.o_name||it.fname||'Unknown';
   const direct=it._direct_url||it._url;
   if(direct){doPlay(direct,name);return;}
@@ -4424,7 +4981,7 @@ function _destroyPlayers(){
   vid.pause(); vid.removeAttribute('src'); vid.load();
 }
 
-function doPlay(url, name){
+function doPlay(url, name, opts={}){
   pUrl=url; pName=name||url;
   setNP('▶ '+pName);
   document.getElementById('pu').textContent=url;
@@ -4438,22 +4995,33 @@ function doPlay(url, name){
   const u=url.toLowerCase().split('?')[0];
   const qs=url.toLowerCase();
 
+  // Stalker storage URLs (stalker_portal/storage/get.php) must NOT go through
+  // /api/proxy — the proxy double-encodes their query string (?filename=...&token=...).
+  // These are direct video files served by the portal; use them as-is.
+  const isStorageUrl = u.includes('storage/get.php') || u.includes('/storage/');
+
   const isHls  = u.endsWith('.m3u8') || u.endsWith('.m3u')
                || u.includes('/hls/')
                || qs.includes('extension=m3u8');
 
-  const isMpegTs = u.endsWith('.ts')
+  const isMpegTs = !isStorageUrl && (u.endsWith('.ts')
                || u.endsWith('.mpg')
                || u.endsWith('/mpegts')
                || u.includes('/mpegts?')
                || qs.includes('extension=ts')
-               || qs.includes('output=ts');
+               || qs.includes('output=ts'));
 
-  const playerType = isHls?'HLS':isMpegTs?'MPEG-TS':'direct';
+  const playerType = isStorageUrl?'storage':isHls?'HLS':isMpegTs?'MPEG-TS':'direct';
   const mpegtsOk = isMpegTs && typeof mpegts!=='undefined' && mpegts.isSupported();
   alog('▶ '+pName+' ['+playerType+(isMpegTs&&!mpegtsOk?' → MSE not supported, trying native':'')+']','k');
 
-  if(isHls && typeof Hls !== 'undefined' && Hls.isSupported()){
+  if(isStorageUrl){
+    // ── Stalker storage/get.php — direct to video, no proxy ──────
+    // Proxying would double-encode the query string (?filename=...&token=...).
+    alog('[Storage] Playing direct (no proxy)','k');
+    vid.src=url; vid.play().catch(()=>{});
+
+  } else if(isHls && typeof Hls !== 'undefined' && Hls.isSupported()){
     // ── HLS via HLS.js ────────────────────────────────────────
     hlsObj=new Hls({
       enableWorker:false, lowLatencyMode:false,
@@ -4485,29 +5053,41 @@ function doPlay(url, name){
     vid.src=url; vid.play().catch(()=>{});
 
   } else if(mpegtsOk){
-    // ── Raw MPEG-TS via mpegts.js (desktop Chrome / some Android) ──
+    // ── Raw MPEG-TS via mpegts.js ──────────────────────────────
+    // isLive=true for live channels, false for catchup/VOD (prevents SourceBuffer errors)
+    const isLiveStream = (opts.isLive !== false);
     mpegtsObj=mpegts.createPlayer({
       type:'mse',
-      isLive:true,
+      isLive: isLiveStream,
       url:px,
       cors:true,
     },{
       enableWorker:false,
-      liveBufferLatencyChasing:true,
-      liveBufferLatencyMaxLatency:8,
-      liveBufferLatencyMinRemain:2,
+      liveBufferLatencyChasing: isLiveStream,
+      liveBufferLatencyMaxLatency: isLiveStream ? 8 : undefined,
+      liveBufferLatencyMinRemain: isLiveStream ? 2 : undefined,
+      autoCleanupSourceBuffer: !isLiveStream,
     });
     mpegtsObj.attachMediaElement(vid);
     mpegtsObj.load();
+    // For catchup/VOD: seek to start once metadata is ready
+    if(!isLiveStream){
+      vid.addEventListener('loadedmetadata', function _seekStart(){
+        vid.removeEventListener('loadedmetadata', _seekStart);
+        if(vid.currentTime > 1) vid.currentTime = 0;
+        vid.play().catch(()=>{});
+      });
+    }
     mpegtsObj.on(mpegts.Events.ERROR,(et,ed)=>{
       const msg=(ed?.msg||JSON.stringify(ed));
       alog('[MPEGTS] '+et+': '+msg,'e');
-      // On fatal network error try reloading once
-      if(et===mpegts.ErrorTypes.NETWORK_ERROR){
+      // Only auto-retry for live streams — catchup tokens are time-sensitive,
+      // retrying after 2s may result in an expired token playing live content
+      if(isLiveStream && et===mpegts.ErrorTypes.NETWORK_ERROR){
         setTimeout(()=>{ if(mpegtsObj){ mpegtsObj.unload(); mpegtsObj.load(); vid.play().catch(()=>{}); }},2000);
       }
     });
-    vid.play().catch(()=>{});
+    if(isLiveStream) vid.play().catch(()=>{});
 
   } else if(isMpegTs){
     // ── MPEG-TS but MSE not supported — try direct native src first,
@@ -4624,6 +5204,150 @@ function closeEPG(){document.getElementById('epg-overlay').style.display='none';
 // Close on backdrop click
 document.getElementById('epg-overlay').addEventListener('click',function(e){if(e.target===this)closeEPG();});
 
+// ── CATCH-UP TV ─────────────────────────────────────────────────────────────
+// Mirrors catchuptestv9.py exactly: uses /api/catchup (get_simple_data_table)
+// which returns mark_archive flag + direct cmd per entry.
+
+function showCatchup(){
+  if(!_epgItem){toast('Play a live channel first','wrn');return;}
+  document.getElementById('catchup-ch-name').textContent='↺ '+(_epgItem.name||'Catch-up TV');
+  document.getElementById('catchup-status').textContent='';
+  document.getElementById('catchup-body').innerHTML=
+    '<div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Loading past programmes…</div>';
+  document.getElementById('catchup-overlay').style.display='flex';
+  _loadCatchupEPG();
+}
+
+function closeCatchup(){document.getElementById('catchup-overlay').style.display='none';}
+document.getElementById('catchup-overlay').addEventListener('click',function(e){if(e.target===this)closeCatchup();});
+
+function _cuFmtTime(ts){const d=new Date(ts*1000);return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
+function _cuFmtDate(ts){const d=new Date(ts*1000);return d.toLocaleDateString([],{weekday:'short',month:'short',day:'numeric'});}
+
+async function _loadCatchupEPG(){
+  document.getElementById('catchup-body').innerHTML=
+    '<div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Loading past programmes…</div>';
+  try{
+    const now=Math.floor(Date.now()/1000);
+    const r=await fetch('/api/catchup',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({item:_epgItem, start:now-86400*3, end:now})});
+    const d=await r.json();
+
+    if(d.archive_listings && d.archive_listings.length){
+      _renderArchiveListings(d.archive_listings);
+      return;
+    }
+    // No archive data — show manual time picker
+    const errMsg=d.error||'No archived programme data found';
+    document.getElementById('catchup-body').innerHTML=
+      `<div style="color:var(--txt3);font-size:12px;text-align:center;padding:16px">${errMsg}</div>`
+      +'<div style="padding:12px">'+_cuManualForm()+'</div>';
+  }catch(e){
+    document.getElementById('catchup-body').innerHTML=
+      `<div style="color:var(--err);font-size:12px;text-align:center;padding:20px">Failed: ${e.message}</div>`
+      +'<div style="padding:12px">'+_cuManualForm()+'</div>';
+  }
+}
+
+function _renderArchiveListings(listings){
+  // Show all programmes; highlight archived ones. Non-archived are dimmed.
+  let lastDate='';
+  const rows=listings.map(p=>{
+    const hasArchive=(p.mark_archive==='1'||p.mark_archive===1);
+    const dateStr=p.start?_cuFmtDate(p.start):'';
+    let dateHdr='';
+    if(dateStr&&dateStr!==lastDate){
+      lastDate=dateStr;
+      dateHdr=`<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--acc);padding:8px 0 4px">${dateStr}</div>`;
+    }
+    const t=p.start&&p.stop?`${_cuFmtTime(p.start)}–${_cuFmtTime(p.stop)}`:(p.start?_cuFmtTime(p.start):'');
+    const cmdSafe=encodeURIComponent(p.cmd||'');
+    const liveCmdSafe=encodeURIComponent(p.live_cmd||'');
+    const realIdSafe=encodeURIComponent(p.epg_id||p.id||'');
+    const titleSafe=(p.title||'').replace(/'/g,"\\'");
+    const opacity=hasArchive?'1':'0.4';
+    const click=hasArchive
+      ?`onclick="doPlayArchiveCmd('${cmdSafe}',${p.start||0},${p.stop||0},'${titleSafe}','${liveCmdSafe}','${realIdSafe}')"`
+      :'';
+    const cursor=hasArchive?'pointer':'default';
+    const archIcon=hasArchive?'<span style="font-size:14px;color:var(--acc)">▶</span>':'';
+    return dateHdr+`<div ${click}
+      style="display:flex;align-items:center;gap:10px;padding:10px 8px;border-radius:var(--rsm);cursor:${cursor};
+             border-left:3px solid var(--s4);margin-bottom:4px;background:var(--s3);
+             transition:background .15s;opacity:${opacity}"
+      ${hasArchive?'onmouseover="this.style.background=\'var(--s4)\'" onmouseout="this.style.background=\'var(--s3)\'"':''}>
+      <span style="font-size:11px;color:var(--txt3);white-space:nowrap;min-width:90px">${t}</span>
+      <span style="flex:1;font-size:12px;font-weight:600;color:var(--txt1)">${p.title||'Unknown'}</span>
+      ${archIcon}
+    </div>`;
+  }).join('');
+  document.getElementById('catchup-body').innerHTML=
+    rows+'<div style="padding-top:8px;border-top:1px solid var(--bdr)">'+_cuManualForm()+'</div>';
+}
+
+function doPlayArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, encodedRealId){
+  const cmd=decodeURIComponent(encodedCmd||'');
+  const liveCmd=decodeURIComponent(encodedLiveCmd||'');
+  const realId=decodeURIComponent(encodedRealId||'');
+  const status=document.getElementById('catchup-status');
+  if(status) status.textContent='Resolving…';
+  fetch('/api/catchup/play',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({cmd, live_cmd:liveCmd, epg_id:realId, start:startTs, stop:stopTs})})
+  .then(r=>r.json()).then(d=>{
+    if(d.url){
+      closeCatchup();
+      const label=(_epgItem?_epgItem.name:'')+' — '+title+' [↺]';
+      // Pass raw URL — doPlay always wraps in /api/proxy itself
+      // Catchup is VOD — isLive:false prevents mpegts.js SourceBuffer crash
+      doPlay(d.url, label, {isLive:false});
+      toast('↺ Playing catch-up: '+title,'ok');
+    } else {
+      if(status) status.textContent='❌ '+(d.error||'Not available');
+    }
+  }).catch(e=>{if(status) status.textContent='❌ '+e.message;});
+}
+
+function _cuManualForm(){
+  const now=new Date(), ago=new Date(now-3600000);
+  const pad=n=>String(n).padStart(2,'0');
+  const fmt=d=>d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes());
+  return `<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--txt3);margin-bottom:6px">Manual time range</div>`
+    +`<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">`
+    +`<input id="cu-start" type="datetime-local" value="${fmt(ago)}" style="height:32px;font-size:11px;background:var(--s3);border:1px solid var(--bdr2);border-radius:var(--rsm);color:var(--txt1);padding:0 6px;flex:1;min-width:130px">`
+    +`<input id="cu-end"   type="datetime-local" value="${fmt(now)}" style="height:32px;font-size:11px;background:var(--s3);border:1px solid var(--bdr2);border-radius:var(--rsm);color:var(--txt1);padding:0 6px;flex:1;min-width:130px">`
+    +`<button class="btn-acc" onclick="doWatchCatchupManual()" style="height:32px;padding:0 14px;font-size:12px">▶ Watch</button>`
+    +`</div>`;
+}
+
+async function doWatchCatchupManual(){
+  const s=document.getElementById('cu-start')?.value;
+  const e=document.getElementById('cu-end')?.value;
+  if(!s||!e){toast('Set start and end time','wrn');return;}
+  const startTs=Math.floor(new Date(s).getTime()/1000);
+  const endTs=Math.floor(new Date(e).getTime()/1000);
+  if(endTs<=startTs){toast('End must be after start','wrn');return;}
+  const status=document.getElementById('catchup-status');
+  if(status) status.textContent='Resolving…';
+  const cmd=_epgItem?.cmd||'';
+  try{
+    const r=await fetch('/api/catchup/play',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({cmd, live_cmd:cmd, start:startTs, stop:endTs})});
+    const d=await r.json();
+    if(d.url){
+      closeCatchup();
+      // Pass raw URL — doPlay always wraps in /api/proxy itself
+      doPlay(d.url, (_epgItem?.name||'Catch-up')+' [↺]', {isLive:false});
+      toast('↺ Playing catch-up','ok');
+    } else {
+      if(status) status.textContent='❌ '+(d.error||'Not available');
+    }
+  }catch(e){if(status) status.textContent='❌ '+e.message;}
+}
+
+
 async function startRec(){
   if(!pUrl){toast('Play a stream first','wrn');return;}
   const od=document.getElementById('o-dir').value.trim();
@@ -4633,9 +5357,7 @@ async function startRec(){
   const d=await r.json();
   if(!d.ok){toast(d.error||'Record failed','err');return;}
   isRec=true;
-  const btn=document.getElementById('rbtn');
-  btn.textContent='⏹ Stop'; btn.classList.add('rec');
-  document.getElementById('rtimer').classList.add('vis');
+  _syncRecBtn(true);
   document.getElementById('rfname').textContent=d.filename||'';
   toast('⏺ Recording: '+(d.filename||''),'ok');
   let s=0;
@@ -4645,6 +5367,9 @@ async function startRec(){
     const m2=String(Math.floor(s%3600/60)).padStart(2,'0');
     const sc=String(s%60).padStart(2,'0');
     document.getElementById('rtimer').textContent=h+':'+m2+':'+sc;
+    // Keep button text in sync with elapsed time
+    const btn=document.getElementById('rbtn');
+    if(btn) btn.textContent=`⏹ Stop Recording ${h}:${m2}:${sc}`;
   },1000);
 }
 
@@ -4654,11 +5379,24 @@ async function stopRec(){
   const d=await r.json();
   if(d.ok) toast('Saved: '+(d.file||''),'ok');
   isRec=false;
-  const btn=document.getElementById('rbtn');
-  btn.textContent='⏺ Record'; btn.classList.remove('rec');
-  document.getElementById('rtimer').classList.remove('vis');
+  _syncRecBtn(false);
   document.getElementById('rfname').textContent='';
   if(recTmr){clearInterval(recTmr);recTmr=null;}
+}
+
+function _syncRecBtn(recording){
+  const btn=document.getElementById('rbtn');
+  const timer=document.getElementById('rtimer');
+  if(!btn) return;
+  if(recording){
+    btn.textContent='⏹ Stop Recording';
+    btn.classList.add('rec');
+    if(timer) timer.classList.add('vis');
+  } else {
+    btn.textContent='⏺ Record';
+    btn.classList.remove('rec');
+    if(timer){timer.classList.remove('vis'); timer.textContent='00:00:00';}
+  }
 }
 
 // ── DOWNLOADS ──────────────────────────────────────────────
@@ -4717,6 +5455,33 @@ setInterval(async()=>{
   const d=await r.json().catch(()=>null); if(!d) return;
   if(d.status) setStatus(d.status);
   if(!d.busy) setBusy(false);
+  // Sync recording button if server state differs from JS state (e.g. page reload)
+  if(d.recording && !isRec){
+    isRec=true; _syncRecBtn(true);
+    // Resync elapsed time from server
+    fetch('/api/record/status').then(r=>r.json()).then(rs=>{
+      if(rs.recording){
+        document.getElementById('rfname').textContent=rs.filename||'';
+        // Restart timer from server elapsed
+        if(recTmr){clearInterval(recTmr);recTmr=null;}
+        const parts=(rs.elapsed||'00:00:00').split(':').map(Number);
+        let s=parts[0]*3600+parts[1]*60+parts[2];
+        recTmr=setInterval(()=>{
+          s++;
+          const h=String(Math.floor(s/3600)).padStart(2,'0');
+          const m2=String(Math.floor(s%3600/60)).padStart(2,'0');
+          const sc=String(s%60).padStart(2,'0');
+          document.getElementById('rtimer').textContent=h+':'+m2+':'+sc;
+          const btn=document.getElementById('rbtn');
+          if(btn) btn.textContent=`⏹ Stop Recording ${h}:${m2}:${sc}`;
+        },1000);
+      }
+    }).catch(()=>{});
+  } else if(!d.recording && isRec){
+    isRec=false; _syncRecBtn(false);
+    document.getElementById('rfname').textContent='';
+    if(recTmr){clearInterval(recTmr);recTmr=null;}
+  }
 },5000);
 
 // ── SSE LOGS ───────────────────────────────────────────────
