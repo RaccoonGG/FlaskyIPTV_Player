@@ -23,10 +23,12 @@ Also on network error and parsing hls errors (altho this can happens when channe
 Added progress bar with real kbs speed for downloading MKV, and items/totalitems for M3U saving.
 Fixed EPG out of memory happening in large EPG lists (altho now large external EPG list can use 2000 MB of ram, like 30k channels lists)
 Fixed laggy input in search filed for Whats on Now tab and dekstop version of saved logins tab.
+Fixed Hevc Vods/Series not following same fix we did for Live Hevc channels, play via ffmpeg.
 Added button that opens external player of your choice (on dekstop select exe, on mobile you can pick VLC, MX, MX PRO, Just Player)
 Added option to add subtitles from opensubtitles.com via inscript serach (get free apikey from https://www.opensubtitles.com/en/consumers)
 Added option to add local subtitles file for subtitles (.srt/.vtt/.ass/.ssa) via Local File tab in the subtitle modal.
 Subtitle delay +/- works the same for local files as for OpenSubtitles.
+Added option to play Catchup and EPG Whats on now tab results in external player.
 Varius UI fixes.
 """
 
@@ -4837,8 +4839,6 @@ def api_proxy_options():
     })
 
 
-
-
 @flask_app.route("/api/browse_exe", methods=["GET"])
 def api_browse_exe():
     """Open a native OS file picker and return the selected executable path."""
@@ -4969,6 +4969,7 @@ def api_open_external():
     item = data.get("item", {})
     mode = data.get("mode", "live")
     cat  = data.get("category", {})
+    pre_url = (data.get("url") or "").strip()  # pre-resolved URL (catchup / WON)
 
     if not exe:
         return jsonify({"error": "No external player configured"}), 400
@@ -4976,10 +4977,13 @@ def api_open_external():
         return jsonify({"error": f"Player not found: {exe}"}), 400
 
     try:
-        async def _resolve():
-            async with _make_client() as client:
-                return await client.resolve_item_url(mode, item, cat)
-        url = run_async(_resolve())
+        if pre_url:
+            url = pre_url
+        else:
+            async def _resolve():
+                async with _make_client() as client:
+                    return await client.resolve_item_url(mode, item, cat)
+            url = run_async(_resolve())
         if not url:
             return jsonify({"error": "Could not resolve stream URL"}), 400
         state.log(f"[EXT] Launching {os.path.basename(exe)} with stream URL")
@@ -5071,7 +5075,6 @@ def api_hls_proxy():
     h = dict(cors)
     h["Content-Type"] = "video/mp2t"
     return Response(stream_with_context(_gen()), status=200, headers=h)
-
 
 
 # ===================== OPENSUBTITLES API =====================
@@ -6735,7 +6738,6 @@ function subLoadLocalFile(input){
 }
 
 
-
 function _subInitLangGrid(){
   const grid = document.getElementById('sub-lang-grid');
   if(!grid || grid.children.length) return;
@@ -8015,6 +8017,9 @@ function _renderArchiveListings(listings){
     const click=hasArchive
       ?`onclick="doPlayArchiveCmd('${cmdSafe}',${p.start||0},${p.stop||0},'${titleSafe}','${liveCmdSafe}','${realIdSafe}')"`
       :'';
+    const extBtn=hasArchive
+      ?`<button class="btn-ghost" onclick="event.stopPropagation();doExternalArchiveCmd('${cmdSafe}',${p.start||0},${p.stop||0},'${titleSafe}','${liveCmdSafe}','${realIdSafe}')" title="Play in external player" style="padding:0 6px;font-size:13px;flex-shrink:0">🎬</button>`
+      :'';
     const cursor=hasArchive?'pointer':'default';
     const archIcon=hasArchive?'<span style="font-size:14px;color:var(--acc)">▶</span>':'';
     return dateHdr+`<div ${click}
@@ -8024,6 +8029,7 @@ function _renderArchiveListings(listings){
       ${hasArchive?'onmouseover="this.style.background=\'var(--s4)\'" onmouseout="this.style.background=\'var(--s3)\'"':''}>
       <span style="font-size:11px;color:var(--txt3);white-space:nowrap;min-width:90px">${t}</span>
       <span style="flex:1;font-size:12px;font-weight:600;color:var(--txt1)">${p.title||'Unknown'}</span>
+      ${extBtn}
       ${archIcon}
     </div>`;
   }).join('');
@@ -8053,6 +8059,43 @@ function doPlayArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, en
       if(status) status.textContent='❌ '+(d.error||'Not available');
     }
   }).catch(e=>{if(status) status.textContent='❌ '+e.message;});
+}
+
+async function doExternalArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, encodedRealId){
+  const cmd=decodeURIComponent(encodedCmd||'');
+  const liveCmd=decodeURIComponent(encodedLiveCmd||'');
+  const realId=decodeURIComponent(encodedRealId||'');
+  const status=document.getElementById('catchup-status');
+  if(status) status.textContent='Resolving for external player…';
+  try{
+    const r=await fetch('/api/catchup/play',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({cmd, live_cmd:liveCmd, epg_id:realId, start:startTs, stop:stopTs})});
+    const d=await r.json();
+    if(!d.url){if(status) status.textContent='❌ '+(d.error||'Not available');return;}
+    const url=d.url;
+    if(_isMobile){
+      const player=localStorage.getItem('mobile_player')||'ask';
+      if(player==='copy'){
+        try{await navigator.clipboard.writeText(url);toast('Stream URL copied!','ok');}
+        catch(e){prompt('Copy stream URL:',url);}
+        if(status) status.textContent='';
+        return;
+      }
+      if(status) status.textContent='';
+      window.location.href=player==='ask'
+        ?`intent:${url}#Intent;type=video/*;S.browser_fallback_url=about:blank;end`
+        :`intent:${url}#Intent;package=${player};type=video/*;S.browser_fallback_url=about:blank;end`;
+    } else {
+      const exe=(localStorage.getItem('ext_player')||'').trim();
+      if(!exe){toast('Set external player path in ⚙ settings first','wrn');return;}
+      const r2=await fetch('/api/open_external',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({exe, url})});
+      const d2=await r2.json();
+      if(d2.error) toast('Error: '+d2.error,'err');
+      else{ toast('Launched: '+title,'ok'); if(status) status.textContent=''; }
+    }
+  }catch(e){if(status) status.textContent='❌ '+e.message;}
 }
 
 function _cuManualForm(){
@@ -8787,6 +8830,10 @@ function wonRender(list){
         <div class="won-item-ch">${esc(p.channel_name)}</div>
         <div class="won-item-times">${start} – ${end}</div>
         <div class="won-find-result" id="won-res-${i}"></div>
+        <div id="won-ext-${i}" style="display:none;margin-top:3px">
+          <span style="font-size:10px;padding:3px 7px;border-radius:4px;background:rgba(139,92,246,.18);color:#a78bfa;cursor:pointer"
+            onclick="wonOpenExternal(${i})">🎬 external player</span>
+        </div>
       </div>
       <div class="won-progress">
         <div class="won-progress-bar"><div class="won-progress-fill" style="width:${p.progress}%"></div></div>
@@ -8834,6 +8881,40 @@ async function wonPlayFound(idx, resEl, name){
   }
 }
 
+async function wonOpenExternal(idx){
+  const ch = _wonMatches[idx];
+  if(!ch){ toast('Find the channel first','wrn'); return; }
+  const name = ch.name || ch.o_name || '?';
+  toast('Resolving for external player…','info');
+  try{
+    const r = await fetch('/api/resolve_url',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({item:ch, mode:'live', category:curCat||{}})});
+    const d = await r.json();
+    if(!d.url){ toast('Could not resolve stream URL','err'); return; }
+    const url = d.url;
+    if(_isMobile){
+      const player = localStorage.getItem('mobile_player')||'ask';
+      if(player==='copy'){
+        try{await navigator.clipboard.writeText(url); toast('Stream URL copied!','ok');}
+        catch(e){prompt('Copy stream URL:',url);}
+        return;
+      }
+      window.location.href = player==='ask'
+        ?`intent:${url}#Intent;type=video/*;S.browser_fallback_url=about:blank;end`
+        :`intent:${url}#Intent;package=${player};type=video/*;S.browser_fallback_url=about:blank;end`;
+    } else {
+      const exe=(localStorage.getItem('ext_player')||'').trim();
+      if(!exe){toast('Set external player path in ⚙ settings first','wrn');return;}
+      const r2=await fetch('/api/open_external',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({exe, url})});
+      const d2=await r2.json();
+      if(d2.error) toast('Error: '+d2.error,'err');
+      else toast('Launched: '+name,'ok');
+    }
+  }catch(e){ toast('Failed: '+e,'err'); }
+}
+
 function _wonFmt(ts){
   const d = new Date(ts * 1000);
   return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
@@ -8872,6 +8953,8 @@ function wonFindChannel(btn, idx){
       res.title = 'Click to play this channel';
       _wonMatches[idx] = data.channel;
       res.onclick = () => wonPlayFound(idx, res, data.name);
+      const extBtn = document.getElementById('won-ext-'+idx);
+      if(extBtn) extBtn.style.display = '';
     } else if(data.error === 'Not connected'){
       res.className = 'won-find-result fail';
       res.textContent = '✗ Not connected to portal';
