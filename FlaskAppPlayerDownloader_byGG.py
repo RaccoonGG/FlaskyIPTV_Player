@@ -21,6 +21,8 @@ Clicking on Search Icon will check currently active portal if your portal has ch
 Fixed different channel url outputs not playing correctly, fixed hevc channels not going thru ffmpeg.
 Also on network error and parsing hls errors (altho this can happens when channel is offline too), we attempt ffmpeg play.
 Added progress bar with real kbs speed for downloading MKV, and items/totalitems for M3U saving.
+Fixed EPG out of memory happening in large EPG lists (altho now large external EPG list can use 2000 MB of ram, like 30k channels lists)
+Fixed laggy input in search filed for Whats on Now tab and dekstop version of saved logins tab.
 Varius UI fixes.
 """
 
@@ -3676,23 +3678,78 @@ def api_find_channel():
             chans = []
 
             if conn == "mac":
-                client_cls = StalkerPortalClient if state.is_stalker_portal else PortalClient
+                is_stalker = state.is_stalker_portal
+                client_cls = StalkerPortalClient if is_stalker else PortalClient
                 async with client_cls(state.url, state.mac, state.log) as client:
                     await client.handshake()
-                    if state.is_stalker_portal:
-                        url = client._load_url(
-                            type="itv", action="get_all_channels",
-                            force_ch_link_check="", JsHttpRequest="1-xml"
-                        )
-                        hdrs = client._headers(include_auth=True)
-                    else:
-                        url = (f"{client.base}/portal.php?type=itv"
-                               f"&action=get_all_channels"
-                               f"&force_ch_link_check=&JsHttpRequest=1-xml")
-                        hdrs = client.headers
-                    async with client.session.get(url, headers=hdrs) as r:
-                        payload = await safe_json(r)
-                    chans = normalize_js(payload)
+
+                    # ── Attempt 1: get_all_channels via portal.php — retry up to 3× ──
+                    # Some portals return 0 on first call if the token is fresh/cold;
+                    # a short back-off and retry usually resolves it.
+                    for _try in range(1, 4):
+                        try:
+                            if is_stalker:
+                                url = client._load_url(
+                                    type="itv", action="get_all_channels",
+                                    force_ch_link_check="", JsHttpRequest="1-xml"
+                                )
+                                hdrs = client._headers(include_auth=True)
+                            else:
+                                url = (f"{client.base}/portal.php?type=itv"
+                                       f"&action=get_all_channels"
+                                       f"&force_ch_link_check=&JsHttpRequest=1-xml")
+                                hdrs = client.headers
+                            state.log(f"[FIND_CH] Attempt 1.{_try}: {url[:80]}")
+                            async with client.session.get(url, headers=hdrs) as r:
+                                payload = await safe_json(r)
+                            chans = normalize_js(payload)
+                            state.log(f"[FIND_CH] Attempt 1.{_try} → {len(chans)} channels")
+                            if chans:
+                                break
+                            if _try < 3:
+                                await asyncio.sleep(1.5)
+                        except Exception as e:
+                            state.log(f"[FIND_CH] Attempt 1.{_try} error: {e}")
+                            chans = []
+                            if _try < 3:
+                                await asyncio.sleep(1.5)
+
+                    # ── Attempt 2: try alternate path (load.php ↔ portal.php swap) ──
+                    if not chans:
+                        try:
+                            alt_base = "/stalker_portal/server/load.php" if is_stalker else "/portal.php"
+                            alt_url = (f"{client.base}{alt_base}?type=itv"
+                                       f"&action=get_all_channels"
+                                       f"&force_ch_link_check=&JsHttpRequest=1-xml")
+                            alt_hdrs = client._headers(include_auth=True) if is_stalker else client.headers
+                            state.log(f"[FIND_CH] Attempt 2: {alt_url[:80]}")
+                            async with client.session.get(alt_url, headers=alt_hdrs) as r2:
+                                payload2 = await safe_json(r2)
+                            chans = normalize_js(payload2)
+                            state.log(f"[FIND_CH] Attempt 2 → {len(chans)} channels")
+                        except Exception as e2:
+                            state.log(f"[FIND_CH] Attempt 2 error: {e2}")
+                            chans = []
+
+                    # ── Attempt 3: walk all live categories page-by-page (always works) ──
+                    if not chans:
+                        state.log("[FIND_CH] Falling back to category walk…")
+                        cats = await client.fetch_categories("live")
+                        for cat in cats:
+                            cat_id = str(cat.get("id", ""))
+                            if not cat_id:
+                                continue
+                            page = 1
+                            while True:
+                                items = await client.fetch_items_page("live", cat_id, page)
+                                if not items:
+                                    break
+                                chans.extend(items)
+                                # Most portals return ≤14 items/page; if full page, try next
+                                if len(items) < 14:
+                                    break
+                                page += 1
+                        state.log(f"[FIND_CH] Category walk found {len(chans)} channels")
 
             elif conn == "xtream" or (conn == "m3u_url" and state.m3u_xtream_override):
                 creds = state.m3u_xtream_override if conn == "m3u_url" else None
@@ -3833,17 +3890,32 @@ def api_find_channel():
                 score = max(score, 45)   # same core but different countries
 
         # ── Core contains ────────────────────────────────────────────────────
+        # Only trigger if the shorter core has ≥2 words — prevents single words
+        # like "jazz" (from "PL| JAZZ HD") from matching "NBA - Utah Jazz"
         if epg_core and ch_core_str:
-            if epg_core in ch_core_str or ch_core_str in epg_core:
+            short, long_ = (ch_core_str, epg_core) if len(ch_core_str) < len(epg_core) else (epg_core, ch_core_str)
+            short_words = set(re.findall(r"[a-z0-9]+", short))
+            if len(short_words) >= 2 and short in long_:
                 score = max(score, 48)
 
         # ── Word overlap on core words ────────────────────────────────────────
         if epg_cwords and ch_core_str:
             ch_cw = _core_words(ch_name)
-            overlap = len(epg_cwords & ch_cw)
-            total   = max(len(epg_cwords), len(ch_cw)) if ch_cw else 1
-            if overlap:
-                score = max(score, int(60 * overlap / total))
+            if ch_cw:
+                overlap = len(epg_cwords & ch_cw)
+                if overlap:
+                    # Proportional score based on coverage of the LARGER set
+                    total = max(len(epg_cwords), len(ch_cw))
+                    word_score = int(60 * overlap / total)
+                    score = max(score, word_score)
+
+                    # All-words-match bonus: if ALL EPG words are present in channel
+                    # (e.g. 'nba','utah','jazz' all in 'NBA: UTAH JAZZ HD') → big boost
+                    if epg_cwords.issubset(ch_cw):
+                        score = max(score, 72)
+                    # Partial but dominant match (≥2 words AND covers ≥2/3 of EPG words)
+                    elif overlap >= 2 and overlap / len(epg_cwords) >= 0.66:
+                        score = max(score, 55)
 
         # ── Apply hard country conflict cap ───────────────────────────────────
         if country_conflict:
@@ -4453,14 +4525,17 @@ def _parse_stalker_epg(payload: dict, ch_id: str) -> dict:
 
 async def _build_xmltv_index(xmltv_url: str, log_cb=None) -> dict:
     """Download XMLTV and build full channel→programmes index.
-    Returns: {channel_id_lower: [{"title","start","end","desc"}, ...]}
-    Same approach as reference app — build once, lookup by exact ID.
+    Streams the download to a temp file and uses iterparse so large files
+    (100MB+) never cause an out-of-memory error.
+    Returns: (epg_dict, chan_names)
+      epg_dict   = {channel_id_lower: [{"title","start","end","desc"}, ...]}
+      chan_names  = {channel_id_lower: [display_name_lower, ...]}
     """
     import xml.etree.ElementTree as ET
+    import tempfile, gzip as _gzip
     _log = log_cb or (lambda x: None)
 
     def _ts(s: str) -> float:
-        """Parse XMLTV datetime string '20240101200000 +0000' → UTC timestamp."""
         s = s.strip()
         try:
             dt = datetime.strptime(s[:14], "%Y%m%d%H%M%S")
@@ -4470,55 +4545,97 @@ async def _build_xmltv_index(xmltv_url: str, log_cb=None) -> dict:
                 sign = 1 if tz.startswith("+") else -1
                 h, m = int(tz[1:3]), int(tz[3:5])
                 offset = sign * (h * 3600 + m * 60)
-            # dt is local time expressed in the given offset.
-            # Convert: UTC = local_time - offset
             return dt.replace(tzinfo=timezone.utc).timestamp() - offset
         except Exception:
             return 0.0
 
     _log(f"[EPG] Downloading XMLTV from {xmltv_url}")
-    async with aiohttp.ClientSession() as sess:
-        async with sess.get(xmltv_url, timeout=aiohttp.ClientTimeout(total=60)) as r:
-            if r.status != 200:
-                raise RuntimeError(f"XMLTV HTTP {r.status}")
-            raw = await r.read()
 
-    # Decompress if gzip (URL ends in .gz or response is gzip-encoded / magic bytes)
-    if xmltv_url.lower().rstrip("?").endswith(".gz") or raw[:2] == b'\x1f\x8b':
+    # Stream the response into a temp file to avoid OOM on large feeds
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xmltv") as tmp:
+        tmp_path = tmp.name
+        total_bytes = 0
         try:
-            import gzip as _gzip
-            raw = _gzip.decompress(raw)
-            _log(f"[EPG] XMLTV gzip decompressed → {len(raw)//1024}KB")
-        except Exception as gz_err:
-            _log(f"[EPG] XMLTV gzip decompress failed: {gz_err}")
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(xmltv_url, timeout=aiohttp.ClientTimeout(total=120)) as r:
+                    if r.status != 200:
+                        raise RuntimeError(f"XMLTV HTTP {r.status}")
+                    async for chunk in r.content.iter_chunked(1 << 16):  # 64 KB chunks
+                        tmp.write(chunk)
+                        total_bytes += len(chunk)
+        except Exception:
+            with contextlib.suppress(Exception):
+                os.remove(tmp_path)
+            raise
 
-    _log(f"[EPG] XMLTV downloaded {len(raw)//1024}KB — parsing…")
-    root = ET.fromstring(raw)
+    _log(f"[EPG] XMLTV downloaded {total_bytes // 1024}KB — parsing…")
 
-    # channel id → list of display-names (normalised lower)
-    chan_names: dict = {}
-    for c in root.findall("channel"):
-        cid = (c.get("id") or "").strip().lower()
-        if cid:
-            names = [dn.text.strip().lower()
-                     for dn in c.findall("display-name") if dn.text]
-            chan_names[cid] = names
+    # Detect gzip by magic bytes or URL extension
+    try:
+        with open(tmp_path, "rb") as _f:
+            _magic = _f.read(2)
+        is_gz = xmltv_url.lower().rstrip("?").endswith(".gz") or _magic == b'\x1f\x8b'
+    except Exception:
+        is_gz = False
 
-    # Build full programme index keyed by channel_id_lower
-    epg_dict: dict = {}
-    for prog in root.findall("programme"):
-        cid = (prog.get("channel") or "").strip().lower()
-        if not cid:
-            continue
-        start = _ts(prog.get("start", ""))
-        end   = _ts(prog.get("stop",  ""))
-        title = (prog.findtext("title") or "").strip()
-        desc  = (prog.findtext("desc")  or "").strip()
-        if not title or not start:
-            continue
-        if cid not in epg_dict:
-            epg_dict[cid] = []
-        epg_dict[cid].append({"title": title, "start": start, "end": end, "desc": desc})
+    if is_gz:
+        _log(f"[EPG] Detected gzip — decompressing on-the-fly into parser (no second temp file)…")
+
+    # Open for iterparse — decompress on-the-fly for .gz so we never hold both
+    # the compressed AND decompressed content in memory simultaneously.
+    # gzip.open() reads lazily, feeding the parser chunk-by-chunk.
+    try:
+        fh = _gzip.open(tmp_path, "rb") if is_gz else open(tmp_path, "rb")
+
+        chan_names: dict = {}
+        epg_dict:   dict = {}
+        root = None
+
+        try:
+            context = ET.iterparse(fh, events=("start", "end"))
+            for event, elem in context:
+                if event == "start" and root is None:
+                    root = elem   # first event is the <tv> root
+                    continue
+                if event != "end":
+                    continue
+
+                tag = elem.tag
+
+                if tag == "channel":
+                    cid = (elem.get("id") or "").strip().lower()
+                    if cid:
+                        names = [dn.text.strip().lower()
+                                 for dn in elem.findall("display-name") if dn.text]
+                        chan_names[cid] = names
+
+                elif tag == "programme":
+                    cid = (elem.get("channel") or "").strip().lower()
+                    if cid:
+                        start = _ts(elem.get("start", ""))
+                        end   = _ts(elem.get("stop",  ""))
+                        title = (elem.findtext("title") or "").strip()
+                        desc  = (elem.findtext("desc")  or "").strip()
+                        if title and start:
+                            if cid not in epg_dict:
+                                epg_dict[cid] = []
+                            epg_dict[cid].append({"title": title, "start": start,
+                                                  "end": end, "desc": desc})
+
+                # Detach processed top-level elements from root so Python's GC
+                # can actually reclaim them. elem.clear() alone is not enough —
+                # root still holds a list reference to each cleared element.
+                if root is not None and elem is not root:
+                    try:
+                        root.remove(elem)
+                    except ValueError:
+                        pass
+        finally:
+            fh.close()
+
+    finally:
+        with contextlib.suppress(Exception):
+            os.remove(tmp_path)
 
     _log(f"[EPG] XMLTV index built: {len(epg_dict)} channels with programmes "
          f"(out of {len(chan_names)} channel defs)")
@@ -4781,7 +4898,8 @@ html,body{height:100dvh;overflow:hidden;background:var(--bg);color:var(--txt);
 /* ─── inputs ─────────────────────────────────────────────────── */
 input,textarea{background:var(--s3);color:var(--txt);border:1.5px solid var(--bdr);
   border-radius:var(--rsm);padding:9px 12px;font-size:13px;outline:none;width:100%;
-  transition:var(--tr);-webkit-appearance:none}
+  transition:border-color .2s cubic-bezier(.4,0,.2,1),box-shadow .2s cubic-bezier(.4,0,.2,1);
+  -webkit-appearance:none}
 input:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--glow2)}
 input::placeholder{color:var(--txt3)}
 input[type=range]{background:transparent;border:none;box-shadow:none;padding:0;cursor:pointer;
@@ -5044,7 +5162,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 /* ─── saved playlists modal ─────────────────────────────────────── */
 #pl-overlay{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.65);
   display:none;align-items:center;justify-content:center;
-  backdrop-filter:blur(4px);padding:12px}
+  backdrop-filter:none;padding:12px}
 #pl-overlay.open{display:flex}
 #pl-modal{background:var(--s2);border:1px solid var(--bdr2);border-radius:var(--r);
   width:min(480px,100%);max-height:88dvh;display:flex;flex-direction:column;
@@ -5078,7 +5196,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 
 /* ─── action drawer ──────────────────────────────────────────── */
 #act-overlay{position:fixed;inset:0;z-index:400;background:rgba(0,0,0,.5);
-  display:none;backdrop-filter:blur(3px)}
+  display:none;backdrop-filter:none}
 #act-overlay.open{display:block}
 #act-drawer{position:fixed;top:0;right:0;bottom:0;z-index:401;
   width:min(300px,85vw);background:var(--s2);border-left:1px solid var(--bdr2);
@@ -5273,26 +5391,26 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
       </div>
       <div id="cr-mac" class="cr" style="flex-direction:column;align-items:stretch">
         <div style="display:flex;gap:6px;align-items:center">
-          <label>URL</label><input id="i-url" type="url" placeholder="http://portal.host:8080">
-          <label>MAC</label><input id="i-mac" placeholder="00:1A:79:XX:XX:XX" style="max-width:200px">
+          <label>URL</label><input id="i-url" type="text" inputmode="url" placeholder="http://portal.host:8080" autocomplete="new-password" autocorrect="off" spellcheck="false">
+          <label>MAC</label><input id="i-mac" placeholder="00:1A:79:XX:XX:XX" style="max-width:200px" autocomplete="new-password" autocorrect="off" spellcheck="false">
         </div>
         <div style="display:flex;gap:6px;align-items:center">
-          <label title="Optional: external XMLTV EPG URL. Leave blank to use portal's own EPG.">EPG</label><input id="i-mac-epg" type="url" placeholder="https://… xmltv URL (optional)">
+          <label title="Optional: external XMLTV EPG URL. Leave blank to use portal's own EPG.">EPG</label><input id="i-mac-epg" type="text" inputmode="url" placeholder="https://… xmltv URL (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false">
         </div>
       </div>
       <div id="cr-xtream" class="cr hidden" style="flex-direction:column;align-items:stretch">
         <div style="display:flex;gap:6px;align-items:center">
-          <label>URL</label><input id="i-xu" type="url" placeholder="http://server.host:8080">
-          <label>User</label><input id="i-us" placeholder="username" style="max-width:150px">
+          <label>URL</label><input id="i-xu" type="text" inputmode="url" placeholder="http://server.host:8080" autocomplete="new-password" autocorrect="off" spellcheck="false">
+          <label>User</label><input id="i-us" placeholder="username" style="max-width:150px" autocomplete="new-password" autocorrect="off" spellcheck="false">
         </div>
         <div style="display:flex;gap:6px;align-items:center">
-          <label title="Optional: external XMLTV EPG URL (e.g. epg.best). Leave blank to use provider's own EPG.">EPG</label><input id="i-epg" type="url" placeholder="https://epg.best/xmltv.php?… (optional)" style="flex:1">
-          <label>Pass</label><input id="i-pw" type="password" placeholder="password" style="max-width:150px">
+          <label title="Optional: external XMLTV EPG URL (e.g. epg.best). Leave blank to use provider's own EPG.">EPG</label><input id="i-epg" type="text" inputmode="url" placeholder="https://epg.best/xmltv.php?… (optional)" style="flex:1" autocomplete="new-password" autocorrect="off" spellcheck="false">
+          <label>Pass</label><input id="i-pw" type="password" placeholder="password" style="max-width:150px" autocomplete="new-password">
         </div>
       </div>
       <div id="cr-m3u" class="cr hidden">
-        <label>URL</label><input id="i-m3u" type="url" placeholder="http://example.com/list.m3u">
-        <label title="Optional: external XMLTV EPG URL. Leave blank to use tvg-url from M3U.">EPG</label><input id="i-m3u-epg" type="url" placeholder="https://epg.best/xmltv.php?… (optional)" style="max-width:300px">
+        <label>URL</label><input id="i-m3u" type="text" inputmode="url" placeholder="http://example.com/list.m3u" autocomplete="new-password" autocorrect="off" spellcheck="false">
+        <label title="Optional: external XMLTV EPG URL. Leave blank to use tvg-url from M3U.">EPG</label><input id="i-m3u-epg" type="text" inputmode="url" placeholder="https://epg.best/xmltv.php?… (optional)" style="max-width:300px" autocomplete="new-password" autocorrect="off" spellcheck="false">
       </div>
       <div class="cr-bot">
         <span id="portal-name-label" style="font-size:12px;font-weight:700;color:var(--acc);
@@ -5624,7 +5742,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
       <button class="btn-ghost" onclick="closeWhatsOn()" style="height:28px;padding:0 10px;font-size:12px">✕</button>
     </div>
     <div class="won-search">
-      <input id="won-srch" type="search" placeholder="Filter by title or channel…" oninput="wonFilter()" autocomplete="off">
+      <input id="won-srch" type="search" placeholder="Filter by title or channel…" oninput="wonFilter()" autocomplete="new-password">
     </div>
     <div class="won-list" id="won-list">
       <div class="won-loading"><span class="spin"></span> Loading EPG data…</div>
@@ -5652,21 +5770,21 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
           <button class="btn-ghost pl-ct-btn" data-t="xtream" onclick="plSetCT('xtream')">📡 Xtream</button>
           <button class="btn-ghost pl-ct-btn" data-t="m3u_url" onclick="plSetCT('m3u_url')">📄 M3U</button>
         </div>
-        <div class="pl-row"><label>Name</label><input id="pl-name" placeholder="My Playlist"></div>
+        <div class="pl-row"><label>Name</label><input id="pl-name" placeholder="My Playlist" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
         <div id="plf-mac">
-          <div class="pl-row"><label>URL</label><input id="pl-url" type="url" placeholder="http://portal.host:8080"></div>
-          <div class="pl-row"><label>MAC</label><input id="pl-mac" placeholder="00:1A:79:XX:XX:XX"></div>
-          <div class="pl-row"><label>EPG</label><input id="pl-mac-epg" type="url" placeholder="External EPG URL (optional)"></div>
+          <div class="pl-row"><label>URL</label><input id="pl-url" type="text" inputmode="url" placeholder="http://portal.host:8080" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
+          <div class="pl-row"><label>MAC</label><input id="pl-mac" placeholder="00:1A:79:XX:XX:XX" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
+          <div class="pl-row"><label>EPG</label><input id="pl-mac-epg" type="text" inputmode="url" placeholder="External EPG URL (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
         </div>
         <div id="plf-xtream" class="hidden">
-          <div class="pl-row"><label>URL</label><input id="pl-xu" type="url" placeholder="http://server.host:8080"></div>
-          <div class="pl-row"><label>User</label><input id="pl-us" placeholder="username"></div>
-          <div class="pl-row"><label>Pass</label><input id="pl-pw" type="password" placeholder="password"></div>
-          <div class="pl-row"><label>EPG</label><input id="pl-epg" type="url" placeholder="External EPG URL (optional)"></div>
+          <div class="pl-row"><label>URL</label><input id="pl-xu" type="text" inputmode="url" placeholder="http://server.host:8080" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
+          <div class="pl-row"><label>User</label><input id="pl-us" placeholder="username" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
+          <div class="pl-row"><label>Pass</label><input id="pl-pw" type="password" placeholder="password" autocomplete="new-password"></div>
+          <div class="pl-row"><label>EPG</label><input id="pl-epg" type="text" inputmode="url" placeholder="External EPG URL (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
         </div>
         <div id="plf-m3u" class="hidden">
-          <div class="pl-row"><label>URL</label><input id="pl-m3u" type="url" placeholder="http://example.com/list.m3u"></div>
-          <div class="pl-row"><label>EPG</label><input id="pl-m3u-epg" type="url" placeholder="External EPG URL (optional)"></div>
+          <div class="pl-row"><label>URL</label><input id="pl-m3u" type="text" inputmode="url" placeholder="http://example.com/list.m3u" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
+          <div class="pl-row"><label>EPG</label><input id="pl-m3u-epg" type="text" inputmode="url" placeholder="External EPG URL (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
         </div>
         <div class="pl-row" style="justify-content:flex-end;gap:7px">
           <button class="btn-ghost" onclick="plClearForm()" style="height:34px;padding:0 12px;font-size:12px">Clear</button>
@@ -7032,15 +7150,39 @@ function startLog(){
 }
 
 // ── HELPERS ────────────────────────────────────────────────
-function alog(msg,cls){
+// Log entries are buffered and flushed once per animation frame.
+// This prevents the forced synchronous reflow (scrollHeight read) from
+// blocking the main thread on every incoming SSE message.
+let _logBuf = [];
+let _logRafPending = false;
+
+function _flushLog(){
+  _logRafPending = false;
+  if(!_logBuf.length) return;
+  const entries = _logBuf.splice(0);
   ['logout','desktop-logout'].forEach(id=>{
-    const out=document.getElementById(id); if(!out) return;
-    const d=document.createElement('div');
-    d.className='ll'+(cls?' l'+cls:'');
-    d.textContent=msg; out.appendChild(d);
-    out.scrollTop=out.scrollHeight;
-    while(out.children.length>600) out.removeChild(out.firstChild);
+    const out = document.getElementById(id); if(!out) return;
+    const frag = document.createDocumentFragment();
+    entries.forEach(({msg, cls})=>{
+      const d = document.createElement('div');
+      d.className = 'll' + (cls ? ' l'+cls : '');
+      d.textContent = msg;
+      frag.appendChild(d);
+    });
+    out.appendChild(frag);
+    // Trim to 600 lines
+    while(out.children.length > 600) out.removeChild(out.firstChild);
+    // Single scroll — reads scrollHeight only once per frame
+    out.scrollTop = out.scrollHeight;
   });
+}
+
+function alog(msg, cls){
+  _logBuf.push({msg, cls});
+  if(!_logRafPending){
+    _logRafPending = true;
+    requestAnimationFrame(_flushLog);
+  }
 }
 function clearLog(){
   ['logout','desktop-logout'].forEach(id=>{
@@ -7298,7 +7440,15 @@ function closeWhatsOn(){
   document.getElementById('won-overlay').classList.remove('open');
 }
 
+let _wonFilterTimer = null;
+const WON_PAGE_SIZE = 200;  // max items rendered at once
+
 function wonFilter(){
+  clearTimeout(_wonFilterTimer);
+  _wonFilterTimer = setTimeout(_wonFilterApply, 180);  // debounce 180ms
+}
+
+function _wonFilterApply(){
   const q = document.getElementById('won-srch').value.toLowerCase().trim();
   if(!q){ wonRender(_wonPrograms); return; }
   wonRender(_wonPrograms.filter(p =>
@@ -7307,13 +7457,19 @@ function wonFilter(){
 }
 
 function wonRender(list){
-  document.getElementById('won-count').textContent = list.length + ' programmes';
+  const total = list.length;
+  const shown = list.slice(0, WON_PAGE_SIZE);
+  document.getElementById('won-count').textContent =
+    total > WON_PAGE_SIZE
+      ? `${WON_PAGE_SIZE} of ${total} programmes (refine filter to see more)`
+      : total + ' programmes';
   const el = document.getElementById('won-list');
-  if(!list.length){
+  if(!total){
     el.innerHTML = '<div class="won-empty"><span>🔍</span>No programmes match your filter.</div>';
     return;
   }
-  el.innerHTML = list.map((p, i) => {
+  // Build HTML as a single string — much faster than appending nodes one-by-one
+  const parts = shown.map((p, i) => {
     const start = _wonFmt(p.start);
     const end   = _wonFmt(p.end);
     return `<div class="won-item" title="${esc(p.desc||'')}">
@@ -7329,7 +7485,8 @@ function wonRender(list){
       </div>
       <button class="won-find-btn" id="won-fbtn-${i}" data-name="${esc(p.channel_name)}" data-cid="${esc(p.channel_id)}" onclick="wonFindChannel(this,${i})" title="Find on portal">🔍</button>
     </div>`;
-  }).join('');
+  });
+  el.innerHTML = parts.join('');
 }
 
 async function wonPlayFound(idx, resEl, name){
