@@ -12,6 +12,7 @@ Updates:
 Added support for /stalker_portal/ type of MAC portals.
 Added support for EPG.
 Added support for CatchUp (where avialaible and supported by portal).
+Added support for external EPG url, to cover channels where portal does not provide EPG.
 """
 
 import base64
@@ -2426,6 +2427,7 @@ class AppState:
         self.username = ""
         self.password = ""
         self.m3u_url = ""
+        self.ext_epg_url = ""  # User-supplied external XMLTV EPG URL (overrides portal's own)
         self.connected = False
         self.is_stalker_portal = False  # True when URL contains 'stalker_portal'
         self.cats_cache: dict = {}
@@ -2450,6 +2452,17 @@ class AppState:
         # EPG cache: key → (timestamp, result_dict), TTL = 30 minutes
         self._epg_cache: dict = {}
         self._epg_cache_ttl = 1800  # seconds
+        # Per-portal flag: set of base_urls where get_short_epg always returns empty.
+        # After one confirmed empty response we skip straight to XMLTV for that portal.
+        self._short_epg_broken: set = set()
+        # XMLTV cache: key=base_norm → (fetched_ts, epg_dict, chan_names)
+        # epg_dict: {channel_id_lower: [{"title","start","end","desc"}, ...]}
+        # TTL = 1 hour, same as reference app
+        self._xmltv_cache: dict = {}
+        self._xmltv_cache_ttl = 3600
+        # Portals whose xmltv.php has channel defs but zero programme entries —
+        # marked after first download so we never re-download this session.
+        self._xmltv_no_data: set = set()
         # Persistent StalkerPortalClient — reused across requests to avoid
         # repeated handshake/profile calls that cause portal rate-limiting
         self._stalker_client: object = None
@@ -2646,6 +2659,7 @@ def api_connect():
         state.username = data.get("username", "").strip()
         state.password = data.get("password", "").strip()
         state.m3u_url = data.get("m3u_url", "").strip()
+        state.ext_epg_url = data.get("ext_epg_url", "").strip()
         state.is_stalker_portal = (
             state.conn_type == "mac" and
             "stalker_portal" in state.url.lower()
@@ -2654,6 +2668,9 @@ def api_connect():
         state.m3u_cache = None
         state.m3u_xtream_override = None
         state._epg_cache = {}
+        state._xmltv_cache = {}
+        state._short_epg_broken = set()
+        state._xmltv_no_data = set()
         state.connected = False
         state.stop_flag.clear()
 
@@ -3127,6 +3144,7 @@ def api_epg():
     # stream_id for Xtream, ch_id for Stalker/MAC, tvg_id for M3U
     stream_id = str(item.get("stream_id") or item.get("id") or "").strip()
     tvg_id    = str(item.get("tvg_id") or item.get("epg_channel_id") or item.get("name") or "").strip()
+    state.log(f"[EPG] item keys={list(item.keys())} stream_id={stream_id!r} tvg_id={tvg_id!r} epg_channel_id={item.get('epg_channel_id')!r}")
 
     # Cache key: portal type + channel identifier
     cache_key = f"{state.conn_type}:{stream_id or tvg_id}"
@@ -3142,7 +3160,10 @@ def api_epg():
     async def fetch_epg():
         conn = state.conn_type
 
-        # ── Xtream (direct or M3U override) — use XMLTV feed directly ─────────
+        # ── Xtream (direct or M3U override) ──────────────────────────────────
+        # Method 1: player_api get_short_epg (fast, per-channel)
+        # Method 2: portal's /xmltv.php
+        # Method 3: user-supplied external XMLTV (fallback for channels portal has no data for)
         if conn == "xtream" or (conn == "m3u_url" and state.m3u_xtream_override):
             creds = state.m3u_xtream_override if conn == "m3u_url" else None
             base  = creds["base"]      if creds else state.url
@@ -3150,11 +3171,74 @@ def api_epg():
             pwd   = creds["password"]  if creds else state.password
             from urllib.parse import urlparse as _up, quote as _q
             _p = _up(base.rstrip("/"))
-            xmltv_url = (f"{_p.scheme}://{_p.netloc}/xmltv.php"
-                         f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}")
-            tvg_lookup = tvg_id or stream_id
-            state.log(f"[EPG] Xtream XMLTV: {xmltv_url} (looking for: {tvg_lookup})")
-            return await _fetch_xmltv_epg(xmltv_url, tvg_lookup, state.log)
+            base_norm = f"{_p.scheme}://{_p.netloc}"
+
+            # ── Method 1: get_short_epg (per-channel, fast) ──────────────────
+            short_epg_skip = base_norm in state._short_epg_broken
+            if stream_id and not short_epg_skip:
+                epg_api_url = (f"{base_norm}/player_api.php"
+                               f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}"
+                               f"&action=get_short_epg&stream_id={stream_id}&limit=3")
+                state.log(f"[EPG] Xtream get_short_epg stream_id={stream_id}")
+                try:
+                    async with aiohttp.ClientSession() as sess:
+                        async with sess.get(epg_api_url,
+                                            timeout=aiohttp.ClientTimeout(total=10)) as r:
+                            payload = await safe_json(r)
+                    listings = (payload.get("epg_listings") or
+                                (payload.get("js") or {}).get("data") or
+                                (payload.get("js") or {}).get("epg_listings") or []) \
+                               if isinstance(payload, dict) else []
+                    if listings and isinstance(listings, list):
+                        state.log(f"[EPG] get_short_epg first entry: {listings[0]}")
+                        result = _parse_xtream_short_epg(payload)
+                        if result.get("current") or result.get("next"):
+                            state.log(f"[EPG] get_short_epg OK — current={result.get('current',{}).get('title','?')!r}")
+                            return result
+                        state.log(f"[EPG] get_short_epg has entries but none current/next — falling through")
+                    else:
+                        state._short_epg_broken.add(base_norm)
+                        state.log(f"[EPG] get_short_epg empty — portal flagged, skipping next time")
+                except Exception as e:
+                    state.log(f"[EPG] get_short_epg error: {e}")
+            elif short_epg_skip:
+                state.log(f"[EPG] Skipping get_short_epg (portal flagged as broken)")
+
+            # ── Method 2: portal's own XMLTV ─────────────────────────────────
+            epg_ch_id = str(item.get("epg_channel_id") or "").strip()
+            portal_result = None
+            if epg_ch_id and epg_ch_id != item.get("name", "") \
+                    and base_norm not in state._xmltv_no_data:
+                xmltv_url = (f"{base_norm}/xmltv.php"
+                             f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}")
+                state.log(f"[EPG] Xtream portal XMLTV (epg_channel_id={epg_ch_id!r})")
+                portal_result = await _fetch_xmltv_epg(xmltv_url, epg_ch_id, state.log,
+                                                       cache_key=base_norm)
+                if portal_result.get("current") or portal_result.get("next"):
+                    return portal_result
+                state.log(f"[EPG] Portal XMLTV returned no data for this channel")
+            elif not epg_ch_id or epg_ch_id == item.get("name", ""):
+                state.log(f"[EPG] No epg_channel_id — skipping portal XMLTV")
+
+            # ── Method 3: external XMLTV fallback ────────────────────────────
+            # Use epg_channel_id if available, else fall back to tvg_id (channel name).
+            # Even if tvg_id is a display name it's worth trying — some EPG sources
+            # use display-name matching and it costs nothing once the index is cached.
+            if state.ext_epg_url:
+                lookup_id = epg_ch_id or tvg_id
+                if lookup_id:
+                    state.log(f"[EPG] External EPG fallback (lookup={lookup_id!r})")
+                    ext_result = await _fetch_xmltv_epg(state.ext_epg_url, lookup_id,
+                                                        state.log, cache_key=state.ext_epg_url)
+                    if ext_result.get("current") or ext_result.get("next"):
+                        return ext_result
+                    state.log(f"[EPG] External EPG: no match for {lookup_id!r}")
+
+            # Nothing worked
+            err = "No EPG data found."
+            if not state.ext_epg_url:
+                err += " Try adding an external EPG URL in settings."
+            return {"current": None, "next": None, "error": err}
 
         # ── Stalker / MAC portal ──────────────────────────────────────────────
         if conn == "mac":
@@ -3167,33 +3251,54 @@ def api_epg():
                 headers = client._headers(include_auth=True) if state.is_stalker_portal \
                           else client.headers
                 base_url = normalize_base_url(state.url)
-                # MAC/Stalker portals vary — try all known EPG actions in order
-                # action=get_epg_info: standard Stalker, returns {js:{ch_id:[{name,time,time_to}]}}
-                # action=get_short_epg: some portals, returns {js:{data:[...]}}
-                # action=get_content:   older MAC portals with &type=epg
                 if not ch_id:
-                    return {"current": None, "next": None, "error": "No channel ID for EPG"}
-                epg_url = (f"{base_url}{php}?type=itv&action=get_short_epg"
-                           f"&ch_id={ch_id}&count=10&JsHttpRequest=1-xml")
-                state.log(f"[EPG] Trying: {epg_url}")
-                async with client.session.get(epg_url, headers=headers,
-                                              timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    state.log(f"[EPG] HTTP {r.status}")
-                    payload = await safe_json(r)
-                state.log(f"[EPG] Raw: {str(payload)[:300]}")
-                result = _parse_stalker_epg(payload, ch_id)
-                if result.get("current") or result.get("next") or result.get("schedule"):
-                    return result
-            return {"current": None, "next": None, "error": "No EPG data from portal"}
+                    # No portal ch_id — skip straight to external EPG if available
+                    pass
+                else:
+                    epg_url = (f"{base_url}{php}?type=itv&action=get_short_epg"
+                               f"&ch_id={ch_id}&count=10&JsHttpRequest=1-xml")
+                    state.log(f"[EPG] Trying: {epg_url}")
+                    async with client.session.get(epg_url, headers=headers,
+                                                  timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        state.log(f"[EPG] HTTP {r.status}")
+                        payload = await safe_json(r)
+                    state.log(f"[EPG] Raw: {str(payload)[:300]}")
+                    result = _parse_stalker_epg(payload, ch_id)
+                    if result.get("current") or result.get("next") or result.get("schedule"):
+                        return result
+                    state.log(f"[EPG] Portal returned no EPG data for this channel")
 
-        # ── M3U without Xtream — try tvg-url XMLTV ───────────────────────────
+            # External EPG fallback for MAC/Stalker
+            if state.ext_epg_url:
+                lookup_id = str(item.get("epg_channel_id") or tvg_id or "").strip()
+                if lookup_id:
+                    state.log(f"[EPG] MAC external EPG fallback (lookup={lookup_id!r})")
+                    ext_result = await _fetch_xmltv_epg(state.ext_epg_url, lookup_id,
+                                                        state.log, cache_key=state.ext_epg_url)
+                    if ext_result.get("current") or ext_result.get("next"):
+                        return ext_result
+
+            err = "No EPG data from portal."
+            if state.ext_epg_url:
+                err += " Channel not found in external EPG either."
+            else:
+                err += " Try adding an external EPG URL in settings."
+            return {"current": None, "next": None, "error": err}
+
+        # ── M3U without Xtream — try tvg-url XMLTV then external ─────────────
         if conn == "m3u_url" and tvg_id:
             tvg_url = str(item.get("tvg_url") or item.get("_tvg_url") or "").strip()
             if not tvg_url:
-                # Try to get from M3U header if cached
                 tvg_url = getattr(state, "_tvg_url_cache", "")
             if tvg_url and tvg_url.startswith("http"):
-                return await _fetch_xmltv_epg(tvg_url, tvg_id, state.log)
+                m3u_result = await _fetch_xmltv_epg(tvg_url, tvg_id, state.log)
+                if m3u_result.get("current") or m3u_result.get("next"):
+                    return m3u_result
+                state.log(f"[EPG] M3U tvg-url returned no data — trying external EPG")
+            # External EPG fallback
+            if state.ext_epg_url:
+                return await _fetch_xmltv_epg(state.ext_epg_url, tvg_id, state.log,
+                                              cache_key=state.ext_epg_url)
 
         return {"current": None, "next": None, "error": "EPG not available for this portal/item"}
 
@@ -3252,10 +3357,9 @@ def api_catchup():
         # flag per entry plus direct archive cmd. get_epg_info only returns today's
         # upcoming schedule and does NOT have mark_archive.
         if conn == "mac":
-            import re as _re
             cmd_field  = str(item.get("cmd") or "").strip()
             item_ch_id = str(item.get("ch_id") or item.get("id") or "").strip()
-            m          = _re.search(r'/ch/(\d+)', cmd_field)
+            m          = re.search(r'/ch/(\d+)', cmd_field)
             cmd_ch_id  = m.group(1) if m else None
             ch_id      = item_ch_id or cmd_ch_id
             state.log(f"[CatchUp] ch_id={ch_id}")
@@ -3368,7 +3472,6 @@ def api_catchup_play():
     cmd must be the original live-channel stub (ffmpeg http:///ch/NNNN_), NOT
     an archive-specific cmd from EPG entries.
     """
-    import re as _re
     data     = request.get_json(force=True)
     cmd_in   = str(data.get("cmd")      or "").strip()
     live_cmd = str(data.get("live_cmd") or "").strip()
@@ -3427,14 +3530,14 @@ def api_catchup_play():
         # Strip any live-manifest filename to get the stream base path.
         # Flussonic serves live via: mpegts, index.m3u8, mono.m3u8, playlist.m3u8, chunklist*, manifest*
         _live_manifest_re = r'/(mpegts|index\.m3u8|mono\.m3u8|playlist\.m3u8|chunklist[^/]*|manifest[^/]*)$'
-        _stream_base = _re.sub(_live_manifest_re, '', _path, flags=_re.IGNORECASE)
+        _stream_base = re.sub(_live_manifest_re, '', _path, flags=re.IGNORECASE)
         # A URL is a Flussonic live token URL if:
         #   - it has a token query param
         #   - its path ends with a known live-manifest name (NOT already an archive URL)
         _is_flussonic = (
             _tok and
-            _re.search(_live_manifest_re, _path, _re.IGNORECASE) and
-            not _re.search(r'archive|timeshift', _path, _re.IGNORECASE)
+            re.search(_live_manifest_re, _path, re.IGNORECASE) and
+            not re.search(r'archive|timeshift', _path, re.IGNORECASE)
         )
         if _is_flussonic and _stream_base:
             dur_secs    = stop_ts - start_ts
@@ -3457,6 +3560,104 @@ def api_catchup_play():
     except Exception as e:
         state.log(f"[CatchUp/Play] Error: {e}")
         return jsonify({"error": str(e)})
+
+
+def _parse_xtream_short_epg(payload: dict) -> dict:
+    """Parse Xtream player_api get_short_epg response.
+
+    Response shape (two known variants):
+      {"epg_listings": [{"title": b64, "start": "2024-01-01 20:00:00",
+                          "end": "2024-01-01 21:00:00", "description": b64, ...}, ...]}
+      {"js": {"data": [...]}}   — some panels wrap it
+
+    title/description fields are base64-encoded on most panels.
+    start/end are UTC strings "YYYY-MM-DD HH:MM:SS".
+    """
+    now = datetime.now(timezone.utc).timestamp()
+    out = {"current": None, "next": None, "schedule": []}
+
+    def _safe_b64(s: str) -> str:
+        """Decode base64 if it looks encoded, else return as-is."""
+        if not s:
+            return s
+        try:
+            decoded = base64.b64decode(s + "==").decode("utf-8", errors="replace")
+            if decoded.isprintable() and len(decoded) >= 1:
+                return decoded.strip()
+        except Exception:
+            pass
+        return s.strip()
+
+    def _to_ts(val) -> float:
+        """Convert Xtream EPG time value to UTC unix timestamp.
+        Xtream panels use: start_timestamp (unix int), start (local datetime string),
+        or occasionally time (unix int). Prefer unix timestamps over formatted strings.
+        """
+        if not val:
+            return 0.0
+        if isinstance(val, (int, float)):
+            return float(val)
+        s = str(val).strip()
+        # Integer string (most common for start_timestamp)
+        try:
+            return float(s)
+        except ValueError:
+            pass
+        # Formatted datetime strings
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(s[:19], fmt).replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                continue
+        return 0.0
+
+    if not isinstance(payload, dict):
+        return out
+
+    # Unwrap js/data envelope if present
+    listings = payload.get("epg_listings") or []
+    if not listings:
+        js = payload.get("js", {})
+        if isinstance(js, dict):
+            listings = js.get("data") or js.get("epg_listings") or []
+        elif isinstance(js, list):
+            listings = js
+
+    if not isinstance(listings, list):
+        return out
+
+    entries = []
+    for ep in listings:
+        if not isinstance(ep, dict):
+            continue
+        title = _safe_b64(str(ep.get("title") or ep.get("name") or ""))
+        desc  = _safe_b64(str(ep.get("description") or ep.get("desc") or ep.get("plot") or ""))
+        # Prefer unix timestamp fields (start_timestamp, stop_timestamp) over formatted strings
+        start = _to_ts(ep.get("start_timestamp") or ep.get("time") or ep.get("start"))
+        end   = _to_ts(ep.get("stop_timestamp")  or ep.get("time_to") or ep.get("end") or ep.get("stop"))
+        if not title or not start:
+            continue
+        entries.append({"title": title, "start": start, "end": end, "desc": desc})
+
+    entries.sort(key=lambda x: x["start"])
+    out["schedule"] = entries
+
+    for ep in entries:
+        if ep["start"] <= now < ep["end"]:
+            out["current"] = ep
+        elif ep["start"] > now and out["next"] is None:
+            out["next"] = ep
+
+    # If nothing matched by time window, pick closest past as current and first future as next
+    if not out["current"] and entries:
+        past = [e for e in entries if e["end"] <= now]
+        future = [e for e in entries if e["start"] > now]
+        if past:
+            out["current"] = past[-1]
+        if future:
+            out["next"] = future[0]
+
+    return out
 
 
 def _parse_stalker_epg(payload: dict, ch_id: str) -> dict:
@@ -3526,91 +3727,160 @@ def _parse_stalker_epg(payload: dict, ch_id: str) -> dict:
     return out
 
 
-async def _fetch_xmltv_epg(xmltv_url: str, tvg_id: str, log_cb=None) -> dict:
-    """Fetch XMLTV and find schedule for tvg_id."""
+async def _build_xmltv_index(xmltv_url: str, log_cb=None) -> dict:
+    """Download XMLTV and build full channel→programmes index.
+    Returns: {channel_id_lower: [{"title","start","end","desc"}, ...]}
+    Same approach as reference app — build once, lookup by exact ID.
+    """
     import xml.etree.ElementTree as ET
-    out = {"current": None, "next": None, "schedule": []}
-    if not tvg_id:
-        return out
     _log = log_cb or (lambda x: None)
-    now = datetime.now(timezone.utc).timestamp()
 
-    def _ts(s):
+    def _ts(s: str) -> float:
+        """Parse XMLTV datetime string '20240101200000 +0000' → UTC timestamp."""
         s = s.strip()
         try:
             dt = datetime.strptime(s[:14], "%Y%m%d%H%M%S")
+            offset = 0
             if len(s) > 14:
                 tz = s[14:].strip()
                 sign = 1 if tz.startswith("+") else -1
                 h, m = int(tz[1:3]), int(tz[3:5])
                 offset = sign * (h * 3600 + m * 60)
-                return dt.replace(tzinfo=timezone.utc).timestamp() - offset
-            return dt.replace(tzinfo=timezone.utc).timestamp()
+            # dt is local time expressed in the given offset.
+            # Convert: UTC = local_time - offset
+            return dt.replace(tzinfo=timezone.utc).timestamp() - offset
         except Exception:
-            return 0
+            return 0.0
 
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(xmltv_url, timeout=aiohttp.ClientTimeout(total=30)) as r:
-                if r.status != 200:
-                    out["error"] = f"XMLTV HTTP {r.status}"
-                    return out
-                # Stream and parse iteratively — XMLTV files can be huge
-                raw = await r.read()
+    _log(f"[EPG] Downloading XMLTV from {xmltv_url}")
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(xmltv_url, timeout=aiohttp.ClientTimeout(total=60)) as r:
+            if r.status != 200:
+                raise RuntimeError(f"XMLTV HTTP {r.status}")
+            raw = await r.read()
 
-        root = ET.fromstring(raw)
-        tvg_lower = tvg_id.lower()
-        schedule = []
+    # Decompress if gzip (URL ends in .gz or response is gzip-encoded / magic bytes)
+    if xmltv_url.lower().rstrip("?").endswith(".gz") or raw[:2] == b'\x1f\x8b':
+        try:
+            import gzip as _gzip
+            raw = _gzip.decompress(raw)
+            _log(f"[EPG] XMLTV gzip decompressed → {len(raw)//1024}KB")
+        except Exception as gz_err:
+            _log(f"[EPG] XMLTV gzip decompress failed: {gz_err}")
 
-        # Build a set of channel identifiers to match against
-        # Some XMLTV files have empty id but populated display-name, or vice versa
-        chan_map = {}  # id → display-name for logging
-        for c in root.findall("channel"):
-            cid = (c.get("id") or "").strip()
-            dname = (c.findtext("display-name") or "").strip()
-            chan_map[cid] = dname
+    _log(f"[EPG] XMLTV downloaded {len(raw)//1024}KB — parsing…")
+    root = ET.fromstring(raw)
 
-        _log(f"[EPG] XMLTV channels ({len(chan_map)}): {list(chan_map.items())[:8]}")
-        _log(f"[EPG] Looking for tvg_id: '{tvg_id}'")
+    # channel id → list of display-names (normalised lower)
+    chan_names: dict = {}
+    for c in root.findall("channel"):
+        cid = (c.get("id") or "").strip().lower()
+        if cid:
+            names = [dn.text.strip().lower()
+                     for dn in c.findall("display-name") if dn.text]
+            chan_names[cid] = names
 
-        def _matches(chan_attr: str) -> bool:
-            """Check if a programme's channel attribute matches our tvg_id."""
-            c = chan_attr.lower().strip()
-            t = tvg_lower.strip()
-            if not c or not t:
-                return False
-            if c == t or t in c or c in t:
-                return True
-            # Also check display-name for this channel id
-            dname = chan_map.get(chan_attr, "").lower()
-            return dname and (dname == t or t in dname or dname in t)
+    # Build full programme index keyed by channel_id_lower
+    epg_dict: dict = {}
+    for prog in root.findall("programme"):
+        cid = (prog.get("channel") or "").strip().lower()
+        if not cid:
+            continue
+        start = _ts(prog.get("start", ""))
+        end   = _ts(prog.get("stop",  ""))
+        title = (prog.findtext("title") or "").strip()
+        desc  = (prog.findtext("desc")  or "").strip()
+        if not title or not start:
+            continue
+        if cid not in epg_dict:
+            epg_dict[cid] = []
+        epg_dict[cid].append({"title": title, "start": start, "end": end, "desc": desc})
 
-        for prog in root.findall("programme"):
-            chan = prog.get("channel", "")
-            if not _matches(chan):
-                continue
-            start = _ts(prog.get("start", ""))
-            end   = _ts(prog.get("stop", ""))
-            title = (prog.findtext("title") or "").strip()
-            desc  = (prog.findtext("desc") or "").strip()
-            if not title or not start:
-                continue
-            entry = {"title": title, "start": start, "end": end, "desc": desc}
-            schedule.append(entry)
-            # Only collect up to 10 entries around now
-            if len(schedule) >= 10 and all(e["start"] > now + 3600 for e in schedule[-3:]):
-                break
+    _log(f"[EPG] XMLTV index built: {len(epg_dict)} channels with programmes "
+         f"(out of {len(chan_names)} channel defs)")
+    if not epg_dict:
+        _log(f"[EPG] XMLTV has channel defs but NO programme data — portal serves stub XMLTV")
+    return epg_dict, chan_names
 
-        schedule.sort(key=lambda x: x["start"])
-        out["schedule"] = schedule
-        for ep in schedule:
-            if ep["start"] <= now < ep["end"]:
-                out["current"] = ep
-            elif ep["start"] > now and out["next"] is None:
-                out["next"] = ep
 
-    except Exception as e:
-        out["error"] = str(e)
+async def _fetch_xmltv_epg(xmltv_url: str, tvg_id: str, log_cb=None,
+                           cache_key: str = "") -> dict:
+    """Look up EPG for tvg_id using cached XMLTV index.
+    cache_key should be base_norm (e.g. 'http://host:port') to share the
+    index across all channels on the same portal.
+    """
+    out = {"current": None, "next": None, "schedule": []}
+    if not tvg_id:
+        return out
+    _log = log_cb or (lambda x: None)
+    now = datetime.now(timezone.utc).timestamp()
+    lookup = tvg_id.strip().lower()
+    ck = cache_key or xmltv_url
+
+    # Fast-path: portal already confirmed to have no programme data
+    if ck in state._xmltv_no_data:
+        _log(f"[EPG] Portal XMLTV has no programme data (flagged) — skipping")
+        out["error"] = "Provider XMLTV contains no programme data"
+        return out
+
+    # ── Get or build the index ────────────────────────────────────────────────
+    cached = state._xmltv_cache.get(ck)
+    if cached:
+        cached_ts, epg_dict, chan_names = cached
+        if time.time() - cached_ts < state._xmltv_cache_ttl:
+            _log(f"[EPG] XMLTV cache hit for {ck}")
+        else:
+            _log(f"[EPG] XMLTV cache expired — refreshing")
+            cached = None
+
+    if not cached:
+        try:
+            epg_dict, chan_names = await _build_xmltv_index(xmltv_url, _log)
+            state._xmltv_cache[ck] = (time.time(), epg_dict, chan_names)
+            if not epg_dict:
+                state._xmltv_no_data.add(ck)
+                out["error"] = "Provider XMLTV contains no programme data"
+                return out
+        except Exception as e:
+            _log(f"[EPG] XMLTV download/parse error: {e}")
+            out["error"] = str(e)
+            return out
+
+    # ── Resolve channel ID → programme list ───────────────────────────────────
+    entries = epg_dict.get(lookup)
+
+    # Fallback: match via display-name if exact ID miss
+    if not entries:
+        for cid, names in chan_names.items():
+            if lookup in names or any(lookup in n or n in lookup for n in names):
+                entries = epg_dict.get(cid)
+                if entries:
+                    _log(f"[EPG] XMLTV display-name fallback: {tvg_id!r} → {cid!r}")
+                    break
+
+    if not entries:
+        _log(f"[EPG] XMLTV: no programmes found for {tvg_id!r}")
+        out["error"] = f"No EPG data in provider for '{tvg_id}'"
+        return out
+
+    _log(f"[EPG] XMLTV: {len(entries)} programmes for {tvg_id!r}")
+
+    # Filter to window around now (keep past 1h and next 3h)
+    window = [e for e in entries if e["end"] >= now - 3600 and e["start"] <= now + 10800]
+    if not window:
+        window = entries  # fallback: no filtering
+    window.sort(key=lambda x: x["start"])
+    out["schedule"] = window[:12]
+
+    for ep in window:
+        if ep["start"] <= now < ep["end"]:
+            out["current"] = ep
+        elif ep["start"] > now and out["next"] is None:
+            out["next"] = ep
+
+    _cur = out["current"]["title"] if out["current"] else None
+    _nxt = out["next"]["title"] if out["next"] else None
+    _log(f"[EPG] XMLTV result: current={_cur!r} next={_nxt!r}")
     return out
 
 
@@ -4126,17 +4396,28 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
         <button class="btn-ghost ct-btn" data-t="xtream" onclick="setCT('xtream')">📡 Xtream</button>
         <button class="btn-ghost ct-btn" data-t="m3u_url" onclick="setCT('m3u_url')">📄 M3U</button>
       </div>
-      <div id="cr-mac" class="cr">
-        <label>URL</label><input id="i-url" type="url" placeholder="http://portal.host:8080">
-        <label>MAC</label><input id="i-mac" placeholder="00:1A:79:XX:XX:XX" style="max-width:200px">
+      <div id="cr-mac" class="cr" style="flex-direction:column;align-items:stretch">
+        <div style="display:flex;gap:6px;align-items:center">
+          <label>URL</label><input id="i-url" type="url" placeholder="http://portal.host:8080">
+          <label>MAC</label><input id="i-mac" placeholder="00:1A:79:XX:XX:XX" style="max-width:200px">
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <label title="Optional: external XMLTV EPG URL. Leave blank to use portal's own EPG.">EPG</label><input id="i-mac-epg" type="url" placeholder="https://… xmltv URL (optional)">
+        </div>
       </div>
-      <div id="cr-xtream" class="cr hidden">
-        <label>URL</label><input id="i-xu" type="url" placeholder="http://server.host:8080">
-        <label>User</label><input id="i-us" placeholder="username" style="max-width:150px">
-        <label>Pass</label><input id="i-pw" type="password" placeholder="password" style="max-width:150px">
+      <div id="cr-xtream" class="cr hidden" style="flex-direction:column;align-items:stretch">
+        <div style="display:flex;gap:6px;align-items:center">
+          <label>URL</label><input id="i-xu" type="url" placeholder="http://server.host:8080">
+          <label>User</label><input id="i-us" placeholder="username" style="max-width:150px">
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <label title="Optional: external XMLTV EPG URL (e.g. epg.best). Leave blank to use provider's own EPG.">EPG</label><input id="i-epg" type="url" placeholder="https://epg.best/xmltv.php?… (optional)" style="flex:1">
+          <label>Pass</label><input id="i-pw" type="password" placeholder="password" style="max-width:150px">
+        </div>
       </div>
       <div id="cr-m3u" class="cr hidden">
         <label>URL</label><input id="i-m3u" type="url" placeholder="http://example.com/list.m3u">
+        <label title="Optional: external XMLTV EPG URL. Leave blank to use tvg-url from M3U.">EPG</label><input id="i-m3u-epg" type="url" placeholder="https://epg.best/xmltv.php?… (optional)" style="max-width:300px">
       </div>
       <div class="cr-bot">
         <button class="btn-acc" id="cbtn" onclick="doConnect()" style="height:36px;min-width:120px">🔌 Connect</button>
@@ -4443,14 +4724,17 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
         <div id="plf-mac">
           <div class="pl-row"><label>URL</label><input id="pl-url" type="url" placeholder="http://portal.host:8080"></div>
           <div class="pl-row"><label>MAC</label><input id="pl-mac" placeholder="00:1A:79:XX:XX:XX"></div>
+          <div class="pl-row"><label>EPG</label><input id="pl-mac-epg" type="url" placeholder="External EPG URL (optional)"></div>
         </div>
         <div id="plf-xtream" class="hidden">
           <div class="pl-row"><label>URL</label><input id="pl-xu" type="url" placeholder="http://server.host:8080"></div>
           <div class="pl-row"><label>User</label><input id="pl-us" placeholder="username"></div>
           <div class="pl-row"><label>Pass</label><input id="pl-pw" type="password" placeholder="password"></div>
+          <div class="pl-row"><label>EPG</label><input id="pl-epg" type="url" placeholder="External EPG URL (optional)"></div>
         </div>
         <div id="plf-m3u" class="hidden">
           <div class="pl-row"><label>URL</label><input id="pl-m3u" type="url" placeholder="http://example.com/list.m3u"></div>
+          <div class="pl-row"><label>EPG</label><input id="pl-m3u-epg" type="url" placeholder="External EPG URL (optional)"></div>
         </div>
         <div class="pl-row" style="justify-content:flex-end;gap:7px">
           <button class="btn-ghost" onclick="plClearForm()" style="height:34px;padding:0 12px;font-size:12px">Clear</button>
@@ -4509,6 +4793,11 @@ async function doConnect(){
     username:document.getElementById('i-us').value.trim(),
     password:document.getElementById('i-pw').value.trim(),
     m3u_url:document.getElementById('i-m3u').value.trim(),
+    ext_epg_url:(CT==='xtream'
+      ? document.getElementById('i-epg').value.trim()
+      : CT==='mac'
+        ? document.getElementById('i-mac-epg').value.trim()
+        : document.getElementById('i-m3u-epg').value.trim()),
   };
   const saveBtn = document.getElementById('save-profile-chk');
   const saveToProfile = saveBtn._on || false;
@@ -4539,6 +4828,7 @@ async function doConnect(){
           username: payload.username,
           password: payload.password,
           m3u_url: payload.m3u_url,
+          ext_epg_url: payload.ext_epg_url||'',
         };
         arr.push(entry);
         plSaveAll(arr);
@@ -4612,12 +4902,6 @@ function onCatChkIdx(i, checked){
 }
 
 // ── CATEGORY SELECTION ─────────────────────────────────────
-function onCatChk(cj, checked){
-  const c=JSON.parse(cj);
-  const key=c.id||c.title;
-  if(checked) selCats.set(key,c); else selCats.delete(key);
-  refreshCatBtns();
-}
 function selAllCats(v){
   selCats.clear();
   if(v) allCats.forEach(c=>selCats.set(c.id||c.title,c));
@@ -5060,6 +5344,7 @@ async function showEPG(){
       if(cur) cur.scrollIntoView({block:'nearest'});
     }
     if(d.current) document.getElementById('epg-now').textContent='▸ '+d.current.title;
+    else if(d.error) document.getElementById('epg-now').textContent='No EPG';
   }catch(e){
     document.getElementById('epg-body').innerHTML=`<div style="color:var(--err);font-size:12px;text-align:center;padding:20px">Failed: ${e.message}</div>`;
   }
@@ -5116,8 +5401,8 @@ async function _loadCatchupEPG(){
 
 let _cuListings = [];
 function _renderArchiveListings(listings){
-  // Show all programmes; highlight archived ones. Non-archived are dimmed.
   _cuListings = listings;
+  // Show all programmes; highlight archived ones. Non-archived are dimmed.
   let lastDate='';
   const rows=listings.map(p=>{
     const hasArchive=(p.mark_archive==='1'||p.mark_archive===1);
@@ -5517,6 +5802,11 @@ function plSave(){
     username: document.getElementById('pl-us').value.trim(),
     password: document.getElementById('pl-pw').value.trim(),
     m3u_url: document.getElementById('pl-m3u').value.trim(),
+    ext_epg_url: (plCT==='xtream'
+      ? document.getElementById('pl-epg').value.trim()
+      : plCT==='mac'
+        ? document.getElementById('pl-mac-epg').value.trim()
+        : document.getElementById('pl-m3u-epg').value.trim()),
   };
   if(plEditId){
     const idx=arr.findIndex(p=>p.id===plEditId);
@@ -5541,6 +5831,9 @@ function plEdit(i){
   document.getElementById('pl-us').value=p.username||'';
   document.getElementById('pl-pw').value=p.password||'';
   document.getElementById('pl-m3u').value=p.m3u_url||'';
+  document.getElementById('pl-epg').value=p.ext_epg_url||'';
+  document.getElementById('pl-mac-epg').value=p.ext_epg_url||'';
+  document.getElementById('pl-m3u-epg').value=p.ext_epg_url||'';
   // scroll form into view
   document.querySelector('.pl-add').scrollIntoView({behavior:'smooth'});
 }
@@ -5552,7 +5845,8 @@ function plDelete(i){
 
 function plClearForm(){
   plEditId=null;
-  ['pl-name','pl-url','pl-mac','pl-xu','pl-us','pl-pw','pl-m3u'].forEach(id=>
+  ['pl-name','pl-url','pl-mac','pl-xu','pl-us','pl-pw','pl-m3u',
+   'pl-epg','pl-mac-epg','pl-m3u-epg'].forEach(id=>
     document.getElementById(id).value='');
 }
 
@@ -5568,6 +5862,9 @@ async function plConnect(i){
   document.getElementById('i-us').value=p.username||'';
   document.getElementById('i-pw').value=p.password||'';
   document.getElementById('i-m3u').value=p.m3u_url||'';
+  document.getElementById('i-epg').value=p.ext_epg_url||'';
+  document.getElementById('i-mac-epg').value=p.ext_epg_url||'';
+  document.getElementById('i-m3u-epg').value=p.ext_epg_url||'';
   // Auto-connect
   await doConnect();
 }
