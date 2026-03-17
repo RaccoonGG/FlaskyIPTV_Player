@@ -27,6 +27,7 @@ Added button that opens external player of your choice (on dekstop select exe, o
 Added option to add subtitles from opensubtitles.com via inscript serach (get free apikey from https://www.opensubtitles.com/en/consumers)
 Added option to add local subtitles file for subtitles (.srt/.vtt/.ass/.ssa) via Local File tab in the subtitle modal.
 Subtitle delay +/- works the same for local files as for OpenSubtitles.
+Dekstop view optimizations, bigger player, now activity log is hidden by default, can expand, player controls can be hidden to expand player, theater mode button to fully expand player and hiding all tabs.
 Added external play button inside Whats on Now tab after search and matching channel, and added also inside catchup tab.
 Fixed major bug with yt-dlp fallback not respecting stop button.
 Fixed ffmpeg mkv download not working on specific hls vods/series, by adding mpeg-ts format as fallback to mkv.
@@ -1263,6 +1264,8 @@ class StalkerPortalClient:
         # Derived IDs — mirroring stalker.py
         self.serial = hashlib.md5(self.mac.encode()).hexdigest()[:13].upper()
         self.device_id = hashlib.sha256(self.mac.encode()).hexdigest().upper()
+        # Cache for channel id → logo URL, populated lazily from get_all_channels
+        self._ch_logo_cache: dict | None = None
 
     # ── context manager ──────────────────────────────────────────────────────
 
@@ -1277,6 +1280,42 @@ class StalkerPortalClient:
             await self.session.close()
 
     # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _fix_logo_url(self, val: str) -> str:
+        """Normalise a logo/screenshot URL returned by the stalker portal.
+
+        Stalker portals are notorious for returning image paths in three broken forms
+        in addition to well-formed absolute URLs:
+
+          1. Relative path    – ``/stalker_portal/misc/logos/480.png``
+          2. Hostless URL     – ``http://:/stalker_portal/...`` or
+                                ``http:///stalker_portal/...``  (no host, no port)
+          3. Localhost URL    – ``http://localhost/stalker_portal/misc/logos/480.png``
+                                The portal embeds 'localhost' in image paths (same as
+                                it does in stream cmd fields). The browser would try to
+                                load this from the user's own machine instead of the
+                                portal server, so we must replace it with self.base.
+
+        In all three cases the path is intact; only the authority is missing or wrong.
+        """
+        if not val or not isinstance(val, str):
+            return val or ""
+        val = val.strip()
+        if not val:
+            return ""
+        # Case 2: hostless URL — http://:/... or http:///...
+        if re.match(r'https?://[:/]', val):
+            path_part = re.sub(r'^https?://[^/]*', '', val)
+            return self.base.rstrip("/") + "/" + path_part.lstrip("/")
+        # Case 3: localhost URL — replace localhost authority with portal base
+        if re.match(r'https?://localhost(?:[:/]|$)', val):
+            path_part = re.sub(r'^https?://localhost(?::\d+)?', '', val)
+            return self.base.rstrip("/") + "/" + path_part.lstrip("/")
+        # Case 1 (already absolute, correct host) — return as-is
+        if val.startswith(("http://", "https://")):
+            return val
+        # Case 1b: relative path
+        return self.base.rstrip("/") + "/" + val.lstrip("/")
 
     def _cookie_str(self, include_token: bool = True) -> str:
         parts = [
@@ -1490,6 +1529,58 @@ class StalkerPortalClient:
 
     # ── items ─────────────────────────────────────────────────────────────────
 
+    async def _fetch_ch_logo_cache(self) -> dict:
+        """Fetch get_all_channels once and return a dict of {channel_id: logo_url}.
+        Tries load.php first, then portal.php as fallback if no logos come back.
+        Results are cached on the instance so subsequent pages pay no extra cost."""
+        if self._ch_logo_cache is not None:
+            return self._ch_logo_cache
+        self._ch_logo_cache = {}
+        headers = self._headers(include_auth=True)
+
+        def _extract_logos(all_ch: list) -> dict:
+            out = {}
+            for ch in all_ch:
+                if not isinstance(ch, dict):
+                    continue
+                ch_id = str(ch.get("id") or "").strip()
+                logo  = str(ch.get("logo") or ch.get("screenshot_uri") or
+                            ch.get("tv_logo") or ch.get("pic") or "").strip()
+                if ch_id and logo:
+                    out[ch_id] = self._fix_logo_url(logo)
+            return out
+
+        # Attempt 1: /stalker_portal/server/load.php
+        try:
+            url = self._load_url(type="itv", action="get_all_channels",
+                                 force_ch_link_check="", JsHttpRequest="1-xml")
+            self.log("[STALKER] Logo cache: trying load.php get_all_channels…")
+            async with self.session.get(url, headers=headers,
+                                        timeout=aiohttp.ClientTimeout(total=20)) as r:
+                self.log(f"[STALKER] Logo cache load.php HTTP {r.status}")
+                payload = await safe_json(r)
+            self._ch_logo_cache = _extract_logos(normalize_js(payload))
+            self.log(f"[STALKER] Logo cache (load.php): {len(self._ch_logo_cache)} entries")
+        except Exception as e:
+            self.log(f"[STALKER] Logo cache load.php error: {e}")
+
+        # Attempt 2: /stalker_portal/portal.php — only if attempt 1 yielded nothing
+        if not self._ch_logo_cache:
+            try:
+                url2 = self._load_url_alt(type="itv", action="get_all_channels",
+                                          force_ch_link_check="", JsHttpRequest="1-xml")
+                self.log("[STALKER] Logo cache: trying portal.php get_all_channels…")
+                async with self.session.get(url2, headers=headers,
+                                            timeout=aiohttp.ClientTimeout(total=20)) as r2:
+                    self.log(f"[STALKER] Logo cache portal.php HTTP {r2.status}")
+                    payload2 = await safe_json(r2)
+                self._ch_logo_cache = _extract_logos(normalize_js(payload2))
+                self.log(f"[STALKER] Logo cache (portal.php): {len(self._ch_logo_cache)} entries")
+            except Exception as e2:
+                self.log(f"[STALKER] Logo cache portal.php error: {e2}")
+
+        return self._ch_logo_cache
+
     async def fetch_items_page(self, mode: str, cat_id: str, page: int):
         assert self.session is not None
         if mode == "live":
@@ -1530,6 +1621,24 @@ class StalkerPortalClient:
             # Fallback: name ends with "Season N" — untagged season containers
             elif re.search(r'\bSeason\s+\d+\b', it.get("name") or it.get("o_name") or "", re.IGNORECASE):
                 it["_is_show_item"] = True
+            # Rewrite logo/screenshot URLs to absolute (handles relative, hostless,
+            # AND localhost URLs that stalker portals embed in item data)
+            for logo_field in ("logo", "screenshot_uri", "pic"):
+                val = it.get(logo_field)
+                if val and isinstance(val, str):
+                    fixed = self._fix_logo_url(val)
+                    if fixed != val:
+                        it[logo_field] = fixed
+        # For live channels whose logo field is empty, try get_all_channels as fallback.
+        # Only triggered when at least one channel in this page is missing a logo.
+        if mode == "live" and any(not it.get("logo") for it in items if isinstance(it, dict)):
+            logo_cache = await self._fetch_ch_logo_cache()
+            if logo_cache:
+                for it in items:
+                    if isinstance(it, dict) and not it.get("logo"):
+                        ch_id = str(it.get("id") or "").strip()
+                        if ch_id and ch_id in logo_cache:
+                            it["logo"] = logo_cache[ch_id]
         self.log(f"[STALKER] {mode.upper()} cat={cat_id} p={page}: {len(items)} items")
         return items
 
@@ -1549,6 +1658,16 @@ class StalkerPortalClient:
             payload = await safe_json(r)
         items = normalize_js(payload)
         self.log(f"[STALKER] Series episodes: {len(items)} found")
+        # Rewrite logo URLs to absolute (handles relative, hostless and localhost URLs)
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            for logo_field in ("logo", "screenshot_uri", "pic"):
+                val = it.get(logo_field)
+                if val and isinstance(val, str):
+                    fixed = self._fix_logo_url(val)
+                    if fixed != val:
+                        it[logo_field] = fixed
         return items
 
     # ── stream link ───────────────────────────────────────────────────────────
@@ -1875,6 +1994,17 @@ class StalkerPortalClient:
                     it["_season_id"] = season_id
 
         self.log(f"[STALKER] {series_name}: {len(all_items)} items found")
+        # Rewrite logo/screenshot URLs on every returned item (season containers
+        # and actual episode rows both suffer from localhost/hostless paths)
+        for it in all_items:
+            if not isinstance(it, dict):
+                continue
+            for logo_field in ("logo", "screenshot_uri", "pic"):
+                val = it.get(logo_field)
+                if val and isinstance(val, str):
+                    fixed = self._fix_logo_url(val)
+                    if fixed != val:
+                        it[logo_field] = fixed
         return all_items
 
     async def dump_single_item_to_file(self, mode: str, item: dict, category: dict, out_path: str, stop_flag=None):
@@ -2716,7 +2846,8 @@ async def _connect_async():
                             state.cats_cache[m] = []
                     state.connected = True
                     state.set_status(f"Connected (Xtream via M3U): {ident} | {exp}")
-                    return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp}
+                    return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
+                            "is_stalker": False}
             except Exception as e:
                 state.log(f"[CONNECT] Xtream failed ({e}) — falling back to M3U download…")
                 state.m3u_xtream_override = None
@@ -2737,7 +2868,8 @@ async def _connect_async():
                     state.log(f"[CONNECT] {m.upper()}: {len(state.cats_cache[m])} categories")
         state.connected = True
         state.set_status(f"Connected: {ident} | {exp}")
-        return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp}
+        return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
+                "is_stalker": state.is_stalker_portal}
 
     # MAC / Xtream
     if state.is_stalker_portal:
@@ -2755,7 +2887,8 @@ async def _connect_async():
                 state.cats_cache[m] = []
     state.connected = True
     state.set_status(f"Connected: {ident} | {exp}")
-    return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp}
+    return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
+            "is_stalker": state.is_stalker_portal}
 
 
 # ===================== FLASK APP =====================
@@ -2882,6 +3015,9 @@ def api_episodes():
     cat_title = data.get("cat_title", "Unknown")
     cat_id = str(data.get("cat_id", ""))
     mode = data.get("mode", "series"); mode = mode if mode in ("live","vod","series") else "series"
+    # parent_logo: the show's logo URL sent by the JS frontend so the backend can
+    # inject it into any episode that carries no thumbnail of its own.
+    parent_logo = str(data.get("parent_logo") or "").strip()
     item = dict(item)
     item["_cat_id"] = cat_id
     item["_mode"] = mode
@@ -2892,6 +3028,17 @@ def api_episodes():
                 return await client.fetch_episodes_for_show(item, cat_title)
 
         episodes = run_async(fetch())
+
+        # Server-side parent-logo injection: fill in any episode that has no
+        # thumbnail with the parent show's logo.  This mirrors the client-side
+        # propagation in drillShow() and acts as a belt-and-suspenders guarantee.
+        if parent_logo:
+            for ep in episodes:
+                if isinstance(ep, dict):
+                    if not (ep.get("logo") or ep.get("stream_icon") or ep.get("cover")
+                            or ep.get("screenshot_uri") or ep.get("pic")):
+                        ep["logo"] = parent_logo
+
         return jsonify({"episodes": episodes, "count": len(episodes)})
     except Exception as e:
         state.log(f"[EPISODES] Error: {e}")
@@ -6560,6 +6707,7 @@ let CT='mac', mode='live', curCat=null;
 let allCats=[], catsCache={}, selCats=new Map();
 let allItems=[], filtItems=[], navStack=[], selSet=new Set();
 let pUrl='', pName='', pIdx=-1;
+let isStalker=false;  // true when connected to a stalker_portal MAC portal
 let _dlActive=false, _dlTaskType='', _dlItemNames=[];
 let hlsObj=null, mpegtsObj=null, recTmr=null, isRec=false, logEs=null, cpOpen=false;
 const vid = document.getElementById('vid');
@@ -7145,6 +7293,7 @@ async function doConnect(){
     if(d.success){
       document.getElementById('cdot').classList.add('on');
       setStatus('Connected: '+d.ident+(d.exp&&d.exp!=='unknown'?' · exp '+d.exp:''));
+      isStalker = !!d.is_stalker;
       const _rawUrl = payload.m3u_url || payload.url || '';
       const _portalHost = _rawUrl ? (()=>{try{return new URL(_rawUrl).hostname;}catch(e){return _rawUrl.replace(/https?:\/\//,'').split('/')[0].split(':')[0];}})() : '';
       document.getElementById('portal-name-label').textContent = _portalHost || '—';
@@ -7430,9 +7579,15 @@ function renderItems(items){
     const epLogo=grp&&!it.logo&&!it.stream_icon&&!it.cover
       ?(ep0.logo||ep0.stream_icon||ep0.cover||ep0.screenshot_uri||ep0.pic||''):'';
     const logo=it.logo||it.stream_icon||it.cover||it.screenshot_uri||it.pic||epLogo||'';
+    // Route all external logo URLs through /api/proxy.
+    // Stalker portal servers typically do NOT send CORS headers for static image files,
+    // so a direct <img src="http://portal-host/..."> will be blocked by the browser and
+    // silently hidden by onerror. Proxying through Flask serves the image same-origin.
+    const logoSrc = logo && (logo.startsWith('http://') || logo.startsWith('https://'))
+      ? '/api/proxy?url='+encodeURIComponent(logo) : logo;
     return '<div class="irow'+(playing?' now':'')+'" style="--d:'+(Math.min(i,50)*.016)+'s">'
       +'<input class="ichk" type="checkbox" data-i="'+i+'" onchange="onChk('+i+',this.checked)">'
-      +(logo?'<img class="ilogo" src="'+esc(logo)+'" onerror="this.style.display=\'none\'">'+'':'<span style="width:36px;height:24px;flex-shrink:0;display:inline-block"></span>')
+      +(logoSrc?'<img class="ilogo" src="'+esc(logoSrc)+'" onerror="this.style.display=\'none\'">'+'':'<span style="width:36px;height:24px;flex-shrink:0;display:inline-block"></span>')
       +'<button onclick="toggleFav('+i+')" title="Favourite"'
       +' style="background:none;border:none;cursor:pointer;font-size:15px;padding:0 2px;line-height:1;flex-shrink:0;color:'+(isFav(it)?'#f5c518':'rgba(255,255,255,0.25)')+'">★</button>'
       +'<span class="iname" title="'+esc(name)+'">'+esc(name)+'</span>'
@@ -7577,15 +7732,30 @@ function drillGrp(i){
 
 function drillShow(i){
   const it=filtItems[i]; if(!it) return;
+  // Capture the parent show's logo — episodes rarely have their own thumbnail.
+  // Also fall back to the current category logo (curCat.logo / curCat.screenshot_uri)
+  // if the show item itself carries no image, so there is always something to show.
+  const parentLogo = it.logo||it.stream_icon||it.cover||it.screenshot_uri||it.pic
+    ||curCat?.logo||curCat?.screenshot_uri||curCat?.pic||'';
   setBusy(true);
   _setLoadingHeader(it.name);
   setStatus("Loading eps for '"+it.name+"'…");
   showSkels(8, true);
   fetch('/api/episodes',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({item:it, mode, cat_id:curCat?.id||'', cat_title:curCat?.title||''})})
+    body:JSON.stringify({item:it, mode, cat_id:curCat?.id||'', cat_title:curCat?.title||'',
+      parent_logo:parentLogo})})
   .then(r=>r.json()).then(d=>{
     _setLoadingHeader(null);
     if(d.error||!d.episodes?.length){toast('No episodes found','warn');showItems(it.name||'',allItems);return;}
+    // Propagate parent logo to any episode that has no logo of its own.
+    // Stalker portals rarely provide per-episode thumbnails; using the show's
+    // poster is far better than showing blank squares.
+    if(parentLogo){
+      d.episodes.forEach(ep=>{
+        if(!ep.logo&&!ep.stream_icon&&!ep.cover&&!ep.screenshot_uri&&!ep.pic)
+          ep.logo=parentLogo;
+      });
+    }
     navStack.push({label:'Browse',items:[...allItems]});
     setStatus(it.name+' — '+d.episodes.length+' episodes');
     showItems(it.name, d.episodes);
