@@ -8,10 +8,12 @@ Tested on Windows 10 with python 3.14 and Termux on Android 16.
 """
 
 import base64
+import hashlib
 import json
 import re
 import contextlib
 import os
+import random
 import shutil
 import string
 import subprocess
@@ -1093,6 +1095,566 @@ class PortalClient:
         self.log(f"Finished {cat_title} (items: {lines_written})")
 
 
+# ===================== STALKER PORTAL CLIENT =====================
+# Mirrors the working stalker.py logic but using aiohttp for async compatibility.
+# Key differences from the standard PortalClient:
+#   - URL path: /stalker_portal/server/load.php  (not /portal.php)
+#   - Requires MAG200 User-Agent, Referer, X-User-Agent, Cookie as header string
+#   - 404 handshake: generate token+prehash and retry
+#   - get_profile must be called after handshake to confirm/refresh token
+
+class StalkerPortalClient:
+    LOAD_PHP = "/stalker_portal/server/load.php"
+
+    def __init__(self, base_url: str, mac: str, log_cb):
+        self.base = normalize_base_url(base_url)
+        self.mac = mac.strip().upper()
+        self.log = log_cb
+        self.session = None
+        self.token = None
+        self.bearer_token = None
+        self._random = None
+        # Derived IDs — mirroring stalker.py
+        self.serial = hashlib.md5(self.mac.encode()).hexdigest()[:13].upper()
+        self.device_id = hashlib.sha256(self.mac.encode()).hexdigest().upper()
+
+    # ── context manager ──────────────────────────────────────────────────────
+
+    async def __aenter__(self):
+        _timeout = aiohttp.ClientTimeout(total=60, connect=10)
+        # NO session-level cookies — stalker portals require Cookie as a header string
+        self.session = aiohttp.ClientSession(timeout=_timeout)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self.session:
+            await self.session.close()
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _cookie_str(self, include_token: bool = True) -> str:
+        parts = [
+            f"mac={quote(self.mac)}",
+            "stb_lang=en",
+            f"timezone={quote('Europe/Paris')}",
+        ]
+        if include_token and self.bearer_token:
+            parts.append(f"token={quote(self.bearer_token)}")
+        return "; ".join(parts)
+
+    def _headers(self, include_auth: bool = False, include_token: bool = True) -> dict:
+        h = {
+            "Accept": "*/*",
+            "User-Agent": (
+                "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 "
+                "(KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3"
+            ),
+            "Referer": f"{self.base}/stalker_portal/c/index.html",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Pragma": "no-cache",
+            "X-User-Agent": "Model: MAG250; Link: WiFi",
+            "Cookie": self._cookie_str(include_token=include_token),
+            "Connection": "close",
+            "Accept-Encoding": "gzip, deflate",
+        }
+        if include_auth and self.bearer_token:
+            h["Authorization"] = f"Bearer {self.bearer_token}"
+        return h
+
+    def _load_url(self, **params) -> str:
+        from urllib.parse import urlencode
+        return f"{self.base}{self.LOAD_PHP}?{urlencode(params)}"
+
+    def _generate_token(self) -> str:
+        return ''.join(random.choices(string.ascii_uppercase + string.digits, k=32))
+
+    def _generate_prehash(self, token: str) -> str:
+        return hashlib.sha1(token.encode()).hexdigest()
+
+    def _generate_random(self) -> str:
+        return ''.join(random.choices('0123456789abcdef', k=40))
+
+    def _generate_signature(self) -> str:
+        data = f"{self.mac}{self.serial}{self.device_id}{self.device_id}"
+        return hashlib.sha256(data.encode()).hexdigest().upper()
+
+    def _generate_metrics(self) -> str:
+        if not self._random:
+            self._random = self._generate_random()
+        return json.dumps({
+            "mac": self.mac, "sn": self.serial, "type": "STB",
+            "model": "MAG250", "uid": "", "random": self._random
+        })
+
+    # ── auth ──────────────────────────────────────────────────────────────────
+
+    async def handshake(self) -> str:
+        assert self.session is not None
+        url = self._load_url(type="stb", action="handshake", token="", JsHttpRequest="1-xml")
+        headers = self._headers(include_auth=False, include_token=False)
+        self.log(f"[STALKER] Handshake → {self.base}{self.LOAD_PHP}")
+        async with self.session.get(url, headers=headers) as r:
+            self.log(f"[STALKER] Handshake HTTP {r.status}")
+            if r.status == 404:
+                # Stalker-specific: generate token+prehash and retry
+                self.log("[STALKER] 404 on handshake — retrying with token+prehash")
+                tok = self._generate_token()
+                prehash = self._generate_prehash(tok)
+                url2 = self._load_url(type="stb", action="handshake",
+                                      token=tok, prehash=prehash, JsHttpRequest="1-xml")
+                async with self.session.get(url2, headers=headers) as r2:
+                    self.log(f"[STALKER] Retry handshake HTTP {r2.status}")
+                    payload = await safe_json(r2)
+            else:
+                payload = await safe_json(r)
+
+        if not isinstance(payload, dict) or "js" not in payload:
+            raise RuntimeError(f"[STALKER] Handshake failed — no valid JSON response")
+        js = payload["js"]
+        if not isinstance(js, dict):
+            raise RuntimeError("[STALKER] Handshake failed — unexpected js structure")
+        self.token = js.get("token")
+        if not self.token:
+            raise RuntimeError("[STALKER] Handshake failed — token missing in response")
+        rand = js.get("random")
+        self._random = rand.lower() if rand else self._generate_random()
+        self.bearer_token = self.token
+        self.log(f"[STALKER] Token acquired: {self.token[:16]}…")
+
+        # Call get_profile to confirm/refresh token (required by stalker protocol)
+        await self.get_profile()
+        return self.token
+
+    async def get_profile(self) -> dict:
+        assert self.session is not None
+        # Must match stalker.py exactly — ver and metrics are required to activate the token
+        from urllib.parse import urlencode
+        params = {
+            "type": "stb",
+            "action": "get_profile",
+            "hd": "1",
+            "ver": (
+                "ImageDescription: 0.2.18-r23-250; ImageDate: Thu Sep 13 11:31:16 EEST 2018; "
+                "PORTAL version: 5.6.2; API Version: JS API version: 343; "
+                "STB API version: 146; Player Engine version: 0x58c"
+            ),
+            "num_banks": "2",
+            "sn": self.serial,
+            "stb_type": "MAG250",
+            "client_type": "STB",
+            "image_version": "218",
+            "video_out": "hdmi",
+            "device_id": self.device_id,
+            "device_id2": self.device_id,
+            "signature": self._generate_signature(),
+            "auth_second_step": "1",
+            "hw_version": "1.7-BD-00",
+            "not_valid_token": "0",
+            "metrics": self._generate_metrics(),
+            "hw_version_2": hashlib.sha1(self.mac.encode()).hexdigest(),
+            "timestamp": int(time.time()),
+            "api_signature": "262",
+            "prehash": "",
+            "JsHttpRequest": "1-xml",
+        }
+        url = f"{self.base}{self.LOAD_PHP}?{urlencode(params)}"
+        headers = self._headers(include_auth=True, include_token=False)
+        self.log("[STALKER] Getting profile…")
+        async with self.session.get(url, headers=headers) as r:
+            self.log(f"[STALKER] Profile HTTP {r.status}")
+            payload = await safe_json(r)
+        if isinstance(payload, dict):
+            js = payload.get("js", {})
+            if isinstance(js, dict):
+                new_token = js.get("token")
+                if new_token:
+                    self.token = new_token
+                    self.bearer_token = new_token
+                    self.log(f"[STALKER] Profile token refreshed: {self.token[:16]}…")
+                return js
+        return {}
+
+    async def account_info(self):
+        assert self.session is not None
+        url = self._load_url(type="account_info", action="get_main_info", JsHttpRequest="1-xml")
+        headers = self._headers(include_auth=True)
+        self.log("[STALKER] Fetching account info…")
+        async with self.session.get(url, headers=headers) as r:
+            self.log(f"[STALKER] Account info HTTP {r.status}")
+            payload = await safe_json(r)
+        if isinstance(payload, dict):
+            js = payload.get("js", {})
+            if isinstance(js, dict):
+                mac = str(js.get("mac") or js.get("device_mac") or self.mac)
+                exp = str(js.get("phone") or js.get("expire_billing_date") or "unknown")
+                self.log(f"[STALKER] Account: MAC={mac}  expiry={exp}")
+                return (mac, exp)
+        return (self.mac, "unknown")
+
+    # ── categories ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_series_cat(name: str) -> bool:
+        return any(k in name.lower() for k in ('tv', 'series', 'show', 'episode'))
+
+    async def fetch_categories(self, mode: str):
+        assert self.session is not None
+        if mode == "live":
+            url = self._load_url(type="itv", action="get_genres", JsHttpRequest="1-xml")
+        else:
+            # Both vod and series use the same endpoint — filtered by name below
+            url = self._load_url(type="vod", action="get_categories", JsHttpRequest="1-xml")
+        headers = self._headers(include_auth=True)
+        self.log(f"[STALKER] Fetching {mode.upper()} categories…")
+        async with self.session.get(url, headers=headers) as r:
+            self.log(f"[STALKER] Categories HTTP {r.status} ({mode.upper()})")
+            payload = await safe_json(r)
+        cats = normalize_js(payload)
+        result = []
+        for c in cats:
+            if not isinstance(c, dict):
+                continue
+            cid = str(c.get("id") or c.get("category_id") or "").strip()
+            name = str(c.get("title") or c.get("name") or c.get("category_name") or "").strip()
+            if not cid or not name:
+                continue
+            # Filter: series tab gets TV/series/show categories; vod tab gets the rest
+            if mode == "series" and not self._is_series_cat(name):
+                continue
+            if mode == "vod" and self._is_series_cat(name):
+                continue
+            result.append({"id": cid, "title": name})
+        self.log(f"[STALKER] {mode.upper()} categories: {len(result)} found")
+        return result
+
+    # ── items ─────────────────────────────────────────────────────────────────
+
+    async def fetch_items_page(self, mode: str, cat_id: str, page: int):
+        assert self.session is not None
+        if mode == "live":
+            url = self._load_url(type="itv", action="get_ordered_list",
+                                 genre=cat_id, JsHttpRequest="1-xml", p=page)
+        else:
+            # Both vod and series use type=vod in the stalker protocol
+            url = self._load_url(type="vod", action="get_ordered_list",
+                                 category=cat_id, JsHttpRequest="1-xml", p=page)
+        headers = self._headers(include_auth=True)
+        self.log(f"[STALKER] Fetching {mode.upper()} items page={page} cat={cat_id}…")
+        async with self.session.get(url, headers=headers) as r:
+            self.log(f"[STALKER] Items HTTP {r.status} ({mode.upper()} cat={cat_id} p={page})")
+            payload = await safe_json(r)
+        items = normalize_js(payload)
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            # is_series=1 → show with seasons
+            if str(it.get("is_series", "0")) == "1":
+                it["_is_show_item"] = True
+            # is_season present → season container returned inside a show drill
+            elif "is_season" in it:
+                it["_is_show_item"] = True
+            # Fallback: name ends with "Season N" — untagged season containers
+            elif re.search(r'\bSeason\s+\d+\b', it.get("name") or it.get("o_name") or "", re.IGNORECASE):
+                it["_is_show_item"] = True
+        self.log(f"[STALKER] {mode.upper()} cat={cat_id} p={page}: {len(items)} items")
+        return items
+
+    async def fetch_series_episodes(self, series_id: str, category_id: str):
+        assert self.session is not None
+        # Stalker portals use type=vod for series episode lists.
+        # Pass series_id raw — _load_url/urlencode handles encoding (no pre-quoting).
+        url = self._load_url(type="vod", action="get_ordered_list",
+                             movie_id=series_id, season_id="0", episode_id="0",
+                             row="0", JsHttpRequest="1-xml", category=category_id,
+                             sortby="added", fav="0", hd="0", not_ended="0",
+                             abc="*", genre="*", years="*", search="", p="1")
+        headers = self._headers(include_auth=True)
+        self.log(f"[STALKER] Fetching episodes series_id={series_id}")
+        async with self.session.get(url, headers=headers) as r:
+            self.log(f"[STALKER] Episodes HTTP {r.status} (series_id={series_id})")
+            payload = await safe_json(r)
+        items = normalize_js(payload)
+        self.log(f"[STALKER] Series episodes: {len(items)} found")
+        return items
+
+    # ── stream link ───────────────────────────────────────────────────────────
+
+    async def _resolve_stub_url(self, stub: str) -> str:
+        """Resolve a Stalker stub URL like http:///ch/27063_ or http://localhost/ch/27063_
+        by making a second create_link call with the forced_storage/series params."""
+        assert self.session is not None
+        # Extract channel id from /ch/{id}_ pattern
+        m = re.search(r'/ch/(\d+)_?', stub)
+        if not m:
+            return stub
+        cid = m.group(1)
+        cmd = f"ffmpeg http://localhost/ch/{cid}_"
+        from urllib.parse import urlencode
+        params = {
+            "type": "itv",
+            "action": "create_link",
+            "cmd": cmd,
+            "series": "",
+            "forced_storage": "0",
+            "disable_ad": "0",
+            "download": "0",
+            "force_ch_link_check": "0",
+            "JsHttpRequest": "1-xml",
+        }
+        url = f"{self.base}{self.LOAD_PHP}?{urlencode(params)}"
+        headers = self._headers(include_auth=True)
+        self.log(f"[STALKER] Resolving stub ch={cid}…")
+        async with self.session.get(url, headers=headers) as r:
+            self.log(f"[STALKER] Stub resolve HTTP {r.status} (ch={cid})")
+            payload = await safe_json(r)
+        if not isinstance(payload, dict):
+            return stub
+        js = payload.get("js", {})
+        if isinstance(js, list) and js:
+            js = js[0]
+        if not isinstance(js, dict):
+            return stub
+        resolved = js.get("cmd") or js.get("url") or ""
+        if not resolved:
+            return stub
+        resolved = resolved.strip()
+        if resolved.lower().startswith("ffmpeg "):
+            resolved = resolved.split(" ", 1)[1].strip()
+        if resolved.lower().startswith("auto "):
+            resolved = resolved.split(" ", 1)[1].strip()
+        resolved = resolved.replace("\\/", "/")
+        if resolved.startswith(("http://", "https://", "rtsp://")):
+            self.log(f"[STALKER] Resolved ch={cid} → {resolved[:80]}")
+            return resolved
+        extracted = _extract_url_from_text(resolved)
+        if extracted:
+            return extracted
+        return stub
+
+    async def create_stream_link(self, cmd: str, ptype: str = "itv") -> str:
+        assert self.session is not None
+        # Pass raw cmd — _load_url uses urlencode() which encodes it correctly once.
+        # Do NOT quote_plus() here or the cmd gets double-encoded.
+        url = self._load_url(type=ptype, action="create_link",
+                             cmd=cmd, JsHttpRequest="1-xml")
+        headers = self._headers(include_auth=True)
+        self.log(f"[STALKER] create_link ({ptype}) cmd={cmd[:40]}…")
+        async with self.session.get(url, headers=headers) as r:
+            self.log(f"[STALKER] create_link HTTP {r.status}")
+            payload = await safe_json(r)
+        if not isinstance(payload, dict):
+            return ""
+        js = payload.get("js", {})
+        if isinstance(js, list) and js:
+            js = js[0]
+        if not isinstance(js, dict):
+            return ""
+        cmd_value = js.get("cmd") or js.get("url") or ""
+        if not cmd_value:
+            return ""
+        # Strip 'ffmpeg '/'auto ' prefix
+        cmd_value = cmd_value.strip()
+        if cmd_value.lower().startswith("ffmpeg "):
+            cmd_value = cmd_value.split(" ", 1)[1].strip()
+        if cmd_value.lower().startswith("auto "):
+            cmd_value = cmd_value.split(" ", 1)[1].strip()
+        cmd_value = cmd_value.replace("\\/", "/")
+        # Detect stub: empty host (http:///ch/...) or localhost/ch/...
+        is_stub = (
+            re.search(r'https?:///ch/', cmd_value) is not None or
+            re.search(r'https?://localhost/ch/', cmd_value) is not None
+        )
+        if is_stub:
+            return await self._resolve_stub_url(cmd_value)
+        if cmd_value.startswith(("http://", "https://", "rtsp://")):
+            return cmd_value
+        # Relative path (e.g. /media/7382.mpg) — build full URL.
+        # stalker.py derives stream_base_url as {scheme}://{netloc}/vod4
+        if cmd_value.startswith("/"):
+            from urllib.parse import urlparse as _up
+            p = _up(self.base)
+            full = f"{p.scheme}://{p.netloc}/vod4{cmd_value}"
+            self.log(f"[STALKER] Relative path → {full}")
+            return full
+        extracted = _extract_url_from_text(cmd_value)
+        return extracted or ""
+
+    # ── expose same interface as PortalClient ─────────────────────────────────
+
+    async def fetch_vod_play_link(self, cmd: str) -> str:
+        return await self.create_stream_link(cmd, ptype="vod")
+
+    async def create_episode_link(self, cmd: str, call_mode: str = "series") -> str:
+        type_map = {"series": "vod", "vod": "vod", "live": "itv"}
+        return await self.create_stream_link(cmd, ptype=type_map.get(call_mode, "vod"))
+
+    async def resolve_item_url(self, mode: str, item: dict, category: dict) -> str:
+        if mode == "live":
+            cmd = item.get("cmd") or item.get("rtsp_url") or ""
+            if not cmd:
+                return ""
+            return await self.create_stream_link(cmd, ptype="itv")
+
+        # Episode item: has _parent_movie_id and _season_id set during drill
+        # stalker.py get_episode_stream_url: get_ordered_list(movie_id, season_id, episode_id)
+        parent_movie_id = str(item.get("_parent_movie_id") or "").strip()
+        season_id = str(item.get("_season_id") or "").strip()
+        episode_id = str(item.get("id") or "").strip()
+
+        if parent_movie_id and season_id and episode_id:
+            url = self._load_url(type="vod", action="get_ordered_list",
+                                 movie_id=parent_movie_id, season_id=season_id,
+                                 episode_id=episode_id, JsHttpRequest="1-xml")
+            headers = self._headers(include_auth=True)
+            self.log(f"[STALKER] episode lookup movie_id={parent_movie_id} season_id={season_id} episode_id={episode_id}")
+            async with self.session.get(url, headers=headers) as r:
+                payload = await safe_json(r)
+            if isinstance(payload, dict):
+                js = payload.get("js", {})
+                data = js.get("data", []) if isinstance(js, dict) else []
+                if data and isinstance(data, list):
+                    stream_id = str(data[0].get("id") or "").strip()
+                    if stream_id:
+                        cmd = f"/media/file_{stream_id}.mpg"
+                        self.log(f"[STALKER] create_link stream_id={stream_id}")
+                        return await self.create_stream_link(cmd, ptype="vod")
+
+        # Regular VOD/Series: two-step lookup
+        movie_id = str(item.get("movie_id") or item.get("id") or "").strip()
+        if movie_id:
+            url = self._load_url(type="vod", action="get_ordered_list",
+                                 movie_id=movie_id, JsHttpRequest="1-xml")
+            headers = self._headers(include_auth=True)
+            self.log(f"[STALKER] stream lookup movie_id={movie_id} mode={mode}")
+            async with self.session.get(url, headers=headers) as r:
+                payload = await safe_json(r)
+            if isinstance(payload, dict):
+                js = payload.get("js", {})
+                data = js.get("data", []) if isinstance(js, dict) else []
+                if data and isinstance(data, list):
+                    stream_id = str(data[0].get("id") or "").strip()
+                    if stream_id:
+                        cmd = f"/media/file_{stream_id}.mpg"
+                        self.log(f"[STALKER] create_link stream_id={stream_id}")
+                        return await self.create_stream_link(cmd, ptype="vod")
+
+        # Fallback: use cmd directly
+        cmd = item.get("cmd") or item.get("rtsp_url") or ""
+        if not cmd:
+            return ""
+        cmd = cmd.strip()
+        if cmd.lower().startswith("ffmpeg "):
+            cmd = cmd.split(" ", 1)[1].strip()
+        if cmd.lower().startswith("auto "):
+            cmd = cmd.split(" ", 1)[1].strip()
+        cmd = cmd.replace("\\/", "/")
+        if cmd.startswith(("http://", "https://", "rtsp://")):
+            is_stub = (re.search(r'https?:///ch/', cmd) or re.search(r'https?://localhost/ch/', cmd))
+            if is_stub:
+                return await self._resolve_stub_url(cmd)
+            return cmd
+        return await self.create_stream_link(cmd, ptype="vod")
+
+    async def fetch_episodes_for_show(self, item: dict, cat_title: str):
+        series_name = item.get("name") or item.get("o_name") or item.get("fname") or "Unknown"
+        cat_id = str(item.get("_cat_id", ""))
+
+        # Season item: has _parent_movie_id set by previous drill
+        # stalker.py: fetch_episode_pages(movie_id, season_id) where season_id = it["id"]
+        parent_movie_id = str(item.get("_parent_movie_id") or "").strip()
+        if parent_movie_id:
+            movie_id = parent_movie_id
+            season_id = str(item.get("id") or "").strip()
+            self.log(f"[STALKER] Fetching episodes for season: {series_name} (movie_id={movie_id} season_id={season_id})")
+        else:
+            movie_id = str(item.get("id") or item.get("movie_id") or "").strip()
+            season_id = ""
+            self.log(f"[STALKER] Fetching episodes for: {series_name} (movie_id={movie_id})")
+
+        if not movie_id:
+            return []
+
+        all_items = []
+        page = 1
+        while True:
+            params = dict(type="vod", action="get_ordered_list",
+                         movie_id=movie_id, JsHttpRequest="1-xml", p=page)
+            if season_id:
+                params["season_id"] = season_id
+                params["episode_id"] = "0"
+            if cat_id:
+                params["category"] = cat_id
+            url = self._load_url(**params)
+            headers = self._headers(include_auth=True)
+            async with self.session.get(url, headers=headers) as r:
+                payload = await safe_json(r)
+            items = normalize_js(payload)
+            if not items:
+                break
+            all_items.extend(items)
+            if len(items) < 5:
+                break
+            page += 1
+
+        # If results are season containers (have is_season), mark them drillable
+        # with parent movie_id stored so next drill can fetch actual episodes
+        if all_items and all_items[0].get("is_season") is not None:
+            for it in all_items:
+                if isinstance(it, dict):
+                    it["_is_show_item"] = True
+                    it["_parent_movie_id"] = movie_id
+                    it["_cat_id"] = cat_id
+        elif season_id:
+            # These are actual episodes — stamp parent ids for resolve_item_url
+            for it in all_items:
+                if isinstance(it, dict):
+                    it["_parent_movie_id"] = movie_id
+                    it["_season_id"] = season_id
+
+        self.log(f"[STALKER] {series_name}: {len(all_items)} items found")
+        return all_items
+
+    async def dump_single_item_to_file(self, mode: str, item: dict, category: dict, out_path: str, stop_flag=None):
+        # Reuse PortalClient's dump logic by forwarding — same API shape
+        cat_title = category.get("title", "Unknown")
+        cmd = item.get("cmd") or item.get("rtsp_url") or ""
+        name = item.get("name") or item.get("o_name") or "Unknown"
+        logo = item.get("logo") or item.get("screenshot_uri") or ""
+        tvg_type = "live" if mode == "live" else "movie" if mode == "vod" else "series"
+        if not cmd:
+            return
+        ptype = "itv" if mode == "live" else "vod"
+        resolved = await self.create_stream_link(cmd, ptype=ptype)
+        if resolved and resolved.startswith(("http://", "https://", "rtsp://")):
+            resolved = unquote(resolved)
+            with open(out_path, "a", encoding="utf-8") as f:
+                f.write(f'#EXTINF:-1 tvg-name="{name}" tvg-type="{tvg_type}" tvg-logo="{logo}" group-title="{cat_title}",{name}\n{resolved}\n')
+            self.log(f"[STALKER] ✓ {name}")
+        else:
+            self.log(f"[STALKER] ✗ Could not resolve: {name}")
+
+    async def dump_category_to_file(self, mode: str, category: dict, out_path: str, append=True, stop_flag=None):
+        cat_title = category.get("title", "Unknown")
+        cat_id = str(category.get("id", ""))
+        page = 1
+        lines_written = 0
+        while True:
+            items = await self.fetch_items_page(mode, cat_id, page)
+            if not items:
+                break
+            for it in items:
+                if stop_flag and stop_flag.is_set():
+                    return
+                if not isinstance(it, dict):
+                    continue
+                await self.dump_single_item_to_file(mode, it, category, out_path, stop_flag)
+                lines_written += 1
+            if len(items) < 5:
+                break
+            page += 1
+        self.log(f"[STALKER] Finished {cat_title} (items: {lines_written})")
+
+
 # ===================== XTREAM CODES CLIENT =====================
 
 class XtreamClient:
@@ -1371,6 +1933,7 @@ class M3UClient:
         self._all_groups = preloaded or {}
         self._xtream_creds = extract_xtream_from_m3u_url(m3u_url)
         self._xtream_client = None
+        self._tvg_url = ""
 
     async def __aenter__(self):
         _timeout = aiohttp.ClientTimeout(total=300, connect=20, sock_read=None)
@@ -1448,6 +2011,11 @@ class M3UClient:
         groups: dict = {}
         lines = raw.splitlines()
         i = 0
+        # Cache tvg-url from #EXTM3U header for EPG fallback
+        if lines and lines[0].startswith("#EXTM3U"):
+            m = re.search(r'(?:url-tvg|x-tvg-url)="([^"]*)"', lines[0], re.IGNORECASE)
+            if m:
+                self._tvg_url = m.group(1).strip()
         while i < len(lines):
             line = lines[i].strip()
             if line.startswith("#EXTINF"):
@@ -1473,6 +2041,9 @@ class M3UClient:
                 m = re.search(r'tvg-name="([^"]*)"', info_line)
                 if m:
                     attrs["tvg_name"] = m.group(1)
+                m = re.search(r'tvg-id="([^"]*)"', info_line)
+                if m:
+                    attrs["tvg_id"] = m.group(1)
                 m = re.search(r'tvg-logo="([^"]*)"', info_line)
                 if m:
                     attrs["tvg_logo"] = m.group(1)
@@ -1489,6 +2060,7 @@ class M3UClient:
                 group = attrs.get("group_title") or "Uncategorized"
                 logo = attrs.get("tvg_logo") or ""
                 tvg_type = attrs.get("tvg_type") or ""
+                tvg_id = attrs.get("tvg_id") or ""
 
                 if not tvg_type:
                     url_lower = url_line.lower()
@@ -1499,7 +2071,7 @@ class M3UClient:
                     else:
                         tvg_type = "live"
 
-                entry = {"name": name, "logo": logo, "_url": url_line, "tvg_type": tvg_type}
+                entry = {"name": name, "logo": logo, "_url": url_line, "tvg_type": tvg_type, "tvg_id": tvg_id}
                 groups.setdefault(group, []).append(entry)
 
             i += 1
@@ -1688,6 +2260,7 @@ class AppState:
         self.password = ""
         self.m3u_url = ""
         self.connected = False
+        self.is_stalker_portal = False  # True when URL contains 'stalker_portal'
         self.cats_cache: dict = {}
         self.m3u_cache = None
         self.m3u_xtream_override = None
@@ -1707,6 +2280,13 @@ class AppState:
         self.record_file_path = ""
         self.mkv_folder = ""
         self.mkv_fallback = True
+        # EPG cache: key → (timestamp, result_dict), TTL = 30 minutes
+        self._epg_cache: dict = {}
+        self._epg_cache_ttl = 1800  # seconds
+        # Persistent StalkerPortalClient — reused across requests to avoid
+        # repeated handshake/profile calls that cause portal rate-limiting
+        self._stalker_client: object = None
+        self._stalker_client_lock = threading.Lock()
 
     def log(self, msg: str):
         try:
@@ -1749,7 +2329,10 @@ async def _make_client(do_handshake=True):
                     state.m3u_cache = dict(client._all_groups)
                 yield client
     else:  # mac
-        client = PortalClient(state.url, state.mac, state.log)
+        if state.is_stalker_portal:
+            client = StalkerPortalClient(state.url, state.mac, state.log)
+        else:
+            client = PortalClient(state.url, state.mac, state.log)
         async with client:
             if do_handshake:
                 await client.handshake()
@@ -1830,6 +2413,7 @@ async def _connect_async():
         async with client:
             await client.handshake()
             state.m3u_cache = dict(client._all_groups)
+            state._tvg_url_cache = client._tvg_url
             ident, exp = await client.account_info()
             state.log(f"[CONNECT] ✓ Connected: {ident} | {exp}")
             for m in ("live", "vod", "series"):
@@ -1842,6 +2426,8 @@ async def _connect_async():
         return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp}
 
     # MAC / Xtream
+    if state.is_stalker_portal:
+        state.log("[CONNECT] 🔌 Stalker portal detected — using StalkerPortalClient (/stalker_portal/server/load.php)")
     async with _make_client() as client:
         ident, exp = await client.account_info()
         state.log(f"[CONNECT] ✓ Connected: {ident} | {exp}")
@@ -1893,9 +2479,14 @@ def api_connect():
         state.username = data.get("username", "").strip()
         state.password = data.get("password", "").strip()
         state.m3u_url = data.get("m3u_url", "").strip()
+        state.is_stalker_portal = (
+            state.conn_type == "mac" and
+            "stalker_portal" in state.url.lower()
+        )
         state.cats_cache = {}
         state.m3u_cache = None
         state.m3u_xtream_override = None
+        state._epg_cache = {}
         state.connected = False
         state.stop_flag.clear()
 
@@ -1965,8 +2556,10 @@ def api_episodes():
     item = data.get("item", {})
     cat_title = data.get("cat_title", "Unknown")
     cat_id = str(data.get("cat_id", ""))
+    mode = data.get("mode", "series")
     item = dict(item)
     item["_cat_id"] = cat_id
+    item["_mode"] = mode
 
     try:
         async def fetch():
@@ -1995,7 +2588,7 @@ def api_resolve():
         url = run_async(resolve())
         return jsonify({"url": url})
     except Exception as e:
-        state.log(f"[RESOLVE] Error: {e}")
+        state.log(f"[RESOLVE] Error: {type(e).__name__}: {e}")
         return jsonify({"url": "", "error": str(e)})
 
 
@@ -2356,6 +2949,297 @@ def _rewrite_m3u8(content: str, base_url: str) -> str:
     return '\n'.join(result)
 
 
+@flask_app.route("/api/epg", methods=["POST"])
+def api_epg():
+    """Fetch current + next EPG for a live channel.
+    Works for: Xtream, Stalker, MAC portal, M3U (via Xtream override or tvg-url XMLTV).
+    Returns: {current: {title, start, end, desc}, next: {title, start, end, desc}}
+    """
+    data = request.get_json(force=True)
+    item = data.get("item", {})
+    # stream_id for Xtream, ch_id for Stalker/MAC, tvg_id for M3U
+    stream_id = str(item.get("stream_id") or item.get("id") or "").strip()
+    tvg_id    = str(item.get("tvg_id") or item.get("epg_channel_id") or item.get("name") or "").strip()
+
+    # Cache key: portal type + channel identifier
+    cache_key = f"{state.conn_type}:{stream_id or tvg_id}"
+    cached = state._epg_cache.get(cache_key)
+    if cached:
+        ts, result = cached
+        if time.time() - ts < state._epg_cache_ttl:
+            state.log(f"[EPG] Cache hit for {cache_key}")
+            return jsonify(result)
+        else:
+            del state._epg_cache[cache_key]
+
+    async def fetch_epg():
+        conn = state.conn_type
+
+        # ── Xtream (direct or M3U override) — use XMLTV feed directly ─────────
+        if conn == "xtream" or (conn == "m3u_url" and state.m3u_xtream_override):
+            creds = state.m3u_xtream_override if conn == "m3u_url" else None
+            base  = creds["base"]      if creds else state.url
+            user  = creds["username"]  if creds else state.username
+            pwd   = creds["password"]  if creds else state.password
+            from urllib.parse import urlparse as _up, quote as _q
+            _p = _up(base.rstrip("/"))
+            xmltv_url = (f"{_p.scheme}://{_p.netloc}/xmltv.php"
+                         f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}")
+            tvg_lookup = tvg_id or stream_id
+            state.log(f"[EPG] Xtream XMLTV: {xmltv_url} (looking for: {tvg_lookup})")
+            return await _fetch_xmltv_epg(xmltv_url, tvg_lookup, state.log)
+
+        # ── Stalker / MAC portal ──────────────────────────────────────────────
+        if conn == "mac":
+            ch_id = str(item.get("ch_id") or item.get("id") or stream_id or "").strip()
+            php = "/stalker_portal/server/load.php" if state.is_stalker_portal else "/portal.php"
+            client = StalkerPortalClient(state.url, state.mac, state.log) if state.is_stalker_portal \
+                     else PortalClient(state.url, state.mac, state.log)
+            async with client:
+                await client.handshake()
+                headers = client._headers(include_auth=True) if state.is_stalker_portal \
+                          else client.headers
+                base_url = normalize_base_url(state.url)
+                # MAC/Stalker portals vary — try all known EPG actions in order
+                # action=get_epg_info: standard Stalker, returns {js:{ch_id:[{name,time,time_to}]}}
+                # action=get_short_epg: some portals, returns {js:{data:[...]}}
+                # action=get_content:   older MAC portals with &type=epg
+                if not ch_id:
+                    return {"current": None, "next": None, "error": "No channel ID for EPG"}
+                epg_url = (f"{base_url}{php}?type=itv&action=get_short_epg"
+                           f"&ch_id={ch_id}&count=10&JsHttpRequest=1-xml")
+                state.log(f"[EPG] Trying: {epg_url}")
+                async with client.session.get(epg_url, headers=headers,
+                                              timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    state.log(f"[EPG] HTTP {r.status}")
+                    payload = await safe_json(r)
+                state.log(f"[EPG] Raw: {str(payload)[:300]}")
+                result = _parse_stalker_epg(payload, ch_id)
+                if result.get("current") or result.get("next") or result.get("schedule"):
+                    return result
+            return {"current": None, "next": None, "error": "No EPG data from portal"}
+
+        # ── M3U without Xtream — try tvg-url XMLTV ───────────────────────────
+        if conn == "m3u_url" and tvg_id:
+            tvg_url = str(item.get("tvg_url") or item.get("_tvg_url") or "").strip()
+            if not tvg_url:
+                # Try to get from M3U header if cached
+                tvg_url = getattr(state, "_tvg_url_cache", "")
+            if tvg_url and tvg_url.startswith("http"):
+                return await _fetch_xmltv_epg(tvg_url, tvg_id, state.log)
+
+        return {"current": None, "next": None, "error": "EPG not available for this portal/item"}
+
+    try:
+        result = run_async(fetch_epg())
+        # Cache successful results (even empty ones to avoid hammering unavailable portals)
+        if not result.get("error"):
+            state._epg_cache[cache_key] = (time.time(), result)
+        return jsonify(result)
+    except Exception as e:
+        state.log(f"[EPG] Error: {type(e).__name__}: {e}")
+        return jsonify({"current": None, "next": None, "error": str(e)})
+
+
+def _parse_xtream_epg(listings: list) -> dict:
+    """Parse Xtream get_short_epg response into current/next/schedule."""
+    import base64 as _b64
+    from datetime import datetime as _dt, timezone as _tz
+
+    def _safe_b64(s):
+        """Decode base64 only if result is valid UTF-8 printable text, else return original."""
+        if not s:
+            return s
+        try:
+            decoded = _b64.b64decode(s + "==").decode("utf-8")
+            # Sanity check: decoded should be printable, not binary garbage
+            if decoded.isprintable() and len(decoded) > 1:
+                return decoded
+        except Exception:
+            pass
+        return s
+
+    out = {"current": None, "next": None, "schedule": []}
+    now = _dt.now(_tz.utc).timestamp()
+    parsed = []
+    for ep in listings:
+        try:
+            start = int(ep.get("start_timestamp") or ep.get("start") or 0)
+            end   = int(ep.get("stop_timestamp")  or ep.get("end")   or 0)
+            title = _safe_b64(ep.get("title") or ep.get("name") or "").strip()
+            desc  = _safe_b64(ep.get("description") or ep.get("plot") or "").strip()
+            if not title:
+                continue
+            parsed.append({"title": title, "start": start, "end": end, "desc": desc})
+        except Exception:
+            continue
+    parsed.sort(key=lambda x: x["start"])
+    out["schedule"] = parsed
+    for ep in parsed:
+        if ep["start"] <= now < ep["end"]:
+            out["current"] = ep
+        elif ep["start"] > now and out["next"] is None:
+            out["next"] = ep
+    return out
+
+
+def _parse_stalker_epg(payload: dict, ch_id: str) -> dict:
+    """Parse Stalker/MAC get_epg_info / get_short_epg response."""
+    from datetime import datetime as _dt, timezone as _tz
+    out = {"current": None, "next": None, "schedule": []}
+    if not isinstance(payload, dict):
+        return out
+    now = _dt.now(_tz.utc).timestamp()
+
+    def _to_ts(val):
+        """Convert value to UTC unix timestamp. Handles int or 'YYYY-MM-DD HH:MM:SS' string."""
+        if not val:
+            return 0
+        if isinstance(val, (int, float)):
+            return float(val)
+        s = str(val).strip()
+        try:
+            return float(s)
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d.%m.%Y %H:%M"):
+            try:
+                return _dt.strptime(s[:19], fmt).replace(tzinfo=_tz.utc).timestamp()
+            except ValueError:
+                continue
+        return 0
+
+    js = payload.get("js", {})
+    listings = []
+
+    if isinstance(js, list):
+        for entry in js:
+            if isinstance(entry, dict) and str(entry.get("ch_id", "")) == str(ch_id):
+                listings.append(entry)
+        if not listings:
+            listings = js
+
+    elif isinstance(js, dict):
+        inner = js.get("data") or js
+        if isinstance(inner, dict):
+            listings = (inner.get(str(ch_id)) or inner.get(ch_id)
+                        or next(iter(inner.values()), []))
+        if isinstance(listings, dict):
+            listings = list(listings.values())
+
+    if not isinstance(listings, list):
+        return out
+
+    for ep in listings:
+        if not isinstance(ep, dict):
+            continue
+        try:
+            start = _to_ts(ep.get("time") or ep.get("start_timestamp") or ep.get("start"))
+            end   = _to_ts(ep.get("time_to") or ep.get("stop_timestamp") or ep.get("stop") or ep.get("end"))
+            title = str(ep.get("name") or ep.get("title") or "").strip()
+            desc  = str(ep.get("descr") or ep.get("description") or ep.get("desc") or "").strip()
+            if not title or not start:
+                continue
+            prog = {"title": title, "start": start, "end": end, "desc": desc}
+            out["schedule"].append(prog)
+            if start <= now < end:
+                out["current"] = prog
+            elif start > now and out["next"] is None:
+                out["next"] = prog
+        except Exception:
+            continue
+    return out
+
+
+async def _fetch_xmltv_epg(xmltv_url: str, tvg_id: str, log_cb=None) -> dict:
+    """Fetch XMLTV and find schedule for tvg_id."""
+    import xml.etree.ElementTree as ET
+    from datetime import datetime as _dt, timezone as _tz
+    out = {"current": None, "next": None, "schedule": []}
+    if not tvg_id:
+        return out
+    _log = log_cb or (lambda x: None)
+    now = _dt.now(_tz.utc).timestamp()
+
+    def _ts(s):
+        s = s.strip()
+        try:
+            dt = _dt.strptime(s[:14], "%Y%m%d%H%M%S")
+            if len(s) > 14:
+                tz = s[14:].strip()
+                sign = 1 if tz.startswith("+") else -1
+                h, m = int(tz[1:3]), int(tz[3:5])
+                offset = sign * (h * 3600 + m * 60)
+                return dt.replace(tzinfo=_tz.utc).timestamp() - offset
+            return dt.replace(tzinfo=_tz.utc).timestamp()
+        except Exception:
+            return 0
+
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(xmltv_url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                if r.status != 200:
+                    out["error"] = f"XMLTV HTTP {r.status}"
+                    return out
+                # Stream and parse iteratively — XMLTV files can be huge
+                raw = await r.read()
+
+        root = ET.fromstring(raw)
+        tvg_lower = tvg_id.lower()
+        schedule = []
+
+        # Build a set of channel identifiers to match against
+        # Some XMLTV files have empty id but populated display-name, or vice versa
+        chan_map = {}  # id → display-name for logging
+        for c in root.findall("channel"):
+            cid = (c.get("id") or "").strip()
+            dname = (c.findtext("display-name") or "").strip()
+            chan_map[cid] = dname
+
+        _log(f"[EPG] XMLTV channels ({len(chan_map)}): {list(chan_map.items())[:8]}")
+        _log(f"[EPG] Looking for tvg_id: '{tvg_id}'")
+
+        def _matches(chan_attr: str) -> bool:
+            """Check if a programme's channel attribute matches our tvg_id."""
+            c = chan_attr.lower().strip()
+            t = tvg_lower.strip()
+            if not c or not t:
+                return False
+            if c == t or t in c or c in t:
+                return True
+            # Also check display-name for this channel id
+            dname = chan_map.get(chan_attr, "").lower()
+            return dname and (dname == t or t in dname or dname in t)
+
+        for prog in root.findall("programme"):
+            chan = prog.get("channel", "")
+            if not _matches(chan):
+                continue
+            start = _ts(prog.get("start", ""))
+            end   = _ts(prog.get("stop", ""))
+            title = (prog.findtext("title") or "").strip()
+            desc  = (prog.findtext("desc") or "").strip()
+            if not title or not start:
+                continue
+            entry = {"title": title, "start": start, "end": end, "desc": desc}
+            schedule.append(entry)
+            # Only collect up to 10 entries around now
+            if len(schedule) >= 10 and all(e["start"] > now + 3600 for e in schedule[-3:]):
+                break
+
+        schedule.sort(key=lambda x: x["start"])
+        out["schedule"] = schedule
+        for ep in schedule:
+            if ep["start"] <= now < ep["end"]:
+                out["current"] = ep
+            elif ep["start"] > now and out["next"] is None:
+                out["next"] = ep
+
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
 @flask_app.route("/api/proxy")
 def api_proxy():
     url = request.args.get("url", "").strip()
@@ -2406,6 +3290,58 @@ def api_proxy_options():
         "Access-Control-Allow-Methods": "GET, OPTIONS",
         "Access-Control-Allow-Headers": "*",
     })
+
+
+@flask_app.route("/api/hls_proxy")
+def api_hls_proxy():
+    """Remux any MPEG-TS/MPG stream to HLS on-the-fly via ffmpeg.
+    Used as fallback when the browser cannot play MPEG-TS natively via MSE.
+    Returns a chunked MPEG-TS stream wrapped as HLS-compatible for mpegts.js,
+    OR if ?hls=1 is requested, pipes through ffmpeg → fmp4/HLS for native <video>.
+    """
+    url = request.args.get("url", "").strip()
+    if not url or not url.startswith(("http://", "https://", "rtsp://")):
+        return Response("Invalid URL", status=400)
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return Response("ffmpeg not available", status=503)
+    cors = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+    }
+    # Remux to MPEG-TS via ffmpeg — copy streams, no re-encode
+    cmd = [
+        ffmpeg, "-hide_banner", "-nostdin",
+        "-user_agent", "Mozilla/5.0",
+        "-i", url,
+        "-c", "copy",
+        "-f", "mpegts",
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        return Response(f"ffmpeg error: {e}", status=502)
+
+    def _gen():
+        try:
+            while True:
+                chunk = proc.stdout.read(16384)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            proc.kill()
+            proc.wait()
+
+    h = dict(cors)
+    h["Content-Type"] = "video/mp2t"
+    return Response(stream_with_context(_gen()), status=200, headers=h)
 
 
 # ===================== HTML TEMPLATE =====================
@@ -2734,7 +3670,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .adr-count{font-size:12px;color:var(--acc);font-weight:700;
   text-align:center;padding:6px 0 2px}
 /* FAB — floating action button to open drawer */
-.fab{position:absolute;bottom:70px;right:14px;z-index:50;
+.fab{position:absolute;bottom:70px;right:60px;z-index:50;
   width:48px;height:48px;border-radius:50%;padding:0;font-size:20px;
   background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
   box-shadow:0 4px 20px var(--glow);border:none;cursor:pointer;
@@ -2822,9 +3758,9 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
         <div style="font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1px;color:var(--txt3);padding-bottom:2px">Output Paths</div>
         <div class="prow" style="position:relative">
           <span class="plbl">M3U:</span>
-          <input id="o-m3u" type="text" placeholder="/sdcard/Download/playlist.m3u" style="height:30px;font-size:12px">
+          <input id="o-m3u" type="text" placeholder="/sdcard/Download/playlist.m3u" oninput="saveFP()" style="height:30px;font-size:12px">
           <button class="btn-ghost psug-btn" onclick="togSug('m3u')" title="Suggestions">📁</button>
-          <div class="psug" id="sg-m3u">
+          <div class="psug" id="sg-m3u" style="top:auto;bottom:calc(100% + 3px)">
             <div class="psopt" onclick="pickP('m3u','/sdcard/Download/playlist.m3u')">/sdcard/Download/playlist.m3u</div>
             <div class="psopt" onclick="pickP('m3u','/storage/emulated/0/Download/playlist.m3u')">/storage/emulated/0/Download/playlist.m3u</div>
             <div class="psopt" onclick="pickP('m3u','/data/data/com.termux/files/home/playlist.m3u')">Termux ~/playlist.m3u</div>
@@ -2834,7 +3770,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
           <span class="plbl">Folder:</span>
           <input id="o-dir" type="text" placeholder="/sdcard/Download/" oninput="saveFP()" style="height:30px;font-size:12px">
           <button class="btn-ghost psug-btn" onclick="togSug('dir')" title="Suggestions">📁</button>
-          <div class="psug" id="sg-dir">
+          <div class="psug" id="sg-dir" style="top:auto;bottom:calc(100% + 3px)">
             <div class="psopt" onclick="pickP('dir','/sdcard/Download/')">/sdcard/Download/</div>
             <div class="psopt" onclick="pickP('dir','/storage/emulated/0/Download/')">/storage/emulated/0/Download/</div>
             <div class="psopt" onclick="pickP('dir','/data/data/com.termux/files/home/Downloads/')">Termux ~/Downloads/</div>
@@ -2916,6 +3852,10 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
         <button class="pbig" id="ppbtn" onclick="playerPP()">▶</button>
         <button class="btn-ghost pnav" onclick="playerStop()" title="Stop">⏹</button>
         <button class="btn-ghost pnav" onclick="playerNext()" title="Next">⏭</button>
+        <button class="btn-ghost pnav" id="epgbtn" onclick="showEPG()" title="EPG" style="font-size:14px;opacity:0.35">📅</button>
+      </div>
+      <div style="min-height:16px;padding:0 4px">
+        <span id="epg-now" style="font-size:11px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block"></span>
       </div>
       <div class="vrow">
         <span style="font-size:15px">🔉</span>
@@ -2941,6 +3881,23 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
         font-family:'Cascadia Code','JetBrains Mono','Courier New',monospace;
         font-size:11px;line-height:1.7;color:#4a556a;background:var(--bg);
         white-space:pre-wrap;word-break:break-word"></div>
+    </div>
+  </div>
+
+  <!-- EPG OVERLAY -->
+  <div id="epg-overlay" style="display:none;position:fixed;inset:0;z-index:900;
+    background:rgba(0,0,0,.7);align-items:flex-end;justify-content:center">
+    <div style="background:var(--s2);border-radius:var(--rs) var(--rs) 0 0;
+      width:100%;max-width:600px;padding:16px;box-shadow:var(--sh);
+      border-top:1px solid var(--bdr2);max-height:60vh;overflow-y:auto">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+        <span style="font-size:13px;font-weight:700;color:var(--txt1)" id="epg-ch-name">EPG</span>
+        <button class="btn-ghost" onclick="closeEPG()"
+          style="height:28px;width:28px;padding:0;font-size:14px;border-radius:var(--rss)">✕</button>
+      </div>
+      <div id="epg-body">
+        <div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Loading…</div>
+      </div>
     </div>
   </div>
 
@@ -3083,7 +4040,8 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js" crossorigin="anonymous"></script>
+<script>if(typeof Hls==='undefined'){document.write('<scr'+'ipt src="https://unpkg.com/hls.js@1.5.7/dist/hls.min.js"><\/scr'+'ipt>');}</script>
 <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js"></script>
 <script>
 const CFG = {{ config | safe }};
@@ -3301,7 +4259,7 @@ function renderItems(items){
     el.innerHTML='<div style="text-align:center;padding:20px;color:var(--txt3);font-size:12px">No items found</div>';
     refreshBtns(); return;
   }
-  const isSeries=mode==='series'&&navStack.length===0;
+  const isSeries=mode==='series'||mode==='vod';
   el.innerHTML=items.map((it,i)=>{
     const name=it.name||it.o_name||it.fname||'Unknown';
     const logo=it.logo||it.stream_icon||it.cover||'';
@@ -3373,7 +4331,7 @@ function drillShow(i){
   const it=filtItems[i]; if(!it) return;
   setBusy(true); setStatus("Loading eps for '"+it.name+"'…");
   fetch('/api/episodes',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({item:it, cat_id:curCat?.id||'', cat_title:curCat?.title||''})})
+    body:JSON.stringify({item:it, mode, cat_id:curCat?.id||'', cat_title:curCat?.title||''})})
   .then(r=>r.json()).then(d=>{
     if(d.error||!d.episodes?.length){toast('No episodes found','warn');return;}
     navStack.push({label:'Browse',items:[...allItems]});
@@ -3401,6 +4359,10 @@ function goBack(){
 async function playItem(i){
   const it=filtItems[i]; if(!it) return;
   pIdx=i;
+  // Store item for EPG lookup (live channels only)
+  _epgItem = (mode==='live') ? it : null;
+  document.getElementById('epg-now').textContent='';
+  document.getElementById('epgbtn').style.opacity=(mode==='live')?'1':'0.35';
   const name=it.name||it.o_name||it.fname||'Unknown';
   const direct=it._direct_url||it._url;
   if(direct){doPlay(direct,name);return;}
@@ -3441,6 +4403,9 @@ function doPlay(url, name){
                || qs.includes('extension=m3u8');
 
   const isMpegTs = u.endsWith('.ts')
+               || u.endsWith('.mpg')
+               || u.endsWith('/mpegts')
+               || u.includes('/mpegts?')
                || qs.includes('extension=ts')
                || qs.includes('output=ts');
 
@@ -3448,7 +4413,7 @@ function doPlay(url, name){
   const mpegtsOk = isMpegTs && typeof mpegts!=='undefined' && mpegts.isSupported();
   alog('▶ '+pName+' ['+playerType+(isMpegTs&&!mpegtsOk?' → MSE not supported, trying native':'')+']','k');
 
-  if(isHls && Hls.isSupported()){
+  if(isHls && typeof Hls !== 'undefined' && Hls.isSupported()){
     // ── HLS via HLS.js ────────────────────────────────────────
     hlsObj=new Hls({
       enableWorker:false, lowLatencyMode:false,
@@ -3472,6 +4437,11 @@ function doPlay(url, name){
 
   } else if(isHls && vid.canPlayType('application/vnd.apple.mpegurl')){
     // ── Native HLS (Safari / iOS WebView) ─────────────────────
+    vid.src=url; vid.play().catch(()=>{});
+
+  } else if(isHls){
+    // ── HLS.js not loaded, try native src as last resort ──────
+    alog('[HLS] hls.js unavailable — trying native src','w');
     vid.src=url; vid.play().catch(()=>{});
 
   } else if(mpegtsOk){
@@ -3500,13 +4470,19 @@ function doPlay(url, name){
     vid.play().catch(()=>{});
 
   } else if(isMpegTs){
-    // ── MPEG-TS but MSE not supported (Brave Android, some WebViews) ──
-    // Last resort: feed raw stream directly and hope the browser handles it
-    alog('[MPEGTS] MSE unavailable — trying direct src (may not play in this browser)','w');
+    // ── MPEG-TS but MSE not supported — try direct native src first,
+    // then server-side ffmpeg proxy as fallback ────────────────────
+    alog('[MPEGTS] MSE unavailable — trying direct native src…','w');
     vid.src=px;
-    vid.play().catch(e=>{
-      alog('[MPEGTS] Autoplay blocked or unsupported: '+e.message+' — tap ▶ to try','w');
-      document.getElementById('ppbtn').textContent='▶';
+    vid.play().catch(()=>{
+      // Direct failed — try ffmpeg remux proxy
+      alog('[MPEGTS] Direct failed — remuxing via ffmpeg proxy…','w');
+      const hlsProxyUrl='/api/hls_proxy?url='+encodeURIComponent(url);
+      vid.src=hlsProxyUrl;
+      vid.play().catch(e=>{
+        alog('[MPEGTS/proxy] '+e.message,'e');
+        document.getElementById('ppbtn').textContent='▶';
+      });
     });
 
   } else {
@@ -3540,6 +4516,73 @@ function cpyUrl(){
 
 // ── RECORDING ──────────────────────────────────────────────
 async function togRec(){isRec?stopRec():startRec();}
+
+// ── EPG ────────────────────────────────────────────────────────────────────
+let _epgItem=null;
+function _fmtEpgTime(ts){
+  if(!ts) return '';
+  const d=new Date(ts*1000);
+  return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+}
+function _epgCard(prog, label){
+  if(!prog) return `<div style="color:var(--txt3);font-size:12px;padding:6px 0">${label}: —</div>`;
+  const start=_fmtEpgTime(prog.start), end=_fmtEpgTime(prog.end);
+  const time=start&&end?`<span style="color:var(--acc);font-size:11px;margin-left:6px">${start}–${end}</span>`:'';
+  const desc=prog.desc?`<div style="color:var(--txt3);font-size:11px;margin-top:4px;line-height:1.5">${prog.desc}</div>`:'';
+  return `<div style="background:var(--s3);border-radius:var(--rsm);padding:10px 12px;margin-bottom:8px">
+    <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--txt3);margin-bottom:4px">${label}</div>
+    <div style="display:flex;align-items:baseline;flex-wrap:wrap;gap:4px">
+      <span style="font-size:13px;font-weight:600;color:var(--txt1)">${prog.title||'Unknown'}</span>${time}
+    </div>${desc}
+  </div>`;
+}
+async function showEPG(){
+  if(!_epgItem){toast('No channel loaded','warn');return;}
+  const ov=document.getElementById('epg-overlay');
+  document.getElementById('epg-ch-name').textContent=_epgItem.name||'EPG';
+  document.getElementById('epg-body').innerHTML='<div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Loading…</div>';
+  ov.style.display='flex';
+  try{
+    const r=await fetch('/api/epg',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({item:_epgItem})});
+    const d=await r.json();
+    if(d.error&&!d.current&&!d.next&&!d.schedule?.length){
+      document.getElementById('epg-body').innerHTML=`<div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">${d.error}</div>`;
+      return;
+    }
+    // Build full schedule list, highlighting current
+    const schedule = d.schedule||[];
+    if(schedule.length===0){
+      document.getElementById('epg-body').innerHTML=_epgCard(d.current,'Now')+_epgCard(d.next,'Next');
+    } else {
+      const now=Date.now()/1000;
+      const rows=schedule.map(p=>{
+        const isCurrent=p.start<=now&&now<p.end;
+        const start=_fmtEpgTime(p.start), end=_fmtEpgTime(p.end);
+        const bg=isCurrent?'var(--s3)':'transparent';
+        const titleColor=isCurrent?'var(--acc)':'var(--txt1)';
+        const dot=isCurrent?'<span style="color:var(--acc);margin-right:5px">▸</span>':'';
+        const desc=p.desc?`<div style="color:var(--txt3);font-size:11px;margin-top:3px;line-height:1.4">${p.desc}</div>`:'';
+        return `<div style="background:${bg};border-radius:var(--rsm);padding:8px 10px;margin-bottom:4px;border-left:2px solid ${isCurrent?'var(--acc)':'transparent'}">
+          <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">
+            <span style="font-size:11px;color:var(--acc);white-space:nowrap;min-width:90px">${start}${end?' – '+end:''}</span>
+            <span style="font-size:13px;font-weight:${isCurrent?700:400};color:${titleColor}">${dot}${p.title}</span>
+          </div>${desc}
+        </div>`;
+      }).join('');
+      document.getElementById('epg-body').innerHTML=rows;
+      // Scroll current item into view
+      const cur=document.querySelector('#epg-body [style*="var(--acc)"]');
+      if(cur) cur.scrollIntoView({block:'nearest'});
+    }
+    if(d.current) document.getElementById('epg-now').textContent='▸ '+d.current.title;
+  }catch(e){
+    document.getElementById('epg-body').innerHTML=`<div style="color:var(--err);font-size:12px;text-align:center;padding:20px">Failed: ${e.message}</div>`;
+  }
+}
+function closeEPG(){document.getElementById('epg-overlay').style.display='none';}
+// Close on backdrop click
+document.getElementById('epg-overlay').addEventListener('click',function(e){if(e.target===this)closeEPG();});
 
 async function startRec(){
   if(!pUrl){toast('Play a stream first','wrn');return;}
@@ -3720,6 +4763,7 @@ document.addEventListener('click',e=>{
 });
 function saveFP(){
   try{localStorage.setItem('mkv_folder',document.getElementById('o-dir').value);}catch(e){}
+  try{localStorage.setItem('m3u_path',document.getElementById('o-m3u').value);}catch(e){}
 }
 function esc(s){
   return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
@@ -3867,7 +4911,11 @@ async function plConnect(i){
 document.addEventListener('DOMContentLoaded',()=>{
   setCT('mac'); toggleCP();
   try{const sv=localStorage.getItem('mkv_folder');
-    if(sv) document.getElementById('o-dir').value=sv;}catch(e){}
+    if(sv) document.getElementById('o-dir').value=sv;
+    else document.getElementById('o-dir').value='/sdcard/Download/';}catch(e){}
+  try{const sm=localStorage.getItem('m3u_path');
+    if(sm) document.getElementById('o-m3u').value=sm;
+    else document.getElementById('o-m3u').value='/sdcard/Download/playlist.m3u';}catch(e){}
   startLog();
   alog('IPTV Portal Builder ready.','k');
   alog('Tap ⚙ in the header to enter credentials and connect.','i');
