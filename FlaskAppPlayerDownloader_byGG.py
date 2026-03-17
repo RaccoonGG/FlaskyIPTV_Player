@@ -3430,7 +3430,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 
 /* ─── conn panel ─────────────────────────────────────────────── */
 #cpanel{overflow:hidden;max-height:0;transition:max-height .35s cubic-bezier(.4,0,.2,1)}
-#cpanel.open{max-height:240px}
+#cpanel.open{max-height:420px}
 #cpi{padding:4px 12px 14px;display:flex;flex-direction:column;gap:8px}
 .ct-row{display:flex;gap:5px}
 .ct-btn{flex:1;height:32px;font-size:12px;padding:0;border-radius:var(--rsm)}
@@ -3752,6 +3752,11 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
       </div>
       <div class="cr-bot">
         <button class="btn-acc" id="cbtn" onclick="doConnect()" style="height:36px;min-width:120px">🔌 Connect</button>
+        <button id="save-profile-chk" onclick="toggleSaveChk(this)"
+          style="height:36px;padding:0 12px;font-size:12px;border-radius:var(--rss);
+                 border:1px solid var(--bdr2);background:var(--s3);color:var(--txt2);
+                 cursor:pointer;white-space:nowrap;transition:var(--tr)"
+          >💾 Save</button>
       </div>
       <!-- Output paths — always accessible from settings panel -->
       <div style="border-top:1px solid var(--bdr);padding-top:8px;display:flex;flex-direction:column;gap:6px">
@@ -4055,6 +4060,14 @@ let hlsObj=null, mpegtsObj=null, recTmr=null, isRec=false, logEs=null, cpOpen=fa
 const vid = document.getElementById('vid');
 
 // ── HEADER ─────────────────────────────────────────────────
+function toggleSaveChk(btn){
+  btn._on=!btn._on;
+  btn.style.background=btn._on?'var(--acc)':'var(--s3)';
+  btn.style.color=btn._on?'#fff':'var(--txt2)';
+  btn.style.borderColor=btn._on?'var(--acc)':'var(--bdr2)';
+  btn.textContent=btn._on?'💾 Save ✓':'💾 Save';
+}
+
 function toggleCP(){
   cpOpen=!cpOpen;
   document.getElementById('cpanel').classList.toggle('open',cpOpen);
@@ -4081,6 +4094,8 @@ async function doConnect(){
     password:document.getElementById('i-pw').value.trim(),
     m3u_url:document.getElementById('i-m3u').value.trim(),
   };
+  const saveBtn = document.getElementById('save-profile-chk');
+  const saveToProfile = saveBtn._on || false;
   setBusy(true); setStatus('Connecting…'); toggleCP();
   try{
     const r=await fetch('/api/connect',{method:'POST',
@@ -4092,6 +4107,31 @@ async function doConnect(){
       catsCache=d.categories||{};
       switchMode(mode, catsCache[mode]||[]);
       toast('✓ Connected!','ok');
+      // Save to profiles if toggle was active
+      if(saveToProfile){
+        const arr=plLoadAll();
+        // Auto-generate name from URL/ident
+        const autoName = d.ident && d.ident!=='unknown' ? d.ident
+          : (payload.url||payload.m3u_url||'').replace(/https?:\/\//,'').split('/')[0].split(':')[0];
+        const entry={
+          id: Date.now().toString(36),
+          name: autoName || 'Profile '+arr.length,
+          type: payload.conn_type,
+          url: payload.url,
+          mac: payload.mac,
+          url_xtream: payload.url,
+          username: payload.username,
+          password: payload.password,
+          m3u_url: payload.m3u_url,
+        };
+        arr.push(entry);
+        plSaveAll(arr);
+        renderPLList();
+        toast('✓ Connected & saved to profiles!','ok');
+        // Reset save button
+        saveBtn._on = true; // toggleSaveChk will flip it to false
+        toggleSaveChk(saveBtn);
+      }
     } else {
       document.getElementById('cdot').classList.remove('on');
       setStatus('Error: '+(d.error||'Unknown'));
