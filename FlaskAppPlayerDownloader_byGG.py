@@ -23,12 +23,11 @@ Also on network error and parsing hls errors (altho this can happens when channe
 Added progress bar with real kbs speed for downloading MKV, and items/totalitems for M3U saving.
 Fixed EPG out of memory happening in large EPG lists (altho now large external EPG list can use 2000 MB of ram, like 30k channels lists)
 Fixed laggy input in search filed for Whats on Now tab and dekstop version of saved logins tab.
-Fixed Hevc Vods/Series not following same fix we did for Live Hevc channels, play via ffmpeg.
 Added button that opens external player of your choice (on dekstop select exe, on mobile you can pick VLC, MX, MX PRO, Just Player)
 Added option to add subtitles from opensubtitles.com via inscript serach (get free apikey from https://www.opensubtitles.com/en/consumers)
 Added option to add local subtitles file for subtitles (.srt/.vtt/.ass/.ssa) via Local File tab in the subtitle modal.
 Subtitle delay +/- works the same for local files as for OpenSubtitles.
-Added option to play Catchup and EPG Whats on now tab results in external player.
+Dekstop view optimizations, bigger player, now activity log is hidden by default, can expand, player controls can be hidden to expand player, theater mode button to fully expand player and hiding all tabs.
 Varius UI fixes.
 """
 
@@ -5326,19 +5325,35 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .cr-bot{display:flex;gap:7px;align-items:center;justify-content:space-between}
 
 /* ─── main panels ─────────────────────────────────────────────── */
-#main{flex:1;overflow:hidden;display:flex;min-height:0}
+#main{flex:1;overflow:hidden;display:flex;min-height:0;transition:grid-template-columns .25s ease}
 .panel{display:none;flex-direction:column;overflow:hidden;min-width:0;min-height:0}
-.panel.active{display:flex;flex:1}
+.panel.active{display:flex!important;flex:1}
+/* pctrl: always open on mobile, collapsible on desktop */
+#pctrl-hdr{display:none}
+#pctrl-body{max-height:none!important;overflow:visible!important}
 @media(min-width:900px){
-  #main{display:grid!important;grid-template-columns:260px 1fr 400px}
-  .panel{display:flex!important;flex:unset;border-right:1px solid var(--bdr)}
+  #pctrl-hdr{display:flex}
+  #pctrl-body{overflow:hidden!important;transition:max-height .25s ease;max-height:0!important}
+  #pctrl-panel.expanded #pctrl-body{max-height:300px!important}
+}
+@media(min-width:900px){
+  #main{display:grid!important;grid-template-columns:350px 350px 1fr;height:100%}
+  .panel{display:flex!important;flex:unset;border-right:1px solid var(--bdr);height:100%}
+  #theaterbtn{display:flex!important}
+  #main.theater{grid-template-columns:0 0 1fr}
+  #main.theater #p-cats,
+  #main.theater #p-items{overflow:hidden;opacity:0;pointer-events:none}
   .panel:last-child{border-right:none}
   #botnav{display:none!important}
   /* On desktop, log panel is hidden — log is shown inline inside player */
   #p-log{display:none!important}
   /* Re-add log area at bottom of player panel on desktop */
-  #p-player{overflow-y:auto}
   #desktop-log{display:flex!important}
+  #desktop-log.expanded #desktop-log-body{max-height:200px!important}
+  #desktop-log.expanded #desktop-log-arrow{transform:rotate(0deg)}
+  #desktop-log #desktop-log-arrow{transform:rotate(180deg)}
+  #pctrl-panel.expanded #pctrl-arrow{transform:rotate(0deg)}
+  #pctrl-panel #pctrl-arrow{transform:rotate(180deg)}
 }
 
 /* ─── panel header ───────────────────────────────────────────── */
@@ -5477,10 +5492,11 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 
 
 /* ─── player ─────────────────────────────────────────────────── */
-#p-player{background:#000}
-#vwrap{position:relative;background:#000;flex-shrink:0;width:100%}
-#vid{width:100%;display:block;aspect-ratio:16/9;background:#000;max-height:58dvh}
-@media(min-width:900px){ #vid{max-height:55vh;aspect-ratio:16/9}}
+#p-player{background:#000;flex-direction:column;overflow:hidden;display:none}
+@media(min-width:900px){ #p-player{display:flex!important}}
+#vwrap{position:relative;background:#000;flex:1;min-height:0;display:flex;flex-direction:column}
+#vid{flex:1;min-height:0;width:100%;display:block;background:#000;object-fit:contain}
+@media(min-width:900px){ #vid{width:100%;object-fit:contain}}
 #vph{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
   justify-content:center;gap:12px;pointer-events:none;
   background:radial-gradient(ellipse at 50% 55%,var(--s2) 0%,#000 70%);
@@ -5504,9 +5520,9 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   box-shadow:0 4px 22px var(--glow);flex-shrink:0}
 .pbig:hover:not(:disabled){box-shadow:0 6px 30px var(--glow);filter:brightness(1.1);
   transform:scale(1.06)!important}
-.pnav{width:42px;height:42px;border-radius:50%;font-size:16px;padding:0;flex-shrink:0}
+.pnav{width:42px;height:42px;border-radius:50%;font-size:16px;padding:0;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}
 .vrow{display:flex;align-items:center;gap:9px}
-.vrow input[type=range]{flex:1;height:4px;accent-color:var(--acc)}
+.vrow input[type=range]{width:140px;flex-shrink:0;flex:1;height:4px;accent-color:var(--acc)}
 .vlbl{font-size:11px;color:var(--txt2);width:28px;text-align:right;flex-shrink:0}
 .recrow{display:flex;align-items:center;gap:8px}
 #rbtn{height:34px;padding:0 14px}
@@ -6003,54 +6019,81 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 
   <!-- PLAYER -->
   <div class="panel" id="p-player" style="background:#000">
-    <div id="vwrap">
-      <video id="vid" controls preload="none" playsinline webkit-playsinline></video>
+    <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0">
+    <div style="flex:1;background:#000;min-height:0;display:flex;flex-direction:column" id="vwrap">
+      <video id="vid" controls preload="none" playsinline webkit-playsinline style="flex:1;min-height:0;width:100%;object-fit:contain;background:#000"></video>
       <div id="vph">
         <div id="vph-ico">▶</div>
         <div>No stream loaded</div>
       </div>
     </div>
-    <div class="pinfo">
-      <div id="np">No stream loaded</div>
-      <div id="pu" onclick="cpyUrl()" title="Tap to copy stream URL">—</div>
+    <!-- Collapsible player controls -->
+    <div id="pctrl-panel" style="flex-shrink:0;border-top:1px solid var(--bdr)">
+      <div id="pctrl-hdr" onclick="togglePlayerControls()" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:5px 14px;background:var(--s2);user-select:none">
+        <div style="display:flex;align-items:center;gap:7px">
+          <span id="pctrl-arrow" style="font-size:10px;color:var(--txt3);transition:transform .2s;display:inline-block">▲</span>
+          <h3 style="font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1.5px;color:var(--txt2);margin:0">Player Controls</h3>
+        </div>
+      </div>
+      <div id="pctrl-body" style="overflow:hidden;transition:max-height .25s ease;max-height:0">
+        <div class="pinfo">
+          <div id="np">No stream loaded</div>
+          <div id="pu" onclick="cpyUrl()" title="Tap to copy stream URL">—</div>
+        </div>
+        <div class="pctrl">
+          <div class="ctrl-r ctr">
+            <button class="btn-ghost pnav" onclick="playerPrev()" title="Prev">⏮</button>
+            <button class="pbig" id="ppbtn" onclick="playerPP()">▶</button>
+            <button class="btn-ghost pnav" onclick="playerStop()" title="Stop">⏹</button>
+            <button class="btn-ghost pnav" onclick="playerNext()" title="Next">⏭</button>
+            <button class="btn-ghost pnav" id="epgbtn" onclick="showEPG()" title="EPG" style="font-size:14px;opacity:0.35">📅</button>
+            <button class="btn-ghost pnav" id="catchupbtn" onclick="showCatchup()" title="Catch-up TV" style="font-size:16px;opacity:0.35">↺</button>
+            <button class="btn-ghost pnav" id="subbtn" onclick="openSubSearch()" title="Subtitles" style="font-size:14px;opacity:0.35">💬</button>
+            <button class="btn-ghost pnav" id="theaterbtn" onclick="toggleTheater()" title="Theater mode" style="display:none;padding:0;justify-content:center;align-items:center">
+              <svg id="theater-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:auto">
+                <polyline points="4,2 2,2 2,4"/>
+                <polyline points="12,2 14,2 14,4"/>
+                <polyline points="4,14 2,14 2,12"/>
+                <polyline points="12,14 14,14 14,12"/>
+              </svg>
+            </button>
+          </div>
+          <div style="min-height:16px;padding:0 4px">
+            <span id="epg-now" style="font-size:11px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block"></span>
+          </div>
+          <div class="vrow">
+            <span style="font-size:15px">🔉</span>
+            <input type="range" id="vol" min="0" max="100" value="80" oninput="setVol(this.value)">
+            <span class="vlbl" id="vlbl">80</span>
+            <span style="font-size:15px">🔊</span>
+          </div>
+          <div class="recrow">
+            <button class="btn-red" id="rbtn" onclick="togRec()">⏺ Record</button>
+            <span class="rtimer" id="rtimer">00:00:00</span>
+            <span class="rfname" id="rfname"></span>
+          </div>
+        </div>
+      </div>
     </div>
-    <div class="pctrl">
-      <div class="ctrl-r ctr">
-        <button class="btn-ghost pnav" onclick="playerPrev()" title="Prev">⏮</button>
-        <button class="pbig" id="ppbtn" onclick="playerPP()">▶</button>
-        <button class="btn-ghost pnav" onclick="playerStop()" title="Stop">⏹</button>
-        <button class="btn-ghost pnav" onclick="playerNext()" title="Next">⏭</button>
-        <button class="btn-ghost pnav" id="epgbtn" onclick="showEPG()" title="EPG" style="font-size:14px;opacity:0.35">📅</button>
-        <button class="btn-ghost pnav" id="catchupbtn" onclick="showCatchup()" title="Catch-up TV" style="font-size:16px;opacity:0.35">↺</button>
-        <button class="btn-ghost pnav" id="subbtn" onclick="openSubSearch()" title="Subtitles" style="font-size:14px;opacity:0.35">💬</button>
-      </div>
-      <div style="min-height:16px;padding:0 4px">
-        <span id="epg-now" style="font-size:11px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block"></span>
-      </div>
-      <div class="vrow">
-        <span style="font-size:15px">🔉</span>
-        <input type="range" id="vol" min="0" max="100" value="80" oninput="setVol(this.value)">
-        <span class="vlbl" id="vlbl">80</span>
-        <span style="font-size:15px">🔊</span>
-      </div>
-      <div class="recrow">
-        <button class="btn-red" id="rbtn" onclick="togRec()">⏺ Record</button>
-        <span class="rtimer" id="rtimer">00:00:00</span>
-        <span class="rfname" id="rfname"></span>
-      </div>
-    </div>
+    </div><!-- end flex:1 player content wrapper -->
     <!-- Desktop-only inline log (hidden on mobile via CSS) -->
-    <div id="desktop-log" style="display:none;flex-direction:column;
-      flex:1;overflow:hidden;border-top:1px solid var(--bdr);min-height:100px">
-      <div class="ph" style="padding:8px 14px">
-        <h3>Activity Log</h3>
-        <button class="btn-ghost" onclick="clearLog()"
-          style="height:24px;padding:0 8px;font-size:11px;border-radius:var(--rss)">Clear</button>
+    <div id="desktop-log" style="display:none;flex-direction:column;flex-shrink:0;border-top:1px solid var(--bdr)">
+      <div id="desktop-log-hdr" onclick="toggleDesktopLog()" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:5px 14px;background:var(--s2);user-select:none">
+        <div style="display:flex;align-items:center;gap:7px">
+          <span id="desktop-log-arrow" style="font-size:10px;color:var(--txt3);transition:transform .2s">▲</span>
+          <h3 style="font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1.5px;color:var(--txt2);margin:0">Activity Log</h3>
+        </div>
+        <div style="display:flex;gap:6px" onclick="event.stopPropagation()">
+          <button class="btn-ghost" onclick="clearLog()" style="height:22px;padding:0 8px;font-size:11px;border-radius:var(--rss)">Clear</button>
+          <button class="btn-ghost" onclick="toggleDesktopLog()" style="height:22px;padding:0 8px;font-size:11px;border-radius:var(--rss)">✕</button>
+        </div>
       </div>
-      <div id="desktop-logout" style="flex:1;overflow-y:auto;padding:8px 12px;
-        font-family:'Cascadia Code','JetBrains Mono','Courier New',monospace;
-        font-size:11px;line-height:1.7;color:#4a556a;background:var(--bg);
-        white-space:pre-wrap;word-break:break-word"></div>
+      <div id="desktop-log-body" style="overflow:hidden;transition:max-height .25s ease;max-height:0">
+        <div id="desktop-logout" style="height:180px;overflow-y:auto;padding:8px 12px;
+          font-family:'Cascadia Code','JetBrains Mono','Courier New',monospace;
+          font-size:11px;line-height:1.7;color:#4a556a;background:var(--bg);
+          white-space:pre-wrap;word-break:break-word"></div>
+      </div>
     </div>
   </div>
 
@@ -7046,6 +7089,7 @@ function setMode(m){
   mode=m; navStack=[]; selSet.clear(); selCats.clear(); refreshCatBtns();
   if(m==='favs'){ showFavs(); return; }
   switchMode(m, catsCache[m]||[]);
+  showT('p-cats','t-cats');
 }
 
 function showFavs(){
@@ -7872,6 +7916,29 @@ function playerPrev(){if(!filtItems.length)return; playItem(pIdx<=0?filtItems.le
 function playerNext(){if(!filtItems.length)return; playItem(pIdx<0||pIdx>=filtItems.length-1?0:pIdx+1);}
 function setVol(v){document.getElementById('vlbl').textContent=v; vid.volume=v/100;}
 function setNP(t){document.getElementById('np').textContent=t;}
+function togglePlayerControls(){
+  const panel = document.getElementById('pctrl-panel');
+  if(!panel) return;
+  panel.classList.toggle('expanded');
+}
+
+function toggleTheater(){
+  const main = document.getElementById('main');
+  const btn  = document.getElementById('theaterbtn');
+  const on   = main.classList.toggle('theater');
+  // Also collapse/restore player controls
+  const pctrl = document.getElementById('pctrl-panel');
+  if(pctrl){
+    if(on) pctrl.classList.remove('expanded');
+    else pctrl.classList.add('expanded');
+  }
+  const icon = document.getElementById('theater-icon');
+  if(icon) icon.innerHTML = on
+    ? '<polyline points="2,4 2,2 4,2"/><polyline points="12,2 14,2 14,4"/><polyline points="2,12 2,14 4,14"/><polyline points="14,12 14,14 12,14"/>'
+    : '<polyline points="4,2 2,2 2,4"/><polyline points="12,2 14,2 14,4"/><polyline points="4,14 2,14 2,12"/><polyline points="12,14 14,14 14,12"/>';
+  btn.title = on ? 'Exit theater mode' : 'Theater mode';
+}
+
 function cpyUrl(){
   if(!pUrl)return;
   navigator.clipboard?.writeText(pUrl)
@@ -8462,6 +8529,16 @@ function clearLog(){
     const el=document.getElementById(id); if(el) el.innerHTML='';
   });
 }
+function toggleDesktopLog(){
+  const panel = document.getElementById('desktop-log');
+  if(!panel) return;
+  const expanded = panel.classList.toggle('expanded');
+  // After expand, scroll log to bottom
+  if(expanded){
+    const out = document.getElementById('desktop-logout');
+    if(out) setTimeout(()=>{ out.scrollTop = out.scrollHeight; }, 260);
+  }
+}
 function setStatus(m){document.getElementById('hdr-status').textContent=m;}
 function setBusy(v){
   document.getElementById('busy-sp').classList.toggle('hidden',!v);
@@ -8738,6 +8815,9 @@ async function plConnect(i){
 // ── INIT ───────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded',()=>{
   setCT('mac'); toggleCP();
+  // Player controls expanded by default
+  const pc = document.getElementById('pctrl-panel');
+  if(pc) pc.classList.add('expanded');
   try{const sv=localStorage.getItem('mkv_folder');
     if(sv) document.getElementById('o-dir').value=sv;
     else document.getElementById('o-dir').value='/sdcard/Download/';}catch(e){}
