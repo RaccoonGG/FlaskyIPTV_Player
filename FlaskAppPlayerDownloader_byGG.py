@@ -27,7 +27,12 @@ Added button that opens external player of your choice (on dekstop select exe, o
 Added option to add subtitles from opensubtitles.com via inscript serach (get free apikey from https://www.opensubtitles.com/en/consumers)
 Added option to add local subtitles file for subtitles (.srt/.vtt/.ass/.ssa) via Local File tab in the subtitle modal.
 Subtitle delay +/- works the same for local files as for OpenSubtitles.
-Varius UI fixes.
+Added external play button inside Whats on Now tab after search and matching channel, and added also inside catchup tab.
+Fixed major bug with yt-dlp fallback not respecting stop button.
+Fixed ffmpeg mkv download not working on specific hls vods/series, by adding mpeg-ts format as fallback to mkv.
+Added logos to channels/vods/series.
+Added sub-menu option on channels/vods/series.
+Varius UI fixes, and adjustments.
 """
 
 import base64
@@ -159,34 +164,73 @@ def run_ffmpeg_download(url: str, out_path: str, pre_input_args=None, post_input
     return proc.returncode
 
 
-def run_yt_dlp_download(url: str, out_path: str, stop_event: threading.Event = None):
+def run_yt_dlp_download(url: str, out_path: str, stop_event: threading.Event = None,
+                        on_progress=None):
     if not YTDLP_AVAILABLE:
         return False, "yt-dlp not installed"
+
+    # Work inside a dedicated temp subfolder named after the item so all yt-dlp
+    # .part / -FragN.part / .ytdl files are isolated there.  On stop or failure
+    # we simply rmtree the whole folder — no pattern matching, no risk of
+    # accidentally touching other files in the output directory.
+    dirn      = os.path.dirname(out_path) or "."
+    item_name = os.path.splitext(os.path.basename(out_path))[0]   # e.g. "A Bug_s Life"
+    work_dir  = os.path.join(dirn, f"{item_name}_ytdlp_tmp")
+
+    def _cleanup():
+        with contextlib.suppress(Exception):
+            for fname in os.listdir(work_dir):
+                with contextlib.suppress(Exception):
+                    os.remove(os.path.join(work_dir, fname))
+            with contextlib.suppress(Exception):
+                os.rmdir(work_dir)
+
+    def _progress_hook(d):
+        if stop_event and stop_event.is_set():
+            raise Exception("stopped")
+        if d.get("status") == "downloading" and on_progress:
+            try:
+                on_progress(d)
+            except Exception:
+                pass
+
+    try:
+        os.makedirs(work_dir, exist_ok=True)
+    except Exception as e:
+        return False, f"Could not create temp dir: {e}"
+
     ydl_opts = {
-        "outtmpl": out_path + ".%(ext)s",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "format": "best",
+        "outtmpl":      os.path.join(work_dir, "%(title)s.%(ext)s"),
+        "quiet":        True,
+        "no_warnings":  True,
+        "noplaylist":   True,
+        "format":       "best",
+        "progress_hooks": [_progress_hook],
     }
     try:
         if stop_event and stop_event.is_set():
+            _cleanup()
             return False, "stopped"
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         if stop_event and stop_event.is_set():
+            time.sleep(1.0)
+            _cleanup()
             return False, "stopped"
-        dirn = os.path.dirname(out_path) or "."
-        nameprefix = os.path.splitext(os.path.basename(out_path))[0]
-        for f in os.listdir(dirn):
-            if f.startswith(nameprefix) and f != os.path.basename(out_path):
-                try:
-                    os.replace(os.path.join(dirn, f), out_path)
-                    return True, None
-                except Exception:
-                    pass
+        # Find the downloaded file and move it to the final out_path
+        candidates = [f for f in os.listdir(work_dir)
+                      if not f.endswith(".part") and not f.endswith(".ytdl")
+                      and not ".part-Frag" in f]
+        if candidates:
+            src = os.path.join(work_dir, candidates[0])
+            os.replace(src, out_path)
+        _cleanup()
         return True, None
     except Exception as e:
+        time.sleep(1.0)  # allow yt-dlp to release file handles before cleanup
+        _cleanup()
+        if stop_event and stop_event.is_set():
+            return False, "stopped"
         return False, str(e)
 
 
@@ -2546,8 +2590,9 @@ class AppState:
         self._won_ch_cache: tuple = (0.0, [])
         self._won_ch_cache_ttl = 1200  # 20 minutes
         # Download/export progress tracking (polled via /api/status)
-        self.task_type    = ""   # "m3u" | "mkv" | ""
-        self.task_label   = ""   # current item name
+        self.task_type       = ""   # "m3u" | "mkv" | ""
+        self.task_label      = ""   # current item name
+        self.task_item_names: list = []   # names of all items in the current download job
         self.task_total   = 0    # total items (item counter)
         self.task_done    = 0    # items completed/written
         self.task_skipped = 0    # items skipped (no URL / failed to resolve)
@@ -3031,6 +3076,10 @@ def api_download_mkv():
     state.mkv_folder = out_dir
     state.mkv_fallback = use_fallback
     state.stop_flag.clear()
+    state.task_item_names = [
+        (item.get("name") or item.get("o_name") or item.get("fname") or "")
+        for item in items
+    ]
     state.set_status(f"Resolving + downloading {len(items)} item(s) as MKV…")
 
     async def worker():
@@ -3108,6 +3157,11 @@ def api_download_mkv():
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_delay_max", "10",
+            # Generate PTS for packets that have unset timestamps (common in HLS
+            # streams whose segments start at a large offset such as 600 s).
+            # Without this the matroska muxer rejects the first few packets and
+            # aborts with "Can't write packet with unknown timestamp".
+            "-fflags", "+genpts+igndts",
         ]
 
         MAX_RETRIES = 3  # max retry attempts on unexpected failure
@@ -3130,10 +3184,14 @@ def api_download_mkv():
             state.log("[MKV]   Probing codecs…")
             codecs = probe_stream_codecs(url, pre_input_args=pre_args)
             state.task_file_duration = (codecs.get("duration") or 0.0) if codecs else 0.0
-            post_args = []
+            # -avoid_negative_ts make_zero: shifts output timestamps so they start
+            # at 0, which resolves "Can't write packet with unknown timestamp" when
+            # the HLS stream has a large start offset (e.g. 600 s) and the raw TS
+            # packets arrive with NOPTS DTS — genpts alone can't help in that case.
+            post_args = ["-avoid_negative_ts", "make_zero"]
             if codecs and codecs.get("audio"):
                 if any(c.lower() == "aac" for c in codecs["audio"]):
-                    post_args = ["-bsf:a", "aac_adtstoasc"]
+                    post_args += ["-bsf:a", "aac_adtstoasc"]
                     state.log("[MKV]   AAC audio → adding -bsf:a aac_adtstoasc")
 
             def _set_proc(p):
@@ -3164,69 +3222,17 @@ def api_download_mkv():
             for attempt in range(1, MAX_RETRIES + 1):
                 if state.stop_flag.is_set():
                     break
+                if attempt > 1:
+                    state.task_file_pct     = 0.0
+                    state.task_file_elapsed = ""
+                    state.task_speed        = ""
 
-                # Resume from partial file if it exists and has content
-                resume_pre_args = list(pre_args)
-                skip_seconds = 0.0
-                if attempt > 1 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                    state.log(f"[MKV]   Attempt {attempt}/{MAX_RETRIES} — checking partial file…")
-                    partial_info = probe_stream_codecs(out_path)
-                    if partial_info and partial_info.get("duration"):
-                        skip_seconds = max(0.0, partial_info["duration"] - 2.0)  # back off 2s for clean join
-                        state.log(f"[MKV]   Resuming from {skip_seconds:.1f}s (partial file duration)")
-                        resume_pre_args = ["-ss", f"{skip_seconds:.3f}"] + resume_pre_args
-                        # Append to existing partial file
-                        resume_out = out_path + ".part"
-                        rc = run_ffmpeg_download(
-                            url, resume_out,
-                            pre_input_args=resume_pre_args,
-                            post_input_args=post_args,
-                            on_progress=_on_ffmpeg_line,
-                            stop_event=state.stop_flag,
-                            set_proc=_set_proc,
-                        )
-                        with state.mkv_proc_lock:
-                            state.mkv_proc = None
-                        # Concatenate partial + resume using ffmpeg concat
-                        if rc == 0 and not state.stop_flag.is_set():
-                            concat_list = out_path + ".concat.txt"
-                            try:
-                                with open(concat_list, "w") as cf:
-                                    cf.write(f"file '{os.path.abspath(out_path)}'\n")
-                                    cf.write(f"file '{os.path.abspath(resume_out)}'\n")
-                                concat_out = out_path + ".merged.mkv"
-                                ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
-                                merge_rc = subprocess.run(
-                                    [ffmpeg, "-hide_banner", "-nostdin", "-y",
-                                     "-f", "concat", "-safe", "0", "-i", concat_list,
-                                     "-c", "copy", concat_out],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120
-                                ).returncode
-                                if merge_rc == 0:
-                                    os.replace(concat_out, out_path)
-                                    state.log(f"[MKV]   ✓ Resume merged into: {out_path}")
-                                else:
-                                    state.log(f"[MKV]   ✗ Merge failed (rc={merge_rc}), keeping partial")
-                                    rc = merge_rc
-                            except Exception as me:
-                                state.log(f"[MKV]   ✗ Resume merge error: {me}")
-                                rc = -1
-                            finally:
-                                for tf in [concat_list, resume_out]:
-                                    with contextlib.suppress(Exception):
-                                        os.remove(tf)
-                        break  # done with this file regardless
-
-                else:
-                    # Normal (first attempt or no partial file)
-                    if attempt > 1:
-                        state.log(f"[MKV]   Retry {attempt}/{MAX_RETRIES}…")
-                        state.task_file_pct = 0.0
-                        state.task_file_elapsed = ""
-                        state.task_speed = ""
+                if attempt == 1:
+                    # ── Attempt 1: direct HLS → MKV ──────────────────────────
+                    state.log(f"[MKV]   Attempt {attempt}/{MAX_RETRIES} — direct MKV…")
                     rc = run_ffmpeg_download(
                         url, out_path,
-                        pre_input_args=resume_pre_args,
+                        pre_input_args=pre_args,
                         post_input_args=post_args,
                         on_progress=_on_ffmpeg_line,
                         stop_event=state.stop_flag,
@@ -3234,14 +3240,51 @@ def api_download_mkv():
                     )
                     with state.mkv_proc_lock:
                         state.mkv_proc = None
+                    if rc == 0:
+                        break
+                    if state.stop_flag.is_set():
+                        break
+                    state.log(f"[MKV]   ✗ Direct MKV exit {rc} — retrying via TS intermediate…")
+                    with contextlib.suppress(Exception):
+                        os.remove(out_path)
 
-                if state.stop_flag.is_set():
+                else:
+                    # ── Attempts 2-3: direct HLS → MPEG-TS ───────────────────
+                    # MPEG-TS tolerates unset/negative timestamps that MKV rejects.
+                    # Save directly as .ts — no remux step needed.
+                    state.log(f"[MKV]   Attempt {attempt}/{MAX_RETRIES} — saving as MPEG-TS…")
+                    ts_out = os.path.splitext(out_path)[0] + ".ts"
+                    ts_post_args = [a for a in post_args
+                                    if a not in ("-avoid_negative_ts", "make_zero",
+                                                 "-bsf:a", "aac_adtstoasc")]
+                    ts_post_args += ["-f", "mpegts"]
+
+                    rc = run_ffmpeg_download(
+                        url, ts_out,
+                        pre_input_args=pre_args,
+                        post_input_args=ts_post_args,
+                        on_progress=_on_ffmpeg_line,
+                        stop_event=state.stop_flag,
+                        set_proc=_set_proc,
+                    )
+                    with state.mkv_proc_lock:
+                        state.mkv_proc = None
+
+                    if state.stop_flag.is_set():
+                        break
+
+                    if rc != 0:
+                        state.log(f"[MKV]   ✗ TS download exit {rc} on attempt {attempt}/{MAX_RETRIES}")
+                        with contextlib.suppress(Exception):
+                            os.remove(ts_out)
+                        if attempt < MAX_RETRIES:
+                            time.sleep(2)
+                        continue
+
+                    state.log(f"[MKV]   Saved as MPEG-TS: {os.path.basename(ts_out)}")
+                    # Use ts_out as the successful output for logging purposes
+                    out_path = ts_out
                     break
-                if rc == 0:
-                    break  # success
-                state.log(f"[MKV]   ✗ ffmpeg exit {rc} on attempt {attempt}/{MAX_RETRIES}")
-                if attempt < MAX_RETRIES:
-                    time.sleep(2)  # brief pause before retry
 
             if state.stop_flag.is_set():
                 break
@@ -3252,9 +3295,45 @@ def api_download_mkv():
                 state.log(f"[MKV] ✗ Failed after {MAX_RETRIES} attempt(s): {name}")
                 if use_fallback and YTDLP_AVAILABLE and not state.stop_flag.is_set():
                     state.log("[MKV]   Trying yt-dlp fallback…")
-                    ok, err = run_yt_dlp_download(url, out_path, stop_event=state.stop_flag)
+                    state.task_file_pct     = 0.0
+                    state.task_file_elapsed = ""
+                    state.task_speed        = ""
+
+                    def _ytdlp_progress(d):
+                        downloaded = d.get("downloaded_bytes") or 0
+                        total      = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                        speed      = d.get("speed") or 0          # bytes/s
+                        elapsed    = d.get("elapsed") or 0        # seconds so far
+                        frag_idx   = d.get("fragment_index") or 0
+                        frag_total = d.get("fragment_count") or 0
+                        if total > 0:
+                            state.task_file_pct = min(100.0, round(downloaded / total * 100, 1))
+                        if speed:
+                            kbytes = speed / 1024.0
+                            state.task_speed = (f"{kbytes/1024:.1f} MB/s"
+                                                if kbytes >= 1024 else f"{kbytes:.0f} KB/s")
+                        if elapsed:
+                            h = int(elapsed) // 3600
+                            m = (int(elapsed) % 3600) // 60
+                            s = int(elapsed) % 60
+                            state.task_file_elapsed = f"{h:02d}:{m:02d}:{s:02d}"
+                        # Log to activity log every 10 fragments (avoids flooding)
+                        if frag_idx and frag_idx % 10 == 0:
+                            pct_str  = d.get("_percent_str", "").strip() or (
+                                f"{state.task_file_pct:.1f}%" if state.task_file_pct else "?")
+                            spd_str  = d.get("_speed_str", "").strip() or state.task_speed
+                            eta_str  = d.get("_eta_str", "").strip() or ""
+                            frag_str = f" (frag {frag_idx}/{frag_total})" if frag_total else ""
+                            eta_part = f" ETA {eta_str}" if eta_str else ""
+                            state.log(f"[yt-dlp] {pct_str} at {spd_str}{eta_part}{frag_str}")
+
+                    ok, err = run_yt_dlp_download(url, out_path,
+                                                  stop_event=state.stop_flag,
+                                                  on_progress=_ytdlp_progress)
                     if ok:
                         state.log(f"[MKV]   ✓ yt-dlp saved: {out_path}")
+                    elif err == "stopped":
+                        state.log("[MKV]   yt-dlp stopped by user.")
                     else:
                         state.log(f"[MKV]   ✗ yt-dlp failed: {err}")
 
@@ -3266,6 +3345,7 @@ def api_download_mkv():
         state.task_file_pct     = 0.0
         state.task_file_elapsed = ""
         state.task_speed        = ""
+        state.task_item_names   = []
         state.log("DONE.")
 
     run_worker(worker())
@@ -3381,8 +3461,9 @@ def api_status():
         "recording": state.recording,
         "conn_type": state.conn_type,
         "ffmpeg": shutil.which("ffmpeg") is not None,
-        "task_type":  state.task_type,
-        "task_label": state.task_label,
+        "task_type":       state.task_type,
+        "task_label":      state.task_label,
+        "task_item_names": list(state.task_item_names),
         "task_total": state.task_total,
         "task_done":  state.task_done,
         "task_skipped": state.task_skipped,
@@ -6479,6 +6560,7 @@ let CT='mac', mode='live', curCat=null;
 let allCats=[], catsCache={}, selCats=new Map();
 let allItems=[], filtItems=[], navStack=[], selSet=new Set();
 let pUrl='', pName='', pIdx=-1;
+let _dlActive=false, _dlTaskType='', _dlItemNames=[];
 let hlsObj=null, mpegtsObj=null, recTmr=null, isRec=false, logEs=null, cpOpen=false;
 const vid = document.getElementById('vid');
 
@@ -7401,6 +7483,7 @@ function openItemMenu(i, btn){
   menu.style.left = left + 'px';
   menu.style.top  = top  + 'px';
   document.getElementById('item-menu-bg').style.display = 'block';
+  _refreshDlButtons();
 }
 
 function closeItemMenu(){
@@ -8445,6 +8528,8 @@ async function dlCat(){
 async function doStop(){
   await fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
   setBusy(false); toast('Stopped','info');
+  _dlActive=false; _dlTaskType=''; _dlItemNames=[];
+  _refreshDlButtons();
 }
 
 // ── POLLING ────────────────────────────────────────────────
@@ -8453,6 +8538,7 @@ async function pollBusy(){
   const d=await r.json().catch(()=>null); if(!d) return;
   if(d.status) setStatus(d.status);
   updateTaskProgress(d);
+  _syncDlState(d);
   if(d.busy){
     setTimeout(pollBusy,800);
   } else {
@@ -8569,6 +8655,7 @@ setInterval(async()=>{
   if(d.status) setStatus(d.status);
   if(!d.busy) setBusy(false);
   updateTaskProgress(d);
+  _syncDlState(d);
   // Sync recording button if server state differs from JS state (e.g. page reload)
   if(d.recording && !isRec){
     isRec=true; _syncRecBtn(true);
@@ -8672,6 +8759,56 @@ function setBusy(v){
   document.getElementById('busy-sp').classList.toggle('hidden',!v);
   document.getElementById('cbtn').disabled=v;
   document.getElementById('stopbtn').disabled=!v;
+}
+
+// ── DOWNLOAD-AWARE BUTTON SYNC ──────────────────────────────
+// Called whenever we receive a fresh /api/status payload.
+// Updates _dlActive/_dlTaskType/_dlItemNames and refreshes the two
+// "Download MKV" buttons that live outside the Action drawer:
+//   • dl-now-btn  — in the Player controls bar
+//   • imenu-mkv   — in the item context menu
+function _syncDlState(d){
+  _dlActive    = !!(d.busy && d.task_type);
+  _dlTaskType  = d.task_type || '';
+  _dlItemNames = Array.isArray(d.task_item_names) ? d.task_item_names : [];
+  _refreshDlButtons();
+}
+
+function _refreshDlButtons(){
+  const mkvRunning = _dlActive && _dlTaskType === 'mkv';
+
+  // ── dl-now-btn (Player controls bar) ─────────────────────
+  const dnBtn = document.getElementById('dl-now-btn');
+  if(dnBtn){
+    if(mkvRunning){
+      dnBtn.innerHTML = '⏹ Stop';
+      dnBtn.title     = 'Stop current MKV download';
+      dnBtn.onclick   = ()=>doStop();
+      dnBtn.disabled  = false;
+      dnBtn.style.color       = 'var(--acc,#f87171)';
+      dnBtn.style.borderColor = 'var(--acc,#f87171)';
+    } else {
+      dnBtn.innerHTML = '⬇ MKV';
+      dnBtn.title     = 'Download currently playing item as MKV';
+      dnBtn.onclick   = ()=>dlNowMKV();
+      dnBtn.disabled  = !pUrl;
+      dnBtn.style.color       = '';
+      dnBtn.style.borderColor = '';
+    }
+  }
+
+  // ── imenu-mkv (item context menu) ────────────────────────
+  const imBtn = document.getElementById('imenu-mkv');
+  if(!imBtn) return;
+  if(mkvRunning){
+    imBtn.innerHTML = '<span class="imenu-ico">⏹</span>Stop Download';
+    imBtn.onclick   = ()=>{ closeItemMenu(); doStop(); };
+    imBtn.style.color = 'var(--acc,#f87171)';
+  } else {
+    imBtn.innerHTML = '<span class="imenu-ico">⬇</span>Download MKV';
+    imBtn.onclick   = iMenuMKV;
+    imBtn.style.color = '';
+  }
 }
 function showT(pid,tid){
   if(window.innerWidth>=900) return;
