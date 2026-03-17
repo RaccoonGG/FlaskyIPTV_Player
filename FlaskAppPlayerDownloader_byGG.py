@@ -16,6 +16,8 @@ Added support for external EPG url, to cover channels where portal does not prov
 Added tag bar above categories.
 Added support for Xtream CatchUp (where supported and available by Xtream portal).
 Added Favourites and saving them across sessions in browser memory.
+Added Whats on TV Now button, it checks external EPG url (you have to set it) for current time, and lists you programs and channels that are playing it,
+Clicking on Search Icon will check currently active portal if your portal has channel that you requested. (experimental, needs testing and good external EPG)
 Varius UI fixes.
 """
 
@@ -2471,6 +2473,10 @@ class AppState:
         # repeated handshake/profile calls that cause portal rate-limiting
         self._stalker_client: object = None
         self._stalker_client_lock = threading.Lock()
+        # Cache for all-channels list used by What's on Now → Find Channel
+        # (timestamp, [{"name", "cmd"/"stream_id"/"url", "tvg_id", ...}])
+        self._won_ch_cache: tuple = (0.0, [])
+        self._won_ch_cache_ttl = 1200  # 20 minutes
 
     def log(self, msg: str):
         try:
@@ -2681,6 +2687,7 @@ def api_connect():
         state._xmltv_cache = {}
         state._short_epg_broken = set()
         state._xmltv_no_data = set()
+        state._won_ch_cache = (0.0, [])
         state.connected = False
         state.stop_flag.clear()
 
@@ -3321,6 +3328,304 @@ def api_epg():
     except Exception as e:
         state.log(f"[EPG] Error: {type(e).__name__}: {e}")
         return jsonify({"current": None, "next": None, "error": str(e)})
+
+
+@flask_app.route("/api/whats_on", methods=["GET"])
+def api_whats_on():
+    """Return all currently airing programmes from cached XMLTV data.
+    If ext_epg_url is set but not yet cached, downloads it first (blocking).
+    """
+    now = time.time()
+
+    # If ext_epg_url is configured but not yet in cache, try to load it now
+    if state.ext_epg_url and state.ext_epg_url not in state._xmltv_cache:
+        if state.ext_epg_url not in state._xmltv_no_data:
+            try:
+                state.log(f"[WHATS_ON] Loading EPG from {state.ext_epg_url}")
+                epg_dict, chan_names = run_async(
+                    _build_xmltv_index(state.ext_epg_url, state.log)
+                )
+                state._xmltv_cache[state.ext_epg_url] = (time.time(), epg_dict, chan_names)
+                if not epg_dict:
+                    state._xmltv_no_data.add(state.ext_epg_url)
+            except Exception as e:
+                state.log(f"[WHATS_ON] EPG load failed: {e}")
+                return jsonify({"programs": [], "count": 0, "status": "error",
+                                "message": f"Failed to load EPG: {e}"})
+
+    if not state._xmltv_cache:
+        msg = ("No EPG data loaded yet. Open any live channel first to trigger EPG load, "
+               "then re-open What's on Now.") if state.ext_epg_url else (
+               "No external EPG URL configured. Add one in Settings (EPG field) and reconnect.")
+        return jsonify({"programs": [], "count": 0, "status": "no_epg", "message": msg})
+
+    results = []
+    seen = set()
+
+    for _ck, (ts, epg_dict, chan_names) in list(state._xmltv_cache.items()):
+        for channel_id, programmes in epg_dict.items():
+            names = chan_names.get(channel_id, [])
+            display_name = names[0].title() if names else channel_id
+            for prog in programmes:
+                if prog["start"] <= now < prog["end"]:
+                    key = (prog["title"].lower(), channel_id)
+                    if key not in seen:
+                        seen.add(key)
+                        # Calculate progress percentage through the show
+                        duration = prog["end"] - prog["start"]
+                        elapsed = now - prog["start"]
+                        progress = int((elapsed / duration * 100)) if duration > 0 else 0
+                        results.append({
+                            "title": prog["title"],
+                            "channel_id": channel_id,
+                            "channel_name": display_name,
+                            "start": prog["start"],
+                            "end": prog["end"],
+                            "desc": prog.get("desc", ""),
+                            "progress": progress,
+                        })
+
+    results.sort(key=lambda x: x["title"].lower())
+    return jsonify({"programs": results, "count": len(results), "status": "ok"})
+
+
+@flask_app.route("/api/find_channel", methods=["POST"])
+def api_find_channel():
+    """Fuzzy-match an EPG channel name against the currently connected portal's live channels.
+    Body: {channel_name: str, channel_id: str}
+    Returns: {found: bool, name: str, score: int, cat: str, cmd/stream_id: ...}
+    """
+    if not state.connected:
+        return jsonify({"found": False, "error": "Not connected"})
+
+    data = request.get_json(force=True)
+    epg_channel_name = (data.get("channel_name") or "").strip()
+    epg_channel_id   = (data.get("channel_id")   or "").strip().lower()
+
+    state.log(f"[FIND_CH] Request: name={epg_channel_name!r} id={epg_channel_id!r} conn={state.conn_type} connected={state.connected}")
+
+    if not epg_channel_name and not epg_channel_id:
+        return jsonify({"found": False, "error": "No channel name provided"})
+
+    # ── Return cached channel list if fresh ──────────────────────────────────
+    cache_ts, cached_channels = state._won_ch_cache
+    if cached_channels and (time.time() - cache_ts) < state._won_ch_cache_ttl:
+        channels = cached_channels
+    else:
+        # ── Fetch all live channels from portal ───────────────────────────────
+        async def fetch_all_channels():
+            conn = state.conn_type
+            chans = []
+
+            if conn == "mac":
+                client_cls = StalkerPortalClient if state.is_stalker_portal else PortalClient
+                async with client_cls(state.url, state.mac, state.log) as client:
+                    await client.handshake()
+                    if state.is_stalker_portal:
+                        url = client._load_url(
+                            type="itv", action="get_all_channels",
+                            force_ch_link_check="", JsHttpRequest="1-xml"
+                        )
+                        hdrs = client._headers(include_auth=True)
+                    else:
+                        url = (f"{client.base}/portal.php?type=itv"
+                               f"&action=get_all_channels"
+                               f"&force_ch_link_check=&JsHttpRequest=1-xml")
+                        hdrs = client.headers
+                    async with client.session.get(url, headers=hdrs) as r:
+                        payload = await safe_json(r)
+                    chans = normalize_js(payload)
+
+            elif conn == "xtream" or (conn == "m3u_url" and state.m3u_xtream_override):
+                creds = state.m3u_xtream_override if conn == "m3u_url" else None
+                base  = creds["base"]     if creds else state.url
+                user  = creds["username"] if creds else state.username
+                pwd   = creds["password"] if creds else state.password
+                async with XtreamClient(base, user, pwd, state.log) as client:
+                    await client.handshake()
+                    url = client._api("get_live_streams")
+                    async with client.session.get(url) as r:
+                        chans = await safe_json(r) or []
+
+            elif conn == "m3u_url" and state.m3u_cache:
+                # Pull all live entries from the in-memory M3U cache
+                type_filter = {"live", ""}
+                for group_items in state.m3u_cache.values():
+                    for it in group_items:
+                        if isinstance(it, dict) and it.get("tvg_type", "") in type_filter:
+                            chans.append(it)
+
+            return [c for c in chans if isinstance(c, dict)]
+
+        try:
+            channels = run_async(fetch_all_channels())
+            state._won_ch_cache = (time.time(), channels)
+            state.log(f"[FIND_CH] Fetched {len(channels)} live channels from portal")
+        except Exception as e:
+            state.log(f"[FIND_CH] Fetch error: {e}")
+            return jsonify({"found": False, "error": str(e)})
+
+    if not channels:
+        return jsonify({"found": False, "error": "No live channels on portal"})
+
+    # ── Fuzzy scoring ─────────────────────────────────────────────────────────
+    QUALITY_TAGS = ["hevc", "h265", "h.265", "hvc1", "hvc", "av1",
+                    "hd", "sd", "fhd", "uhd", "4k", "h264", "h.264",
+                    "avc", "av1", "1080p", "720p", "480p"]
+    # Tags that indicate a stream the browser likely can't play (HEVC/H265)
+    HEVC_TAGS = {"hevc", "h265", "h.265", "hvc1", "hvc", "h.265"}
+
+    # Country code synonyms — portals use these interchangeably as prefixes/suffixes
+    COUNTRY_SYNONYMS = {
+        "sr": "rs",   # Serbia: SR (srpski) ↔ RS (ISO 3166)
+        "rs": "rs",
+        "hr": "hr",   "ba": "ba",  "si": "si",  "mk": "mk",
+        "me": "me",   "al": "al",  "bg": "bg",  "ro": "ro",
+        "hu": "hu",   "sk": "sk",  "cz": "cz",  "pl": "pl",
+        "uk": "uk",   "us": "us",  "de": "de",  "fr": "fr",
+        "it": "it",   "es": "es",  "pt": "pt",  "nl": "nl",
+        "tr": "tr",   "gr": "gr",  "at": "at",  "ch": "ch",
+    }
+    _CC_PATTERN = '|'.join(COUNTRY_SYNONYMS.keys())
+
+    def _strip_country_prefix(s):
+        m = re.match(r'^([A-Za-z]{2,3})\s*[:\|]\s*', s)
+        if m:
+            code = m.group(1).lower()
+            if code in COUNTRY_SYNONYMS:
+                return s[m.end():].strip(), code
+        return s.strip(), None
+
+    def _strip_country_suffix(s):
+        s = re.sub(rf'\.({_CC_PATTERN})$', '', s, flags=re.I)
+        s = re.sub(rf'\s+\(?({_CC_PATTERN})\)?$', '', s, flags=re.I)
+        return s.strip()
+
+    def _norm_code(code):
+        return COUNTRY_SYNONYMS.get((code or "").lower(), (code or "").lower())
+
+    def _strip_quality(s):
+        s = (s or "").lower().strip()
+        for tag in QUALITY_TAGS:
+            s = s.replace(f" {tag}", "").replace(f"({tag})", "").replace(f"[{tag}]", "")
+        return re.sub(r"\s+", " ", s).strip()
+
+    def _core(s):
+        """Strip country prefix + suffix + quality tags → pure channel name."""
+        stripped, _ = _strip_country_prefix(s)
+        stripped = _strip_country_suffix(stripped)
+        return _strip_quality(stripped)
+
+    def _core_words(s):
+        return set(re.findall(r"[a-z0-9]+", _core(s)))
+
+    def _has_hevc(s):
+        sl = (s or "").lower()
+        return any(t in sl for t in HEVC_TAGS)
+
+    # Pre-process EPG side
+    epg_name_l    = epg_channel_name.lower().strip()
+    epg_core      = _core(epg_channel_name)
+    epg_cwords    = _core_words(epg_channel_name)
+    _, epg_cc_raw = _strip_country_prefix(epg_channel_name)
+    if not epg_cc_raw:
+        m = re.search(rf'\.({_CC_PATTERN})$', epg_channel_name, re.I)
+        if m:
+            epg_cc_raw = m.group(1)
+    epg_cc = _norm_code(epg_cc_raw)   # canonical country code or ""
+
+    state.log(f"[FIND_CH] EPG core={epg_core!r} country={epg_cc!r} words={epg_cwords}")
+
+    scored = []   # list of (score, ch) — collect all to log top candidates
+
+    for ch in channels:
+        ch_name     = (ch.get("name") or ch.get("stream_name") or ch.get("title") or "").strip()
+        ch_tvg_id   = (ch.get("epg_channel_id") or ch.get("tvg_id") or "").strip().lower()
+        ch_name_l   = ch_name.lower()
+        score = 0
+
+        ch_core_str, ch_cc_raw = _strip_country_prefix(ch_name)
+        ch_core_str = _strip_country_suffix(ch_core_str)
+        ch_core_str = _strip_quality(ch_core_str)
+        ch_cc = _norm_code(ch_cc_raw)
+
+        # ── Country conflict check ────────────────────────────────────────────
+        # If BOTH sides have explicit country codes and they differ → hard cap at 45
+        # This prevents DE: channel from beating RS: channel
+        country_conflict = bool(epg_cc and ch_cc and epg_cc != ch_cc)
+
+        # ── tvg-id match ──────────────────────────────────────────────────────
+        if epg_channel_id and ch_tvg_id:
+            if epg_channel_id == ch_tvg_id:
+                score = 100
+            elif epg_channel_id in ch_tvg_id or ch_tvg_id in epg_channel_id:
+                score = max(score, 80)
+
+        # ── Exact name ───────────────────────────────────────────────────────
+        if ch_name_l == epg_name_l:
+            score = max(score, 90)
+
+        # ── Core name match (stripped of country + quality tags) ──────────────
+        if epg_core and ch_core_str and epg_core == ch_core_str:
+            if epg_cc and ch_cc and epg_cc == ch_cc:
+                score = max(score, 85)   # same core + same country
+            elif not epg_cc or not ch_cc:
+                score = max(score, 75)   # same core, one side has no country
+            else:
+                score = max(score, 45)   # same core but different countries
+
+        # ── Core contains ────────────────────────────────────────────────────
+        if epg_core and ch_core_str:
+            if epg_core in ch_core_str or ch_core_str in epg_core:
+                score = max(score, 48)
+
+        # ── Word overlap on core words ────────────────────────────────────────
+        if epg_cwords and ch_core_str:
+            ch_cw = _core_words(ch_name)
+            overlap = len(epg_cwords & ch_cw)
+            total   = max(len(epg_cwords), len(ch_cw)) if ch_cw else 1
+            if overlap:
+                score = max(score, int(60 * overlap / total))
+
+        # ── Apply hard country conflict cap ───────────────────────────────────
+        if country_conflict:
+            score = min(score, 45)
+
+        # ── HEVC penalty — deprioritize when non-HEVC alternatives likely exist
+        if _has_hevc(ch_name):
+            score = max(0, score - 10)
+
+        scored.append((score, ch_name, ch))
+
+    # Sort and pick best
+    scored.sort(key=lambda x: -x[0])
+
+    # Log top 5 candidates for debugging
+    state.log(f"[FIND_CH] Top candidates for {epg_channel_name!r}:")
+    for s, n, _ in scored[:5]:
+        state.log(f"[FIND_CH]   score={s:3d}  {n!r}")
+
+    best_score, _, best_channel = scored[0] if scored else (0, "", None)
+
+    MIN_SCORE = 30
+    if not best_channel or best_score < MIN_SCORE:
+        return jsonify({"found": False, "score": best_score,
+                        "message": f"No match found (best score: {best_score})"})
+
+    # Build a tidy result dict
+    result_name = (best_channel.get("name") or best_channel.get("stream_name")
+                   or best_channel.get("title") or "Unknown")
+    result_cat  = (best_channel.get("genre_title") or best_channel.get("category_name")
+                   or best_channel.get("group_title") or best_channel.get("group") or "")
+
+    state.log(f"[FIND_CH] Best match: {result_name!r} score={best_score}")
+    return jsonify({
+        "found":    True,
+        "score":    best_score,
+        "name":     result_name,
+        "cat":      result_cat,
+        "channel":  best_channel,
+    })
 
 
 @flask_app.route("/api/catchup", methods=["POST"])
@@ -4572,6 +4877,56 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 @keyframes slide-up{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
 
 .hidden{display:none!important}
+
+/* ─── What's On Now modal ─────────────────────────────────── */
+#won-overlay{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.6);
+  display:none;align-items:center;justify-content:center}
+#won-overlay.open{display:flex}
+#won-modal{background:var(--s2);border-radius:14px;width:min(700px,96vw);
+  max-height:88vh;display:flex;flex-direction:column;overflow:hidden;
+  box-shadow:0 24px 80px rgba(0,0,0,.6);animation:pop-in .2s ease}
+.won-hdr{display:flex;align-items:center;gap:10px;padding:14px 16px 10px;
+  border-bottom:1px solid var(--s4);flex-shrink:0}
+.won-hdr h3{flex:1;margin:0;font-size:15px;font-weight:700}
+.won-hdr .won-count{font-size:11px;color:var(--txt3);background:var(--s3);
+  padding:2px 8px;border-radius:20px}
+.won-search{padding:10px 14px;flex-shrink:0;border-bottom:1px solid var(--s4)}
+.won-search input{width:100%;box-sizing:border-box;background:var(--s3);border:1px solid var(--s5);
+  color:var(--txt1);border-radius:8px;padding:7px 12px;font-size:13px;outline:none}
+.won-search input:focus{border-color:var(--acc)}
+.won-list{flex:1;overflow-y:auto;padding:6px 8px}
+.won-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;
+  cursor:pointer;transition:background .15s}
+.won-item:hover{background:var(--s3)}
+.won-item-info{flex:1;min-width:0}
+.won-item-title{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.won-item-ch{font-size:11px;color:var(--txt3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.won-item-times{font-size:10px;color:var(--txt3);margin-top:3px}
+.won-progress{width:48px;flex-shrink:0}
+.won-progress-bar{height:3px;background:var(--s4);border-radius:2px;overflow:hidden}
+.won-progress-fill{height:100%;background:var(--acc);border-radius:2px;transition:width .3s}
+.won-progress-pct{font-size:9px;color:var(--txt3);text-align:right;margin-top:2px}
+.won-find-btn{flex-shrink:0;width:30px;height:30px;border-radius:7px;border:1px solid var(--s5);
+  background:var(--s3);color:var(--txt2);font-size:14px;cursor:pointer;display:flex;
+  align-items:center;justify-content:center;transition:background .15s,color .15s}
+.won-find-btn:hover{background:var(--acc);color:#fff;border-color:var(--acc)}
+.won-find-btn.loading{opacity:.5;pointer-events:none}
+.won-find-result{font-size:10px;margin-top:4px;padding:3px 6px;border-radius:4px;display:none}
+.won-find-result.ok{background:rgba(34,197,94,.18);color:var(--green);display:block;
+  cursor:pointer;transition:background .15s}
+.won-find-result.ok:hover{background:rgba(34,197,94,.32)}
+.won-find-result.ok:active{background:rgba(34,197,94,.45)}
+.won-find-result.fail{background:rgba(239,68,68,.13);color:#f87171;display:block}
+.won-find-result.playing{background:rgba(59,130,246,.18);color:#60a5fa;display:block;cursor:default}
+.won-empty{text-align:center;padding:48px 20px;color:var(--txt3);font-size:13px}
+.won-empty span{font-size:40px;display:block;margin-bottom:10px;opacity:.3}
+.won-loading{display:flex;align-items:center;justify-content:center;gap:10px;
+  padding:40px 20px;color:var(--txt3);font-size:13px}
+.won-ftr{padding:10px 14px;border-top:1px solid var(--s4);display:flex;
+  justify-content:flex-end;flex-shrink:0}
+@media(max-width:600px){
+  #won-modal{width:100vw;max-height:100vh;border-radius:0}
+}
 </style>
 </head>
 <body>
@@ -4586,6 +4941,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
       <span id="busy-sp" class="spin hidden"></span>
       {{ tags_html | safe }}
       <button class="btn-ghost hdr-ico" id="stopbtn" onclick="doStop()" disabled title="Stop">⏹</button>
+      <button class="btn-ghost hdr-ico" onclick="openWhatsOn()" title="What's on Now">📺</button>
       <button class="btn-ghost hdr-ico" onclick="openPL()" title="Saved Playlists">📋</button>
       <button class="btn-ghost hdr-ico" onclick="toggleCP()" title="Settings">⚙</button>
     </div>
@@ -4907,6 +5263,26 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 </div>
 
 <div id="toasts"></div>
+
+<!-- WHAT'S ON NOW MODAL -->
+<div id="won-overlay" onclick="if(event.target===this)closeWhatsOn()">
+  <div id="won-modal">
+    <div class="won-hdr">
+      <h3>📺 What's on Now</h3>
+      <span class="won-count" id="won-count">—</span>
+      <button class="btn-ghost" onclick="closeWhatsOn()" style="height:28px;padding:0 10px;font-size:12px">✕</button>
+    </div>
+    <div class="won-search">
+      <input id="won-srch" type="search" placeholder="Filter by title or channel…" oninput="wonFilter()" autocomplete="off">
+    </div>
+    <div class="won-list" id="won-list">
+      <div class="won-loading"><span class="spin"></span> Loading EPG data…</div>
+    </div>
+    <div class="won-ftr">
+      <button class="btn-ghost" onclick="closeWhatsOn()" style="height:32px;padding:0 14px;font-size:12px">Close</button>
+    </div>
+  </div>
+</div>
 
 <!-- SAVED PLAYLISTS MODAL -->
 <div id="pl-overlay" onclick="if(event.target===this)closePL()">
@@ -6214,6 +6590,165 @@ document.addEventListener('DOMContentLoaded',()=>{
   alog('IPTV Portal Builder ready.','k');
   alog('Tap ⚙ in the header to enter credentials and connect.','i');
 });
+// ── WHAT'S ON NOW ──────────────────────────────────────────
+let _wonPrograms = [];
+const _wonMatches = {};   // idx → full channel object from portal
+
+function openWhatsOn(){
+  document.getElementById('won-overlay').classList.add('open');
+  document.getElementById('won-srch').value = '';
+  document.getElementById('won-list').innerHTML =
+    '<div class="won-loading"><span class="spin"></span> Loading EPG data…</div>';
+  document.getElementById('won-count').textContent = '…';
+  Object.keys(_wonMatches).forEach(k => delete _wonMatches[k]);
+  fetch('/api/whats_on')
+    .then(r => r.json())
+    .then(data => {
+      if(data.status === 'no_epg' || data.status === 'error'){
+        document.getElementById('won-list').innerHTML =
+          `<div class="won-empty"><span>📡</span>${esc(data.message||'No EPG data available.')}</div>`;
+        document.getElementById('won-count').textContent = '0';
+        return;
+      }
+      _wonPrograms = data.programs || [];
+      wonRender(_wonPrograms);
+    })
+    .catch(e => {
+      document.getElementById('won-list').innerHTML =
+        `<div class="won-empty"><span>⚠️</span>Failed to load: ${esc(String(e))}</div>`;
+    });
+  setTimeout(()=>document.getElementById('won-srch').focus(), 200);
+}
+
+function closeWhatsOn(){
+  document.getElementById('won-overlay').classList.remove('open');
+}
+
+function wonFilter(){
+  const q = document.getElementById('won-srch').value.toLowerCase().trim();
+  if(!q){ wonRender(_wonPrograms); return; }
+  wonRender(_wonPrograms.filter(p =>
+    p.title.toLowerCase().includes(q) || p.channel_name.toLowerCase().includes(q)
+  ));
+}
+
+function wonRender(list){
+  document.getElementById('won-count').textContent = list.length + ' programmes';
+  const el = document.getElementById('won-list');
+  if(!list.length){
+    el.innerHTML = '<div class="won-empty"><span>🔍</span>No programmes match your filter.</div>';
+    return;
+  }
+  el.innerHTML = list.map((p, i) => {
+    const start = _wonFmt(p.start);
+    const end   = _wonFmt(p.end);
+    return `<div class="won-item" title="${esc(p.desc||'')}">
+      <div class="won-item-info">
+        <div class="won-item-title">${esc(p.title)}</div>
+        <div class="won-item-ch">${esc(p.channel_name)}</div>
+        <div class="won-item-times">${start} – ${end}</div>
+        <div class="won-find-result" id="won-res-${i}"></div>
+      </div>
+      <div class="won-progress">
+        <div class="won-progress-bar"><div class="won-progress-fill" style="width:${p.progress}%"></div></div>
+        <div class="won-progress-pct">${p.progress}%</div>
+      </div>
+      <button class="won-find-btn" id="won-fbtn-${i}" data-name="${esc(p.channel_name)}" data-cid="${esc(p.channel_id)}" onclick="wonFindChannel(this,${i})" title="Find on portal">🔍</button>
+    </div>`;
+  }).join('');
+}
+
+async function wonPlayFound(idx, resEl, name){
+  const ch = _wonMatches[idx];
+  if(!ch){ console.warn('[WON] No cached channel for idx', idx); return; }
+
+  resEl.className = 'won-find-result playing';
+  resEl.textContent = '⟳ Resolving ' + name + '…';
+  resEl.onclick = null;
+
+  console.log('[WON] Resolving channel:', name, ch);
+
+  try {
+    const r = await fetch('/api/resolve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({item: ch, mode: 'live', category: curCat || {}})
+    });
+    const d = await r.json();
+    console.log('[WON] resolve result:', d);
+
+    if(d.url){
+      resEl.textContent = '▶ Playing: ' + name;
+      closeWhatsOn();
+      doPlay(d.url, name);
+    } else {
+      resEl.className = 'won-find-result fail';
+      resEl.textContent = '✗ Could not resolve stream URL';
+      resEl.onclick = () => wonPlayFound(idx, resEl, name);
+    }
+  } catch(e) {
+    console.error('[WON] resolve error:', e);
+    resEl.className = 'won-find-result fail';
+    resEl.textContent = '✗ Error: ' + e;
+    resEl.onclick = () => wonPlayFound(idx, resEl, name);
+  }
+}
+
+function _wonFmt(ts){
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+
+function wonFindChannel(btn, idx){
+  const channelName = btn.dataset.name || '';
+  const channelId   = btn.dataset.cid  || '';
+  const res = document.getElementById('won-res-'+idx);
+  if(!res) return;
+
+  console.log('[WON] Find channel:', channelName, '| id:', channelId);
+
+  btn.classList.add('loading');
+  btn.textContent = '⏳';
+  res.className = 'won-find-result';
+  res.textContent = '';
+
+  fetch('/api/find_channel', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({channel_name: channelName, channel_id: channelId})
+  })
+  .then(r => {
+    console.log('[WON] find_channel HTTP', r.status);
+    return r.json();
+  })
+  .then(data => {
+    console.log('[WON] find_channel result:', data);
+    btn.classList.remove('loading');
+    btn.textContent = '🔍';
+    if(data.found){
+      const cat = data.cat ? ` · ${data.cat}` : '';
+      res.className = 'won-find-result ok';
+      res.textContent = `▶ ${data.name}${cat} (${data.score}%) — tap to play`;
+      res.title = 'Click to play this channel';
+      _wonMatches[idx] = data.channel;
+      res.onclick = () => wonPlayFound(idx, res, data.name);
+    } else if(data.error === 'Not connected'){
+      res.className = 'won-find-result fail';
+      res.textContent = '✗ Not connected to portal';
+    } else {
+      res.className = 'won-find-result fail';
+      res.textContent = data.message || '✗ Not found on this portal';
+    }
+  })
+  .catch(e => {
+    console.error('[WON] find_channel error:', e);
+    btn.classList.remove('loading');
+    btn.textContent = '🔍';
+    res.className = 'won-find-result fail';
+    res.textContent = '✗ Request failed: ' + e;
+  });
+}
+
 </script>
 </body>
 </html>
