@@ -40,6 +40,7 @@ Added cast to Chromecast, DLNA, Airplay feature.
 Added Multi-View feature that also supports external URLs like YouTube/Twitch (does not work on age-gated content)
 Fixed external EPG decompression blocking threads, added EPG caching per attempted channel while we wait external EPG download to finish.
 Improved button highlights and added a glossy style to all buttons.
+Fixed some vods and series with mp4/mkv with hevc video or unsuported audio formats not playing in browser.
 Varius UI fixes, adjustments and overall script optimizations.
 """
 
