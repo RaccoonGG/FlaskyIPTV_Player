@@ -15,6 +15,7 @@ Added support for Stalker Portal CatchUp (where avialaible and supported by port
 Added support for external EPG url, to cover channels where portal does not provide EPG.
 Added tag bar above categories.
 Added support for Xtream CatchUp (where supported and available by Xtream portal).
+Added Favourites and saving them across sessions in browser memory.
 Varius UI fixes.
 """
 
@@ -2693,7 +2694,7 @@ def api_connect():
 
 @flask_app.route("/api/categories", methods=["GET"])
 def api_categories():
-    mode = request.args.get("mode", "live")
+    mode = request.args.get("mode", "live"); mode = mode if mode in ("live","vod","series") else "live"
     if not state.connected:
         return jsonify({"error": "Not connected", "categories": []})
     cats = state.cats_cache.get(mode, [])
@@ -2703,7 +2704,7 @@ def api_categories():
 @flask_app.route("/api/items", methods=["POST"])
 def api_items():
     data = request.get_json(force=True)
-    mode = data.get("mode", "live")
+    mode = data.get("mode", "live"); mode = mode if mode in ("live","vod","series") else "live"
     cat = data.get("category", {})
     cat_id = str(cat.get("id", ""))
     browse = data.get("browse", True)
@@ -2749,7 +2750,7 @@ def api_episodes():
     item = data.get("item", {})
     cat_title = data.get("cat_title", "Unknown")
     cat_id = str(data.get("cat_id", ""))
-    mode = data.get("mode", "series")
+    mode = data.get("mode", "series"); mode = mode if mode in ("live","vod","series") else "series"
     item = dict(item)
     item["_cat_id"] = cat_id
     item["_mode"] = mode
@@ -2770,7 +2771,7 @@ def api_episodes():
 def api_resolve():
     data = request.get_json(force=True)
     item = data.get("item", {})
-    mode = data.get("mode", "live")
+    mode = data.get("mode", "live"); mode = mode if mode in ("live","vod","series") else "live"
     cat = data.get("category", {})
 
     try:
@@ -2790,7 +2791,7 @@ def api_download_m3u():
     data = request.get_json(force=True)
     items = data.get("items", None)    # None = whole category
     cat = data.get("category", {})
-    mode = data.get("mode", "live")
+    mode = data.get("mode", "live"); mode = mode if mode in ("live","vod","series") else "live"
     out_path = data.get("out_path", "").strip()
 
     if not out_path:
@@ -2842,7 +2843,7 @@ def api_download_mkv():
     data = request.get_json(force=True)
     items = data.get("items", [])
     cat = data.get("category", {})
-    mode = data.get("mode", "live")
+    mode = data.get("mode", "live"); mode = mode if mode in ("live","vod","series") else "live"
     out_dir = data.get("out_dir", state.mkv_folder).strip()
     use_fallback = data.get("use_fallback", state.mkv_fallback)
 
@@ -4292,6 +4293,11 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   background:var(--s3);color:var(--txt2);border:1px solid var(--bdr);transition:var(--tr)}
 .mt.on{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
   border-color:transparent;box-shadow:0 2px 12px var(--glow2)}
+@media(min-width:900px){
+  .mtabs{gap:3px}
+  .mt{padding:5px 8px;font-size:11px}
+  .mt[data-m="favs"]{padding:5px 7px}
+}
 .tag-bar{display:flex;gap:5px;overflow-x:auto;padding:4px 10px 2px;flex-shrink:0;scrollbar-width:none}
 .tag-bar::-webkit-scrollbar{display:none}
 .tag-pill{padding:3px 10px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.4px;
@@ -4528,7 +4534,14 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   border-radius:10px;padding:1px 5px;min-width:16px;text-align:center;display:none;
   margin-left:3px;border:1.5px solid var(--bg)}
 .ph-act-badge.vis{display:inline-block}
-@media(min-width:900px){.ph-act-btn{display:flex}}
+@media(min-width:900px){
+  .ph-act-btn{display:flex;padding:4px 8px;font-size:11px;gap:3px}
+  .ph h3{display:none}
+  .ph{padding:8px 10px;gap:5px;justify-content:space-between}
+  .mt-txt{display:none}
+  .mt{padding:5px 8px}
+  .mtabs{gap:3px;flex-shrink:0}
+}
 
 /* ─── toasts ──────────────────────────────────────────────────── */
 #toasts{position:fixed;bottom:72px;left:50%;transform:translateX(-50%);
@@ -4657,9 +4670,10 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
     <div class="ph">
       <h3>Categories</h3>
       <div class="mtabs">
-        <button class="mt on" data-m="live" onclick="setMode('live')">📺 Live</button>
-        <button class="mt" data-m="vod" onclick="setMode('vod')">🎬 VOD</button>
-        <button class="mt" data-m="series" onclick="setMode('series')">📂 Series</button>
+        <button class="mt" data-m="favs" onclick="setMode('favs')">⭐</button>
+        <button class="mt on" data-m="live" onclick="setMode('live')">📺<span class="mt-txt"> Live</span></button>
+        <button class="mt" data-m="vod" onclick="setMode('vod')">🎬<span class="mt-txt"> VOD</span></button>
+        <button class="mt" data-m="series" onclick="setMode('series')">📂<span class="mt-txt"> Series</span></button>
       </div>
       <button class="ph-act-btn" onclick="openDrawer('cats')" title="Download / Actions">
         ⚡ Actions<span class="ph-act-badge" id="ph-cat-badge"></span>
@@ -4688,9 +4702,6 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
     <div class="ph">
       <h3 id="ittitle">Browse</h3>
       <button class="btn-ghost btn-sm" id="backbtn" onclick="goBack()" disabled>◀ Back</button>
-      <button class="ph-act-btn" onclick="openDrawer('items')" title="Download / Actions">
-        ⚡ Actions<span class="ph-act-badge" id="ph-item-badge"></span>
-      </button>
     </div>
     <div style="padding:10px 10px 0;display:flex;flex-direction:column;gap:6px;flex-shrink:0">
       <div class="bcrum" id="bcrum"><span class="bc-s">Categories</span></div>
@@ -4947,11 +4958,39 @@ const CFG = {{ config | safe }};
 
 // ── STATE ──────────────────────────────────────────────────
 let CT='mac', mode='live', curCat=null;
-let allCats=[], catsCache={}, selCats=new Map(); // selCats: id/title → cat object
+let allCats=[], catsCache={}, selCats=new Map();
 let allItems=[], filtItems=[], navStack=[], selSet=new Set();
 let pUrl='', pName='', pIdx=-1;
 let hlsObj=null, mpegtsObj=null, recTmr=null, isRec=false, logEs=null, cpOpen=false;
 const vid = document.getElementById('vid');
+
+// ── FAVOURITES ─────────────────────────────────────────────
+// Stored per portal hostname: localStorage['favs_hardcoremedia.xyz'] = [{...item}]
+function _favsKey(){
+  const lbl=document.getElementById('portal-name-label').textContent||'_';
+  return 'favs_'+lbl;
+}
+function loadFavs(){ try{return JSON.parse(localStorage.getItem(_favsKey())||'[]');}catch(e){return[];} }
+function saveFavs(arr){ try{localStorage.setItem(_favsKey(),JSON.stringify(arr));}catch(e){} }
+function isFav(item){
+  const name=item.name||item.o_name||item.fname||'';
+  return loadFavs().some(f=>f.name===name);
+}
+function toggleFav(i){
+  const it=filtItems[i]; if(!it) return;
+  const name=it.name||it.o_name||it.fname||'';
+  let arr=loadFavs();
+  const idx=arr.findIndex(f=>f.name===name);
+  if(idx>=0){ arr.splice(idx,1); toast('Removed from favourites','info'); }
+  else {
+    // Store the current mode so we can resolve correctly when playing from favs
+    arr.push({...it, _fav_mode: mode});
+    toast('⭐ Added to favourites','ok');
+  }
+  saveFavs(arr);
+  if(mode==='favs') showFavs();
+  else renderItems(filtItems);
+}
 
 // ── HEADER ─────────────────────────────────────────────────
 function toggleSaveChk(btn){
@@ -5058,7 +5097,28 @@ async function doConnect(){
 // ── MODES ──────────────────────────────────────────────────
 function setMode(m){
   mode=m; navStack=[]; selSet.clear(); selCats.clear(); refreshCatBtns();
+  if(m==='favs'){ showFavs(); return; }
   switchMode(m, catsCache[m]||[]);
+}
+
+function showFavs(){
+  mode='favs';
+  document.querySelectorAll('.mt').forEach(b=>b.classList.toggle('on',b.dataset.m==='favs'));
+  const favs=loadFavs();
+  allCats=[]; _activeTag='';
+  document.getElementById('tag-bar').style.display='none';
+  allItems=favs; filtItems=[...favs];
+  showT('p-items','t-items');
+  mkBcrum('⭐ Favourites');
+  renderItems(filtItems);
+  refreshBtns();
+  const b=document.getElementById('badge');
+  b.textContent=favs.length>99?'99+':favs.length;
+  b.classList.toggle('vis',favs.length>0);
+  if(!favs.length){
+    document.getElementById('ilist').innerHTML=
+      '<div style="text-align:center;padding:28px;color:var(--txt3);font-size:12px">No favourites yet.<br>Tap ★ on any channel to add it.</div>';
+  }
 }
 
 function switchMode(m, cats){
@@ -5271,6 +5331,8 @@ function renderItems(items){
       +'<div class="ibtns">'
         +(grp?'<button class="btn-ghost" onclick="drillGrp('+i+')">'+epN+' eps</button>':'')
         +(show&&isSeries?'<button class="btn-ghost" onclick="drillShow('+i+')">Eps</button>':'')
+        +'<button onclick="toggleFav('+i+')" title="Favourite"'
+        +' style="background:none;border:none;cursor:pointer;font-size:15px;padding:0 3px;line-height:1;flex-shrink:0;color:'+(isFav(it)?'#f5c518':'rgba(255,255,255,0.35)')+'">★</button>'
         +(!grp?'<button class="btn-blue" onclick="playItem('+i+')">▶</button>':'')
       +'</div></div>';
   }).join('');
@@ -5362,11 +5424,13 @@ function goBack(){
 async function playItem(i){
   const it=filtItems[i]; if(!it) return;
   pIdx=i;
+  // When playing from favs, use the mode the item was originally saved under
+  const itemMode = (mode==='favs') ? (it._fav_mode||'live') : mode;
   // Store item for EPG lookup (live channels only)
-  _epgItem = (mode==='live') ? it : null;
+  _epgItem = (itemMode==='live') ? it : null;
   document.getElementById('epg-now').textContent='';
-  document.getElementById('epgbtn').style.opacity=(mode==='live')?'1':'0.35';
-  document.getElementById('catchupbtn').style.opacity=(mode==='live')?'1':'0.35';
+  document.getElementById('epgbtn').style.opacity=(itemMode==='live')?'1':'0.35';
+  document.getElementById('catchupbtn').style.opacity=(itemMode==='live')?'1':'0.35';
   const name=it.name||it.o_name||it.fname||'Unknown';
   const direct=it._direct_url||it._url;
   if(direct){doPlay(direct,name);return;}
@@ -5375,7 +5439,7 @@ async function playItem(i){
   try{
     const r=await fetch('/api/resolve',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({item:it, mode, category:curCat||{}})});
+      body:JSON.stringify({item:it, mode:itemMode, category:curCat||{}})});
     const d=await r.json();
     if(d.url) doPlay(d.url, name);
     else{setNP('✗ Could not resolve: '+name);toast('Could not resolve URL','err');}
@@ -6052,8 +6116,8 @@ function renderPLList(){
       +'<div class="pli-sub">'+esc(sub)+'</div></div>'
       +'<div class="pli-acts">'
       +'<button class="btn-acc" onclick="plConnect('+i+')" style="height:28px;padding:0 10px;font-size:11px">▶ Load</button>'
-      +'<button class="btn-ghost" onclick="plEdit('+i+')">✏</button>'
-      +'<button class="btn-red" onclick="plDelete('+i+')">🗑</button>'
+      +'<button class="btn-ghost" onclick="plEdit('+i+')" style="height:28px;padding:0 8px;font-size:11px">✎ Edit</button>'
+      +'<button class="btn-red" onclick="plDelete('+i+')" style="height:28px;padding:0 8px">🗑</button>'
       +'</div></div>';
   }).join('');
 }
