@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-MAC/Xtream/M3U Portal Builder — Flask/Android WebView Edition by GG_Raccoon.
+Reproductor Portal MAC/Xtream/M3U — Edición Flask/Android WebView por GG_Raccoon.
+V13: Fixed offline-channel app freeze. Added local file browser (MKV/MP4/audio/etc).
+V14: Auto-opens browser on launch. FFmpeg dynamic transcoding for incompatible codecs.
+     Multi-track audio/subtitle selector. "Continue Watching" resume system.
+     Adaptive 60s buffer pre-fetch. Full premium dark UI with gesture controls.
 Build on base of Mac2M3UMKV_LiveVodsSeriesGUIPlayer_byGGv5.pyw CustomTkinter by GG_Raccoon.
 Adapted to Flask + HTML5/HLS.js by conversion script.
 
 Tested on Windows 10 with python 3.14 and Termux on Android 16.
-First run install_requirements_FlaskAppPlayerDownloader.py to make sure you have everything you need to run this script.
-Run: python app.py  then open http://localhost:5000 in your WebView/browser.
+Ejecuta primero install_requirements_FlaskAppPlayerDownloader.py para instalar dependencias.
+Ejecutar: python app.py  luego abrir http://localhost:5000 en tu WebView/navegador.
 
 Updates:
 Added support for /stalker_portal/ type of MAC portals.
@@ -18,11 +22,8 @@ Added support for Xtream CatchUp (where supported and available by Xtream portal
 Added Favourites and saving them across sessions in browser memory.
 Added Whats on TV Now button, it checks external EPG url (you have to set it) for current time, and lists you programs and channels that are playing it,
 Clicking on Search Icon will check currently active portal if your portal has channel that you requested. (experimental, needs testing and good external EPG)
-Fixed different channel url outputs not playing correctly, fixed hevc channels not going thru ffmpeg.
-Also on network error and parsing hls errors (altho this can happens when channel is offline too), we attempt ffmpeg play.
 Varius UI fixes.
 """
-
 
 import base64
 import hashlib
@@ -30,6 +31,7 @@ import json
 import re
 import contextlib
 import os
+import platform
 import random
 import shutil
 import string
@@ -39,6 +41,9 @@ import threading
 import time
 import queue
 import sys
+import zipfile
+import tarfile
+import stat
 from datetime import datetime, timezone
 from urllib.parse import urlparse, quote, quote_plus, unquote, parse_qs
 import asyncio
@@ -56,7 +61,363 @@ except Exception:
     YTDLP_AVAILABLE = False
 
 
-# ===================== MKV / FFMPEG HELPERS =====================
+# ===================== FFMPEG AUTO-INSTALLER =====================
+# Descarga ffmpeg/ffprobe como binarios locales junto al script.
+# NO modifica el PATH del sistema. Funciona solo con ejecutar el script.
+# Soporta: Windows x64, Linux x64/arm64/armhf, macOS x64/arm64, Android/Termux.
+
+_SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+_FFMPEG_DIR   = os.path.join(_SCRIPT_DIR, "ffmpeg_bin")
+_EXT          = ".exe" if sys.platform == "win32" else ""
+_FFMPEG_LOCAL = os.path.join(_FFMPEG_DIR, "ffmpeg"  + _EXT)
+_FFPROBE_LOCAL= os.path.join(_FFMPEG_DIR, "ffprobe" + _EXT)
+
+# Estado global de instalación para exponer a la UI
+_install_state = {"running": False, "done": False, "ok": False, "msg": ""}
+
+
+def _get_ffmpeg_path() -> str:
+    """Ruta al binario ffmpeg: prioriza local, luego PATH del sistema."""
+    if os.path.isfile(_FFMPEG_LOCAL):
+        return _FFMPEG_LOCAL
+    found = shutil.which("ffmpeg")
+    return found if found else "ffmpeg"
+
+
+def _get_ffprobe_path() -> str:
+    """Ruta al binario ffprobe: prioriza local, luego PATH del sistema."""
+    if os.path.isfile(_FFPROBE_LOCAL):
+        return _FFPROBE_LOCAL
+    found = shutil.which("ffprobe")
+    return found if found else "ffprobe"
+
+
+def _ffmpeg_ok() -> bool:
+    """True si ffmpeg funciona (local o sistema)."""
+    if os.path.isfile(_FFMPEG_LOCAL):
+        path = _FFMPEG_LOCAL
+    else:
+        path = shutil.which("ffmpeg")
+        if not path:
+            return False
+    try:
+        r = subprocess.run(
+            [path, "-version"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _detect_platform() -> str:
+    """Detecta la plataforma actual."""
+    is_termux = ("com.termux" in os.environ.get("PREFIX", "") or
+                 os.path.isdir("/data/data/com.termux"))
+    if is_termux:
+        return "termux"
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform == "darwin":
+        m = platform.machine().lower()
+        return "macos_arm64" if ("arm" in m or "aarch64" in m) else "macos_x64"
+    if sys.platform.startswith("linux"):
+        m = platform.machine().lower()
+        if "aarch64" in m or "arm64" in m:
+            return "linux_arm64"
+        if "armv7" in m or "armv6" in m or "armhf" in m:
+            return "linux_armhf"
+        return "linux_x64"
+    return "unknown"
+
+
+# ── Fuentes de descarga por plataforma ─────────────────────────────────────
+# Todas son builds estáticas (sin dependencias del sistema).
+# Windows / Linux: BtbN builds — https://github.com/BtbN/FFmpeg-Builds
+# macOS: evermeet.cx — https://evermeet.cx/ffmpeg/
+_FFMPEG_SOURCES = {
+    "windows": {
+        "type": "zip",
+        "url": (
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
+            "ffmpeg-master-latest-win64-gpl.zip"
+        ),
+        "ffmpeg_inner":  "ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe",
+        "ffprobe_inner": "ffmpeg-master-latest-win64-gpl/bin/ffprobe.exe",
+    },
+    "linux_x64": {
+        "type": "tar",
+        "url": (
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
+            "ffmpeg-master-latest-linux64-gpl.tar.xz"
+        ),
+        "ffmpeg_inner":  "ffmpeg-master-latest-linux64-gpl/bin/ffmpeg",
+        "ffprobe_inner": "ffmpeg-master-latest-linux64-gpl/bin/ffprobe",
+    },
+    "linux_arm64": {
+        "type": "tar",
+        "url": (
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
+            "ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
+        ),
+        "ffmpeg_inner":  "ffmpeg-master-latest-linuxarm64-gpl/bin/ffmpeg",
+        "ffprobe_inner": "ffmpeg-master-latest-linuxarm64-gpl/bin/ffprobe",
+    },
+    "linux_armhf": {
+        "type": "tar",
+        "url": (
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
+            "ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
+        ),
+        "ffmpeg_inner":  "ffmpeg-master-latest-linuxarm64-gpl/bin/ffmpeg",
+        "ffprobe_inner": "ffmpeg-master-latest-linuxarm64-gpl/bin/ffprobe",
+    },
+    "macos_x64": {
+        "type": "macos_zip",
+        "ffmpeg_url":  "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip",
+        "ffprobe_url": "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip",
+    },
+    "macos_arm64": {
+        "type": "macos_zip",
+        "ffmpeg_url":  "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip",
+        "ffprobe_url": "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip",
+    },
+    "termux": {
+        "type": "termux",
+    },
+}
+
+
+def _set_install_state(running=False, done=False, ok=False, msg=""):
+    _install_state["running"] = running
+    _install_state["done"]    = done
+    _install_state["ok"]      = ok
+    _install_state["msg"]     = msg
+
+
+def _make_executable(path: str):
+    try:
+        st = os.stat(path)
+        os.chmod(path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    except Exception:
+        pass
+
+
+def _download(url: str, dest: str, label: str, log_fn) -> bool:
+    """Descarga un archivo con reintento y barra de progreso en logs."""
+    log_fn(f"[FFMPEG] ⬇ Descargando {label}…")
+    log_fn(f"[FFMPEG]   {url}")
+    for attempt in range(1, 4):          # 3 intentos
+        try:
+            with _requests_lib.get(
+                url, stream=True, timeout=180,
+                verify=False,
+                proxies={"http": None, "https": None},
+                headers={"User-Agent": "Mozilla/5.0"}
+            ) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0))
+                done  = 0
+                last_pct = -1
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=262144):
+                        if chunk:
+                            f.write(chunk)
+                            done += len(chunk)
+                            if total:
+                                pct = int(done / total * 100)
+                                if pct // 10 != last_pct // 10:
+                                    last_pct = pct
+                                    log_fn(
+                                        f"[FFMPEG]   {pct}%  "
+                                        f"({done//1048576} MB / {total//1048576} MB)"
+                                    )
+            log_fn(f"[FFMPEG] ✓ Descarga completa ({done//1048576} MB)")
+            return True
+        except Exception as e:
+            log_fn(f"[FFMPEG] ✗ Intento {attempt}/3 fallido: {e}")
+            time.sleep(2)
+    return False
+
+
+def _extract_one_from_zip(archive: str, inner: str, dest: str, log_fn) -> bool:
+    """Extrae un único archivo de un ZIP por su nombre final."""
+    try:
+        with zipfile.ZipFile(archive, "r") as z:
+            target = next(
+                (n for n in z.namelist()
+                 if n == inner or n.replace("\\", "/").endswith("/" + os.path.basename(inner))),
+                None
+            )
+            if not target:
+                log_fn(f"[FFMPEG] ✗ No encontrado en ZIP: {inner}")
+                log_fn(f"[FFMPEG]   Archivos disponibles: {z.namelist()[:8]}")
+                return False
+            with z.open(target) as src, open(dest, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        _make_executable(dest)
+        log_fn(f"[FFMPEG] ✓ Extraído: {os.path.basename(dest)}")
+        return True
+    except Exception as e:
+        log_fn(f"[FFMPEG] ✗ Error ZIP: {e}")
+        return False
+
+
+def _extract_one_from_tar(archive: str, inner: str, dest: str, log_fn) -> bool:
+    """Extrae un único archivo de un TAR/TAR.XZ por su nombre final."""
+    try:
+        with tarfile.open(archive, "r:*") as t:
+            target = next(
+                (n for n in t.getnames()
+                 if n == inner or n.endswith("/" + os.path.basename(inner))),
+                None
+            )
+            if not target:
+                log_fn(f"[FFMPEG] ✗ No encontrado en TAR: {inner}")
+                log_fn(f"[FFMPEG]   Archivos disponibles: {t.getnames()[:8]}")
+                return False
+            with t.extractfile(t.getmember(target)) as src, open(dest, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        _make_executable(dest)
+        log_fn(f"[FFMPEG] ✓ Extraído: {os.path.basename(dest)}")
+        return True
+    except Exception as e:
+        log_fn(f"[FFMPEG] ✗ Error TAR: {e}")
+        return False
+
+
+def install_ffmpeg_auto(log_cb=None, force: bool = False) -> bool:
+    """
+    Descarga e instala ffmpeg/ffprobe localmente junto al script.
+    - No necesita permisos de administrador.
+    - No modifica el PATH ni el registro del sistema.
+    - Los binarios quedan en ./ffmpeg_bin/ y se usan automáticamente.
+    Devuelve True si ffmpeg queda operativo al finalizar.
+    """
+    def _log(msg: str):
+        print(msg, flush=True)
+        if log_cb:
+            try:
+                log_cb(msg)
+            except Exception:
+                pass
+
+    if not force and _ffmpeg_ok():
+        _log("[FFMPEG] ✓ ffmpeg ya disponible — omitiendo instalación.")
+        _set_install_state(done=True, ok=True, msg="ffmpeg ya disponible.")
+        return True
+
+    plat = _detect_platform()
+    src  = _FFMPEG_SOURCES.get(plat)
+    _log(f"[FFMPEG] Plataforma: {plat}")
+
+    if not src:
+        msg = f"Plataforma '{plat}' no soportada para auto-instalación."
+        _log(f"[FFMPEG] ✗ {msg}")
+        _set_install_state(done=True, ok=False, msg=msg)
+        return False
+
+    _set_install_state(running=True, msg="Instalando…")
+
+    # ── Termux ────────────────────────────────────────────────────────────────
+    if src["type"] == "termux":
+        _log("[FFMPEG] Termux detectado — ejecutando: pkg install -y ffmpeg")
+        try:
+            r = subprocess.run(
+                ["pkg", "install", "-y", "ffmpeg"],
+                capture_output=True, text=True, timeout=180
+            )
+            ok = r.returncode == 0 or bool(shutil.which("ffmpeg"))
+            msg = "✓ Instalado via Termux." if ok else f"✗ pkg falló: {r.stderr[:200]}"
+            _log(f"[FFMPEG] {msg}")
+            _set_install_state(done=True, ok=ok, msg=msg)
+            return ok
+        except Exception as e:
+            msg = f"Error Termux: {e}"
+            _log(f"[FFMPEG] ✗ {msg}")
+            _set_install_state(done=True, ok=False, msg=msg)
+            return False
+
+    # ── Crear directorio local ────────────────────────────────────────────────
+    try:
+        os.makedirs(_FFMPEG_DIR, exist_ok=True)
+    except Exception as e:
+        msg = f"No se pudo crear {_FFMPEG_DIR}: {e}"
+        _log(f"[FFMPEG] ✗ {msg}")
+        _set_install_state(done=True, ok=False, msg=msg)
+        return False
+
+    # ── macOS (dos ZIPs individuales, uno por binario) ────────────────────────
+    if src["type"] == "macos_zip":
+        ok_all = True
+        for bname, url_key in [("ffmpeg", "ffmpeg_url"), ("ffprobe", "ffprobe_url")]:
+            dest = os.path.join(_FFMPEG_DIR, bname)
+            if os.path.isfile(dest) and not force:
+                continue
+            tmp = dest + "_tmp.zip"
+            if not _download(src[url_key], tmp, bname, _log):
+                ok_all = False
+                continue
+            if not _extract_one_from_zip(tmp, bname, dest, _log):
+                ok_all = False
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+        ok = ok_all and _ffmpeg_ok()
+        msg = "✓ ffmpeg instalado (macOS)." if ok else "✗ Instalación macOS incompleta."
+        _log(f"[FFMPEG] {msg}")
+        _set_install_state(done=True, ok=ok, msg=msg)
+        return ok
+
+    # ── Windows / Linux (un único archivo ZIP o TAR.XZ) ──────────────────────
+    ext      = ".zip" if src["type"] == "zip" else ".tar.xz"
+    tmp_arch = os.path.join(_FFMPEG_DIR, "ffmpeg_bundle" + ext)
+
+    if not _download(src["url"], tmp_arch, "ffmpeg bundle", _log):
+        msg = "✗ Descarga fallida."
+        _log(f"[FFMPEG] {msg}")
+        _set_install_state(done=True, ok=False, msg=msg)
+        return False
+
+    _log("[FFMPEG] Extrayendo binarios del archivo…")
+    extract = _extract_one_from_zip if src["type"] == "zip" else _extract_one_from_tar
+    ok_ff = extract(tmp_arch, src["ffmpeg_inner"],  _FFMPEG_LOCAL,  _log)
+    ok_fp = extract(tmp_arch, src["ffprobe_inner"], _FFPROBE_LOCAL, _log)
+
+    # Limpiar archivo descargado (puede pesar ~120 MB)
+    try:
+        os.unlink(tmp_arch)
+        _log("[FFMPEG] Archivo temporal eliminado.")
+    except Exception:
+        pass
+
+    ok  = ok_ff and ok_fp and _ffmpeg_ok()
+    msg = (
+        f"✓ ffmpeg instalado en {_FFMPEG_DIR}"
+        if ok else
+        "✗ Instalación incompleta — revisa los logs."
+    )
+    _log(f"[FFMPEG] {msg}")
+    _set_install_state(done=True, ok=ok, msg=msg)
+    return ok
+
+
+def _ensure_ffmpeg_bg(log_cb=None):
+    """Arranca instalación de ffmpeg en hilo daemon (no bloquea el servidor)."""
+    if _ffmpeg_ok():
+        return
+    _set_install_state(running=True, msg="Descargando ffmpeg en background…")
+    def _run():
+        try:
+            install_ffmpeg_auto(log_cb=log_cb)
+        except Exception as e:
+            msg = f"Error inesperado: {e}"
+            print(f"[FFMPEG] ✗ {msg}", flush=True)
+            _set_install_state(done=True, ok=False, msg=msg)
+    threading.Thread(target=_run, daemon=True, name="ffmpeg-auto-install").start()
+
+
 
 def safe_filename(name: str) -> str:
     valid = "-_.() %s%s" % (string.ascii_letters, string.digits)
@@ -70,7 +431,7 @@ _time_re = re.compile(r"time=(\d+):(\d+):(\d+\.?\d*)")
 
 
 def probe_stream_codecs(url: str, pre_input_args=None, timeout=15):
-    ffprobe = shutil.which("ffprobe") or "ffprobe"
+    ffprobe = _get_ffprobe_path()
     cmd = [ffprobe, "-v", "error", "-print_format", "json", "-show_streams", "-show_format"]
     if pre_input_args:
         cmd = [ffprobe, "-v", "error", "-print_format", "json",
@@ -107,7 +468,7 @@ def probe_stream_codecs(url: str, pre_input_args=None, timeout=15):
 
 def run_ffmpeg_download(url: str, out_path: str, pre_input_args=None, post_input_args=None,
                         on_progress=None, stop_event: threading.Event = None, set_proc=None):
-    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    ffmpeg = _get_ffmpeg_path()
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y"]
     if pre_input_args:
         cmd += pre_input_args
@@ -187,8 +548,10 @@ def normalize_base_url(url: str) -> str:
     p = urlparse(url)
     scheme = p.scheme or "http"
     host = p.hostname or ""
-    port = p.port or 80
-    return f"{scheme}://{host}:{port}"
+    port = p.port
+    if port and port not in (80, 443):
+        return f"{scheme}://{host}:{port}"
+    return f"{scheme}://{host}"
 
 
 _URL_RE = re.compile(r'https?://[^\s\'"\\]+')
@@ -271,10 +634,28 @@ class PortalClient:
         self.session = None
         self.token = None
         self.headers = {}
+        self._portal_path = "/portal.php"  # updated after successful handshake
+
+    # MAG STB User-Agent — many strict portals reject non-MAG user agents
+    MAG_UA = (
+        "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 "
+        "(KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3"
+    )
+    # Common alternate portal paths some providers use instead of /portal.php
+    _PORTAL_PATHS = ["/portal.php", "/c/portal.php", "/stalker_portal/c/portal.php"]
 
     async def __aenter__(self):
-        _timeout = aiohttp.ClientTimeout(total=15, connect=8)
-        self.session = aiohttp.ClientSession(cookies={"mac": self.mac}, timeout=_timeout)
+        _timeout = aiohttp.ClientTimeout(total=20, connect=10)
+        self.session = aiohttp.ClientSession(
+            cookies={"mac": self.mac},
+            timeout=_timeout,
+            headers={
+                "User-Agent": self.MAG_UA,
+                "Referer": f"{self.base}/c/",
+                "X-User-Agent": "Model: MAG250; Link: WiFi",
+                "Accept": "*/*",
+            }
+        )
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -283,26 +664,47 @@ class PortalClient:
 
     async def handshake(self) -> str:
         assert self.session is not None
-        url = f"{self.base}/portal.php?action=handshake&type=stb&token=&JsHttpRequest=1-xml"
-        self.log(f"[MAC] Handshake → {self.base}")
-        async with self.session.get(url) as r:
-            self.log(f"[MAC] Handshake HTTP {r.status}")
-            payload = await safe_json(r)
-        if not isinstance(payload, dict):
-            raise RuntimeError(f"Handshake failed: empty/non-JSON response (HTTP {r.status})")
-        js = payload.get("js")
-        if isinstance(js, list) and js:
-            js = js[0]
-        if not isinstance(js, dict) or not js.get("token"):
-            raise RuntimeError(f"Handshake failed: token missing (HTTP {r.status})")
-        self.token = js["token"]
-        self.headers = {"Authorization": f"Bearer {self.token}"}
-        self.log(f"[MAC] Token acquired: {self.token[:16]}…")
-        return self.token
+        last_err = None
+        # Try each known portal path until one works
+        for portal_path in self._PORTAL_PATHS:
+            try:
+                url = f"{self.base}{portal_path}?action=handshake&type=stb&token=&JsHttpRequest=1-xml"
+                self.log(f"[MAC] Handshake → {self.base}{portal_path}")
+                async with self.session.get(url) as r:
+                    self.log(f"[MAC] Handshake HTTP {r.status} ({portal_path})")
+                    if r.status in (404, 403):
+                        continue
+                    payload = await safe_json(r)
+                if not isinstance(payload, dict):
+                    continue
+                js = payload.get("js")
+                if isinstance(js, list) and js:
+                    js = js[0]
+                if not isinstance(js, dict):
+                    continue
+                # Some portals put token in different fields
+                token = js.get("token") or js.get("auth_token") or js.get("access_token")
+                if not token:
+                    continue
+                # Success — store working path for subsequent requests
+                self._portal_path = portal_path
+                self.token = token
+                self.headers = {
+                    "Authorization": f"Bearer {self.token}",
+                    "User-Agent": self.MAG_UA,
+                    "Referer": f"{self.base}/c/",
+                    "X-User-Agent": "Model: MAG250; Link: WiFi",
+                }
+                self.log(f"[MAC] Token acquired ({portal_path}): {self.token[:16]}…")
+                return self.token
+            except Exception as e:
+                last_err = e
+                continue
+        raise RuntimeError(f"Handshake failed on all portal paths: {last_err}")
 
     async def account_info(self):
         assert self.session is not None
-        url = f"{self.base}/portal.php?type=account_info&action=get_main_info&JsHttpRequest=1-xml"
+        url = f"{self.base}{self._portal_path}?type=account_info&action=get_main_info&JsHttpRequest=1-xml"
         self.log("[MAC] Fetching account info…")
         async with self.session.get(url, headers=self.headers) as r:
             self.log(f"[MAC] Account info HTTP {r.status}")
@@ -314,32 +716,49 @@ class PortalClient:
             js = js[0]
         if not isinstance(js, dict):
             return ("unknown", "unknown")
-        mac = str(js.get("mac", "unknown"))
-        phone = str(js.get("phone", "unknown"))
+        mac = str(js.get("mac") or js.get("device_mac") or "unknown")
+        # expiry can be in 'phone', 'expire_billing_date', 'account_info' sub-dict
+        phone = str(
+            js.get("phone") or
+            js.get("expire_billing_date") or
+            (js.get("account_info") or {}).get("expire_billing_date") or
+            "unknown"
+        )
         self.log(f"[MAC] Account: MAC={mac}  expiry={phone}")
         return (mac, phone)
 
     async def fetch_categories(self, mode: str):
         assert self.session is not None
+        pp = self._portal_path
         if mode == "live":
-            url = f"{self.base}/portal.php?type=itv&action=get_genres&JsHttpRequest=1-xml"
+            url = f"{self.base}{pp}?type=itv&action=get_genres&JsHttpRequest=1-xml"
         elif mode == "vod":
-            url = f"{self.base}/portal.php?type=vod&action=get_categories&JsHttpRequest=1-xml"
+            url = f"{self.base}{pp}?type=vod&action=get_categories&JsHttpRequest=1-xml"
         else:
-            url = f"{self.base}/portal.php?type=series&action=get_categories&JsHttpRequest=1-xml"
+            url = f"{self.base}{pp}?type=series&action=get_categories&JsHttpRequest=1-xml"
         self.log(f"[MAC] Fetching {mode.upper()} categories…")
         async with self.session.get(url, headers=self.headers) as r:
             self.log(f"[MAC] Categories HTTP {r.status} ({mode.upper()})")
             payload = await safe_json(r)
         cats = normalize_js(payload)
-        cats = [c for c in cats if isinstance(c, dict) and str(c.get("id", "")).strip()]
-        self.log(f"[MAC] {mode.upper()} categories: {len(cats)} found")
-        return cats
+        # Some portals use 'title' instead of 'id', normalise both
+        result = []
+        for c in cats:
+            if not isinstance(c, dict):
+                continue
+            cid = str(c.get("id") or c.get("category_id") or "").strip()
+            title = str(c.get("title") or c.get("name") or c.get("category_name") or "").strip()
+            if cid:
+                c.setdefault("title", title)
+                result.append(c)
+        self.log(f"[MAC] {mode.upper()} categories: {len(result)} found")
+        return result
 
     async def fetch_series_episodes(self, series_id: str, category_id: str):
         assert self.session is not None
+        pp = self._portal_path
         url = (
-            f"{self.base}/portal.php?type=series&action=get_ordered_list"
+            f"{self.base}{pp}?type=series&action=get_ordered_list"
             f"&movie_id={quote(series_id)}&season_id=0&episode_id=0&row=0"
             f"&JsHttpRequest=1-xml&category={category_id}"
             f"&sortby=added&fav=0&hd=0&not_ended=0"
@@ -354,14 +773,15 @@ class PortalClient:
 
     async def fetch_items_page(self, mode: str, cat_id: str, page: int):
         assert self.session is not None
+        pp = self._portal_path
         if mode == "live":
-            url = (f"{self.base}/portal.php?type=itv&action=get_ordered_list"
+            url = (f"{self.base}{pp}?type=itv&action=get_ordered_list"
                    f"&genre={cat_id}&JsHttpRequest=1-xml&p={page}&sortby=number")
         elif mode == "vod":
-            url = (f"{self.base}/portal.php?type=vod&action=get_ordered_list"
+            url = (f"{self.base}{pp}?type=vod&action=get_ordered_list"
                    f"&category={cat_id}&JsHttpRequest=1-xml&p={page}&sortby=added")
         else:
-            url = (f"{self.base}/portal.php?type=series&action=get_ordered_list"
+            url = (f"{self.base}{pp}?type=series&action=get_ordered_list"
                    f"&category={cat_id}&JsHttpRequest=1-xml&p={page}&sortby=added")
         self.log(f"[MAC] Fetching {mode.upper()} items page={page} cat={cat_id}…")
         async with self.session.get(url, headers=self.headers) as r:
@@ -379,7 +799,7 @@ class PortalClient:
         if not cmd:
             return ""
         try:
-            url = f"{self.base}/portal.php?type=vod&action=create_link&cmd={quote(cmd)}"
+            url = f"{self.base}{self._portal_path}?type=vod&action=create_link&cmd={quote(cmd)}"
             self.log(f"[VOD] create_link → {url[:120]}")
             async with self.session.get(url, headers=self.headers,
                                         timeout=aiohttp.ClientTimeout(total=10)) as r:
@@ -473,7 +893,7 @@ class PortalClient:
                 return ""
 
             encoded = quote_plus(cmd)
-            url = f"{self.base}/portal.php?type={ptype}&action=create_link&cmd={encoded}&JsHttpRequest=1-xml"
+            url = f"{self.base}{self._portal_path}?type={ptype}&action=create_link&cmd={encoded}&JsHttpRequest=1-xml"
             self.log(f"[MAC] create_link ({ptype}) encoded")
             try:
                 async with self.session.get(url, headers=self.headers, allow_redirects=True) as r:
@@ -486,7 +906,7 @@ class PortalClient:
                 self.log(f"[MAC] create_link encoded error: {e}")
             # Raw retry — some portals reject quote_plus encoding
             try:
-                url2 = f"{self.base}/portal.php?type={ptype}&action=create_link&cmd={cmd}&JsHttpRequest=1-xml"
+                url2 = f"{self.base}{self._portal_path}?type={ptype}&action=create_link&cmd={cmd}&JsHttpRequest=1-xml"
                 self.log(f"[MAC] create_link ({ptype}) raw retry")
                 async with self.session.get(url2, headers=self.headers, allow_redirects=True) as r2:
                     self.log(f"[MAC] create_link retry HTTP {r2.status} ({ptype})")
@@ -603,7 +1023,7 @@ class PortalClient:
                 cid = stub_url.split("/ch/")[1].split("_")[0]
                 cmd = quote(f"ffmpeg http://localhost/ch/{cid}_")
                 url = (
-                    f"{self.base}/portal.php?type=itv&action=create_link"
+                    f"{self.base}{self._portal_path}?type=itv&action=create_link"
                     f"&cmd={cmd}&series=&forced_storage=0"
                     f"&disable_ad=0&download=0&force_ch_link_check=0"
                     f"&JsHttpRequest=1-xml"
@@ -654,8 +1074,8 @@ class PortalClient:
             if not candidates:
                 encoded = quote_plus(cmd)
                 candidates = [
-                    f"{self.base}/portal.php?type=vod&action=create_link&cmd={encoded}&JsHttpRequest=1-xml",
-                    f"{self.base}/portal.php?type=itv&action=create_link&cmd={encoded}&JsHttpRequest=1-xml",
+                    f"{self.base}{self._portal_path}?type=vod&action=create_link&cmd={encoded}&JsHttpRequest=1-xml",
+                    f"{self.base}{self._portal_path}?type=itv&action=create_link&cmd={encoded}&JsHttpRequest=1-xml",
                 ]
             for url in candidates:
                 try:
@@ -780,7 +1200,7 @@ class PortalClient:
             cmd_b64 = item.get("_mac_cmd_b64", "")
             ep_num = item.get("_mac_episode_num", "")
             series_id = item.get("_mac_series_id", "")
-            url = f"{self.base}/portal.php?type=vod&action=create_link&cmd={quote_plus(cmd_b64)}&series={ep_num}"
+            url = f"{self.base}{self._portal_path}?type=vod&action=create_link&cmd={quote_plus(cmd_b64)}&series={ep_num}"
             resolved = ""
             try:
                 async with self.session.get(url, headers=self.headers, allow_redirects=True) as r:
@@ -885,7 +1305,7 @@ class PortalClient:
                     for episode_num in episodes_list:
                         if stop_flag and stop_flag.is_set():
                             return
-                        url = f"{self.base}/portal.php?type=vod&action=create_link&cmd={quote_plus(cmd_b64)}&series={episode_num}"
+                        url = f"{self.base}{self._portal_path}?type=vod&action=create_link&cmd={quote_plus(cmd_b64)}&series={episode_num}"
                         try:
                             async with self.session.get(url, headers=self.headers, allow_redirects=True) as r:
                                 payload = await safe_json(r)
@@ -1051,7 +1471,7 @@ class PortalClient:
                             cmd_json = json.dumps(cmd_data, separators=(",", ":")).encode("utf-8")
                             cmd_b64 = base64.b64encode(cmd_json).decode("ascii")
                             for episode_num in episodes_list:
-                                url = f"{self.base}/portal.php?type=vod&action=create_link&cmd={quote_plus(cmd_b64)}&series={episode_num}"
+                                url = f"{self.base}{self._portal_path}?type=vod&action=create_link&cmd={quote_plus(cmd_b64)}&series={episode_num}"
                                 try:
                                     async with self.session.get(url, headers=self.headers, allow_redirects=True) as r:
                                         payload = await safe_json(r)
@@ -1151,7 +1571,7 @@ class PortalClient:
                         if not cmd:
                             continue
                         cmd = cmd.split()[-1]
-                        resolved = ""  # resolve normally""
+                        resolved = ""
                         if isinstance(cmd, str) and cmd.startswith(("http://", "https://", "rtsp://")):
                             if "localhost" in cmd:
                                 resolved = await self.resolve_localhost_url(cmd)
@@ -2456,6 +2876,10 @@ class AppState:
         self.record_proc_lock = threading.Lock()
         self.record_start_time = 0.0
         self.record_file_path = ""
+        self.record_file_size = 0       # bytes escritos (leído del filesystem)
+        self.record_stderr_lines: list = []   # últimas líneas stderr de ffmpeg
+        self.record_stop_timer = None   # threading.Timer para auto-stop
+        self.record_scheduled_secs = 0  # duración programada (0 = sin límite)
         self.mkv_folder = ""
         self.mkv_fallback = True
         # EPG cache: key → (timestamp, result_dict), TTL = 30 minutes
@@ -2620,18 +3044,37 @@ async def _connect_async():
 
     # MAC / Xtream
     if state.is_stalker_portal:
-        state.log("[CONNECT] 🔌 Stalker portal detected — using StalkerPortalClient (/stalker_portal/server/load.php)")
-    async with _make_client() as client:
-        ident, exp = await client.account_info()
-        state.log(f"[CONNECT] ✓ Connected: {ident} | {exp}")
-        for m in ("live", "vod", "series"):
-            try:
-                extra = await client.fetch_categories(m)
-                state.cats_cache[m] = extra
-                state.log(f"[CONNECT] {m.upper()}: {len(extra)} categories")
-            except Exception as e:
-                state.log(f"[CONNECT] ✗ Could not load {m.upper()} categories: {e}")
-                state.cats_cache[m] = []
+        state.log("[CONNECT] 🔌 Portal Stalker detectado — using StalkerPortalClient (/stalker_portal/server/load.php)")
+    try:
+        async with _make_client() as client:
+            ident, exp = await client.account_info()
+            state.log(f"[CONNECT] ✓ Connected: {ident} | {exp}")
+            for m in ("live", "vod", "series"):
+                try:
+                    extra = await client.fetch_categories(m)
+                    state.cats_cache[m] = extra
+                    state.log(f"[CONNECT] {m.upper()}: {len(extra)} categories")
+                except Exception as e:
+                    state.log(f"[CONNECT] ✗ Could not load {m.upper()} categories: {e}")
+                    state.cats_cache[m] = []
+    except Exception as first_err:
+        # Auto-fallback: if standard MAC portal fails, try StalkerPortalClient
+        if state.conn_type == "mac" and not state.is_stalker_portal:
+            state.log(f"[CONNECT] MAC portal failed ({first_err}) — retrying as Stalker portal…")
+            state.is_stalker_portal = True
+            async with _make_client() as client:
+                ident, exp = await client.account_info()
+                state.log(f"[CONNECT] ✓ Connected (Stalker fallback): {ident} | {exp}")
+                for m in ("live", "vod", "series"):
+                    try:
+                        extra = await client.fetch_categories(m)
+                        state.cats_cache[m] = extra
+                        state.log(f"[CONNECT] {m.upper()}: {len(extra)} categories")
+                    except Exception as e:
+                        state.log(f"[CONNECT] ✗ Could not load {m.upper()} categories: {e}")
+                        state.cats_cache[m] = []
+        else:
+            raise
     state.connected = True
     state.set_status(f"Connected: {ident} | {exp}")
     return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp}
@@ -2651,15 +3094,22 @@ flask_app.config["SECRET_KEY"] = os.urandom(24)
 
 @flask_app.route("/")
 def index():
-    ffmpeg_ok = shutil.which("ffmpeg") is not None
-    ffprobe_ok = shutil.which("ffprobe") is not None
+    ffmpeg_ok = _ffmpeg_ok()
+    ffprobe_ok = os.path.isfile(_FFPROBE_LOCAL) or bool(shutil.which("ffprobe"))
     config = json.dumps({
         "ffmpeg_ok": ffmpeg_ok,
         "ffprobe_ok": ffprobe_ok,
         "ytdlp_ok": YTDLP_AVAILABLE,
     })
     tags = []
-    tags.append('<span class="tag tag-ok">✓ ffmpeg</span>' if ffmpeg_ok else '<span class="tag tag-err">✗ ffmpeg</span>')
+    if ffmpeg_ok:
+        tags.append('<span class="tag tag-ok">✓ ffmpeg</span>')
+    else:
+        tags.append(
+            '<span class="tag tag-err" style="cursor:pointer" '
+            'title="Haz clic para instalar ffmpeg automáticamente" '
+            'onclick="installFfmpeg()">⚙ Instalar ffmpeg</span>'
+        )
     if not ffprobe_ok:
         tags.append('<span class="tag tag-warn">✗ ffprobe</span>')
     if YTDLP_AVAILABLE:
@@ -2680,8 +3130,10 @@ def api_connect():
         state.m3u_url = data.get("m3u_url", "").strip()
         state.ext_epg_url = data.get("ext_epg_url", "").strip()
         state.is_stalker_portal = (
-            state.conn_type == "mac" and
-            "stalker_portal" in state.url.lower()
+            state.conn_type == "mac" and (
+                "stalker_portal" in state.url.lower() or
+                "/c/" in state.url.lower()
+            )
         )
         state.cats_cache = {}
         state.m3u_cache = None
@@ -2777,54 +3229,6 @@ def api_episodes():
         return jsonify({"error": str(e), "episodes": []})
 
 
-def _probe_hevc(url: str) -> bool:
-    """Read first ~1880 bytes of a MPEG-TS stream and return True if video is HEVC (stream_type 0x24).
-    Times out quickly — failure is non-fatal, we just skip the transcode."""
-    try:
-        hdrs = {"User-Agent": "VLC/3.0", "Accept": "*/*"}
-        r = _requests_lib.get(url, headers=hdrs, stream=True, timeout=5, verify=False,
-                              proxies={"http": None, "https": None})
-        raw = b""
-        for chunk in r.iter_content(1880):
-            raw += chunk
-            if len(raw) >= 1880:
-                break
-        r.close()
-        pmt_pid = None
-        i = 0
-        while i + 188 <= len(raw):
-            pkt = raw[i:i+188]; i += 188
-            if pkt[0] != 0x47: continue
-            pid = ((pkt[1] & 0x1f) << 8) | pkt[2]
-            has_adapt = bool(pkt[3] & 0x20); has_pay = bool(pkt[3] & 0x10)
-            if not has_pay: continue
-            off = 4
-            if has_adapt: off = 5 + pkt[4]
-            if off >= 188: continue
-            if pkt[1] & 0x40: off += 1  # pointer field
-            if pid == 0 and pmt_pid is None:
-                pos = off + 8
-                while pos + 3 < 188:
-                    pn = (pkt[pos] << 8) | pkt[pos+1]
-                    pp = ((pkt[pos+2] & 0x1f) << 8) | pkt[pos+3]
-                    pos += 4
-                    if pn != 0: pmt_pid = pp; break
-            elif pmt_pid and pid == pmt_pid:
-                sec = pkt[off:]
-                if len(sec) < 12: continue
-                pi_len = ((sec[10] & 0x0f) << 8) | sec[11]
-                pos = 12 + pi_len
-                while pos + 4 < len(sec) - 4:
-                    st = sec[pos]
-                    ei = ((sec[pos+3] & 0x0f) << 8) | sec[pos+4]
-                    if st == 0x24: return True   # HEVC
-                    pos += 5 + ei
-                return False
-        return False
-    except Exception:
-        return False
-
-
 @flask_app.route("/api/resolve", methods=["POST"])
 def api_resolve():
     data = request.get_json(force=True)
@@ -2838,17 +3242,6 @@ def api_resolve():
                 return await client.resolve_item_url(mode, item, cat)
 
         url = run_async(resolve())
-        # Probe for HEVC on live streams only — if detected, serve via transcode proxy
-        # so the browser never sees HEVC which it can't decode via MSE
-        if url and isinstance(url, str) and 'play_token=' in url:
-            try:
-                probe = _probe_hevc(url)
-                if probe:
-                    state.log(f"[RESOLVE] HEVC detected — routing to transcode proxy")
-                    transcode_url = f"/api/hls_proxy?transcode=1&url={quote(url, safe='')}"
-                    return jsonify({"url": transcode_url, "hevc": True})
-            except Exception as pe:
-                state.log(f"[RESOLVE] HEVC probe failed: {pe}")
         return jsonify({"url": url})
     except Exception as e:
         state.log(f"[RESOLVE] Error: {type(e).__name__}: {e}")
@@ -2894,7 +3287,7 @@ def api_download_m3u():
             else:
                 for item in items:
                     if state.stop_flag.is_set():
-                        state.log("Stopped by user.")
+                        state.log("Detenido por el usuario.")
                         break
                     name = item.get("name") or item.get("o_name") or item.get("fname") or "?"
                     state.log(f"Processing: {name}")
@@ -2920,7 +3313,7 @@ def api_download_mkv():
         return jsonify({"error": "No items selected"}), 400
     if not out_dir:
         return jsonify({"error": "No output folder specified"}), 400
-    if not shutil.which("ffmpeg"):
+    if not _ffmpeg_ok():
         return jsonify({"error": "ffmpeg not found on PATH"}), 400
     if state.busy:
         return jsonify({"error": "Another operation is in progress"}), 409
@@ -2938,7 +3331,7 @@ def api_download_mkv():
         async with _make_client() as client:
             for i, item in enumerate(items, 1):
                 if state.stop_flag.is_set():
-                    state.log("[MKV] Stopped during URL resolution.")
+                    state.log("[MKV] Detenido durante la resolución de URL.")
                     return
                 name = item.get("name") or item.get("o_name") or item.get("fname") or f"item_{i}"
                 state.log(f"[MKV] Resolving ({i}/{total}): {name}")
@@ -2992,7 +3385,7 @@ def api_download_mkv():
 
         for idx, (name, url) in enumerate(resolved_items, 1):
             if state.stop_flag.is_set():
-                state.log("[MKV] Stopped by user.")
+                state.log("[MKV] Detenido por el usuario.")
                 break
 
             safe = safe_filename(name)
@@ -3047,58 +3440,68 @@ def api_download_mkv():
     return jsonify({"ok": True, "message": f"MKV download started → {out_dir}"})
 
 
-@flask_app.route("/api/record/start", methods=["POST"])
-def api_record_start():
-    data = request.get_json(force=True)
-    stream_url = data.get("url", "").strip()
-    out_dir = data.get("out_dir", state.mkv_folder).strip()
-    stream_name = data.get("name", "recording").strip()
+# ── helpers ─────────────────────────────────────────────────────────────────
 
-    if not stream_url:
-        return jsonify({"error": "No stream URL"}), 400
-    if not shutil.which("ffmpeg"):
-        return jsonify({"error": "ffmpeg not found"}), 400
-    if state.recording:
-        return jsonify({"error": "Already recording"}), 409
-
-    if not out_dir:
-        out_dir = os.path.expanduser("~/Downloads")
-    os.makedirs(out_dir, exist_ok=True)
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = safe_filename(stream_name) + f"_{ts}.mkv"
-    out_path = os.path.join(out_dir, fname)
-
-    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
-    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y",
-           "-protocol_whitelist", "file,http,https,tcp,tls,crypto,rtsp,rtmp",
-           "-i", stream_url, "-c", "copy", out_path]
-
+def _rec_size_mb() -> float:
+    """Tamaño actual del archivo grabado en MB."""
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except Exception as e:
-        return jsonify({"error": f"Failed to start ffmpeg: {e}"}), 500
-
-    with state.record_proc_lock:
-        state.record_proc = proc
-    state.recording = True
-    state.record_start_time = time.time()
-    state.record_file_path = out_path
-    state.log(f"[REC] ⏺ Recording started: {out_path}")
-    state.set_status(f"⏺ Recording → {fname}")
-    return jsonify({"ok": True, "file": out_path, "filename": fname})
+        return os.path.getsize(state.record_file_path) / 1_048_576
+    except Exception:
+        return 0.0
 
 
-@flask_app.route("/api/record/stop", methods=["POST"])
-def api_record_stop():
-    if not state.recording:
-        return jsonify({"error": "Not recording"}), 400
+def _rec_elapsed() -> int:
+    """Segundos transcurridos desde que empezó la grabación."""
+    return int(time.time() - state.record_start_time) if state.recording else 0
+
+
+def _rec_elapsed_str() -> str:
+    s = _rec_elapsed()
+    h, r = divmod(s, 3600)
+    m, s = divmod(r, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _rec_drain_stderr(proc):
+    """Lee stderr de ffmpeg en un hilo y guarda las últimas 60 líneas."""
+    def _run():
+        try:
+            for raw in proc.stderr:
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                state.record_stderr_lines = (state.record_stderr_lines + [line])[-60:]
+                # Detecta si ffmpeg cerró solo (error de stream, etc.)
+                if not state.recording:
+                    break
+        except Exception:
+            pass
+        # Si ffmpeg terminó solo pero recording sigue True → actualizar estado
+        if state.recording and proc.poll() is not None:
+            rc = proc.returncode
+            msg = f"[REC] ⚠ ffmpeg terminó inesperadamente (código {rc})."
+            state.log(msg)
+            state.recording = False
+            state.set_status(f"Grabación interrumpida (ffmpeg rc={rc})")
+    threading.Thread(target=_run, daemon=True, name="rec-stderr").start()
+
+
+def _rec_stop_internal(reason: str = "manual"):
+    """Para la grabación y libera todos los recursos."""
+    # Cancelar auto-stop timer si existe
+    if state.record_stop_timer:
+        try:
+            state.record_stop_timer.cancel()
+        except Exception:
+            pass
+        state.record_stop_timer = None
+
     with state.record_proc_lock:
         p = state.record_proc
-    if p:
+    if p and p.poll() is None:
+        # ffmpeg entiende 'q' en stdin para finalizar limpiamente, pero usamos
+        # terminate() porque stdin está cerrado; wait() asegura escritura final.
         try:
             p.terminate()
-            p.wait(timeout=5)
+            p.wait(timeout=8)
         except Exception:
             try:
                 p.kill()
@@ -3106,25 +3509,160 @@ def api_record_stop():
                 pass
     with state.record_proc_lock:
         state.record_proc = None
-    state.recording = False
+
     saved = state.record_file_path
-    state.log(f"[REC] ⏹ Recording stopped. Saved: {saved}")
-    state.set_status(f"Recording stopped. Saved: {os.path.basename(saved)}")
-    return jsonify({"ok": True, "file": saved})
+    size_mb = _rec_size_mb()
+    state.recording = False
+    state.record_scheduled_secs = 0
+    state.log(f"[REC] ⏹ Grabación detenida ({reason}). "
+              f"Archivo: {os.path.basename(saved)} ({size_mb:.1f} MB)")
+    state.set_status(f"⏹ Grabación guardada: {os.path.basename(saved)}")
+    return saved, size_mb
+
+
+# ── API ─────────────────────────────────────────────────────────────────────
+
+@flask_app.route("/api/record/start", methods=["POST"])
+def api_record_start():
+    data = request.get_json(force=True)
+    stream_url  = data.get("url",  "").strip()
+    stream_name = data.get("name", "grabacion").strip()
+    out_dir     = data.get("out_dir", state.mkv_folder).strip()
+    duration_s  = int(data.get("duration_secs", 0))   # 0 = sin límite
+    fmt         = data.get("format", "mkv").lower()    # mkv | ts | mp4
+
+    if not stream_url:
+        return jsonify({"error": "Sin URL de stream"}), 400
+    if not _ffmpeg_ok():
+        # Intentar instalar si no está disponible
+        _ensure_ffmpeg_bg()
+        return jsonify({
+            "error": "ffmpeg no disponible. Instalación en curso, espera 1-2 min y vuelve a intentarlo."
+        }), 503
+    if state.recording:
+        return jsonify({"error": "Ya hay una grabación activa"}), 409
+
+    if not out_dir:
+        out_dir = os.path.expanduser("~/Downloads")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception as e:
+        return jsonify({"error": f"No se pudo crear carpeta: {e}"}), 500
+
+    # Formato y extensión
+    if fmt not in ("mkv", "ts", "mp4"):
+        fmt = "mkv"
+    ext = f".{fmt}"
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname   = safe_filename(stream_name) + f"_{ts_str}{ext}"
+    out_path = os.path.join(out_dir, fname)
+
+    ffmpeg = _get_ffmpeg_path()
+
+    # Opciones de codificación: copy es lo más eficiente; mp4 necesita
+    # faststart para reproducción inmediata pero requiere que el stream sea
+    # compatible → usamos mkv/ts por defecto para streams live.
+    extra_out = []
+    if fmt == "mp4":
+        extra_out = ["-movflags", "+faststart"]
+
+    # Tiempo máximo si hay duración programada
+    time_limit = ["-t", str(duration_s)] if duration_s > 0 else []
+
+    cmd = [
+        ffmpeg, "-hide_banner", "-nostdin", "-y",
+        # Reconexión automática si el stream cae (streams live)
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "10",
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto,rtsp,rtmp,rtp,udp",
+        # Headers para evitar bloqueos por portales estrictos
+        "-user_agent", "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3",
+        "-i", stream_url,
+        *time_limit,
+        "-c", "copy",
+        *extra_out,
+        out_path
+    ]
+
+    state.record_stderr_lines = []
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            # Windows: no abrir ventana de consola
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        )
+    except Exception as e:
+        return jsonify({"error": f"No se pudo iniciar ffmpeg: {e}"}), 500
+
+    with state.record_proc_lock:
+        state.record_proc = proc
+    state.recording          = True
+    state.record_start_time  = time.time()
+    state.record_file_path   = out_path
+    state.record_file_size   = 0
+    state.record_scheduled_secs = duration_s
+
+    # Hilo que lee stderr y detecta si ffmpeg muere
+    _rec_drain_stderr(proc)
+
+    # Auto-stop programado si hay duración
+    if duration_s > 0:
+        def _auto_stop():
+            if state.recording:
+                state.log(f"[REC] ⏰ Auto-stop programado ({duration_s}s alcanzados)")
+                _rec_stop_internal(reason="auto-stop programado")
+        t = threading.Timer(duration_s + 2, _auto_stop)
+        t.daemon = True
+        t.start()
+        state.record_stop_timer = t
+
+    state.log(f"[REC] ⏺ Grabación iniciada: {fname}  [{fmt.upper()}]"
+              + (f"  duración máx: {duration_s}s" if duration_s else ""))
+    state.set_status(f"⏺ Grabando → {fname}")
+    return jsonify({
+        "ok":       True,
+        "file":     out_path,
+        "filename": fname,
+        "format":   fmt,
+        "duration_secs": duration_s,
+    })
+
+
+@flask_app.route("/api/record/stop", methods=["POST"])
+def api_record_stop():
+    if not state.recording:
+        return jsonify({"error": "No hay grabación activa"}), 400
+    saved, size_mb = _rec_stop_internal(reason="manual")
+    return jsonify({"ok": True, "file": saved, "size_mb": round(size_mb, 2)})
 
 
 @flask_app.route("/api/record/status", methods=["GET"])
 def api_record_status():
     if not state.recording:
-        return jsonify({"recording": False})
-    elapsed = int(time.time() - state.record_start_time)
-    h, rem = divmod(elapsed, 3600)
-    m, s = divmod(rem, 60)
+        # Puede que haya terminado — devolver el último archivo guardado
+        return jsonify({
+            "recording":  False,
+            "last_file":  os.path.basename(state.record_file_path) if state.record_file_path else "",
+        })
+    elapsed_s = _rec_elapsed()
+    size_mb   = _rec_size_mb()
+    sched     = state.record_scheduled_secs
+    remaining = max(0, sched - elapsed_s) if sched > 0 else 0
+    h, rem = divmod(elapsed_s, 3600)
+    m_val, s_val = divmod(rem, 60)
     return jsonify({
-        "recording": True,
-        "elapsed": f"{h:02d}:{m:02d}:{s:02d}",
-        "file": state.record_file_path,
-        "filename": os.path.basename(state.record_file_path),
+        "recording":       True,
+        "elapsed":         f"{h:02d}:{m_val:02d}:{s_val:02d}",
+        "elapsed_secs":    elapsed_s,
+        "size_mb":         round(size_mb, 2),
+        "file":            state.record_file_path,
+        "filename":        os.path.basename(state.record_file_path),
+        "scheduled_secs":  sched,
+        "remaining_secs":  remaining,
+        "stderr_tail":     state.record_stderr_lines[-5:],
     })
 
 
@@ -3142,9 +3680,143 @@ def api_stop():
     task = state.active_task
     if loop and task and not task.done():
         loop.call_soon_threadsafe(task.cancel)
-    state.log("⏹ Stopped by user.")
-    state.set_status("Stopped.")
+    state.log("⏹ Detenido por el usuario.")
+    state.set_status("Detenido.")
     return jsonify({"ok": True})
+
+
+
+@flask_app.route("/api/files", methods=["POST"])
+def api_files():
+    """Browse local filesystem for media files.
+    POST {path: "/some/dir"} → {path, entries: [{name, is_dir, size, ext}]}
+    """
+    VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
+                  ".webm", ".m4v", ".mpeg", ".mpg", ".ogv", ".3gp", ".rmvb", ".vob"}
+    AUDIO_EXTS = {".mp3", ".flac", ".aac", ".ogg", ".opus", ".wav", ".m4a",
+                  ".wma", ".aiff", ".alac", ".ape"}
+    MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS
+
+    data = request.get_json(force=True)
+    req_path = data.get("path", "").strip()
+
+    # Default to common download / media folders
+    if not req_path:
+        for candidate in [
+            os.path.expanduser("~/Downloads"),
+            os.path.expanduser("~/Videos"),
+            "/sdcard/Download",
+            "/sdcard",
+            os.path.expanduser("~"),
+        ]:
+            if os.path.isdir(candidate):
+                req_path = candidate
+                break
+
+    req_path = os.path.abspath(req_path)
+    if not os.path.isdir(req_path):
+        return jsonify({"error": f"No es un directorio: {req_path}", "path": req_path, "entries": []})
+
+    try:
+        raw = os.scandir(req_path)
+        entries = []
+        for e in raw:
+            try:
+                is_dir = e.is_dir(follow_symlinks=False)
+                ext = os.path.splitext(e.name)[1].lower()
+                if is_dir or ext in MEDIA_EXTS:
+                    size = 0
+                    try:
+                        if not is_dir:
+                            size = e.stat().st_size
+                    except Exception:
+                        pass
+                    entries.append({
+                        "name": e.name,
+                        "is_dir": is_dir,
+                        "size": size,
+                        "ext": ext,
+                        "path": os.path.join(req_path, e.name),
+                    })
+            except Exception:
+                pass
+        entries.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+        parent = str(os.path.dirname(req_path)) if req_path != os.path.dirname(req_path) else None
+        return jsonify({"path": req_path, "parent": parent, "entries": entries})
+    except PermissionError:
+        return jsonify({"error": "Permiso denegado", "path": req_path, "entries": []})
+
+
+@flask_app.route("/api/play_local", methods=["POST"])
+def api_play_local():
+    """Return a URL to stream a local file via the proxy endpoint."""
+    data = request.get_json(force=True)
+    file_path = data.get("path", "").strip()
+    if not file_path or not os.path.isfile(file_path):
+        return jsonify({"error": "Archivo no encontrado", "url": ""})
+    # Use file:// URL; the /api/proxy won't handle it, so serve directly.
+    # We serve the file over a dedicated /api/localfile endpoint.
+    from urllib.parse import quote as _q
+    url = "/api/localfile?path=" + _q(file_path, safe="")
+    return jsonify({"url": url, "name": os.path.basename(file_path)})
+
+
+@flask_app.route("/api/localfile")
+def api_localfile():
+    """Stream a local media file to the browser with range-request support."""
+    file_path = request.args.get("path", "").strip()
+    if not file_path or not os.path.isfile(file_path):
+        return Response("Archivo no encontrado", status=404)
+    file_size = os.path.getsize(file_path)
+    ext = os.path.splitext(file_path)[1].lower()
+    mime_map = {
+        ".mkv": "video/x-matroska", ".mp4": "video/mp4", ".avi": "video/x-msvideo",
+        ".mov": "video/quicktime", ".wmv": "video/x-ms-wmv", ".flv": "video/x-flv",
+        ".ts": "video/mp2t", ".m2ts": "video/mp2t", ".webm": "video/webm",
+        ".m4v": "video/mp4", ".mpeg": "video/mpeg", ".mpg": "video/mpeg",
+        ".ogv": "video/ogg", ".3gp": "video/3gpp",
+        ".mp3": "audio/mpeg", ".flac": "audio/flac", ".aac": "audio/aac",
+        ".ogg": "audio/ogg", ".opus": "audio/ogg", ".wav": "audio/wav",
+        ".m4a": "audio/mp4", ".wma": "audio/x-ms-wma",
+    }
+    mime = mime_map.get(ext, "application/octet-stream")
+    range_header = request.headers.get("Range")
+    if range_header:
+        try:
+            byte_range = range_header.replace("bytes=", "").split("-")
+            start = int(byte_range[0]) if byte_range[0] else 0
+            end = int(byte_range[1]) if byte_range[1] else file_size - 1
+            end = min(end, file_size - 1)
+            length = end - start + 1
+            def _gen(s, e):
+                with open(file_path, "rb") as f:
+                    f.seek(s)
+                    remaining = e - s + 1
+                    while remaining > 0:
+                        chunk = f.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                        yield chunk
+            resp = Response(_gen(start, end), status=206, mimetype=mime,
+                            direct_passthrough=True)
+            resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            resp.headers["Content-Length"] = str(length)
+            resp.headers["Accept-Ranges"] = "bytes"
+            return resp
+        except Exception:
+            pass
+    def _gen_full():
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+    resp = Response(_gen_full(), mimetype=mime, direct_passthrough=True)
+    resp.headers["Content-Length"] = str(file_size)
+    resp.headers["Accept-Ranges"] = "bytes"
+    return resp
 
 
 @flask_app.route("/api/status", methods=["GET"])
@@ -3155,7 +3827,7 @@ def api_status():
         "status": state.status,
         "recording": state.recording,
         "conn_type": state.conn_type,
-        "ffmpeg": shutil.which("ffmpeg") is not None,
+        "ffmpeg": _ffmpeg_ok(),
         "ytdlp": YTDLP_AVAILABLE,
     })
 
@@ -3183,6 +3855,222 @@ def api_logs():
                         "X-Accel-Buffering": "no",
                         "Connection": "keep-alive",
                     })
+
+
+
+# ── Active transcode sessions (path → proc) ──────────────────────────────────
+_transcode_sessions: dict = {}
+_transcode_lock = threading.Lock()
+
+BROWSER_SAFE_VIDEO = {"h264", "vp8", "vp9", "av1", "theora"}
+BROWSER_SAFE_AUDIO = {"aac", "mp3", "opus", "vorbis", "flac"}
+
+
+@flask_app.route("/api/probe_local", methods=["POST"])
+def api_probe_local():
+    """Probe a local file and return codec/track info.
+    Returns: {video:[{codec,idx}], audio:[{codec,idx,lang,title}],
+              subtitle:[{idx,lang,title,codec}], needs_transcode: bool}
+    """
+    data = request.get_json(force=True)
+    file_path = data.get("path", "").strip()
+    if not file_path or not os.path.isfile(file_path):
+        return jsonify({"error": "Archivo no encontrado"})
+    ffprobe = _get_ffprobe_path()
+    cmd = [ffprobe, "-v", "error", "-print_format", "json",
+           "-show_streams", "-show_format", "-i", file_path]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, timeout=20)
+        data_j = json.loads(proc.stdout)
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+    streams = data_j.get("streams", [])
+    result = {"video": [], "audio": [], "subtitle": [], "needs_transcode": False,
+              "duration": None}
+    fmt = data_j.get("format", {})
+    try:
+        result["duration"] = float(fmt.get("duration", 0))
+    except Exception:
+        pass
+
+    for s in streams:
+        idx = s.get("index", 0)
+        codec = (s.get("codec_name") or "unknown").lower()
+        lang = s.get("tags", {}).get("language", "")
+        title = s.get("tags", {}).get("title", "")
+        ctype = s.get("codec_type", "")
+        if ctype == "video":
+            result["video"].append({"codec": codec, "idx": idx})
+            if codec not in BROWSER_SAFE_VIDEO:
+                result["needs_transcode"] = True
+        elif ctype == "audio":
+            result["audio"].append({"codec": codec, "idx": idx, "lang": lang,
+                                    "title": title})
+            if codec not in BROWSER_SAFE_AUDIO:
+                result["needs_transcode"] = True
+        elif ctype == "subtitle":
+            result["subtitle"].append({"idx": idx, "lang": lang,
+                                       "title": title, "codec": codec})
+
+    # Determine if remux (copy, fast) or full transcode (slow) is needed.
+    # Remux = container change only — codecs are already browser-compatible.
+    # Transcode = codecs must be re-encoded (HEVC→H264, AC3→AAC, etc.)
+    result["can_remux"] = not result["needs_transcode"]
+    # Extension tells us if a container change is needed at all
+    ext = os.path.splitext(file_path)[1].lower()
+    result["needs_remux"] = ext not in {".mp4", ".webm"}
+    # If codecs are fine AND it's already mp4/webm → play directly
+    result["play_direct"] = (not result["needs_transcode"] and not result["needs_remux"])
+    return jsonify(result)
+
+
+@flask_app.route("/api/transcode")
+def api_transcode():
+    """Stream a local file through FFmpeg → H.264/AAC in fragmented MP4 (fmp4).
+    Query params: path, audio_idx (optional, default first), subs_idx (opcional).
+    Supports byte-range partial content for seeking.
+    """
+    file_path = request.args.get("path", "").strip()
+    audio_idx = request.args.get("audio_idx", "")
+    subs_idx  = request.args.get("subs_idx", "")
+
+    if not file_path or not os.path.isfile(file_path):
+        return Response("Archivo no encontrado", status=404)
+
+    ffmpeg = _get_ffmpeg_path()
+
+    cmd = [ffmpeg, "-hide_banner", "-nostdin",
+           "-i", file_path]
+
+    # Audio track selection
+    if audio_idx:
+        cmd += ["-map", "0:v:0", "-map", f"0:a:{audio_idx}"]
+    else:
+        cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
+
+    # Subtitle burn-in (only if requested and a subtitle stream exists)
+    if subs_idx:
+        # Use subtitles filter to burn in
+        safe_path = file_path.replace("'", "\\'").replace("\\", "\\\\").replace(":", "\\:")
+        cmd += ["-vf", f"subtitles='{safe_path}':si={subs_idx}"]
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23"]
+    else:
+        # Check if video needs encoding (copy if h264, else encode)
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-profile:v", "high", "-level", "4.1"]
+
+    cmd += [
+        "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof+faststart",
+        "-f", "mp4",
+        "pipe:1"
+    ]
+
+    def generate():
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                bufsize=65536)
+        key = file_path + audio_idx + subs_idx
+        with _transcode_lock:
+            _transcode_sessions[key] = proc
+        try:
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            with _transcode_lock:
+                _transcode_sessions.pop(key, None)
+
+    resp = Response(stream_with_context(generate()), mimetype="video/mp4",
+                    direct_passthrough=True)
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"
+    return resp
+
+
+@flask_app.route("/api/extract_sub")
+def api_extract_sub():
+    """Extract an embedded subtitle track as WebVTT for browser use.
+    Query params: path, sub_idx
+    """
+    file_path = request.args.get("path", "").strip()
+    sub_idx   = request.args.get("sub_idx", "0")
+    if not file_path or not os.path.isfile(file_path):
+        return Response("Archivo no encontrado", status=404)
+    ffmpeg = _get_ffmpeg_path()
+    cmd = [ffmpeg, "-hide_banner", "-nostdin",
+           "-i", file_path,
+           "-map", f"0:s:{sub_idx}",
+           "-c:s", "webvtt",
+           "-f", "webvtt",
+           "pipe:1"]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=30)
+        if proc.returncode != 0 or not proc.stdout:
+            return Response("No se pudieron extraer los subtítulos", status=500)
+        return Response(proc.stdout, mimetype="text/vtt",
+                        headers={"Content-Disposition": "inline"})
+    except Exception as e:
+        return Response(str(e), status=500)
+
+
+
+@flask_app.route("/api/remux_local")
+def api_remux_local():
+    """Remuxea un archivo local a MP4 fragmentado SIN recodificar (solo cambia el contenedor).
+    Esto es instantáneo para archivos con códecs H.264/AAC/AAC-LC.
+    Para códecs incompatibles usa /api/transcode en su lugar.
+    """
+    file_path = request.args.get("path", "").strip()
+    audio_idx = request.args.get("audio_idx", "0")
+    if not file_path or not os.path.isfile(file_path):
+        return Response("Archivo no encontrado", status=404)
+
+    ffmpeg = _get_ffmpeg_path()
+    cmd = [
+        ffmpeg, "-hide_banner", "-nostdin",
+        "-i", file_path,
+        "-map", "0:v:0",
+        "-map", f"0:a:{audio_idx}?",
+        "-c", "copy",                           # ← sin recodificación
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof+faststart",
+        "-f", "mp4",
+        "pipe:1",
+    ]
+
+    def generate():
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                bufsize=131072)
+        key = "remux_" + file_path + audio_idx
+        with _transcode_lock:
+            _transcode_sessions[key] = proc
+        try:
+            while True:
+                chunk = proc.stdout.read(131072)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            with _transcode_lock:
+                _transcode_sessions.pop(key, None)
+
+    resp = Response(stream_with_context(generate()), mimetype="video/mp4",
+                    direct_passthrough=True)
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"
+    return resp
 
 
 # ===================== HLS PROXY =====================
@@ -3295,7 +4183,7 @@ def api_epg():
                                                        cache_key=base_norm)
                 if portal_result.get("current") or portal_result.get("next"):
                     return portal_result
-                state.log(f"[EPG] Portal XMLTV returned no data for this channel")
+                state.log(f"[EPG] El portal XMLTV no tiene datos para este canal")
             elif not epg_ch_id or epg_ch_id == item.get("name", ""):
                 state.log(f"[EPG] No epg_channel_id — skipping portal XMLTV")
 
@@ -3345,7 +4233,7 @@ def api_epg():
                     result = _parse_stalker_epg(payload, ch_id)
                     if result.get("current") or result.get("next") or result.get("schedule"):
                         return result
-                    state.log(f"[EPG] Portal returned no EPG data for this channel")
+                    state.log(f"[EPG] El portal no tiene datos EPG para este canal")
 
             # External EPG fallback for MAC/Stalker
             if state.ext_epg_url:
@@ -3418,7 +4306,7 @@ def api_whats_on():
     if not state._xmltv_cache:
         msg = ("No EPG data loaded yet. Open any live channel first to trigger EPG load, "
                "then re-open What's on Now.") if state.ext_epg_url else (
-               "No external EPG URL configured. Add one in Settings (EPG field) and reconnect.")
+               "No se configuró una URL EPG externa. Add one in Settings (EPG field) and reconnect.")
         return jsonify({"programs": [], "count": 0, "status": "no_epg", "message": msg})
 
     results = []
@@ -4043,7 +4931,7 @@ def api_catchup_play():
                                                        archive_cmd="")
 
         if not url:
-            return {"error": "Portal returned no catch-up URL"}
+            return {"error": "El portal no devolvió URL de Catch-up"}
 
         # Flussonic CDN: portal returns live token URL even for archive requests.
         # Detect /stream/mpegts?token=XYZ and rewrite to /stream/archive-{ts}-{dur}.m3u8?token=XYZ
@@ -4415,20 +5303,51 @@ async def _fetch_xmltv_epg(xmltv_url: str, tvg_id: str, log_cb=None,
 @flask_app.route("/api/proxy")
 def api_proxy():
     url = request.args.get("url", "").strip()
-    if not url or not url.startswith(("http://", "https://")):
-        return Response("Invalid URL", status=400)
+    if not url or not url.startswith(("http://", "https://", "rtsp://")):
+        return Response("URL inválida", status=400)
+    # For RTSP streams redirect to HLS proxy via ffmpeg
+    if url.startswith("rtsp://"):
+        from urllib.parse import quote as _q
+        return Response(
+            "",
+            status=302,
+            headers={"Location": f"/api/hls_proxy?url={_q(url, safe='')}"}
+        )
     try:
-        headers = {
-            "User-Agent": "VLC/3.0.0 LibVLC/3.0.0",
+        # Rotate User-Agents to maximise portal compatibility.
+        # Some portals block VLC; others block cURL. We try the request UA first,
+        # then fall back through a list of known-working agents.
+        _ua_pool = [
+            request.headers.get("User-Agent", ""),
+            "VLC/3.0.18 LibVLC/3.0.18",
+            "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Dalvik/2.1.0 (Linux; U; Android 9; MAG-BOX)",
+            "okhttp/4.9.3",
+        ]
+        headers_base = {
             "Accept": "*/*",
             "Connection": "keep-alive",
         }
         if "Range" in request.headers:
-            headers["Range"] = request.headers["Range"]
-        # proxies={} bypasses Windows system proxy (fixes ERR_UNEXPECTED_PROXY_AUTH)
-        resp = _requests_lib.get(url, headers=headers, stream=True, timeout=20,
-                                 allow_redirects=True, verify=False,
-                                 proxies={"http": None, "https": None})
+            headers_base["Range"] = request.headers["Range"]
+        resp = None
+        for ua in _ua_pool:
+            if not ua:
+                continue
+            try:
+                h = dict(headers_base)
+                h["User-Agent"] = ua
+                resp = _requests_lib.get(url, headers=h, stream=True, timeout=25,
+                                         allow_redirects=True, verify=False,
+                                         proxies={"http": None, "https": None})
+                if resp.status_code < 400:
+                    break
+            except Exception:
+                resp = None
+                continue
+        if resp is None:
+            return Response("Proxy: no se pudo conectar al stream", status=502)
         ct = resp.headers.get("Content-Type", "application/octet-stream")
         cors = {
             "Access-Control-Allow-Origin": "*",
@@ -4439,9 +5358,6 @@ def api_proxy():
                    'mpegurl' in ct.lower() or 'x-mpegurl' in ct.lower())
         if is_m3u8:
             text = resp.text
-            # Use resp.url (final URL after any redirects) as the base for resolving
-            # relative segment/chunklist URLs. Using the original `url` would produce
-            # wrong absolute URLs if the server redirected the manifest request.
             rewritten = _rewrite_m3u8(text, resp.url)
             return Response(rewritten, content_type="application/vnd.apple.mpegurl", headers=cors)
         def _gen():
@@ -4476,63 +5392,38 @@ def api_hls_proxy():
     """
     url = request.args.get("url", "").strip()
     if not url or not url.startswith(("http://", "https://", "rtsp://")):
-        return Response("Invalid URL", status=400)
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        return Response("ffmpeg not available", status=503)
+        return Response("URL inválida", status=400)
+    ffmpeg = _get_ffmpeg_path()
+    if not _ffmpeg_ok():
+        return Response("FFmpeg no disponible", status=503)
     cors = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
         "Access-Control-Allow-Headers": "*",
     }
-    transcode = request.args.get("transcode", "0") == "1"
-    if transcode:
-        # Re-encode HEVC/unsupported video → H.264, keep audio as AAC
-        # Used as fallback when browser MSE rejects the native codec (e.g. HEVC)
-        cmd = [
-            ffmpeg, "-hide_banner", "-nostdin",
-            "-user_agent", "Mozilla/5.0",
-            "-i", url,
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-            "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            "-f", "mpegts",
-            "pipe:1",
-        ]
-    else:
-        # Remux to MPEG-TS via ffmpeg — copy streams, no re-encode
-        cmd = [
-            ffmpeg, "-hide_banner", "-nostdin",
-            "-user_agent", "Mozilla/5.0",
-            "-i", url,
-            "-c", "copy",
-            "-f", "mpegts",
-            "pipe:1",
-        ]
+    # Remux to MPEG-TS via ffmpeg — copy streams, no re-encode
+    # Use MAG User-Agent + reconnect flags for live/IPTV streams
+    cmd = [
+        ffmpeg, "-hide_banner", "-nostdin",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-user_agent",
+        "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 "
+        "(KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3",
+        "-i", url,
+        "-c", "copy",
+        "-f", "mpegts",
+        "pipe:1",
+    ]
     try:
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
     except Exception as e:
         return Response(f"ffmpeg error: {e}", status=502)
-
-    # Log ffmpeg stderr in background thread so we can see errors in the app log
-    mode_label = "transcode" if transcode else "remux"
-    def _log_stderr():
-        try:
-            for raw in proc.stderr:
-                line = raw.decode("utf-8", errors="replace").rstrip()
-                if line:
-                    # Only log errors/warnings, skip progress lines (fps= bitrate= etc.)
-                    low = line.lower()
-                    if any(k in low for k in ("error", "invalid", "failed", "no such", "unable", "could not", "permission", "fatal")):
-                        state.log(f"[ffmpeg/{mode_label}] {line}")
-        except Exception:
-            pass
-    threading.Thread(target=_log_stderr, daemon=True).start()
-    state.log(f"[ffmpeg/{mode_label}] Started: {url[:80]}")
 
     def _gen():
         try:
@@ -4544,38 +5435,80 @@ def api_hls_proxy():
         finally:
             proc.kill()
             proc.wait()
-            state.log(f"[ffmpeg/{mode_label}] Stopped")
 
     h = dict(cors)
     h["Content-Type"] = "video/mp2t"
     return Response(stream_with_context(_gen()), status=200, headers=h)
 
 
+# ===================== FFMPEG INSTALL API =====================
+
+@flask_app.route("/api/ffmpeg_install", methods=["POST"])
+def api_ffmpeg_install():
+    """Instala ffmpeg localmente en un hilo de fondo."""
+    if _ffmpeg_ok():
+        return jsonify({"ok": True, "message": "ffmpeg ya está disponible."})
+    def _do():
+        install_ffmpeg_auto(log_cb=state.log, force=True)
+    threading.Thread(target=_do, daemon=True, name="ffmpeg-manual-install").start()
+    return jsonify({"ok": True, "message": "Instalación iniciada. Revisa los logs para el progreso."})
+
+
+@flask_app.route("/api/ffmpeg_status", methods=["GET"])
+def api_ffmpeg_status():
+    """Devuelve el estado actual de ffmpeg/ffprobe y del instalador."""
+    ok = _ffmpeg_ok()
+    return jsonify({
+        "ffmpeg_ok":        ok,
+        "ffprobe_ok":       os.path.isfile(_FFPROBE_LOCAL) or bool(shutil.which("ffprobe")),
+        "ffmpeg_path":      _get_ffmpeg_path(),
+        "ffprobe_path":     _get_ffprobe_path(),
+        "local_dir":        _FFMPEG_DIR,
+        "local_installed":  os.path.isfile(_FFMPEG_LOCAL),
+        "platform":         _detect_platform(),
+        "install_running":  _install_state["running"],
+        "install_done":     _install_state["done"],
+        "install_ok":       _install_state["ok"],
+        "install_msg":      _install_state["msg"],
+    })
+
+
 # ===================== HTML TEMPLATE =====================
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
-<html lang="en">
+<html lang="es">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="theme-color" content="#060612">
-<title>IPTV Portal</title>
+<title>Reproductor IPTV</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+/* Premium dark theme — V14 */
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,500;0,9..40,700;0,9..40,900;1,9..40,400&family=DM+Mono:wght@400;500&display=swap');
 :root{
-  --bg:#060612;--s1:#0b0b1a;--s2:#10101e;--s3:#161628;--s4:#1c1c33;--s5:#23233d;
-  --bdr:rgba(255,255,255,.07);--bdr2:rgba(255,255,255,.13);
-  --acc:#7c3aed;--acc2:#6d28d9;--acc3:#5b21b6;
-  --glow:rgba(124,58,237,.45);--glow2:rgba(124,58,237,.18);--glow3:rgba(124,58,237,.07);
-  --cyan:#06b6d4;--green:#22c55e;--red:#ef4444;--orange:#f59e0b;--blue:#3b82f6;
-  --txt:#e4e8f5;--txt2:#7d8a9e;--txt3:#3d4558;
-  --r:12px;--rsm:8px;--rss:5px;
-  --tr:all .2s cubic-bezier(.4,0,.2,1);
-  --sh:0 8px 32px rgba(0,0,0,.7);
+  --bg:#050508;--s1:#09090f;--s2:#0e0e18;--s3:#131320;--s4:#18182a;--s5:#1e1e30;
+  --bdr:rgba(255,255,255,.06);--bdr2:rgba(255,255,255,.12);
+  --acc:#a855f7;--acc2:#9333ea;--acc3:#7e22ce;
+  --glow:rgba(168,85,247,.5);--glow2:rgba(168,85,247,.2);--glow3:rgba(168,85,247,.08);
+  --cyan:#22d3ee;--green:#4ade80;--red:#f87171;--orange:#fb923c;--blue:#60a5fa;
+  --txt:#eef0f8;--txt1:#eef0f8;--txt2:#8892a4;--txt3:#3e4558;
+  --r:14px;--rsm:9px;--rss:6px;
+  --tr:all .18s cubic-bezier(.4,0,.2,1);
+  --sh:0 12px 40px rgba(0,0,0,.8);
+  /* Noise texture as data URI for premium depth */
+  --noise:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
 }
-html,body{height:100dvh;overflow:hidden;background:var(--bg);color:var(--txt);
-  font-family:'Segoe UI',-apple-system,system-ui,sans-serif;font-size:14px;line-height:1.5;
-  -webkit-font-smoothing:antialiased}
+html,body{height:100dvh;overflow:hidden;
+  background:var(--bg);
+  color:var(--txt);
+  font-family:'DM Sans','Segoe UI',-apple-system,system-ui,sans-serif;
+  font-size:14px;line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+  background-image:
+    radial-gradient(ellipse 80% 50% at 20% -10%, rgba(168,85,247,.06) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 40% at 80% 110%, rgba(34,211,238,.04) 0%, transparent 60%);
+}
 ::-webkit-scrollbar{width:3px;height:3px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--s5);border-radius:3px}
@@ -4602,8 +5535,9 @@ button:active:not(:disabled){transform:scale(.95)}
 button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 
 .btn-acc{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
-  box-shadow:0 3px 14px var(--glow2)}
-.btn-acc:hover:not(:disabled){box-shadow:0 5px 22px var(--glow);filter:brightness(1.1)}
+  box-shadow:0 3px 14px var(--glow2);letter-spacing:.3px}
+.btn-acc:hover:not(:disabled){box-shadow:0 5px 24px var(--glow);
+  background:linear-gradient(135deg,#b874ff,var(--acc));filter:brightness(1.05)}
 .btn-green{background:rgba(34,197,94,.1);color:var(--green);border:1px solid rgba(34,197,94,.22)}
 .btn-green:hover:not(:disabled){background:rgba(34,197,94,.2)}
 .btn-red{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.22)}
@@ -4619,8 +5553,11 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 
 /* ─── header ─────────────────────────────────────────────────── */
 #hdr{flex-shrink:0;z-index:200;
-  background:linear-gradient(180deg,rgba(11,11,26,.98) 0%,rgba(10,10,22,.95) 100%);
-  border-bottom:1px solid var(--bdr);box-shadow:0 2px 20px rgba(0,0,0,.5)}
+  background:rgba(9,9,15,.85);
+  backdrop-filter:blur(20px) saturate(180%);
+  -webkit-backdrop-filter:blur(20px) saturate(180%);
+  border-bottom:1px solid rgba(168,85,247,.15);
+  box-shadow:0 1px 0 rgba(168,85,247,.08), 0 4px 24px rgba(0,0,0,.6)}
 #hdr-bar{display:flex;align-items:center;gap:8px;padding:8px 12px;min-height:52px}
 #cdot{width:9px;height:9px;border-radius:50%;background:var(--txt3);flex-shrink:0;transition:var(--tr)}
 #cdot.on{background:var(--green);box-shadow:0 0 8px var(--green),0 0 20px rgba(34,197,94,.3);
@@ -4663,22 +5600,26 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 }
 
 /* ─── panel header ───────────────────────────────────────────── */
-.ph{background:linear-gradient(90deg,var(--s1),var(--s2));border-bottom:1px solid var(--bdr);
+.ph{background:rgba(14,14,24,.7);backdrop-filter:blur(10px);border-bottom:1px solid var(--bdr);
   padding:10px 14px;display:flex;align-items:center;gap:8px;flex-shrink:0}
 .ph h3{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1.5px;
   color:var(--txt2);flex:1;min-width:0}
 
 /* ─── bottom nav ─────────────────────────────────────────────── */
-#botnav{display:flex;background:var(--s1);border-top:1px solid var(--bdr);
-  flex-shrink:0;z-index:100;padding-bottom:env(safe-area-inset-bottom)}
+#botnav{display:flex;
+  background:rgba(5,5,8,.94);backdrop-filter:blur(24px) saturate(200%);
+  -webkit-backdrop-filter:blur(24px) saturate(200%);
+  border-top:1px solid rgba(168,85,247,.12);
+  flex-shrink:0;z-index:100;padding-bottom:env(safe-area-inset-bottom);
+  box-shadow:0 -4px 24px rgba(0,0,0,.5)}
 .nt{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
   padding:8px 4px 10px;gap:3px;border:none;background:none;color:var(--txt3);
   font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;
   transition:var(--tr);position:relative;border-radius:0;overflow:visible}
-.nt.on{color:var(--acc)}
-.nt.on::before{content:'';position:absolute;top:0;left:25%;right:25%;height:2.5px;
-  background:linear-gradient(90deg,var(--acc),var(--cyan));border-radius:0 0 4px 4px;
-  animation:pop-in .2s ease}
+.nt.on{color:var(--acc);text-shadow:0 0 10px rgba(168,85,247,.4)}
+.nt.on::before{content:'';position:absolute;top:0;left:20%;right:20%;height:2.5px;
+  background:linear-gradient(90deg,var(--acc),var(--cyan));border-radius:0 0 6px 6px;
+  animation:pop-in .2s ease;box-shadow:0 0 8px var(--glow)}
 .nt-ico{font-size:22px;transition:var(--tr)}
 .nt.on .nt-ico{transform:scale(1.12)}
 .badge{position:absolute;top:4px;right:calc(50% - 22px);background:var(--acc);
@@ -4798,45 +5739,83 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 
 
 /* ─── player ─────────────────────────────────────────────────── */
-#p-player{background:#000}
-#vwrap{position:relative;background:#000;flex-shrink:0;width:100%}
+#p-player{background:var(--bg)}
+#vwrap{position:relative;background:#000;flex-shrink:0;width:100%;
+  border-radius:var(--r);overflow:hidden;margin:0;
+  box-shadow:0 0 0 1px rgba(168,85,247,.1), 0 20px 60px rgba(0,0,0,.7)}
 #vid{width:100%;display:block;aspect-ratio:16/9;background:#000;max-height:58dvh}
 @media(min-width:900px){ #vid{max-height:55vh;aspect-ratio:16/9}}
 #vph{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
-  justify-content:center;gap:12px;pointer-events:none;
-  background:radial-gradient(ellipse at 50% 55%,var(--s2) 0%,#000 70%);
-  transition:opacity .35s;color:var(--txt3);font-size:13px}
-#vph-ico{font-size:52px;opacity:.18;animation:float 3.5s ease infinite}
+  justify-content:center;gap:14px;pointer-events:none;
+  background:radial-gradient(ellipse 80% 70% at 50% 55%,rgba(168,85,247,.06) 0%,#000 65%);
+  transition:opacity .5s;color:var(--txt3);font-size:13px}
+#vph-ico{font-size:60px;opacity:.18;animation:float 3.5s ease infinite;
+  filter:drop-shadow(0 0 20px rgba(168,85,247,.3))}
+#vph-txt{font-size:12px;color:var(--txt3);letter-spacing:.8px;font-weight:600;
+  text-transform:uppercase}
 
-.pinfo{background:linear-gradient(180deg,var(--s1),var(--s2));padding:11px 14px;
-  border-bottom:1px solid var(--bdr);flex-shrink:0}
-#np{font-size:14px;font-weight:600;color:var(--txt);overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap;margin-bottom:2px}
-#pu{font-size:11px;color:var(--acc);overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap;cursor:pointer;transition:var(--tr)}
-#pu:hover{color:var(--cyan)}
+.pinfo{background:linear-gradient(180deg,rgba(9,9,15,.95),rgba(14,14,24,.9));
+  padding:11px 16px;border-bottom:1px solid var(--bdr);flex-shrink:0;
+  backdrop-filter:blur(8px)}
+#np{font-size:14px;font-weight:700;color:var(--txt);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;margin-bottom:3px;
+  background:linear-gradient(90deg,var(--txt),rgba(168,85,247,.9));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+#pu{font-size:11px;color:rgba(168,85,247,.7);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;cursor:pointer;transition:var(--tr);font-family:'DM Mono','Cascadia Code',monospace}
+#pu:hover{color:var(--acc)}
 
-.pctrl{background:var(--s2);padding:12px 14px;display:flex;flex-direction:column;
+.pctrl{background:rgba(9,9,15,.92);backdrop-filter:blur(16px);
+  padding:12px 14px;display:flex;flex-direction:column;
+  border-top:1px solid rgba(168,85,247,.1);
   gap:10px;flex-shrink:0;border-bottom:1px solid var(--bdr)}
 .ctrl-r{display:flex;align-items:center;gap:7px}
 .ctrl-r.ctr{justify-content:center}
-.pbig{width:54px;height:54px;font-size:22px;border-radius:50%;
-  background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
-  box-shadow:0 4px 22px var(--glow);flex-shrink:0}
-.pbig:hover:not(:disabled){box-shadow:0 6px 30px var(--glow);filter:brightness(1.1);
-  transform:scale(1.06)!important}
-.pnav{width:42px;height:42px;border-radius:50%;font-size:16px;padding:0;flex-shrink:0}
+.pbig{width:56px;height:56px;font-size:22px;border-radius:50%;
+  background:conic-gradient(from 120deg, var(--acc), var(--cyan), var(--acc2));
+  color:#fff;box-shadow:0 0 0 3px rgba(168,85,247,.2),0 6px 28px var(--glow2);
+  flex-shrink:0;transition:all .2s cubic-bezier(.34,1.56,.64,1)}
+.pbig:hover:not(:disabled){box-shadow:0 0 0 5px rgba(168,85,247,.35),0 8px 36px var(--glow);
+  transform:scale(1.1)!important;filter:brightness(1.08)}
+.pbig:active:not(:disabled){transform:scale(.94)!important}
+.pnav{width:40px;height:40px;border-radius:50%;font-size:16px;padding:0;flex-shrink:0;
+  border:1px solid transparent;transition:all .15s}
+.pnav:hover:not(:disabled){border-color:rgba(168,85,247,.3);
+  background:rgba(168,85,247,.12)!important;color:var(--acc)}
 .vrow{display:flex;align-items:center;gap:9px}
-.vrow input[type=range]{flex:1;height:4px;accent-color:var(--acc)}
+.vrow input[type=range]{flex:1;height:4px;accent-color:var(--acc);cursor:pointer}
+.vrow input[type=range]::-webkit-slider-thumb{width:14px;height:14px;
+  background:var(--acc);border-radius:50%;box-shadow:0 0 6px var(--glow2)}
 .vlbl{font-size:11px;color:var(--txt2);width:28px;text-align:right;flex-shrink:0}
-.recrow{display:flex;align-items:center;gap:8px}
-#rbtn{height:34px;padding:0 14px}
+.recrow{display:flex;flex-direction:column;gap:6px;padding:6px 0 2px}
+.rec-main-row{display:flex;align-items:center;gap:8px}
+#rbtn{height:34px;padding:0 14px;flex-shrink:0}
 #rbtn.rec{animation:rec-glow 1.5s ease infinite;
   background:rgba(239,68,68,.18);color:var(--red);border:1px solid rgba(239,68,68,.4)}
 .rtimer{font-size:13px;color:var(--red);font-variant-numeric:tabular-nums;font-weight:700;
   display:none;letter-spacing:.5px}
 .rtimer.vis{display:block;animation:blink .9s infinite}
 .rfname{font-size:11px;color:var(--txt3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.rec-size{font-size:11px;color:var(--acc);font-variant-numeric:tabular-nums;white-space:nowrap;
+  display:none;font-weight:600}
+.rec-size.vis{display:block}
+/* Recording options panel */
+.rec-opts{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding-top:2px}
+.rec-opts.hidden-opts{display:none}
+.rec-opt-row{display:flex;align-items:center;gap:5px;flex-shrink:0}
+.rec-opt-lbl{font-size:10px;color:var(--txt3);white-space:nowrap;font-weight:700;letter-spacing:.3px}
+.rec-sel{height:26px;font-size:11px;padding:0 6px;background:var(--s3);
+  border:1px solid var(--bdr2);color:var(--txt1);border-radius:var(--rss);cursor:pointer}
+.rec-dir-inp{height:26px;font-size:11px;padding:0 7px;background:var(--s3);
+  border:1px solid var(--bdr2);color:var(--txt2);border-radius:var(--rss);
+  width:160px;cursor:pointer}
+.rec-dir-inp:not([readonly]){color:var(--txt1);border-color:var(--acc)}
+/* Progress bar for timed recordings */
+.rec-prog-wrap{display:flex;align-items:center;gap:8px;margin-top:2px}
+.rec-prog-bar{flex:1;height:4px;background:var(--s4);border-radius:3px;overflow:hidden}
+.rec-prog-fill{height:100%;background:linear-gradient(90deg,var(--red),var(--orange));
+  border-radius:3px;transition:width 1s linear;width:0%}
+.rec-prog-lbl{font-size:10px;color:var(--txt3);white-space:nowrap;font-variant-numeric:tabular-nums}
 
 /* ─── log ─────────────────────────────────────────────────────── */
 #p-log #logout{background:var(--bg)}
@@ -4962,6 +5941,9 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 @keyframes fade-up{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 @keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
 @keyframes spin{to{transform:rotate(360deg)}}
+@keyframes shimmer{0%{background-position:-200% center}100%{background-position:200% center}}
+.loading-shimmer{background:linear-gradient(90deg,var(--s3) 25%,var(--s4) 50%,var(--s3) 75%);
+  background-size:200% 100%;animation:shimmer 1.5s infinite;border-radius:4px}
 @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
 @keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.35}}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
@@ -4971,6 +5953,99 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 @keyframes slide-up{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
 
 .hidden{display:none!important}
+
+/* ─── Channel/Item cards (premium) ──────────────────────────── */
+.icard,
+div[onclick*="loadCat"],
+div[onclick*="playItem"]{transition:background .15s, border-color .15s, box-shadow .15s}
+
+/* ─── Local File Browser modal ──────────────────────────── */
+#fb-overlay{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.65);
+  display:none;align-items:center;justify-content:center;
+  backdrop-filter:blur(4px);padding:12px}
+#fb-overlay.open{display:flex}
+#fb-modal{background:var(--s2);border:1px solid var(--bdr2);border-radius:var(--r);
+  width:min(520px,98vw);max-height:88dvh;display:flex;flex-direction:column;
+  box-shadow:0 24px 64px rgba(0,0,0,.8);animation:slide-up .25s cubic-bezier(.34,1.56,.64,1)}
+.fbm-hdr{display:flex;align-items:center;gap:8px;padding:14px 16px;
+  border-bottom:1px solid var(--bdr);flex-shrink:0}
+.fbm-hdr h2{flex:1;font-size:14px;font-weight:800;
+  background:linear-gradient(90deg,var(--txt),var(--acc));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.fbm-path{font-size:11px;color:var(--txt3);padding:6px 16px 4px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-bottom:1px solid var(--bdr);flex-shrink:0}
+#fb-manual-row{display:flex;gap:6px;padding:8px 14px;border-bottom:1px solid var(--bdr);flex-shrink:0}
+#fb-manual{flex:1;height:32px;font-size:12px;background:var(--s3);border:1px solid var(--bdr2);
+  color:var(--txt);border-radius:var(--rsm);padding:0 10px}
+.fb-list{flex:1;overflow-y:auto;padding:8px}
+.fb-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:var(--rsm);
+  cursor:pointer;transition:var(--tr);border:1px solid transparent;margin-bottom:3px}
+.fb-item:hover{background:var(--s3);border-color:var(--bdr)}
+.fb-item.fb-dir{color:var(--acc)}
+.fb-item.fb-file{}
+.fb-ico{font-size:20px;flex-shrink:0;width:26px;text-align:center}
+.fb-name{flex:1;font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fb-size{font-size:11px;color:var(--txt3);flex-shrink:0}
+.fb-empty{text-align:center;padding:40px 16px;color:var(--txt3);font-size:13px}
+.fbm-up{height:32px;padding:0 12px;font-size:12px}
+
+
+/* ─── Panel Continuar Viendo ──────────────────────────────── */
+#cw-overlay{position:fixed;inset:0;z-index:601;background:rgba(0,0,0,.75);
+  display:none;align-items:flex-end;justify-content:center;
+  backdrop-filter:blur(8px)}
+#cw-overlay.open{display:flex}
+#cw-box{background:var(--s2);border:1px solid var(--bdr2);border-radius:20px 20px 0 0;
+  width:100%;max-width:640px;max-height:70dvh;display:flex;flex-direction:column;
+  box-shadow:0 -8px 60px rgba(0,0,0,.7);animation:slide-up .25s ease}
+.cw-item{display:flex;align-items:center;gap:12px;padding:12px 16px;
+  border-bottom:1px solid var(--bdr);cursor:pointer;transition:background .15s}
+.cw-item:hover{background:var(--s3)}
+.cw-item:last-child{border-bottom:none}
+.cw-thumb{width:48px;height:48px;border-radius:8px;background:var(--s4);
+  display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0}
+.cw-info{flex:1;min-width:0}
+.cw-title{font-size:13px;font-weight:700;color:var(--txt);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cw-meta{font-size:11px;color:var(--txt2);margin-top:2px}
+.cw-prog{height:3px;background:var(--s4);border-radius:3px;margin-top:6px;overflow:hidden}
+.cw-prog-fill{height:100%;background:linear-gradient(90deg,var(--acc),var(--cyan));
+  border-radius:3px;transition:width .3s}
+.cw-del{background:none;border:none;color:var(--txt3);font-size:16px;padding:4px 8px;
+  cursor:pointer;border-radius:6px;transition:var(--tr)}
+.cw-del:hover{color:var(--red);background:rgba(248,113,113,.1)}
+
+.ts-section{margin-bottom:16px}
+.ts-title{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1.2px;
+  color:var(--txt3);margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--bdr)}
+.ts-opt{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;
+  cursor:pointer;font-size:13px;color:var(--txt);margin-bottom:4px;transition:background .15s}
+.ts-opt:hover{background:var(--s3)}
+.ts-opt input{accent-color:var(--acc);width:16px;height:16px}
+#track-overlay.open{display:flex}
+
+/* ── Gesture control overlay ─────────────────────────────────────── */
+#gesture-left,#gesture-right{position:absolute;top:0;bottom:0;width:40%;z-index:10;
+  display:flex;align-items:center;justify-content:center;pointer-events:auto;
+  user-select:none;-webkit-user-select:none}
+#gesture-left{left:0}
+#gesture-right{right:0}
+.gesture-hint{position:absolute;padding:8px 18px;background:rgba(255,255,255,.15);
+  backdrop-filter:blur(8px);border-radius:30px;font-size:14px;font-weight:700;
+  color:#fff;pointer-events:none;opacity:0;transition:opacity .2s;white-space:nowrap}
+#vol-bar-wrap{position:absolute;right:12px;top:50%;transform:translateY(-50%);
+  height:120px;width:6px;background:rgba(255,255,255,.15);border-radius:3px;
+  overflow:hidden;opacity:0;transition:opacity .3s;pointer-events:none}
+#vol-bar-fill{position:absolute;bottom:0;width:100%;background:var(--acc);
+  border-radius:3px;transition:height .1s}
+
+/* ── Premium player enhancements ──────────────────────────────────── */
+#p-player{position:relative}
+.vwrap{position:relative;background:#000;border-radius:var(--r);overflow:hidden;
+  box-shadow:0 0 0 1px rgba(168,85,247,.12), 0 24px 80px rgba(0,0,0,.8);}
+.vwrap::before{content:'';position:absolute;inset:-1px;border-radius:inherit;
+  background:linear-gradient(135deg,rgba(168,85,247,.08) 0%,transparent 50%);
+  pointer-events:none;z-index:1}
 
 /* ─── What's On Now modal ─────────────────────────────────── */
 #won-overlay{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.6);
@@ -5030,14 +6105,16 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 <header id="hdr">
   <div id="hdr-bar">
     <div id="cdot"></div>
-    <span id="hdr-status">Not connected — tap ⚙ to set up</span>
+    <span id="hdr-status">Sin conexión — pulsa ⚙ para configurar</span>
     <div class="hdr-r">
       <span id="busy-sp" class="spin hidden"></span>
       {{ tags_html | safe }}
-      <button class="btn-ghost hdr-ico" id="stopbtn" onclick="doStop()" disabled title="Stop">⏹</button>
-      <button class="btn-ghost hdr-ico" onclick="openWhatsOn()" title="What's on Now">📺</button>
-      <button class="btn-ghost hdr-ico" onclick="openPL()" title="Saved Playlists">📋</button>
-      <button class="btn-ghost hdr-ico" onclick="toggleCP()" title="Settings">⚙</button>
+      <button class="btn-ghost hdr-ico" id="stopbtn" onclick="doStop()" disabled title="Parar">⏹</button>
+      <button class="btn-ghost hdr-ico" onclick="openFiles()" title="Abrir Archivo Local">📂</button>
+      <button class="btn-ghost hdr-ico" onclick="openCW()" title="Continuar Viendo" id="cw-hdr-btn" style="position:relative">🕐<span id="cw-badge" class="badge" style="display:none"></span></button>
+      <button class="btn-ghost hdr-ico" onclick="openWhatsOn()" title="¿Qué hay ahora?">📺</button>
+      <button class="btn-ghost hdr-ico" onclick="openPL()" title="Listas Guardadas">📋</button>
+      <button class="btn-ghost hdr-ico" onclick="toggleCP()" title="Ajustes">⚙</button>
     </div>
   </div>
   <div id="cpanel">
@@ -5053,43 +6130,43 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
           <label>MAC</label><input id="i-mac" placeholder="00:1A:79:XX:XX:XX" style="max-width:200px">
         </div>
         <div style="display:flex;gap:6px;align-items:center">
-          <label title="Optional: external XMLTV EPG URL. Leave blank to use portal's own EPG.">EPG</label><input id="i-mac-epg" type="url" placeholder="https://… xmltv URL (optional)">
+          <label title="Optional: external XMLTV EPG URL. Dejar en blanco para usar el EPG del portal.">EPG</label><input id="i-mac-epg" type="url" placeholder="https://… URL XMLTV (opcional)">
         </div>
       </div>
       <div id="cr-xtream" class="cr hidden" style="flex-direction:column;align-items:stretch">
         <div style="display:flex;gap:6px;align-items:center">
           <label>URL</label><input id="i-xu" type="url" placeholder="http://server.host:8080">
-          <label>User</label><input id="i-us" placeholder="username" style="max-width:150px">
+          <label>User</label><input id="i-us" placeholder="usuario" style="max-width:150px">
         </div>
         <div style="display:flex;gap:6px;align-items:center">
-          <label title="Optional: external XMLTV EPG URL (e.g. epg.best). Leave blank to use provider's own EPG.">EPG</label><input id="i-epg" type="url" placeholder="https://epg.best/xmltv.php?… (optional)" style="flex:1">
-          <label>Pass</label><input id="i-pw" type="password" placeholder="password" style="max-width:150px">
+          <label title="Optional: external XMLTV EPG URL (e.g. epg.best). Dejar en blanco para usar el EPG del proveedor.">EPG</label><input id="i-epg" type="url" placeholder="https://epg.best/xmltv.php?… (opcional)" style="flex:1">
+          <label>Pass</label><input id="i-pw" type="password" placeholder="contraseña" style="max-width:150px">
         </div>
       </div>
       <div id="cr-m3u" class="cr hidden">
         <label>URL</label><input id="i-m3u" type="url" placeholder="http://example.com/list.m3u">
-        <label title="Optional: external XMLTV EPG URL. Leave blank to use tvg-url from M3U.">EPG</label><input id="i-m3u-epg" type="url" placeholder="https://epg.best/xmltv.php?… (optional)" style="max-width:300px">
+        <label title="Optional: external XMLTV EPG URL. Dejar en blanco para usar tvg-url del M3U.">EPG</label><input id="i-m3u-epg" type="url" placeholder="https://epg.best/xmltv.php?… (opcional)" style="max-width:300px">
       </div>
       <div class="cr-bot">
         <span id="portal-name-label" style="font-size:12px;font-weight:700;color:var(--acc);
               white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%;
               opacity:0.85">—</span>
         <div style="display:flex;gap:7px;align-items:center;flex-shrink:0">
-          <button class="btn-acc" id="cbtn" onclick="doConnect()" style="height:36px;min-width:120px">🔌 Connect</button>
+          <button class="btn-acc" id="cbtn" onclick="doConnect()" style="height:36px;min-width:120px">🔌 Conectar</button>
           <button id="save-profile-chk" onclick="toggleSaveChk(this)"
             style="height:36px;padding:0 12px;font-size:12px;border-radius:var(--rss);
                    border:1px solid var(--bdr2);background:var(--s3);color:var(--txt2);
                    cursor:pointer;white-space:nowrap;transition:var(--tr)"
-            >💾 Save</button>
+            >💾 Guardar</button>
         </div>
       </div>
       <!-- Output paths — always accessible from settings panel -->
       <div style="border-top:1px solid var(--bdr);padding-top:8px;display:flex;flex-direction:column;gap:6px">
-        <div style="font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1px;color:var(--txt3);padding-bottom:2px">Output Paths</div>
+        <div style="font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1px;color:var(--txt3);padding-bottom:2px">Rutas de Salida</div>
         <div class="prow" style="position:relative">
           <span class="plbl">M3U:</span>
           <input id="o-m3u" type="text" placeholder="/sdcard/Download/playlist.m3u" oninput="saveFP()" style="height:30px;font-size:12px">
-          <button class="btn-ghost psug-btn" onclick="togSug('m3u')" title="Suggestions">📁</button>
+          <button class="btn-ghost psug-btn" onclick="togSug('m3u')" title="Sugerencias">📁</button>
           <div class="psug" id="sg-m3u" style="top:auto;bottom:calc(100% + 3px)">
             <div class="psopt" onclick="pickP('m3u','/sdcard/Download/playlist.m3u')">/sdcard/Download/playlist.m3u</div>
             <div class="psopt" onclick="pickP('m3u','/storage/emulated/0/Download/playlist.m3u')">/storage/emulated/0/Download/playlist.m3u</div>
@@ -5097,9 +6174,9 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
           </div>
         </div>
         <div class="prow" style="position:relative">
-          <span class="plbl">Folder:</span>
+          <span class="plbl">Carpeta:</span>
           <input id="o-dir" type="text" placeholder="/sdcard/Download/" oninput="saveFP()" style="height:30px;font-size:12px">
-          <button class="btn-ghost psug-btn" onclick="togSug('dir')" title="Suggestions">📁</button>
+          <button class="btn-ghost psug-btn" onclick="togSug('dir')" title="Sugerencias">📁</button>
           <div class="psug" id="sg-dir" style="top:auto;bottom:calc(100% + 3px)">
             <div class="psopt" onclick="pickP('dir','/sdcard/Download/')">/sdcard/Download/</div>
             <div class="psopt" onclick="pickP('dir','/storage/emulated/0/Download/')">/storage/emulated/0/Download/</div>
@@ -5118,19 +6195,21 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   <!-- CATEGORIES -->
   <div class="panel active" id="p-cats">
     <div class="ph">
-      <h3>Categories</h3>
+      <h3>Categorías</h3>
       <div class="mtabs">
         <button class="mt" data-m="favs" onclick="setMode('favs')">⭐</button>
-        <button class="mt on" data-m="live" onclick="setMode('live')">📺<span class="mt-txt"> Live</span></button>
-        <button class="mt" data-m="vod" onclick="setMode('vod')">🎬<span class="mt-txt"> VOD</span></button>
+        <button class="mt on" data-m="live" onclick="setMode('live')">📺<span class="mt-txt"> Directo</span></button>
+        <button class="mt" data-m="vod" onclick="setMode('vod')">🎬<span class="mt-txt"> Películas</span></button>
         <button class="mt" data-m="series" onclick="setMode('series')">📂<span class="mt-txt"> Series</span></button>
       </div>
-      <!-- Category-level actions accessible via FAB on mobile only -->
+      <button class="ph-act-btn" onclick="openDrawer('cats')" title="Descargas / Acciones">
+        ⚡ Acciones<span class="ph-act-badge" id="ph-cat-badge"></span>
+      </button>
     </div>
     <div style="padding:8px 10px 0;flex-shrink:0;display:flex;flex-direction:column;gap:6px">
       <div class="tag-bar" id="tag-bar" style="display:none"></div>
       <div class="sbar"><span class="sico">🔍</span>
-        <input id="csrch" type="search" placeholder="Search categories…" oninput="filterCats()">
+        <input id="csrch" type="search" placeholder="Buscar categorías…" oninput="filterCats()">
       </div>
 
     </div>
@@ -5148,18 +6227,13 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   <!-- BROWSE -->
   <div class="panel" id="p-items">
     <div class="ph">
-      <h3 id="ittitle">Browse</h3>
+      <h3 id="ittitle">Explorar</h3>
       <button class="btn-ghost btn-sm" id="backbtn" onclick="goBack()" disabled>◀ Back</button>
     </div>
     <div style="padding:10px 10px 0;display:flex;flex-direction:column;gap:6px;flex-shrink:0">
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
-        <div class="bcrum" id="bcrum" style="flex:1;min-width:0"><span class="bc-s">Categories</span></div>
-        <button class="ph-act-btn" onclick="openDrawer('items')" title="Download / Actions" id="ph-items-act-btn">
-          ⚡ Actions<span class="ph-act-badge" id="ph-item-badge"></span>
-        </button>
-      </div>
+      <div class="bcrum" id="bcrum"><span class="bc-s">Categories</span></div>
       <div class="sbar"><span class="sico">🔍</span>
-        <input id="isrch" type="search" placeholder="Search items…" oninput="filterItems()">
+        <input id="isrch" type="search" placeholder="Buscar elementos…" oninput="filterItems()">
       </div>
     </div>
     <div style="flex:1;overflow-y:auto;padding:6px 10px 0;min-height:0" id="ilist"></div>
@@ -5175,23 +6249,31 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   <div class="panel" id="p-player" style="background:#000">
     <div id="vwrap">
       <video id="vid" controls preload="none" playsinline webkit-playsinline></video>
-      <div id="vph">
+      <div id="gesture-left">
+          <span class="gesture-hint" id="gh-left"></span>
+        </div>
+        <div id="gesture-right">
+          <span class="gesture-hint" id="gh-right"></span>
+          <div id="vol-bar-wrap"><div id="vol-bar-fill" style="height:100%"></div></div>
+        </div>
+        <div id="vph">
         <div id="vph-ico">▶</div>
-        <div>No stream loaded</div>
+        <div>Sin stream cargado</div>
       </div>
     </div>
     <div class="pinfo">
-      <div id="np">No stream loaded</div>
-      <div id="pu" onclick="cpyUrl()" title="Tap to copy stream URL">—</div>
+      <div id="np">Sin stream cargado</div>
+      <div id="pu" onclick="cpyUrl()" title="Pulsa para copiar URL del stream">—</div>
     </div>
     <div class="pctrl">
       <div class="ctrl-r ctr">
-        <button class="btn-ghost pnav" onclick="playerPrev()" title="Prev">⏮</button>
+        <button class="btn-ghost pnav" onclick="playerPrev()" title="Anterior">⏮</button>
         <button class="pbig" id="ppbtn" onclick="playerPP()">▶</button>
-        <button class="btn-ghost pnav" onclick="playerStop()" title="Stop">⏹</button>
-        <button class="btn-ghost pnav" onclick="playerNext()" title="Next">⏭</button>
-        <button class="btn-ghost pnav" id="epgbtn" onclick="showEPG()" title="EPG" style="font-size:14px;opacity:0.35">📅</button>
-        <button class="btn-ghost pnav" id="catchupbtn" onclick="showCatchup()" title="Catch-up TV" style="font-size:16px;opacity:0.35">↺</button>
+        <button class="btn-ghost pnav" onclick="playerStop()" title="Parar">⏹</button>
+        <button class="btn-ghost pnav" onclick="playerNext()" title="Siguiente">⏭</button>
+        <button class="btn-ghost pnav" id="epgbtn" onclick="showEPG()" title="Guía EPG" style="font-size:14px;opacity:0.35">📅</button>
+        <button class="btn-ghost pnav" id="catchupbtn" onclick="showCatchup()" title="TV a la Carta" style="font-size:16px;opacity:0.35">↺</button>
+        <button class="btn-ghost pnav" id="tracksbtn" onclick="openTracksForCurrent()" title="Pistas de Audio/Subtítulos" style="font-size:14px;opacity:0.5">🎛️</button>
       </div>
       <div style="min-height:16px;padding:0 4px">
         <span id="epg-now" style="font-size:11px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block"></span>
@@ -5202,19 +6284,56 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
         <span class="vlbl" id="vlbl">80</span>
         <span style="font-size:15px">🔊</span>
       </div>
-      <div class="recrow">
-        <button class="btn-red" id="rbtn" onclick="togRec()">⏺ Record</button>
-        <span class="rtimer" id="rtimer">00:00:00</span>
-        <span class="rfname" id="rfname"></span>
+      <div class="recrow" id="recpanel">
+        <!-- Fila principal: botón grabar + timer + tamaño -->
+        <div class="rec-main-row">
+          <button class="btn-red" id="rbtn" onclick="togRec()">⏺ Grabar</button>
+          <span class="rtimer" id="rtimer">00:00:00</span>
+          <span class="rec-size" id="rec-size"></span>
+          <span class="rfname" id="rfname"></span>
+        </div>
+        <!-- Opciones de grabación (visible solo cuando no está grabando) -->
+        <div class="rec-opts" id="rec-opts">
+          <div class="rec-opt-row">
+            <label class="rec-opt-lbl">Formato</label>
+            <select id="rec-fmt" class="rec-sel">
+              <option value="mkv" selected>MKV (recomendado)</option>
+              <option value="ts">TS (más compatible)</option>
+              <option value="mp4">MP4</option>
+            </select>
+          </div>
+          <div class="rec-opt-row">
+            <label class="rec-opt-lbl">⏱ Duración máx.</label>
+            <select id="rec-dur" class="rec-sel">
+              <option value="0" selected>Sin límite</option>
+              <option value="1800">30 min</option>
+              <option value="3600">1 hora</option>
+              <option value="5400">1h 30min</option>
+              <option value="7200">2 horas</option>
+              <option value="10800">3 horas</option>
+            </select>
+          </div>
+          <div class="rec-opt-row" style="flex:1;min-width:120px">
+            <label class="rec-opt-lbl">📁 Carpeta</label>
+            <input id="rec-dir-input" class="rec-dir-inp" placeholder="Usa la ruta de abajo ↓"
+              title="Dejar vacío para usar la carpeta configurada en Ajustes" readonly
+              onclick="this.readOnly=false" onblur="this.readOnly=!!this.value">
+          </div>
+        </div>
+        <!-- Barra de progreso (grabación programada) -->
+        <div class="rec-prog-wrap" id="rec-prog-wrap" style="display:none">
+          <div class="rec-prog-bar"><div class="rec-prog-fill" id="rec-prog-fill"></div></div>
+          <span class="rec-prog-lbl" id="rec-prog-lbl"></span>
+        </div>
       </div>
     </div>
     <!-- Desktop-only inline log (hidden on mobile via CSS) -->
     <div id="desktop-log" style="display:none;flex-direction:column;
       flex:1;overflow:hidden;border-top:1px solid var(--bdr);min-height:100px">
       <div class="ph" style="padding:8px 14px">
-        <h3>Activity Log</h3>
+        <h3>Registro de Actividad</h3>
         <button class="btn-ghost" onclick="clearLog()"
-          style="height:24px;padding:0 8px;font-size:11px;border-radius:var(--rss)">Clear</button>
+          style="height:24px;padding:0 8px;font-size:11px;border-radius:var(--rss)">Limpiar</button>
       </div>
       <div id="desktop-logout" style="flex:1;overflow-y:auto;padding:8px 12px;
         font-family:'Cascadia Code','JetBrains Mono','Courier New',monospace;
@@ -5230,12 +6349,12 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
       width:100%;max-width:600px;padding:16px;box-shadow:var(--sh);
       border-top:1px solid var(--bdr2);max-height:60vh;overflow-y:auto">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
-        <span style="font-size:13px;font-weight:700;color:var(--txt1)" id="epg-ch-name">EPG</span>
+        <span style="font-size:13px;font-weight:700;color:var(--txt1)" id="epg-ch-name">Guía EPG</span>
         <button class="btn-ghost" onclick="closeEPG()"
           style="height:28px;width:28px;padding:0;font-size:14px;border-radius:var(--rss)">✕</button>
       </div>
       <div id="epg-body">
-        <div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Loading…</div>
+        <div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Cargando…</div>
       </div>
     </div>
   </div>
@@ -5256,7 +6375,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
       </div>
       <div id="catchup-status" style="font-size:11px;color:var(--txt3);min-height:14px;margin-bottom:4px"></div>
       <div id="catchup-body" style="margin-top:4px">
-        <div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Loading…</div>
+        <div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Cargando…</div>
       </div>
     </div>
   </div>
@@ -5264,7 +6383,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   <!-- LOG (mobile tab) -->
   <div class="panel" id="p-log" style="background:var(--bg)">
     <div class="ph">
-      <h3>Activity Log</h3>
+      <h3>Registro de Actividad</h3>
       <button class="btn-ghost" onclick="clearLog()"
         style="height:24px;padding:0 8px;font-size:11px;border-radius:var(--rss)">Clear</button>
     </div>
@@ -5278,17 +6397,17 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 <!-- BOTTOM NAV -->
 <nav id="botnav">
   <button class="nt on" id="t-cats" onclick="showT('p-cats','t-cats')">
-    <span class="nt-ico">📁</span><span>Browse</span>
+    <span class="nt-ico">📁</span><span>Explorar</span>
   </button>
   <button class="nt" id="t-items" onclick="showT('p-items','t-items')">
     <span class="nt-ico">📋</span><span>Items</span>
     <span class="badge" id="badge"></span>
   </button>
   <button class="nt" id="t-player" onclick="showT('p-player','t-player')">
-    <span class="nt-ico">▶️</span><span>Player</span>
+    <span class="nt-ico">▶️</span><span>Reproductor</span>
   </button>
   <button class="nt" id="t-log" onclick="showT('p-log','t-log')">
-    <span class="nt-ico">📜</span><span>Log</span>
+    <span class="nt-ico">📜</span><span>Registro</span>
   </button>
 </nav>
 
@@ -5311,15 +6430,15 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
         <div class="adr-count" id="adr-cat-count">0 selected</div>
       </div>
       <div class="adr-section">
-        <div class="adr-section-title">Download Selected</div>
+        <div class="adr-section-title">Descargar Seleccionados</div>
         <button class="adr-btn btn-blue" id="adr-cat-m3u" onclick="dlSelCats('m3u');closeDrawer()" disabled>
           <span class="adr-ico">💾</span>
-          <span class="adr-lbl">Export as M3U</span>
+          <span class="adr-lbl">Exportar como M3U</span>
           <span class="adr-sub" id="adr-cat-m3u-sub"></span>
         </button>
         <button class="adr-btn btn-acc" id="adr-cat-mkv" onclick="dlSelCats('mkv');closeDrawer()" disabled>
           <span class="adr-ico">🎬</span>
-          <span class="adr-lbl">Download as MKV</span>
+          <span class="adr-lbl">Descargar como MKV</span>
           <span class="adr-sub" id="adr-cat-mkv-sub"></span>
         </button>
       </div>
@@ -5338,12 +6457,12 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
         <div class="adr-section-title">Selected Items</div>
         <button class="adr-btn btn-blue" id="adr-dlm3u" onclick="dlM3U();closeDrawer()" disabled>
           <span class="adr-ico">💾</span>
-          <span class="adr-lbl">Export selected → M3U</span>
+          <span class="adr-lbl">Exportar seleccionados → M3U</span>
           <span class="adr-sub" id="adr-m3u-sub"></span>
         </button>
         <button class="adr-btn btn-acc" id="adr-dlmkv" onclick="dlMKV();closeDrawer()" disabled>
           <span class="adr-ico">🎬</span>
-          <span class="adr-lbl">Download selected → MKV</span>
+          <span class="adr-lbl">Descargar seleccionados → MKV</span>
           <span class="adr-sub" id="adr-mkv-sub"></span>
         </button>
       </div>
@@ -5351,7 +6470,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
         <div class="adr-section-title">Whole Category</div>
         <button class="adr-btn btn-ghost" onclick="dlCat();closeDrawer()">
           <span class="adr-ico">📂</span>
-          <span class="adr-lbl">Export entire category → M3U</span>
+          <span class="adr-lbl">Exportar categoría completa → M3U</span>
           <span class="adr-sub" id="adr-cat-all-sub"></span>
         </button>
       </div>
@@ -5362,6 +6481,22 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 <div id="toasts"></div>
 
 <!-- WHAT'S ON NOW MODAL -->
+<div id="fb-overlay" onclick="if(event.target===this)closeFiles()">
+  <div id="fb-modal">
+    <div class="fbm-hdr">
+      <span style="font-size:22px">📂</span>
+      <h2>Open Local File</h2>
+      <button class="btn-ghost fbm-up" id="fb-upbtn" onclick="fbUp()" title="Subir">⬆ Subir</button>
+      <button class="btn-ghost" style="height:32px;padding:0 10px;font-size:16px" onclick="closeFiles()">✕</button>
+    </div>
+    <div class="fbm-path" id="fb-path-label">—</div>
+    <div id="fb-manual-row">
+      <input id="fb-manual" placeholder="Escribe o pega una ruta y pulsa Ir →">
+      <button class="btn-acc" style="height:32px;padding:0 12px;font-size:12px" onclick="fbGo()">Go</button>
+    </div>
+    <div class="fb-list" id="fb-list"><div class="fb-empty">Cargando…</div></div>
+  </div>
+</div>
 <div id="won-overlay" onclick="if(event.target===this)closeWhatsOn()">
   <div id="won-modal">
     <div class="won-hdr">
@@ -5370,7 +6505,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
       <button class="btn-ghost" onclick="closeWhatsOn()" style="height:28px;padding:0 10px;font-size:12px">✕</button>
     </div>
     <div class="won-search">
-      <input id="won-srch" type="search" placeholder="Filter by title or channel…" oninput="wonFilter()" autocomplete="off">
+      <input id="won-srch" type="search" placeholder="Filtrar por título o canal…" oninput="wonFilter()" autocomplete="off">
     </div>
     <div class="won-list" id="won-list">
       <div class="won-loading"><span class="spin"></span> Loading EPG data…</div>
@@ -5398,25 +6533,25 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
           <button class="btn-ghost pl-ct-btn" data-t="xtream" onclick="plSetCT('xtream')">📡 Xtream</button>
           <button class="btn-ghost pl-ct-btn" data-t="m3u_url" onclick="plSetCT('m3u_url')">📄 M3U</button>
         </div>
-        <div class="pl-row"><label>Name</label><input id="pl-name" placeholder="My Playlist"></div>
+        <div class="pl-row"><label>Name</label><input id="pl-name" placeholder="Mi Lista"></div>
         <div id="plf-mac">
           <div class="pl-row"><label>URL</label><input id="pl-url" type="url" placeholder="http://portal.host:8080"></div>
           <div class="pl-row"><label>MAC</label><input id="pl-mac" placeholder="00:1A:79:XX:XX:XX"></div>
-          <div class="pl-row"><label>EPG</label><input id="pl-mac-epg" type="url" placeholder="External EPG URL (optional)"></div>
+          <div class="pl-row"><label>EPG</label><input id="pl-mac-epg" type="url" placeholder="URL EPG externa (opcional)"></div>
         </div>
         <div id="plf-xtream" class="hidden">
           <div class="pl-row"><label>URL</label><input id="pl-xu" type="url" placeholder="http://server.host:8080"></div>
-          <div class="pl-row"><label>User</label><input id="pl-us" placeholder="username"></div>
-          <div class="pl-row"><label>Pass</label><input id="pl-pw" type="password" placeholder="password"></div>
-          <div class="pl-row"><label>EPG</label><input id="pl-epg" type="url" placeholder="External EPG URL (optional)"></div>
+          <div class="pl-row"><label>User</label><input id="pl-us" placeholder="usuario"></div>
+          <div class="pl-row"><label>Pass</label><input id="pl-pw" type="password" placeholder="contraseña"></div>
+          <div class="pl-row"><label>EPG</label><input id="pl-epg" type="url" placeholder="URL EPG externa (opcional)"></div>
         </div>
         <div id="plf-m3u" class="hidden">
           <div class="pl-row"><label>URL</label><input id="pl-m3u" type="url" placeholder="http://example.com/list.m3u"></div>
-          <div class="pl-row"><label>EPG</label><input id="pl-m3u-epg" type="url" placeholder="External EPG URL (optional)"></div>
+          <div class="pl-row"><label>EPG</label><input id="pl-m3u-epg" type="url" placeholder="URL EPG externa (opcional)"></div>
         </div>
         <div class="pl-row" style="justify-content:flex-end;gap:7px">
           <button class="btn-ghost" onclick="plClearForm()" style="height:34px;padding:0 12px;font-size:12px">Clear</button>
-          <button class="btn-acc" onclick="plSave()" style="height:34px;padding:0 16px;font-size:12px">💾 Save</button>
+          <button class="btn-acc" onclick="plSave()" style="height:34px;padding:0 16px;font-size:12px">💾 Guardar</button>
         </div>
       </div>
     </div>
@@ -5435,6 +6570,7 @@ let allCats=[], catsCache={}, selCats=new Map();
 let allItems=[], filtItems=[], navStack=[], selSet=new Set();
 let pUrl='', pName='', pIdx=-1;
 let hlsObj=null, mpegtsObj=null, recTmr=null, isRec=false, logEs=null, cpOpen=false;
+let _recScheduledSecs=0;
 const vid = document.getElementById('vid');
 
 // ── FAVOURITES ─────────────────────────────────────────────
@@ -5454,11 +6590,11 @@ function toggleFav(i){
   const name=it.name||it.o_name||it.fname||'';
   let arr=loadFavs();
   const idx=arr.findIndex(f=>f.name===name);
-  if(idx>=0){ arr.splice(idx,1); toast('Removed from favourites','info'); }
+  if(idx>=0){ arr.splice(idx,1); toast('Eliminado de favoritos','info'); }
   else {
     // Store the current mode so we can resolve correctly when playing from favs
     arr.push({...it, _fav_mode: mode});
-    toast('⭐ Added to favourites','ok');
+    toast('⭐ Añadido a favoritos','ok');
   }
   saveFavs(arr);
   if(mode==='favs') showFavs();
@@ -5511,7 +6647,7 @@ async function doConnect(){
   };
   const saveBtn = document.getElementById('save-profile-chk');
   const saveToProfile = saveBtn._on || false;
-  setBusy(true); setStatus('Connecting…'); closeCP();
+  setBusy(true); setStatus('Conectando…'); closeCP();
   try{
     const r=await fetch('/api/connect',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -5527,7 +6663,7 @@ async function doConnect(){
       mode='live';
       switchMode('live', catsCache['live']||[]);
       showT('p-cats','t-cats');
-      toast('✓ Connected!','ok');
+      toast('✓ ¡Conectado!','ok');
       // Save to profiles if toggle was active
       if(saveToProfile){
         const arr=plLoadAll();
@@ -5550,7 +6686,7 @@ async function doConnect(){
         arr.push(entry);
         plSaveAll(arr);
         renderPLList();
-        toast('✓ Connected & saved to profiles!','ok');
+        toast('✓ ¡Conectado y guardado en perfiles!','ok');
         // Reset save button
         saveBtn._on = true; // toggleSaveChk will flip it to false
         toggleSaveChk(saveBtn);
@@ -5559,7 +6695,7 @@ async function doConnect(){
       document.getElementById('cdot').classList.remove('on');
       setStatus('Error: '+(d.error||'Unknown'));
       document.getElementById('portal-name-label').textContent = '—';
-      toast(d.error||'Connection failed','err');
+      toast(d.error||'Error de conexión','err');
       alog('❌ '+(d.error||''),'e');
       toggleCP(); // re-open so user can fix credentials
     }
@@ -5631,7 +6767,7 @@ function _buildTagBar(cats){
   const tags=Object.keys(counts).sort();
   if(!tags.length){ bar.style.display='none'; _activeTag=''; return; }
   bar.style.display='flex';
-  bar.innerHTML='<span class="tag-pill on" data-tag="" onclick="setTag(this,\'\')">All</span>'
+  bar.innerHTML='<span class="tag-pill on" data-tag="" onclick="setTag(this,\'\')">Todo</span>'
     +tags.map(t=>`<span class="tag-pill" data-tag="${t}" onclick="setTag(this,'${t}')">${t} <span style="opacity:.55;font-size:9px">${counts[t]}</span></span>`).join('');
 }
 
@@ -5646,7 +6782,7 @@ let _renderedCats=[];
 function renderCats(cats){
   const el=document.getElementById('catlist');
   if(!cats.length){
-    el.innerHTML='<div style="text-align:center;padding:24px;color:var(--txt3);font-size:12px">No categories found</div>';
+    el.innerHTML='<div style="text-align:center;padding:24px;color:var(--txt3);font-size:12px">No se encontraron categorías</div>';
     return;
   }
   _renderedCats=cats;
@@ -5703,24 +6839,24 @@ function refreshCatBtns(){
 }
 async function dlSelCats(type){
   const cats=[...selCats.values()];
-  if(!cats.length){toast('Select categories first','wrn');return;}
+  if(!cats.length){toast('Selecciona categorías primero','wrn');return;}
   const op=document.getElementById('o-m3u').value.trim();
   const od=document.getElementById('o-dir').value.trim();
-  if(type==='m3u'&&!op){toast('Set M3U output path in ⚙ settings','wrn');return;}
-  if(type==='mkv'&&!od){toast('Set output folder in ⚙ settings','wrn');return;}
+  if(type==='m3u'&&!op){toast('Configura la ruta M3U en ⚙ ajustes','wrn');return;}
+  if(type==='mkv'&&!od){toast('Configura la carpeta de salida en ⚙ ajustes','wrn');return;}
   setBusy(true);
   let done=0;
   for(const cat of cats){
-    setStatus('Downloading cat '+(++done)+'/'+cats.length+': '+cat.title+'…');
+    setStatus('Descargando cat '+(++done)+'/'+cats.length+': '+cat.title+'…');
     const r=await fetch('/api/download/m3u',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({items:null,category:cat,mode,
         out_path:type==='m3u'?op:(od.replace(/\/?$/,'/')+mode+'_'+cat.title.replace(/[^a-z0-9]/gi,'_')+'.m3u')
       })});
     const d=await r.json();
-    if(!d.ok) toast('Error on '+cat.title+': '+(d.error||'?'),'err');
+    if(!d.ok) toast('Error en '+cat.title+': '+(d.error||'?'),'err');
   }
-  toast('Done! '+done+' categories exported','ok');
+  toast('¡Listo! '+done+' categorías exportadas','ok');
   pollBusy();
 }
 
@@ -5729,7 +6865,7 @@ function browseC(cj){
   const cat=(typeof cj==='string')?JSON.parse(cj):cj; curCat=cat;
   navStack=[]; setBusy(true);
   _setLoadingHeader(cat.title);
-  setStatus("Loading '"+cat.title+"'…");
+  setStatus("Cargando '"+cat.title+"'…");
   showSkels(12); showT('p-items','t-items');
   fetch('/api/items',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({mode, category:cat, browse:true})})
@@ -5737,7 +6873,7 @@ function browseC(cj){
     _setLoadingHeader(null);
     if(d.error){toast(d.error,'err');setStatus('Error: '+d.error);return;}
     allItems=d.items||[];
-    setStatus("'"+cat.title+"' — "+allItems.length+' items');
+    setStatus("'"+cat.title+"' — "+allItems.length+' elementos');
     showItems(cat.title, allItems);
   }).catch(e=>{_setLoadingHeader(null);toast(e.message,'err');}).finally(()=>setBusy(false));
 }
@@ -5751,7 +6887,7 @@ function showSkels(count=10, small=false){
 
 function _setLoadingHeader(text){
   const el=document.getElementById('ittitle');
-  if(!text){el.innerHTML='Browse';return;}
+  if(!text){el.innerHTML='Explorar';return;}
   el.innerHTML=`<span style="display:flex;align-items:center;gap:6px">`
     +`<span style="width:12px;height:12px;border-radius:50%;border:2px solid var(--acc);`
     +`border-top-color:transparent;animation:spin .7s linear infinite;flex-shrink:0"></span>`
@@ -5786,7 +6922,7 @@ function renderItems(items){
   const el=document.getElementById('ilist');
   document.getElementById('icount').textContent=items.length+' item'+(items.length!==1?'s':'');
   if(!items.length){
-    el.innerHTML='<div style="text-align:center;padding:20px;color:var(--txt3);font-size:12px">No items found</div>';
+    el.innerHTML='<div style="text-align:center;padding:20px;color:var(--txt3);font-size:12px">No se encontraron elementos</div>';
     refreshBtns(); return;
   }
   const isSeries=mode==='series'||mode==='vod';
@@ -5865,13 +7001,13 @@ function drillShow(i){
   const it=filtItems[i]; if(!it) return;
   setBusy(true);
   _setLoadingHeader(it.name);
-  setStatus("Loading eps for '"+it.name+"'…");
+  setStatus("Cargando eps de '"+it.name+"'…");
   showSkels(8, true);
   fetch('/api/episodes',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({item:it, mode, cat_id:curCat?.id||'', cat_title:curCat?.title||''})})
   .then(r=>r.json()).then(d=>{
     _setLoadingHeader(null);
-    if(d.error||!d.episodes?.length){toast('No episodes found','warn');showItems(it.name||'',allItems);return;}
+    if(d.error||!d.episodes?.length){toast('No se encontraron episodios','warn');showItems(it.name||'',allItems);return;}
     navStack.push({label:'Browse',items:[...allItems]});
     setStatus(it.name+' — '+d.episodes.length+' episodes');
     showItems(it.name, d.episodes);
@@ -5894,9 +7030,15 @@ function goBack(){
 }
 
 // ── PLAY ───────────────────────────────────────────────────
-async function playItem(i){
+async function playItem(i, _isRetry){
   const it=filtItems[i]; if(!it) return;
-  pIdx=i;
+  // If this is a fresh user click (not an internal retry), reset all retry counters
+  if(!_isRetry){
+    pIdx=i;
+    window._resolveRetries[i] = 0;
+    window._ptRetries = {};
+    window._mpegRetries = {};
+  }
   // When playing from favs, use the mode the item was originally saved under
   const itemMode = (mode==='favs') ? (it._fav_mode||'live') : mode;
   // Store item for EPG lookup (live channels only)
@@ -5907,7 +7049,7 @@ async function playItem(i){
   const name=it.name||it.o_name||it.fname||'Unknown';
   const direct=it._direct_url||it._url;
   if(direct){doPlay(direct,name);return;}
-  setNP('⟳ Resolving: '+name+'…');
+  setNP('⟳ Resolviendo: '+name+'…');
   forceTab('p-player','t-player');
   try{
     const r=await fetch('/api/resolve',{method:'POST',
@@ -5915,14 +7057,52 @@ async function playItem(i){
       body:JSON.stringify({item:it, mode:itemMode, category:curCat||{}})});
     const d=await r.json();
     if(d.url) doPlay(d.url, name);
-    else{setNP('✗ Could not resolve: '+name);toast('Could not resolve URL','err');}
-  }catch(e){setNP('✗ '+e.message);}
+    else{_stopChannel('No se pudo resolver: '+name);toast('Canal no disponible','err');}
+  }catch(e){_stopChannel(e.message);}
 }
 
 let _playerStopped = false;  // set true when user stops — blocks any pending retries
+window._pendingResumeAt = 0;
+window._pendingSubUrl = null;
+window._pendingMediaPath = '';
+window._progressTimer = null;
+
+function _showResumeBar(pos, dur){
+  const h=Math.floor(pos/3600), m=Math.floor((pos%3600)/60), s=pos%60;
+  const ts=(h>0?h+'h ':'')+m+'m '+s+'s';
+  const bar = document.getElementById('resume-bar');
+  if(!bar){ vid.play().catch(()=>{}); return; }
+  document.getElementById('resume-time').textContent = ts;
+  bar.style.display = 'flex';
+  document.getElementById('resume-yes').onclick = ()=>{
+    bar.style.display='none';
+    vid.currentTime = pos;
+    vid.play().catch(()=>{});
+  };
+  document.getElementById('resume-no').onclick = ()=>{
+    bar.style.display='none';
+    vid.currentTime=0; vid.play().catch(()=>{});
+  };
+}
+// Global per-channel retry counters — keyed by pIdx so switching channel resets them,
+// but NOT reset by doPlay() itself (avoids the infinite-retry freeze bug).
+window._resolveRetries = {};  // pIdx → number of full resolve retries
+window._ptRetries      = {};  // pIdx|urlSuffix → play_token retries
+window._mpegRetries    = {};  // pIdx|urlSuffix → generic mpegts retries
+const MAX_RESOLVE_RETRIES = 2;  // max times we re-resolve a dead channel
+const MAX_PT_RETRIES      = 2;
+const MAX_MPEG_RETRIES    = 3;
+
+function _stopChannel(reason){
+  // Unified "give up on this channel" path — shows error, unlocks UI
+  _playerStopped = true;
+  setNP('✗ ' + reason);
+  document.getElementById('ppbtn').textContent = '▶';
+  document.getElementById('vph').style.opacity = '1';
+}
 
 function _destroyPlayers(){
-  // Note: does NOT set _playerStopped — caller (doPlay/playerStop) manages that
+  _playerStopped = true;
   if(hlsObj){hlsObj.destroy();hlsObj=null;}
   if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
   vid.pause(); vid.removeAttribute('src'); vid.load();
@@ -5930,13 +7110,10 @@ function _destroyPlayers(){
 
 function doPlay(url, name, opts={}){
   pUrl=url; pName=name||url;
-  _playerStopped = false;                        // new play — clear stop flag
-  window._mseTranscodeFired = false;             // reset MSE transcode guard
-  if(window._ptRetries) window._ptRetries = {}; // reset play_token retry counter
-  if(window._mpegRetries) window._mpegRetries = {}; // reset general retry counter
-  window._remuxFired = false;                        // reset remux fallback flag
-  window._hlsRemuxFired = false;                     // reset HLS remux fallback flag
-  if(window._hlsRetries) window._hlsRetries = {};    // reset HLS retry counter
+  _playerStopped = false;   // new play — clear stop flag
+  // NOTE: do NOT reset _resolveRetries/_ptRetries/_mpegRetries here — they are
+  // managed per-channel-index so that re-entering doPlay() from a retry handler
+  // doesn't wipe the counter and cause an infinite loop (the freeze bug).
   setNP('▶ '+pName);
   document.getElementById('pu').textContent=url;
   document.getElementById('ppbtn').textContent='⏸';
@@ -5945,8 +7122,7 @@ function doPlay(url, name, opts={}){
 
   _destroyPlayers();
 
-  // Local /api/ URLs (transcode proxy) must never be wrapped in /api/proxy again
-  const px = url.startsWith('/api/') ? url : '/api/proxy?url='+encodeURIComponent(url);
+  const px='/api/proxy?url='+encodeURIComponent(url);
   const u=url.toLowerCase().split('?')[0];
   const qs=url.toLowerCase();
   const fallbackUrl=opts.fallbackUrl||null;
@@ -5954,7 +7130,9 @@ function doPlay(url, name, opts={}){
   // Stalker storage URLs (stalker_portal/storage/get.php) must NOT go through
   // /api/proxy — the proxy double-encodes their query string (?filename=...&token=...).
   // These are direct video files served by the portal; use them as-is.
-  const isStorageUrl = u.includes('storage/get.php') || u.includes('/storage/');
+  // Local files served via /api/localfile — stream directly, no proxy double-encoding
+  const isLocalFile = url.startsWith('/api/localfile');
+  const isStorageUrl = isLocalFile || u.includes('storage/get.php') || u.includes('/storage/');
 
   const isHls  = u.endsWith('.m3u8') || u.endsWith('.m3u')
                || u.includes('/hls/')
@@ -5962,8 +7140,7 @@ function doPlay(url, name, opts={}){
                || qs.includes('extension=m3u8');
 
   const isMpegTs = !isStorageUrl && (
-               url.includes('/api/hls_proxy') // server-side transcode proxy
-               || qs.includes('play_token=')  // MAC portals: short-lived token = raw MPEG-TS stream
+               qs.includes('play_token=')   // MAC portals: short-lived token = raw MPEG-TS stream
                || u.endsWith('.ts')
                || u.endsWith('.mpg')
                || u.endsWith('/mpegts')
@@ -5973,19 +7150,68 @@ function doPlay(url, name, opts={}){
 
   const playerType = isStorageUrl?'storage':isHls?'HLS':isMpegTs?'MPEG-TS':'direct';
   const mpegtsOk = isMpegTs && typeof mpegts!=='undefined' && mpegts.isSupported();
-  alog('▶ '+pName+' ['+playerType+(isMpegTs&&!mpegtsOk?' → MSE not supported, trying native':'')+']','k');
+  alog('▶ '+pName+' ['+playerType+(isMpegTs&&!mpegtsOk?' → MSE no soportado, probando nativo':'')+']','k');
 
-  if(isStorageUrl){
+  if(isLocalFile){
+    // ── Local file — direct stream (with optional transcode via /api/transcode) ──
+    alog('[Local] Reproduciendo: '+pName,'k');
+    const _tb=document.getElementById('tracksbtn'); if(_tb) _tb.style.opacity='1';
+    // We tell the browser to buffer aggressively (60 s ahead)
+    vid.preload = 'auto';
+    try { if(vid.buffered) vid.defaultPlaybackRate = 1; } catch(e){}
+    vid.src = url;
+
+    // Resume from saved position
+    const _rAt = window._pendingResumeAt || 0;
+    window._pendingResumeAt = 0;
+
+    // External subtitle track
+    const _subUrl = window._pendingSubUrl || null;
+    window._pendingSubUrl = null;
+
+    // Remove old tracks
+    Array.from(vid.querySelectorAll('track')).forEach(t=>t.remove());
+    if(_subUrl){
+      const tr = document.createElement('track');
+      tr.kind = 'subtitles'; tr.label = 'Subtitles';
+      tr.src = _subUrl; tr.default = true;
+      vid.appendChild(tr);
+    }
+
+    vid.addEventListener('loadedmetadata', function _onMeta(){
+      vid.removeEventListener('loadedmetadata', _onMeta);
+      if(_rAt > 5){
+        _showResumeBar(_rAt, vid.duration);
+      } else {
+        vid.play().catch(()=>{});
+      }
+      // Set track to showing if subtitle loaded
+      if(_subUrl){ try{ vid.textTracks[0].mode='showing'; }catch(e){} }
+    });
+    // Save progress every 5 s
+    if(window._progressTimer) clearInterval(window._progressTimer);
+    const _mpath = window._pendingMediaPath || url;
+    window._progressTimer = setInterval(()=>{
+      if(!vid.paused && !vid.ended && vid.currentTime>5 && vid.duration>10){
+        const rk = 'resume_'+btoa(_mpath).slice(0,32);
+        try{ localStorage.setItem(rk, JSON.stringify({pos:Math.floor(vid.currentTime), dur:Math.floor(vid.duration), name:pName, ts:Date.now()})); }catch(e){}
+        // También actualizar historial Continuar Viendo
+        try{ _cwAdd(_mpath, pName, vid.currentTime, vid.duration); }catch(e){}
+      }
+    }, 5000);
+    // Actualizar badge al cargar
+    try{ _cwUpdateBadge(); }catch(e){}
+
+  } else if(isStorageUrl){
     // ── Stalker storage/get.php — direct to video, no proxy ──────
-    // Proxying would double-encode the query string (?filename=...&token=...).
-    alog('[Storage] Playing direct (no proxy)','k');
+    alog('[Storage] Reproduciendo directo (sin proxy)','k');
     vid.src=url; vid.play().catch(()=>{});
 
   } else if(isHls && typeof Hls !== 'undefined' && Hls.isSupported()){
     // ── HLS via HLS.js ────────────────────────────────────────
     hlsObj=new Hls({
       enableWorker:false, lowLatencyMode:false,
-      maxBufferLength:60, maxMaxBufferLength:180,
+      maxBufferLength:60, maxMaxBufferLength:180, maxBufferSize:60*1024*1024,
       fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
       levelLoadingTimeOut:20000,
       xhrSetup(xhr){xhr.withCredentials=false;}
@@ -5994,106 +7220,44 @@ function doPlay(url, name, opts={}){
     hlsObj.attachMedia(vid);
     hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>vid.play().catch(()=>{}));
     hlsObj.on(Hls.Events.ERROR,(_,data)=>{
-      const _det=(data.details||'').toLowerCase();
-      const _isManifest=_det.includes('manifest');
-      // Log all fatal errors and manifest errors
-      if(data.fatal || _isManifest) alog('[HLS] '+data.type+': '+data.details+(data.fatal?' (fatal)':' (non-fatal)'),'e');
-      // 503/403/404 — hard stop immediately
-      const hc=data?.response?.code||0;
-      if(hc===503||hc===403||hc===404){
-        alog('[HLS] Channel unavailable ('+hc+') — stopping','e');
-        setNP('✗ Channel unavailable ('+hc+')');
-        document.getElementById('ppbtn').textContent='▶';
-        if(hlsObj){hlsObj.destroy();hlsObj=null;}
-        return;
-      }
-      // manifestParsingError: retrying same manifest is pointless, go straight to remux
-      if(_isManifest && !_playerStopped && !url.includes('hls_proxy') && !window._hlsRemuxFired){
-        window._hlsRemuxFired=true;
-        alog('[HLS] Manifest unparseable — trying ffmpeg remux…','w');
-        if(hlsObj){hlsObj.destroy();hlsObj=null;}
-        const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
-        setTimeout(()=>{
-          if(_playerStopped) return;
-          setNP('▶ '+name+' [remux]');
-          if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
-            _playerStopped=false;
-            mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{
-              enableWorker:false,liveBufferLatencyChasing:true,
-              liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3,
-            });
-            mpegtsObj.attachMediaElement(vid);
-            mpegtsObj.load();
-            vid.play().catch(()=>{});
-            mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
-              if(!_playerStopped){
-                alog('[HLS/remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
-                setNP('✗ Stream unavailable: '+name);
-                document.getElementById('ppbtn').textContent='▶';
-              }
-            });
-          } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
-        },0);
-        return;
-      }
-      if(!data.fatal) return;
-      // Fatal non-manifest errors
-      if(data.type===Hls.ErrorTypes.NETWORK_ERROR){
-        if(!window._hlsRetries) window._hlsRetries={};
-        const _hk=String(pIdx)+'|'+url.slice(-20);
-        window._hlsRetries[_hk]=(window._hlsRetries[_hk]||0)+1;
-        if(window._hlsRetries[_hk]<=3&&!_playerStopped){
-          setTimeout(()=>{if(hlsObj&&!_playerStopped)hlsObj.startLoad();},2500);
-        } else if(!_playerStopped&&!url.includes('hls_proxy')&&!window._hlsRemuxFired){
-          window._hlsRemuxFired=true;
-          alog('[HLS] Retries exhausted — trying ffmpeg remux…','w');
-          const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
-          if(hlsObj){hlsObj.destroy();hlsObj=null;}
-          setTimeout(()=>{
-            if(_playerStopped) return;
-            setNP('▶ '+name+' [remux]');
-            _playerStopped=false;
-            if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
-              mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{
-                enableWorker:false,liveBufferLatencyChasing:true,
-                liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3,
-              });
-              mpegtsObj.attachMediaElement(vid);
-              mpegtsObj.load();
-              vid.play().catch(()=>{});
-              mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
-                if(!_playerStopped){
-                  alog('[HLS/remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
-                  setNP('✗ Stream unavailable: '+name);
-                  document.getElementById('ppbtn').textContent='▶';
-                }
-              });
-            } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
-          },0);
-        } else if(!_playerStopped){
-          alog('[HLS] Stream failed — channel may be offline','e');
-          setNP('✗ Stream unavailable: '+name);
-          document.getElementById('ppbtn').textContent='▶';
-          if(hlsObj){hlsObj.destroy();hlsObj=null;}
+      if(data.fatal){
+        alog('[HLS] '+data.type+': '+data.details,'e');
+        const hc = data?.response?.code || 0;
+        // Hard failures (403/404/503 or no response) → stop, never retry
+        if(hc===503 || hc===403 || hc===404){
+          if(hlsObj){ hlsObj.destroy(); hlsObj=null; }
+          _stopChannel('Channel unavailable ('+hc+')'); return;
         }
-      } else if(data.type===Hls.ErrorTypes.MEDIA_ERROR){
-        hlsObj.recoverMediaError();
+        if(data.type===Hls.ErrorTypes.NETWORK_ERROR){
+          if(!window._hlsRetries) window._hlsRetries={};
+          const _hk=String(pIdx)+'|'+url.slice(-20);
+          window._hlsRetries[_hk]=(window._hlsRetries[_hk]||0)+1;
+          if(window._hlsRetries[_hk]<=3 && !_playerStopped)
+            setTimeout(()=>{if(hlsObj && !_playerStopped)hlsObj.startLoad();},2500);
+          else{ if(hlsObj){hlsObj.destroy();hlsObj=null;} _stopChannel('HLS stream failed'); }
+        } else if(data.type===Hls.ErrorTypes.MEDIA_ERROR)
+          hlsObj.recoverMediaError();
       }
     });
+
   } else if(isHls && vid.canPlayType('application/vnd.apple.mpegurl')){
     // ── Native HLS (Safari / iOS WebView) ─────────────────────
     vid.src=url; vid.play().catch(()=>{});
 
   } else if(isHls){
     // ── HLS.js not loaded, try native src as last resort ──────
-    alog('[HLS] hls.js unavailable — trying native src','w');
+    alog('[HLS] hls.js no disponible — probando src nativo','w');
     vid.src=url; vid.play().catch(()=>{});
 
   } else if(mpegtsOk){
     // ── Raw MPEG-TS via mpegts.js ──────────────────────────────
+    // isLive=true for live channels, false for catchup/VOD (prevents SourceBuffer errors)
     const isLiveStream = (opts.isLive !== false);
     mpegtsObj=mpegts.createPlayer({
-      type:'mse', isLive: isLiveStream, url:px, cors:true,
+      type:'mse',
+      isLive: isLiveStream,
+      url:px,
+      cors:true,
     },{
       enableWorker:false,
       liveBufferLatencyChasing: isLiveStream,
@@ -6103,7 +7267,7 @@ function doPlay(url, name, opts={}){
     });
     mpegtsObj.attachMediaElement(vid);
     mpegtsObj.load();
-        // For catchup/VOD: seek to start once metadata is ready
+    // For catchup/VOD: seek to start once metadata is ready
     if(!isLiveStream){
       vid.addEventListener('loadedmetadata', function _seekStart(){
         vid.removeEventListener('loadedmetadata', _seekStart);
@@ -6113,115 +7277,39 @@ function doPlay(url, name, opts={}){
     }
     mpegtsObj.on(mpegts.Events.ERROR,(et,ed)=>{
       const msg=(ed?.msg||JSON.stringify(ed));
-      const etStr = String(et||'');
-      const edStr = String(ed||'');
-      alog('[MPEGTS] '+etStr+': '+msg,'e');
+      alog('[MPEGTS] '+et+': '+msg,'e');
       const hasPlayToken = url.toLowerCase().includes('play_token=');
       const httpCode = ed?.code || ed?.httpStatusCode || 0;
-      // MediaMSEError = codec unsupported by browser (e.g. HEVC/H.265)
-      // Match both strict type check AND string fallback from the log: "MediaError: MediaMSEError"
-      const isMSEError = (et===mpegts.ErrorTypes.MEDIA_ERROR || etStr==='MediaError')
-                      && (edStr.includes('MSE') || edStr.includes('mse') || msg.includes('MSE'));
-      if(isMSEError){
-        if(!_playerStopped && !url.includes('transcode=1') && !window._mseTranscodeFired){
-          window._mseTranscodeFired = true; // guard: only fire once per play session
-          alog('[MPEGTS] MSE codec error — re-encoding via ffmpeg (H.264)…','w');
-          const transcodeUrl='/api/hls_proxy?transcode=1&url='+encodeURIComponent(url);
-          // Defer to next tick — cannot safely destroy mpegts from within its own error callback
-          setTimeout(()=>{
-          if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
-          vid.pause(); vid.removeAttribute('src'); vid.load();
-          _playerStopped = false;
-          if(typeof mpegts!=='undefined' && mpegts.isSupported()){
-            setNP('▶ '+name+' [transcoding HEVC→H.264]');
-            mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:transcodeUrl,cors:true},{
-              enableWorker:false,
-              liveBufferLatencyChasing:true,
-              liveBufferLatencyMaxLatency:12,
-              liveBufferLatencyMinRemain:3,
-            });
-            mpegtsObj.attachMediaElement(vid);
-            mpegtsObj.load();
-            vid.play().catch(()=>{});
-            mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
-              if(!_playerStopped){
-                alog('[MPEGTS/transcode] '+et2+': '+(ed2?.msg||JSON.stringify(ed2)),'e');
-                setNP('✗ Transcode failed — ffmpeg may not support this codec');
-                document.getElementById('ppbtn').textContent='▶';
-              }
-            });
-          } else {
-            // mpegts.js unavailable — try native src as last resort
-            vid.src=transcodeUrl; vid.play().catch(()=>{});
-          }
-          }, 0); // end setTimeout defer
-        }
-        return;
-      }
       // 503/403/404 = channel offline — stop immediately, never retry
       if(httpCode===503 || httpCode===403 || httpCode===404){
-        alog('[MPEGTS] Channel unavailable ('+httpCode+') — stopping','e');
+        alog('[MPEGTS] Canal no disponible ('+httpCode+') — deteniendo','e');
         setNP('✗ Channel unavailable ('+httpCode+')');
         document.getElementById('ppbtn').textContent='▶';
         return;
       }
-      // play_token URLs: re-resolve for fresh token, but cap at 2 retries
+      // play_token URLs: re-resolve for fresh token, but cap at MAX_PT_RETRIES
       if(isLiveStream && et===mpegts.ErrorTypes.NETWORK_ERROR && hasPlayToken){
-        if(!window._ptRetries) window._ptRetries = {};
         const _rk = pIdx+'|'+url.slice(-20);
         window._ptRetries[_rk] = (window._ptRetries[_rk]||0)+1;
-        if(window._ptRetries[_rk] <= 2 && !_playerStopped){
-          alog('[MPEGTS] play_token failed (attempt '+window._ptRetries[_rk]+'/2) — re-resolving…','w');
-          if(pIdx>=0) setTimeout(()=>{ if(!_playerStopped) playItem(pIdx); },1000);
+        if(window._ptRetries[_rk] <= MAX_PT_RETRIES && !_playerStopped){
+          alog('[MPEGTS] play_token failed (attempt '+window._ptRetries[_rk]+'/'+MAX_PT_RETRIES+') — re-resolving…','w');
+          if(pIdx>=0) setTimeout(()=>{ if(!_playerStopped) playItem(pIdx, true); },1000);
         } else {
-          alog('[MPEGTS] play_token failed after 2 retries — channel may be offline','e');
-          setNP('✗ Stream unavailable: '+name);
-          document.getElementById('ppbtn').textContent='▶';
-          window._ptRetries[_rk]=0;
+          alog('[MPEGTS] play_token fallido tras '+MAX_PT_RETRIES+' reintentos — canal offline','e');
+          _stopChannel('Stream unavailable: '+name);
         }
       } else if(isLiveStream && et===mpegts.ErrorTypes.NETWORK_ERROR){
-        if(!window._mpegRetries) window._mpegRetries = {};
         const _mk = String(pIdx)+'|'+url.slice(-20);
         window._mpegRetries[_mk] = (window._mpegRetries[_mk]||0)+1;
-        if(window._mpegRetries[_mk] <= 3 && !_playerStopped){
+        if(window._mpegRetries[_mk] <= MAX_MPEG_RETRIES && !_playerStopped){
           setTimeout(()=>{ if(mpegtsObj && !_playerStopped){ mpegtsObj.unload(); mpegtsObj.load(); vid.play().catch(()=>{}); }},2000);
-        } else if(!_playerStopped && !url.includes('hls_proxy') && !window._remuxFired){
-          // All normal retries exhausted — try ffmpeg -c copy remux as last resort.
-          // Handles container/mux issues that mpegts.js can't parse but ffmpeg can.
-          // -c copy = no re-encode, near-zero CPU cost.
-          window._remuxFired = true;
-          alog('[MPEGTS] Retries exhausted \u2014 trying ffmpeg remux (-c copy)\u2026','w');
-          const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
-          setTimeout(()=>{
-            if(_playerStopped) return;
-            if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
-            vid.pause(); vid.removeAttribute('src'); vid.load();
-            _playerStopped=false;
-            setNP('\u25b6 '+name+' [remux]');
-            mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{
-              enableWorker:false,liveBufferLatencyChasing:true,
-              liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3,
-            });
-            mpegtsObj.attachMediaElement(vid);
-            mpegtsObj.load();
-            vid.play().catch(()=>{});
-            mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
-              if(!_playerStopped){
-                alog('[MPEGTS/remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
-                setNP('\u2717 Stream unavailable: '+name);
-                document.getElementById('ppbtn').textContent='\u25b6';
-              }
-            });
-          },0);
         } else if(!_playerStopped){
-          alog('[MPEGTS] Stream failed after retries \u2014 channel may be offline','e');
-          setNP('\u2717 Stream unavailable: '+name);
-          document.getElementById('ppbtn').textContent='\u25b6';
-          window._mpegRetries[_mk]=0;
+          alog('[MPEGTS] Stream fallido tras '+MAX_MPEG_RETRIES+' reintentos — canal offline','e');
+          _stopChannel('Stream unavailable: '+name);
         }
       } else if(!isLiveStream && fallbackUrl && et===mpegts.ErrorTypes.NETWORK_ERROR){
         // Catchup path-based .ts failed → try query-string format via HLS.js
-        alog('[MPEGTS] Catchup .ts failed — retrying with fallback URL via HLS.js','w');
+        alog('[MPEGTS] Catch-up .ts fallido — reintentando con URL de reserva vía HLS.js','w');
         _destroyPlayers();
         doPlay(fallbackUrl, name, {isLive:false});
       }
@@ -6231,11 +7319,11 @@ function doPlay(url, name, opts={}){
   } else if(isMpegTs){
     // ── MPEG-TS but MSE not supported — try direct native src first,
     // then server-side ffmpeg proxy as fallback ────────────────────
-    alog('[MPEGTS] MSE unavailable — trying direct native src…','w');
+    alog('[MPEGTS] MSE no disponible — probando src nativo…','w');
     vid.src=px;
     vid.play().catch(()=>{
       // Direct failed — try ffmpeg remux proxy
-      alog('[MPEGTS] Direct failed — remuxing via ffmpeg proxy…','w');
+      alog('[MPEGTS] Directo fallido — remuxando vía proxy ffmpeg…','w');
       const hlsProxyUrl='/api/hls_proxy?url='+encodeURIComponent(url);
       vid.src=hlsProxyUrl;
       vid.play().catch(e=>{
@@ -6258,20 +7346,60 @@ vid.addEventListener('canplay',()=>document.getElementById('vph').style.opacity=
 
 function playerPP(){vid.paused||vid.ended?vid.play().catch(()=>{}):vid.pause();}
 function playerStop(){
-  _playerStopped = true;
   _destroyPlayers();
-  pUrl=''; setNP('⏹ Stopped'); document.getElementById('pu').textContent='—';
+  if(window._progressTimer){ clearInterval(window._progressTimer); window._progressTimer=null; }
+  pUrl=''; setNP('⏹ Detenido'); document.getElementById('pu').textContent='—';
   document.getElementById('ppbtn').textContent='▶';
   document.getElementById('vph').style.opacity='1';
+  const rb=document.getElementById('resume-bar'); if(rb) rb.style.display='none';
+  const tb=document.getElementById('tracksbtn'); if(tb) tb.style.opacity='0.5';
 }
 function playerPrev(){if(!filtItems.length)return; playItem(pIdx<=0?filtItems.length-1:pIdx-1);}
 function playerNext(){if(!filtItems.length)return; playItem(pIdx<0||pIdx>=filtItems.length-1?0:pIdx+1);}
 function setVol(v){document.getElementById('vlbl').textContent=v; vid.volume=v/100;}
-function setNP(t){document.getElementById('np').textContent=t;}
+
+// ── FFmpeg auto-install ──────────────────────────────────────────────────────
+function installFfmpeg(){
+  const tag = document.querySelector('.tag-err');
+  if(tag){ tag.textContent='⏳ Descargando…'; tag.onclick=null; tag.style.cursor='default'; }
+  toast('🔧 Descargando ffmpeg automáticamente… puede tardar 1-2 min. Mira los logs.','info',8000);
+  fetch('/api/ffmpeg_install',{method:'POST'})
+    .then(r=>r.json())
+    .then(()=>{
+      // Polling cada 3s hasta que el instalador termine
+      const poll = setInterval(()=>{
+        fetch('/api/ffmpeg_status').then(r=>r.json()).then(s=>{
+          if(tag && s.install_msg) tag.textContent = '⏳ ' + s.install_msg.slice(0,40);
+          if(s.ffmpeg_ok){
+            clearInterval(poll);
+            if(tag){ tag.className='tag tag-ok'; tag.textContent='✓ ffmpeg'; tag.onclick=null; }
+            toast('✅ ffmpeg instalado correctamente. ¡Listo para usar!','ok',5000);
+          } else if(s.install_done && !s.install_ok){
+            clearInterval(poll);
+            if(tag){ tag.textContent='✗ Error — ver logs'; }
+            toast('❌ Error instalando ffmpeg. Revisa la consola para más detalles.','error',8000);
+          }
+        }).catch(()=>{});
+      }, 3000);
+    })
+    .catch(e=>toast('Error: '+e,'error'));
+}
+
+function setNP(t){
+  document.getElementById('np').textContent=t;
+  const vt=document.getElementById('vph-txt');
+  if(vt) vt.textContent=t;
+}
+// ── Open track selector for current local file ──────────────
+function openTracksForCurrent(){
+  if(!_localMeta){ toast('Ningún archivo local cargado','warn'); return; }
+  _showTrackSelector(_localMeta, _localMeta.path, _localMeta.name);
+}
+
 function cpyUrl(){
   if(!pUrl)return;
   navigator.clipboard?.writeText(pUrl)
-    .then(()=>toast('URL copied!','ok')).catch(()=>toast('Copy failed','wrn'));
+    .then(()=>toast('¡URL copiada!','ok')).catch(()=>toast('Error al copiar','wrn'));
 }
 
 // ── RECORDING ──────────────────────────────────────────────
@@ -6297,10 +7425,10 @@ function _epgCard(prog, label){
   </div>`;
 }
 async function showEPG(){
-  if(!_epgItem){toast('No channel loaded','warn');return;}
+  if(!_epgItem){toast('Ningún canal cargado','warn');return;}
   const ov=document.getElementById('epg-overlay');
   document.getElementById('epg-ch-name').textContent=_epgItem.name||'EPG';
-  document.getElementById('epg-body').innerHTML='<div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Loading…</div>';
+  document.getElementById('epg-body').innerHTML='<div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Cargando…</div>';
   ov.style.display='flex';
   try{
     const r=await fetch('/api/epg',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -6336,7 +7464,7 @@ async function showEPG(){
       if(cur) cur.scrollIntoView({block:'nearest'});
     }
     if(d.current) document.getElementById('epg-now').textContent='▸ '+d.current.title;
-    else if(d.error) document.getElementById('epg-now').textContent='No EPG';
+    else if(d.error) document.getElementById('epg-now').textContent='Sin EPG';
   }catch(e){
     document.getElementById('epg-body').innerHTML=`<div style="color:var(--err);font-size:12px;text-align:center;padding:20px">Failed: ${e.message}</div>`;
   }
@@ -6350,7 +7478,7 @@ document.getElementById('epg-overlay').addEventListener('click',function(e){if(e
 // MAC/Stalker: get_simple_data_table). Clicking a programme calls /api/catchup/play.
 
 function showCatchup(){
-  if(!_epgItem){toast('Play a live channel first','wrn');return;}
+  if(!_epgItem){toast('Reproduce un canal en directo primero','wrn');return;}
   document.getElementById('catchup-ch-name').textContent='↺ '+(_epgItem.name||'Catch-up TV');
   document.getElementById('catchup-status').textContent='';
   document.getElementById('catchup-body').innerHTML=
@@ -6380,7 +7508,7 @@ async function _loadCatchupEPG(){
       return;
     }
     // No archive data — show manual time picker
-    const errMsg=d.error||'No archived programme data found';
+    const errMsg=d.error||'No se encontraron datos de programa archivado';
     document.getElementById('catchup-body').innerHTML=
       `<div style="color:var(--txt3);font-size:12px;text-align:center;padding:16px">${errMsg}</div>`
       +'<div style="padding:12px">'+_cuManualForm()+'</div>';
@@ -6434,7 +7562,7 @@ function doPlayArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, en
   const liveCmd=decodeURIComponent(encodedLiveCmd||'');
   const realId=decodeURIComponent(encodedRealId||'');
   const status=document.getElementById('catchup-status');
-  if(status) status.textContent='Resolving…';
+  if(status) status.textContent='Resolviendo…';
   fetch('/api/catchup/play',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({cmd, live_cmd:liveCmd, epg_id:realId, start:startTs, stop:stopTs})})
@@ -6446,9 +7574,9 @@ function doPlayArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, en
       // Catchup is VOD — isLive:false prevents mpegts.js SourceBuffer crash
       // d.fallback_url is the query-string format; used if path-based .ts fails
       doPlay(d.url, label, {isLive:false, fallbackUrl:d.fallback_url||null});
-      toast('↺ Playing catch-up: '+title,'ok');
+      toast('↺ Reproduciendo a la carta: '+title,'ok');
     } else {
-      if(status) status.textContent='❌ '+(d.error||'Not available');
+      if(status) status.textContent='❌ '+(d.error||'No disponible');
     }
   }).catch(e=>{if(status) status.textContent='❌ '+e.message;});
 }
@@ -6468,10 +7596,10 @@ function _cuManualForm(){
 function doWatchCatchupManual(){
   const s=document.getElementById('cu-start')?.value;
   const e=document.getElementById('cu-end')?.value;
-  if(!s||!e){toast('Set start and end time','wrn');return;}
+  if(!s||!e){toast('Establece la hora de inicio y fin','wrn');return;}
   const startTs=Math.floor(new Date(s).getTime()/1000);
   const endTs=Math.floor(new Date(e).getTime()/1000);
-  if(endTs<=startTs){toast('End must be after start','wrn');return;}
+  if(endTs<=startTs){toast('El fin debe ser posterior al inicio','wrn');return;}
   // Find the matching programme and delegate to doPlayArchiveCmd — exactly
   // the same call that clicking a programme row makes.
   const match=_cuListings.find(p=>p.start&&p.stop&&p.start<=startTs&&startTs<p.stop)
@@ -6488,62 +7616,152 @@ function doWatchCatchupManual(){
 }
 
 
+
+
 async function startRec(){
-  if(!pUrl){toast('Play a stream first','wrn');return;}
-  const od=document.getElementById('o-dir').value.trim();
-  const r=await fetch('/api/record/start',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({url:pUrl, name:pName, out_dir:od})});
-  const d=await r.json();
-  if(!d.ok){toast(d.error||'Record failed','err');return;}
-  isRec=true;
+  if(!pUrl){ toast('▶ Reproduce un stream primero','wrn'); return; }
+
+  const od  = (document.getElementById('rec-dir-input')?.value||'').trim()
+            || document.getElementById('o-dir').value.trim();
+  const fmt = document.getElementById('rec-fmt')?.value || 'mkv';
+  const dur = parseInt(document.getElementById('rec-dur')?.value) || 0;
+
+  const payload = { url: pUrl, name: pName, out_dir: od, format: fmt, duration_secs: dur };
+  let d;
+  try {
+    const r = await fetch('/api/record/start', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    d = await r.json();
+  } catch(e) { toast('Error de red al iniciar grabación','err'); return; }
+
+  if(!d.ok){ toast('⚠ ' + (d.error||'Error al grabar'), 'err', 7000); return; }
+
+  isRec = true;
+  _recScheduledSecs = dur;
   _syncRecBtn(true);
-  document.getElementById('rfname').textContent=d.filename||'';
-  toast('⏺ Recording: '+(d.filename||''),'ok');
-  let s=0;
-  recTmr=setInterval(()=>{
+
+  document.getElementById('rfname').textContent   = d.filename || '';
+  const szEl = document.getElementById('rec-size');
+  if(szEl){ szEl.textContent = '0 MB'; szEl.classList.add('vis'); }
+
+  // Barra de progreso si hay duración
+  const wrap = document.getElementById('rec-prog-wrap');
+  if(wrap){
+    if(dur > 0){
+      wrap.style.display = 'flex';
+      const fill = document.getElementById('rec-prog-fill');
+      if(fill) fill.style.width = '0%';
+      const lbl = document.getElementById('rec-prog-lbl');
+      if(lbl) lbl.textContent = _fmtSecs(dur) + ' restante';
+    } else {
+      wrap.style.display = 'none';
+    }
+  }
+
+  let s = 0;
+  recTmr = setInterval(async ()=>{
     s++;
-    const h=String(Math.floor(s/3600)).padStart(2,'0');
-    const m2=String(Math.floor(s%3600/60)).padStart(2,'0');
-    const sc=String(s%60).padStart(2,'0');
-    document.getElementById('rtimer').textContent=h+':'+m2+':'+sc;
-    // Keep button text in sync with elapsed time
-    const btn=document.getElementById('rbtn');
-    if(btn) btn.textContent=`⏹ Stop Recording ${h}:${m2}:${sc}`;
-  },1000);
+    _updateTimerUI(s);
+    // Cada 5s sincronizar con el servidor
+    if(s % 5 === 0){
+      try {
+        const rs = await fetch('/api/record/status').then(r=>r.json());
+        if(!rs.recording){
+          clearInterval(recTmr); recTmr=null;
+          isRec=false; _syncRecBtn(false);
+          if(szEl) szEl.classList.remove('vis');
+          if(wrap) wrap.style.display='none';
+          toast(`⚠ Grabación interrumpida${rs.last_file?' → '+rs.last_file:''}`, 'wrn', 7000);
+          return;
+        }
+        if(rs.size_mb !== undefined && szEl)
+          szEl.textContent = rs.size_mb.toFixed(1) + ' MB';
+        if(_recScheduledSecs > 0 && rs.elapsed_secs !== undefined){
+          const pct = Math.min(100, rs.elapsed_secs / _recScheduledSecs * 100);
+          const fill = document.getElementById('rec-prog-fill');
+          const lbl  = document.getElementById('rec-prog-lbl');
+          if(fill) fill.style.width = pct.toFixed(1) + '%';
+          if(lbl)  lbl.textContent = _fmtSecs(Math.max(0, _recScheduledSecs - rs.elapsed_secs)) + ' restante';
+        }
+      } catch(e){}
+    }
+  }, 1000);
+
+  const durTxt = dur > 0 ? ` (máx ${_fmtSecs(dur)})` : '';
+  toast(`⏺ Grabando${durTxt}: ${d.filename||''}`, 'ok', 5000);
 }
 
 async function stopRec(){
-  const r=await fetch('/api/record/stop',{method:'POST',
-    headers:{'Content-Type':'application/json'},body:'{}'});
-  const d=await r.json();
-  if(d.ok) toast('Saved: '+(d.file||''),'ok');
-  isRec=false;
+  let d;
+  try {
+    const r = await fetch('/api/record/stop',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:'{}'});
+    d = await r.json();
+  } catch(e){ toast('Error al detener grabación','err'); return; }
+
+  if(recTmr){ clearInterval(recTmr); recTmr=null; }
+  isRec = false;
+  _recScheduledSecs = 0;
   _syncRecBtn(false);
   document.getElementById('rfname').textContent='';
-  if(recTmr){clearInterval(recTmr);recTmr=null;}
+  const szEl=document.getElementById('rec-size');
+  if(szEl) szEl.classList.remove('vis');
+  const wrap=document.getElementById('rec-prog-wrap');
+  if(wrap) wrap.style.display='none';
+
+  if(d.ok){
+    const mb  = d.size_mb ? ` · ${d.size_mb.toFixed(1)} MB` : '';
+    const fn  = d.file ? '\n📁 ' + d.file : '';
+    toast(`⏹ Grabación guardada${mb}${fn}`, 'ok', 7000);
+  } else {
+    toast(d.error||'Error al detener grabación','err');
+  }
+}
+
+function _updateTimerUI(s){
+  const h  = String(Math.floor(s/3600)).padStart(2,'0');
+  const m2 = String(Math.floor(s%3600/60)).padStart(2,'0');
+  const sc = String(s%60).padStart(2,'0');
+  document.getElementById('rtimer').textContent = h+':'+m2+':'+sc;
+  const btn = document.getElementById('rbtn');
+  if(btn) btn.textContent = `⏹ ${h}:${m2}:${sc}`;
+}
+
+function _fmtSecs(s){
+  const h=Math.floor(s/3600), m=Math.floor(s%3600/60), sc=s%60;
+  if(h>0) return `${h}h ${String(m).padStart(2,'0')}m`;
+  if(m>0) return `${m}m ${String(sc).padStart(2,'0')}s`;
+  return `${Math.floor(sc)}s`;
 }
 
 function _syncRecBtn(recording){
-  const btn=document.getElementById('rbtn');
-  const timer=document.getElementById('rtimer');
+  const btn   = document.getElementById('rbtn');
+  const timer = document.getElementById('rtimer');
+  const opts  = document.getElementById('rec-opts');
   if(!btn) return;
   if(recording){
-    btn.textContent='⏹ Stop Recording';
+    btn.textContent = '⏹ 00:00:00';
     btn.classList.add('rec');
     if(timer) timer.classList.add('vis');
+    if(opts)  opts.classList.add('hidden-opts');
   } else {
-    btn.textContent='⏺ Record';
+    btn.textContent = '⏺ Grabar';
     btn.classList.remove('rec');
-    if(timer){timer.classList.remove('vis'); timer.textContent='00:00:00';}
+    if(timer){ timer.classList.remove('vis'); timer.textContent='00:00:00'; }
+    if(opts)  opts.classList.remove('hidden-opts');
   }
 }
+
+
 
 // ── DOWNLOADS ──────────────────────────────────────────────
 async function dlM3U(){
   const op=document.getElementById('o-m3u').value.trim();
-  if(!op){toast('Set M3U output path first','wrn');return;}
-  if(!selSet.size){toast('Select items first','wrn');return;}
+  if(!op){toast('Configura la ruta M3U primero','wrn');return;}
+  if(!selSet.size){toast('Selecciona elementos primero','wrn');return;}
   setBusy(true);
   const r=await fetch('/api/download/m3u',{method:'POST',
     headers:{'Content-Type':'application/json'},
@@ -6554,8 +7772,8 @@ async function dlM3U(){
 
 async function dlMKV(){
   const od=document.getElementById('o-dir').value.trim();
-  if(!od){toast('Set output folder first','wrn');return;}
-  if(!selSet.size){toast('Select items first','wrn');return;}
+  if(!od){toast('Configura la carpeta de salida primero','wrn');return;}
+  if(!selSet.size){toast('Selecciona elementos primero','wrn');return;}
   setBusy(true);
   const r=await fetch('/api/download/mkv',{method:'POST',
     headers:{'Content-Type':'application/json'},
@@ -6567,8 +7785,8 @@ async function dlMKV(){
 
 async function dlCat(){
   const op=document.getElementById('o-m3u').value.trim();
-  if(!op){toast('Set M3U output path first','wrn');return;}
-  if(!curCat){toast('Select a category first','wrn');return;}
+  if(!op){toast('Configura la ruta M3U primero','wrn');return;}
+  if(!curCat){toast('Selecciona una categoría primero','wrn');return;}
   setBusy(true);
   const r=await fetch('/api/download/m3u',{method:'POST',
     headers:{'Content-Type':'application/json'},
@@ -6580,7 +7798,7 @@ async function dlCat(){
 // ── STOP ───────────────────────────────────────────────────
 async function doStop(){
   await fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
-  setBusy(false); toast('Stopped','info');
+  setBusy(false); toast('Detenido','info');
 }
 
 // ── POLLING ────────────────────────────────────────────────
@@ -6595,31 +7813,28 @@ setInterval(async()=>{
   const d=await r.json().catch(()=>null); if(!d) return;
   if(d.status) setStatus(d.status);
   if(!d.busy) setBusy(false);
-  // Sync recording button if server state differs from JS state (e.g. page reload)
+  // Sync recording state if it differs from JS (p.ej. recarga de página)
   if(d.recording && !isRec){
     isRec=true; _syncRecBtn(true);
-    // Resync elapsed time from server
     fetch('/api/record/status').then(r=>r.json()).then(rs=>{
-      if(rs.recording){
-        document.getElementById('rfname').textContent=rs.filename||'';
-        // Restart timer from server elapsed
-        if(recTmr){clearInterval(recTmr);recTmr=null;}
-        const parts=(rs.elapsed||'00:00:00').split(':').map(Number);
-        let s=parts[0]*3600+parts[1]*60+parts[2];
-        recTmr=setInterval(()=>{
-          s++;
-          const h=String(Math.floor(s/3600)).padStart(2,'0');
-          const m2=String(Math.floor(s%3600/60)).padStart(2,'0');
-          const sc=String(s%60).padStart(2,'0');
-          document.getElementById('rtimer').textContent=h+':'+m2+':'+sc;
-          const btn=document.getElementById('rbtn');
-          if(btn) btn.textContent=`⏹ Stop Recording ${h}:${m2}:${sc}`;
-        },1000);
+      if(!rs.recording) return;
+      document.getElementById('rfname').textContent = rs.filename||'';
+      const szEl=document.getElementById('rec-size');
+      if(szEl && rs.size_mb!==undefined){
+        szEl.textContent=rs.size_mb.toFixed(1)+' MB';
+        szEl.classList.add('vis');
       }
+      _recScheduledSecs = rs.scheduled_secs||0;
+      if(recTmr){clearInterval(recTmr);recTmr=null;}
+      const parts=(rs.elapsed||'00:00:00').split(':').map(Number);
+      let s=parts[0]*3600+parts[1]*60+(parts[2]||0);
+      recTmr=setInterval(()=>{ s++; _updateTimerUI(s); },1000);
     }).catch(()=>{});
   } else if(!d.recording && isRec){
     isRec=false; _syncRecBtn(false);
     document.getElementById('rfname').textContent='';
+    const szEl=document.getElementById('rec-size');
+    if(szEl) szEl.classList.remove('vis');
     if(recTmr){clearInterval(recTmr);recTmr=null;}
   }
 },5000);
@@ -6630,7 +7845,7 @@ function startLog(){
   logEs=new EventSource('/api/logs');
   logEs.onmessage=e=>{
     const msg=e.data;
-    if(msg==='Connected to log stream') return;
+    if(msg==='Conectado al flujo de registro') return;
     let c='';
     if(msg.includes('[STATUS]')){c='s'; setStatus(msg.replace(/\[STATUS\]\s*/,''));}
     else if(/✓|success|saved|Done/i.test(msg)) c='k';
@@ -6763,7 +7978,7 @@ function renderPLList(){
   const arr=plLoadAll();
   const el=document.getElementById('pl-list');
   if(!arr.length){
-    el.innerHTML='<div class="pl-empty"><span>📋</span>No saved playlists yet.<br>Add one below.</div>';
+    el.innerHTML='<div class="pl-empty"><span>📋</span>Aún no hay listas guardadas.<br>Añade una abajo.</div>';
     return;
   }
   const icons={mac:'🔌',xtream:'📡',m3u_url:'📄'};
@@ -6939,7 +8154,7 @@ function wonRender(list){
         <div class="won-progress-bar"><div class="won-progress-fill" style="width:${p.progress}%"></div></div>
         <div class="won-progress-pct">${p.progress}%</div>
       </div>
-      <button class="won-find-btn" id="won-fbtn-${i}" data-name="${esc(p.channel_name)}" data-cid="${esc(p.channel_id)}" onclick="wonFindChannel(this,${i})" title="Find on portal">🔍</button>
+      <button class="won-find-btn" id="won-fbtn-${i}" data-name="${esc(p.channel_name)}" data-cid="${esc(p.channel_id)}" onclick="wonFindChannel(this,${i})" title="Buscar en portal">🔍</button>
     </div>`;
   }).join('');
 }
@@ -6984,6 +8199,177 @@ function _wonFmt(ts){
   const d = new Date(ts * 1000);
   return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 }
+
+// ── LOCAL FILE BROWSER ────────────────────────────────────
+let _fbCurPath = '';
+
+function openFiles(){
+  document.getElementById('fb-overlay').classList.add('open');
+  fbLoad(_fbCurPath || '');
+}
+function closeFiles(){
+  document.getElementById('fb-overlay').classList.remove('open');
+}
+function fbUp(){
+  fetch('/api/files',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({path:document.getElementById('fb-path-label').dataset.parent||''})})
+  .then(r=>r.json()).then(d=>_fbRender(d)).catch(e=>_fbError(e));
+}
+function fbGo(){
+  const p = document.getElementById('fb-manual').value.trim();
+  if(p) fbLoad(p);
+}
+function fbLoad(path){
+  document.getElementById('fb-list').innerHTML='<div class="fb-empty"><span class="spin"></span></div>';
+  fetch('/api/files',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({path:path})})
+  .then(r=>r.json()).then(d=>_fbRender(d)).catch(e=>_fbError(e));
+}
+function _fbError(e){
+  document.getElementById('fb-list').innerHTML='<div class="fb-empty">⚠️ '+esc(String(e))+'</div>';
+}
+function _fbRender(d){
+  _fbCurPath = d.path||'';
+  const lbl = document.getElementById('fb-path-label');
+  lbl.textContent = d.path||'—';
+  lbl.dataset.parent = d.parent||'';
+  document.getElementById('fb-upbtn').disabled = !d.parent;
+  const list = document.getElementById('fb-list');
+  if(d.error){list.innerHTML='<div class="fb-empty">⚠️ '+esc(d.error)+'</div>';return;}
+  if(!d.entries||!d.entries.length){list.innerHTML='<div class="fb-empty">📭 No media files found here</div>';return;}
+  const AUDIO_EXTS = new Set(['.mp3','.flac','.aac','.ogg','.opus','.wav','.m4a','.wma']);
+  list.innerHTML = d.entries.map((e,i)=>{
+    if(e.is_dir){
+      return `<div class="fb-item fb-dir" onclick="fbLoad(${JSON.stringify(e.path)})">
+        <span class="fb-ico">📁</span>
+        <span class="fb-name">${esc(e.name)}</span>
+      </div>`;
+    }
+    const isAudio = AUDIO_EXTS.has(e.ext);
+    const ico = isAudio ? '🎵' : '🎬';
+    const sz = e.size>1073741824?(e.size/1073741824).toFixed(1)+' GB'
+              :e.size>1048576?(e.size/1048576).toFixed(1)+' MB'
+              :e.size>1024?(e.size/1024).toFixed(0)+' KB':'—';
+    return `<div class="fb-item fb-file" onclick="fbPlay(${JSON.stringify(e.path)},${JSON.stringify(e.name)})">
+      <span class="fb-ico">${ico}</span>
+      <span class="fb-name">${esc(e.name)}</span>
+      <span class="fb-size">${sz}</span>
+    </div>`;
+  }).join('');
+}
+// ── LOCAL FILE PROBE + SMART PLAY ─────────────────────────
+let _localMeta = null;  // {path, duration, audio:[], subtitle:[], needs_transcode}
+
+async function fbPlay(path, name){
+  closeFiles();
+  setNP('⟳ Analizando: '+name+'…');
+  forceTab('p-player','t-player');
+  _localMeta = null;
+
+  try {
+    const pr = await fetch('/api/probe_local', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path})
+    });
+    const meta = await pr.json();
+    if(meta.error){ _localMeta = null; }
+    else {
+      _localMeta = {...meta, path, name};
+      // Show track selector if multiple audio tracks or subtitles
+      if((meta.audio && meta.audio.length > 1) || (meta.subtitle && meta.subtitle.length > 0)){
+        _showTrackSelector(meta, path, name);
+        return;
+      }
+    }
+    _playLocalFile(path, name, '', '');
+  } catch(e) {
+    _playLocalFile(path, name, '', '');
+  }
+}
+
+function _playLocalFile(path, name, audioIdx, subIdx){
+  // Retrieve resume point if any
+  const resumeKey = 'resume_' + btoa(path).slice(0,32);
+  let resumeAt = 0;
+  try {
+    const saved = JSON.parse(localStorage.getItem(resumeKey)||'null');
+    if(saved && saved.pos > 10 && saved.pos < (saved.dur||9999) - 10){
+      resumeAt = saved.pos;
+    }
+  } catch(e){}
+
+  const needsTC  = _localMeta?.needs_transcode;
+  const canRemux = _localMeta?.can_remux;
+  const needsRemux = _localMeta?.needs_remux;
+  const playDirect = _localMeta?.play_direct;
+  let url;
+  if(subIdx){
+    // Subtítulo burn-in requiere transcodificación completa
+    url = '/api/transcode?path='+encodeURIComponent(path);
+    if(audioIdx) url += '&audio_idx='+encodeURIComponent(audioIdx);
+    if(subIdx)   url += '&subs_idx='+encodeURIComponent(subIdx);
+    alog('[Local] Transcodificando: '+name+' +subs…','w');
+  } else if(needsTC){
+    // Códec incompatible → transcodificación completa (CPU)
+    url = '/api/transcode?path='+encodeURIComponent(path);
+    if(audioIdx) url += '&audio_idx='+encodeURIComponent(audioIdx);
+    alog('[Local] Transcodificando: '+name+' (códec incompatible)…','w');
+  } else if(needsRemux || audioIdx){
+    // Códecs OK pero contenedor MKV/AVI → remux rápido sin CPU (solo copia)
+    url = '/api/remux_local?path='+encodeURIComponent(path);
+    if(audioIdx) url += '&audio_idx='+encodeURIComponent(audioIdx);
+    alog('[Local] Remuxando: '+name+' (rápido, sin recodificación)…','k');
+  } else {
+    // MP4/WebM con códecs compatibles → reproducción directa
+    url = '/api/localfile?path='+encodeURIComponent(path);
+    alog('[Local] Stream directo: '+name,'k');
+  }
+
+  // Load external VTT subtitle track if selected but not burned in
+  _pendingSubUrl = null;
+  if(subIdx && !needs){
+    _pendingSubUrl = '/api/extract_sub?path='+encodeURIComponent(path)+'&sub_idx='+encodeURIComponent(subIdx);
+  }
+
+  _pendingResumeAt = resumeAt;
+  _pendingMediaPath = path;
+  doPlay(url, name, {isLocal:true});
+}
+
+// Track selector modal logic
+function _showTrackSelector(meta, path, name){
+  const ov = document.getElementById('track-overlay');
+  const body = document.getElementById('track-body');
+  // Audio tracks
+  let html = '';
+  if(meta.audio && meta.audio.length > 1){
+    html += '<div class="ts-section"><div class="ts-title">🔊 Audio Track</div>';
+    meta.audio.forEach((a,i)=>{
+      const lbl = a.title || a.lang || ('Pista '+(i+1))+' ('+a.codec+')';
+      html += `<label class="ts-opt"><input type="radio" name="ts-audio" value="${i}" ${i===0?'checked':''}> ${escHtml(lbl)}</label>`;
+    });
+    html += '</div>';
+  }
+  if(meta.subtitle && meta.subtitle.length > 0){
+    html += '<div class="ts-section"><div class="ts-title">💬 Subtitles</div>';
+    html += `<label class="ts-opt"><input type="radio" name="ts-sub" value="" checked> None</label>`;
+    meta.subtitle.forEach((s,i)=>{
+      const lbl = s.title || s.lang || ('Pista '+(i+1))+' ('+s.codec+')';
+      html += `<label class="ts-opt"><input type="radio" name="ts-sub" value="${i}"> ${escHtml(lbl)}</label>`;
+    });
+    html += '</div>';
+  }
+  body.innerHTML = html;
+  document.getElementById('ts-play-btn').onclick = ()=>{
+    const aEl = document.querySelector('input[name="ts-audio"]:checked');
+    const sEl = document.querySelector('input[name="ts-sub"]:checked');
+    closeTrackSelector();
+    _playLocalFile(path, name, aEl?aEl.value:'', sEl?sEl.value:'');
+  };
+  ov.classList.add('open');
+}
+function closeTrackSelector(){ document.getElementById('track-overlay').classList.remove('open'); }
+function escHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 function wonFindChannel(btn, idx){
   const channelName = btn.dataset.name || '';
@@ -7036,6 +8422,229 @@ function wonFindChannel(btn, idx){
 }
 
 </script>
+
+<!-- ── Modal Continuar Viendo ──────────────────────────────────────── -->
+<div id="cw-overlay" onclick="if(event.target===this)closeCW()">
+  <div id="cw-box">
+    <div style="display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--bdr)">
+      <span style="font-size:20px">🕐</span>
+      <span style="flex:1;font-size:14px;font-weight:800;color:var(--txt)">Continuar Viendo</span>
+      <button class="btn-ghost" onclick="clearAllCW()" style="height:28px;padding:0 10px;font-size:11px;color:var(--txt3)">Limpiar todo</button>
+      <button onclick="closeCW()" class="btn-ghost" style="height:30px;padding:0 10px">✕</button>
+    </div>
+    <div id="cw-list" style="flex:1;overflow-y:auto;padding:4px 0"></div>
+  </div>
+</div>
+
+
+<!-- ── Track Selector Overlay ──────────────────────────────────────────── -->
+<div id="track-overlay" onclick="if(event.target===this)closeTrackSelector()"
+  style="position:fixed;inset:0;z-index:600;background:rgba(0,0,0,.7);display:none;
+         align-items:center;justify-content:center;backdrop-filter:blur(6px)">
+  <div style="background:var(--s2);border:1px solid var(--bdr2);border-radius:16px;
+              width:min(380px,94vw);max-height:80dvh;display:flex;flex-direction:column;
+              box-shadow:0 24px 80px rgba(0,0,0,.8);overflow:hidden">
+    <div style="display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--bdr)">
+      <span style="font-size:22px">🎛️</span>
+      <span style="flex:1;font-size:14px;font-weight:800;color:var(--txt)">Track Selection</span>
+      <button onclick="closeTrackSelector()" class="btn-ghost" style="height:30px;padding:0 10px">✕</button>
+    </div>
+    <div id="track-body" style="flex:1;overflow-y:auto;padding:16px"></div>
+    <div style="padding:14px 16px;border-top:1px solid var(--bdr);display:flex;justify-content:flex-end;gap:8px">
+      <button class="btn-ghost" onclick="closeTrackSelector()" style="height:36px;padding:0 14px;font-size:13px">Cancelar</button>
+      <button id="ts-play-btn" class="btn-acc" style="height:36px;padding:0 16px;font-size:13px">▶ Reproducir</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Resume Bar ────────────────────────────────────────────────────────── -->
+<div id="resume-bar" style="display:none;position:absolute;bottom:70px;left:50%;
+  transform:translateX(-50%);z-index:200;background:rgba(15,15,20,.92);
+  border:1px solid rgba(255,255,255,.12);border-radius:28px;
+  padding:10px 18px;gap:12px;align-items:center;
+  box-shadow:0 8px 32px rgba(0,0,0,.6);backdrop-filter:blur(12px);
+  font-size:13px;color:var(--txt);white-space:nowrap;animation:slide-up .3s ease">
+  <span>⏱ Continue from <b id="resume-time">—</b>?</span>
+  <button id="resume-yes" class="btn-acc" style="height:28px;padding:0 14px;font-size:12px;border-radius:20px">▶ Continuar</button>
+  <button id="resume-no" class="btn-ghost" style="height:28px;padding:0 12px;font-size:12px;border-radius:20px">↩ Reiniciar</button>
+</div>
+
+<script>
+// ── CONTINUAR VIENDO (Watchlist / Historial) ──────────────────────────
+const CW_KEY = 'iptv_cw_history';
+const CW_MAX = 30;
+
+function _cwGetAll(){
+  try{ return JSON.parse(localStorage.getItem(CW_KEY)||'[]'); }catch(e){return [];}
+}
+function _cwSave(arr){
+  try{ localStorage.setItem(CW_KEY, JSON.stringify(arr.slice(0,CW_MAX))); }catch(e){}
+}
+function _cwAdd(path, name, pos, dur){
+  let arr = _cwGetAll().filter(x=>x.path!==path);
+  arr.unshift({path, name, pos:Math.floor(pos), dur:Math.floor(dur||0), ts:Date.now()});
+  _cwSave(arr);
+  _cwUpdateBadge();
+}
+function _cwUpdateBadge(){
+  const arr = _cwGetAll();
+  const badge = document.getElementById('cw-badge');
+  if(!badge) return;
+  if(arr.length>0){
+    badge.style.display='block';
+    badge.textContent = arr.length > 9 ? '9+' : arr.length;
+    badge.classList.add('vis');
+  } else {
+    badge.style.display='none';
+    badge.classList.remove('vis');
+  }
+}
+function openCW(){
+  const list = document.getElementById('cw-list');
+  const arr = _cwGetAll();
+  if(!arr.length){
+    list.innerHTML='<div style="text-align:center;padding:32px;color:var(--txt3);font-size:13px">'+
+      '<div style="font-size:40px;margin-bottom:12px">🎬</div>'+
+      'Aún no hay historial.<br>Reproduce un archivo local para empezar.</div>';
+  } else {
+    list.innerHTML = arr.map((item,i)=>{
+      const pct = item.dur>0 ? Math.min(100, Math.round(item.pos/item.dur*100)) : 0;
+      const h=Math.floor(item.pos/3600), m=Math.floor((item.pos%3600)/60), s=item.pos%60;
+      const tstr = (h>0?h+'h ':'')+m+'m '+s+'s';
+      const ext = item.name.split('.').pop().toUpperCase();
+      const d = new Date(item.ts);
+      const dstr = d.toLocaleDateString('es-ES',{day:'numeric',month:'short'});
+      return `<div class="cw-item" onclick="cwPlay(${i})">
+        <div class="cw-thumb"><span style="font-size:14px;font-weight:800;color:var(--txt3)">${ext}</span></div>
+        <div class="cw-info">
+          <div class="cw-title">${escHtml(item.name)}</div>
+          <div class="cw-meta">⏱ ${tstr} · ${pct}% · ${dstr}</div>
+          <div class="cw-prog"><div class="cw-prog-fill" style="width:${pct}%"></div></div>
+        </div>
+        <button class="cw-del" onclick="event.stopPropagation();cwDel(${i})" title="Eliminar">🗑</button>
+      </div>`;
+    }).join('');
+  }
+  document.getElementById('cw-overlay').classList.add('open');
+}
+function closeCW(){ document.getElementById('cw-overlay').classList.remove('open'); }
+function cwDel(i){
+  let arr=_cwGetAll(); arr.splice(i,1); _cwSave(arr); _cwUpdateBadge(); openCW();
+}
+function clearAllCW(){
+  if(!confirm('¿Eliminar todo el historial?')) return;
+  _cwSave([]); _cwUpdateBadge(); openCW();
+}
+function cwPlay(i){
+  const item = _cwGetAll()[i];
+  if(!item) return;
+  closeCW();
+  // Set pending resume directly
+  window._pendingResumeAt = item.pos;
+  window._pendingMediaPath = item.path;
+  // Need to probe first
+  setNP('⟳ Analizando: '+item.name+'…');
+  forceTab('p-player','t-player');
+  fetch('/api/probe_local',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({path:item.path})})
+  .then(r=>r.json())
+  .then(meta=>{
+    _localMeta = {...meta, path:item.path, name:item.name};
+    _playLocalFile(item.path, item.name, '', '');
+  })
+  .catch(()=>{_playLocalFile(item.path, item.name, '', '');});
+}
+// Hook into progress timer to also update CW history
+const _origProgTimer = window._progressTimer;
+
+// ── GESTURE CONTROLS ──────────────────────────────────────────────────────
+(function(){
+  const vwrap = document.querySelector('.vwrap') || vid.parentElement;
+  let _gTouch = null, _gStartX=0, _gStartY=0, _gStartVol=0, _gSide='';
+  let _ghTimer = null;
+
+  function _showHint(elId, text){
+    const el = document.getElementById(elId);
+    if(!el) return;
+    el.textContent = text; el.style.opacity='1';
+    if(_ghTimer) clearTimeout(_ghTimer);
+    _ghTimer = setTimeout(()=>{ el.style.opacity='0'; }, 800);
+  }
+
+  function _setVolBar(v){
+    const fill = document.getElementById('vol-bar-fill');
+    const wrap = document.getElementById('vol-bar-wrap');
+    if(fill) fill.style.height = (v*100)+'%';
+    if(wrap){ wrap.style.opacity='1'; clearTimeout(wrap._t); wrap._t=setTimeout(()=>wrap.style.opacity='0',800); }
+  }
+
+  vwrap.addEventListener('touchstart', e=>{
+    if(e.touches.length !== 1) return;
+    const t = e.touches[0];
+    _gTouch = t; _gStartX = t.clientX; _gStartY = t.clientY;
+    _gStartVol = vid.volume;
+    const rect = vwrap.getBoundingClientRect();
+    _gSide = t.clientX < rect.left + rect.width/2 ? 'left' : 'right';
+  }, {passive:true});
+
+  vwrap.addEventListener('touchmove', e=>{
+    if(!_gTouch || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    const dx = t.clientX - _gStartX;
+    const dy = t.clientY - _gStartY;
+    if(Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 20){
+      // Horizontal: seek ±10s per 60px
+      e.preventDefault();
+      const secs = Math.round(dx / 60) * 10;
+      if(secs !== 0 && vid.duration){
+        const icon = secs > 0 ? '⏩ +'+secs+'s' : '⏪ '+secs+'s';
+        _showHint('gh-'+ (_gSide==='left'?'left':'right'), icon);
+      }
+    } else if(Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 20){
+      // Vertical: volume (right side) or brightness (left side, show hint only)
+      e.preventDefault();
+      if(_gSide === 'right'){
+        const newVol = Math.max(0, Math.min(1, _gStartVol - dy/200));
+        vid.volume = newVol;
+        document.getElementById('vlbl').textContent = Math.round(newVol*100);
+        _setVolBar(newVol);
+        _showHint('gh-right', '🔊 '+ Math.round(newVol*100)+'%');
+      } else {
+        _showHint('gh-left', '☀️ '+ Math.round(Math.max(0,Math.min(1,0.5-dy/400))*100)+'%');
+      }
+    }
+  }, {passive:false});
+
+  vwrap.addEventListener('touchend', e=>{
+    if(!_gTouch) return;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - _gStartX;
+    const dy = t.clientY - _gStartY;
+    if(Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 30 && vid.duration){
+      const secs = Math.round(dx / 60) * 10;
+      vid.currentTime = Math.max(0, Math.min(vid.duration, vid.currentTime + secs));
+    } else if(Math.abs(dy) < 10 && Math.abs(dx) < 10){
+      // Tap: toggle play/pause
+      vid.paused ? vid.play().catch(()=>{}) : vid.pause();
+    }
+    _gTouch = null;
+  }, {passive:true});
+
+  // Double-tap: seek ±15s
+  let _lastTap = 0;
+  vwrap.addEventListener('touchend', e=>{
+    const now = Date.now();
+    if(now - _lastTap < 300){
+      const rect = vwrap.getBoundingClientRect();
+      const side = e.changedTouches[0].clientX < rect.left + rect.width/2 ? -1 : 1;
+      vid.currentTime = Math.max(0, Math.min(vid.duration||0, vid.currentTime + side*15));
+      _showHint(side<0?'gh-left':'gh-right', side<0?'⏪ -15s':'⏩ +15s');
+    }
+    _lastTap = now;
+  }, {passive:true});
+})();
+
+</script>
 </body>
 </html>
 """
@@ -7043,11 +8652,36 @@ function wonFindChannel(btn, idx){
 # ===================== ENTRY POINT =====================
 
 if __name__ == "__main__":
+    import webbrowser
+    # Fix asyncio on Windows (Python 3.10+ requires SelectorEventLoop for aiohttp)
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     host = "0.0.0.0"
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀  IPTV Portal Builder starting on http://{host}:{port}")
-    print(f"    Open this address in your browser or WebView.")
-    print(f"    ffmpeg: {'found ✓' if shutil.which('ffmpeg') else 'NOT FOUND ✗'}")
-    print(f"    yt-dlp: {'found ✓' if YTDLP_AVAILABLE else 'not available'}")
-    # Use threaded=True for SSE support
+    print(f"🚀  Reproductor IPTV V15 iniciando en http://localhost:{port}")
+
+    # ── Auto-instalación de ffmpeg ────────────────────────────────────────────
+    _ff_local  = os.path.isfile(_FFMPEG_LOCAL)
+    _ff_system = bool(shutil.which("ffmpeg"))
+    if _ff_local:
+        print(f"    ffmpeg:  ✓ local ({_FFMPEG_LOCAL})")
+        print(f"    ffprobe: {'✓ local' if os.path.isfile(_FFPROBE_LOCAL) else '⚠ pendiente (se instalará pronto)'}")
+    elif _ff_system:
+        print(f"    ffmpeg:  ✓ sistema ({shutil.which('ffmpeg')})")
+        print(f"    ffprobe: {'✓' if shutil.which('ffprobe') else '✗ no encontrado'}")
+    else:
+        print(f"    ffmpeg:  ✗ no encontrado — iniciando descarga automática en background…")
+        print(f"             Los binarios se guardarán en: {_FFMPEG_DIR}")
+        _ensure_ffmpeg_bg()   # descarga en hilo de fondo, no bloquea el servidor
+    print(f"    yt-dlp:  {'✓' if YTDLP_AVAILABLE else 'no disponible'}")
+
+    # ── Abrir navegador ───────────────────────────────────────────────────────
+    def _open_browser():
+        time.sleep(1.2)
+        try:
+            webbrowser.open(f"http://localhost:{port}")
+        except Exception:
+            pass
+    threading.Thread(target=_open_browser, daemon=True).start()
     flask_app.run(host=host, port=port, threaded=True, debug=False)
+
