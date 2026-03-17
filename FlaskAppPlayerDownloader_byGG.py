@@ -22,7 +22,7 @@ Fixed different channel url outputs not playing correctly, fixed hevc channels n
 Also on network error and parsing hls errors (altho this can happens when channel is offline too), we attempt ffmpeg play.
 Added progress bar with real kbs speed for downloading MKV, and items/totalitems for M3U saving.
 Fixed EPG out of memory happening in large EPG lists (altho now large external EPG list can use 2000 MB of ram, like 30k channels lists)
-Fixed laggy input in search filed for Whats on Now tab and dekstop version of saved logins tab.
+Fixed laggy desktop input in search filed for Whats on Now tab and dekstop version of saved logins tab.
 Added button that opens external player of your choice (on dekstop select exe, on mobile you can pick VLC, MX, MX PRO, Just Player)
 Added option to add subtitles from opensubtitles.com via inscript serach (get free apikey from https://www.opensubtitles.com/en/consumers)
 Added option to add local subtitles file for subtitles (.srt/.vtt/.ass/.ssa) via Local File tab in the subtitle modal.
@@ -33,6 +33,7 @@ Fixed major bug with yt-dlp fallback not respecting stop button.
 Fixed ffmpeg mkv download not working on specific hls vods/series, by adding mpeg-ts format as fallback to mkv.
 Added logos to channels/vods/series.
 Added sub-menu option on channels/vods/series.
+Added open imdb page for vods/series in sub-menu of vods/series, it just does a search for imdb title.
 Varius UI fixes, and adjustments.
 """
 
@@ -5564,7 +5565,12 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   #pctrl-panel.expanded #pctrl-body{max-height:300px!important}
 }
 @media(min-width:900px){
-  #main{display:grid!important;grid-template-columns:350px 350px 1fr;height:100%}
+  #main{display:grid!important;grid-template-columns:350px 36px 1fr;height:100%;transition:grid-template-columns .3s ease}
+  #main.items-open{grid-template-columns:350px 350px 1fr}
+  #main.items-open #p-items > *{opacity:1;transition:opacity .2s ease .15s}
+  #main:not(.items-open) #p-items > *{opacity:0;pointer-events:none;transition:opacity .1s ease}
+  #main:not(.items-open) #p-items::after{content:'›';position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:16px;color:var(--txt3);pointer-events:none}
+  #p-items{position:relative}
   .panel{display:flex!important;flex:unset;border-right:1px solid var(--bdr);height:100%}
   #theaterbtn{display:flex!important}
   #main.theater{grid-template-columns:0 0 1fr}
@@ -6207,7 +6213,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
     <div class="ph">
       <h3>Categories</h3>
       <div class="mtabs">
-        <button class="mt" data-m="favs" onclick="setMode('favs')">⭐</button>
+        <button class="mt" data-m="favs" onclick="toggleFavsFilter()">⭐</button>
         <button class="mt on" data-m="live" onclick="setMode('live')">📺<span class="mt-txt"> Live</span></button>
         <button class="mt" data-m="vod" onclick="setMode('vod')">🎬<span class="mt-txt"> VOD</span></button>
         <button class="mt" data-m="series" onclick="setMode('series')">📂<span class="mt-txt"> Series</span></button>
@@ -6395,6 +6401,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   <button class="imenu-btn" id="imenu-epg"      onclick="iMenuEPG()">     <span class="imenu-ico">📅</span>EPG / Programme Info</button>
   <button class="imenu-btn" id="imenu-catchup"  onclick="iMenuCatchup()"> <span class="imenu-ico">↺</span>Catch-up TV</button>
   <div class="imenu-sep" id="imenu-sep2"></div>
+  <button class="imenu-btn" id="imenu-imdb"     onclick="iMenuIMDB()">    <span class="imenu-ico">🎬</span>Open IMDB Page</button>
   <button class="imenu-btn" id="imenu-rec"      onclick="iMenuRec()">     <span class="imenu-ico">⏺</span>Record</button>
   <button class="imenu-btn" id="imenu-mkv"      onclick="iMenuMKV()">     <span class="imenu-ico">⬇</span>Download MKV</button>
 </div>
@@ -7212,30 +7219,32 @@ async function subLoadSubtitle(fileId, fileName, btnIdx){
 }
 
 // ── FAVOURITES ─────────────────────────────────────────────
-// Stored per portal hostname: localStorage['favs_hardcoremedia.xyz'] = [{...item}]
-function _favsKey(){
-  const lbl=document.getElementById('portal-name-label').textContent||'_';
-  return 'favs_'+lbl;
+// Stored per portal + mode: localStorage['favs_live_hardcoremedia.xyz'] = [{...item}]
+let _favsFilterActive = false;
+let _favsPortalKey = '_';   // set at connect time, never read from DOM mid-session
+
+function _favsKey(m){
+  return 'favs_'+(m||mode)+'_'+_favsPortalKey;
 }
-function loadFavs(){ try{return JSON.parse(localStorage.getItem(_favsKey())||'[]');}catch(e){return[];} }
-function saveFavs(arr){ try{localStorage.setItem(_favsKey(),JSON.stringify(arr));}catch(e){} }
+function loadFavs(m){ try{return JSON.parse(localStorage.getItem(_favsKey(m))||'[]');}catch(e){return[];} }
+function saveFavs(arr,m){ try{localStorage.setItem(_favsKey(m),JSON.stringify(arr));}catch(e){} }
 function isFav(item){
   const name=item.name||item.o_name||item.fname||'';
-  return loadFavs().some(f=>f.name===name);
+  return loadFavs(mode).some(f=>(f.name||f.o_name||f.fname||'')===name);
 }
 function toggleFav(i){
   const it=filtItems[i]; if(!it) return;
   const name=it.name||it.o_name||it.fname||'';
-  let arr=loadFavs();
-  const idx=arr.findIndex(f=>f.name===name);
+  let arr=loadFavs(mode);
+  const idx=arr.findIndex(f=>(f.name||f.o_name||f.fname||'')===name);
   if(idx>=0){ arr.splice(idx,1); toast('Removed from favourites','info'); }
   else {
-    // Store the current mode so we can resolve correctly when playing from favs
-    arr.push({...it, _fav_mode: mode});
+    arr.push({...it});
     toast('⭐ Added to favourites','ok');
   }
-  saveFavs(arr);
-  if(mode==='favs') showFavs();
+  saveFavs(arr,mode);
+  // If filter is active, re-apply it so removed items disappear immediately
+  if(_favsFilterActive) _applyFavsFilter();
   else renderItems(filtItems);
 }
 
@@ -7297,10 +7306,12 @@ async function doConnect(){
       const _rawUrl = payload.m3u_url || payload.url || '';
       const _portalHost = _rawUrl ? (()=>{try{return new URL(_rawUrl).hostname;}catch(e){return _rawUrl.replace(/https?:\/\//,'').split('/')[0].split(':')[0];}})() : '';
       document.getElementById('portal-name-label').textContent = _portalHost || '—';
+      _favsPortalKey = (_portalHost || '—').trim();
       catsCache=d.categories||{};
       // Always land on Live categories after any connect
       mode='live';
       switchMode('live', catsCache['live']||[]);
+      document.getElementById('main').classList.remove('items-open');
       showT('p-cats','t-cats');
       toast('✓ Connected!','ok');
       // Save to profiles if toggle was active
@@ -7344,30 +7355,58 @@ async function doConnect(){
 
 // ── MODES ──────────────────────────────────────────────────
 function setMode(m){
-  mode=m; navStack=[]; selSet.clear(); selCats.clear(); refreshCatBtns();
-  if(m==='favs'){ showFavs(); return; }
+  _favsFilterActive=false;
+  document.querySelector('.mt[data-m="favs"]').classList.remove('on');
+  mode=m; navStack=[]; allItems=[]; filtItems=[]; curCat=null;
+  selSet.clear(); selCats.clear(); refreshCatBtns();
   switchMode(m, catsCache[m]||[]);
+  document.getElementById('main').classList.remove('items-open');
   showT('p-cats','t-cats');
 }
 
-function showFavs(){
-  mode='favs';
-  document.querySelectorAll('.mt').forEach(b=>b.classList.toggle('on',b.dataset.m==='favs'));
-  const favs=loadFavs();
-  allCats=[]; _activeTag='';
-  document.getElementById('tag-bar').style.display='none';
-  allItems=favs; filtItems=[...favs];
-  showT('p-items','t-items');
-  mkBcrum('⭐ Favourites');
+function toggleFavsFilter(){
+  // Only works when a real mode is active and portal is connected
+  if(!['live','vod','series'].includes(mode)) return;
+  _favsFilterActive=!_favsFilterActive;
+  document.querySelector('.mt[data-m="favs"]').classList.toggle('on',_favsFilterActive);
+  if(_favsFilterActive){
+    _applyFavsFilter();
+    document.getElementById('main').classList.add('items-open');
+    showT('p-items','t-items');
+  } else {
+    // Restore: if we have items loaded keep them, otherwise go back to cats
+    if(allItems.length){
+      filtItems=[...allItems];
+      document.getElementById('isrch').value='';
+      mkBcrum(curCat?curCat.title:'Browse');
+      renderItems(filtItems);
+    } else {
+      document.getElementById('main').classList.remove('items-open');
+      showT('p-cats','t-cats');
+    }
+  }
+}
+
+function _applyFavsFilter(){
+  const favs=loadFavs(mode);
+  const names=new Set(favs.map(f=>f.name||f.o_name||f.fname||''));
+  filtItems=allItems.filter(it=>names.has(it.name||it.o_name||it.fname||''));
+  // If allItems is empty (no category browsed yet), show all saved favs for this mode
+  if(!allItems.length) filtItems=[...favs];
+  document.getElementById('isrch').value='';
+  const mLabel={live:'Live',vod:'VOD',series:'Series'}[mode]||mode;
+  mkBcrum('⭐ '+mLabel+' Favourites');
+  document.getElementById('icount').textContent=filtItems.length+' item'+(filtItems.length!==1?'s':'');
+  if(!filtItems.length){
+    document.getElementById('ilist').innerHTML=
+      '<div style="text-align:center;padding:28px;color:var(--txt3);font-size:12px">No '+mLabel.toLowerCase()+' favourites yet.<br>Tap ★ on any item to add it.</div>';
+    refreshBtns(); return;
+  }
   renderItems(filtItems);
   refreshBtns();
   const b=document.getElementById('badge');
-  b.textContent=favs.length>99?'99+':favs.length;
-  b.classList.toggle('vis',favs.length>0);
-  if(!favs.length){
-    document.getElementById('ilist').innerHTML=
-      '<div style="text-align:center;padding:28px;color:var(--txt3);font-size:12px">No favourites yet.<br>Tap ★ on any channel to add it.</div>';
-  }
+  const total=loadFavs(mode).length;
+  b.textContent=total>99?'99+':total; b.classList.toggle('vis',total>0);
 }
 
 function switchMode(m, cats){
@@ -7503,6 +7542,9 @@ async function dlSelCats(type){
 // ── BROWSE ─────────────────────────────────────────────────
 function browseC(cj){
   const cat=(typeof cj==='string')?JSON.parse(cj):cj; curCat=cat;
+  // Deactivate favs filter when manually browsing a category
+  _favsFilterActive=false;
+  document.querySelector('.mt[data-m="favs"]').classList.remove('on');
   navStack=[]; setBusy(true);
   _setLoadingHeader(cat.title);
   setStatus("Loading '"+cat.title+"'…");
@@ -7519,6 +7561,7 @@ function browseC(cj){
 }
 
 function showSkels(count=10, small=false){
+  document.getElementById('main').classList.add('items-open');
   const cls=small?'skel-sm':'skel';
   document.getElementById('ilist').innerHTML=
     `<div style="padding:4px 0">`+Array(count).fill(`<div class="${cls}" style="--d:${0}s"></div>`).map((s,i)=>
@@ -7535,13 +7578,14 @@ function _setLoadingHeader(text){
 }
 
 function showItems(label, items){
+  document.getElementById('main').classList.add('items-open');
   allItems=items; filtItems=[...items]; selSet.clear();
   document.getElementById('ilist').scrollTop=0;
   document.getElementById('isrch').value='';
   document.getElementById('backbtn').disabled=false; // always can go back to categories
 
   mkBcrum(label); renderItems(filtItems); refreshBtns();
-  const n=items.length;
+  const n=loadFavs(mode).length;
   const b=document.getElementById('badge');
   b.textContent=n>99?'99+':n; b.classList.toggle('vis',n>0);
 }
@@ -7610,7 +7654,7 @@ function openItemMenu(i, btn){
   _iMenuIdx = i;
   const it = filtItems[i];
   if(!it) return;
-  const isLive = (mode==='live') || (mode==='favs' && (it._fav_mode||'live')==='live');
+  const isLive = mode==='live';
   const grp  = !!it._is_series_group;
   const show = !!it._is_show_item;
   const name = it.name||it.o_name||it.fname||'Unknown';
@@ -7623,6 +7667,7 @@ function openItemMenu(i, btn){
   document.getElementById('imenu-epg').style.display      = isLive&&!grp?'flex':'none';
   document.getElementById('imenu-catchup').style.display  = isLive&&!grp?'flex':'none';
   document.getElementById('imenu-sep2').style.display     = !grp?'block':'none';
+  document.getElementById('imenu-imdb').style.display     = (!isLive&&!grp)?'flex':'none';
   document.getElementById('imenu-rec').style.display      = !grp&&!show?'flex':'none';
   document.getElementById('imenu-mkv').style.display      = !grp?'flex':'none';
 
@@ -7681,9 +7726,21 @@ function iMenuMKV(){
   dlMKV();
 }
 
+function iMenuIMDB(){
+  closeItemMenu();
+  const it = filtItems[_iMenuIdx];
+  if(!it) return;
+  const name = it.name||it.o_name||it.fname||'Unknown';
+  const query = encodeURIComponent(name.trim());
+  window.open('https://www.imdb.com/find/?q='+query+'&s=tt', '_blank');
+}
+
 function filterItems(){
   const q=document.getElementById('isrch').value.toLowerCase();
-  filtItems=q?allItems.filter(it=>(it.name||it.o_name||it.fname||'').toLowerCase().includes(q)):[...allItems];
+  const base=_favsFilterActive
+    ? loadFavs(mode).filter(f=>!allItems.length||allItems.some(it=>(it.name||it.o_name||it.fname||'')===(f.name||f.o_name||f.fname||'')))
+    : allItems;
+  filtItems=q?base.filter(it=>(it.name||it.o_name||it.fname||'').toLowerCase().includes(q)):[...base];
   renderItems(filtItems);
 }
 
@@ -7766,6 +7823,9 @@ function drillShow(i){
 function goBack(){
   if(!navStack.length){
     // No nav stack — go back to categories panel
+    _favsFilterActive=false;
+    document.querySelector('.mt[data-m="favs"]').classList.remove('on');
+    document.getElementById('main').classList.remove('items-open');
     showT('p-cats','t-cats');
     return;
   }
@@ -7782,7 +7842,7 @@ async function playItem(i){
   const it=filtItems[i]; if(!it) return;
   pIdx=i;
   // When playing from favs, use the mode the item was originally saved under
-  const itemMode = (mode==='favs') ? (it._fav_mode||'live') : mode;
+  const itemMode = mode;
   // Store item for EPG lookup (live channels only)
   _epgItem = (itemMode==='live') ? it : null;
   document.getElementById('epg-now').textContent='';
@@ -8637,6 +8697,8 @@ function _showProgressNow(ctx, title, label, total){
   if(speedEl) speedEl.textContent="";
   if(stopBtn) stopBtn.style.display="";
   if(dismissBtn) dismissBtn.style.display="none";
+  // Always open the drawer to the right context so progress is visible on all screen sizes
+  openDrawer(ctx);
 }
 
 async function dlM3U(){
