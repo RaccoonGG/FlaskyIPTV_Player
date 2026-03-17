@@ -24,6 +24,9 @@ Added progress bar with real kbs speed for downloading MKV, and items/totalitems
 Fixed EPG out of memory happening in large EPG lists (altho now large external EPG list can use 2000 MB of ram, like 30k channels lists)
 Fixed laggy input in search filed for Whats on Now tab and dekstop version of saved logins tab.
 Added button that opens external player of your choice (on dekstop select exe, on mobile you can pick VLC, MX, MX PRO, Just Player)
+Added option to add subtitles from opensubtitles.com via inscript serach (get free apikey from https://www.opensubtitles.com/en/consumers)
+Added option to add local subtitles file.
+Addedd Subtitles delay by 0.1 + / - for fixing sync.
 Varius UI fixes.
 """
 
@@ -1202,7 +1205,8 @@ class PortalClient:
 #   - get_profile must be called after handshake to confirm/refresh token
 
 class StalkerPortalClient:
-    LOAD_PHP = "/stalker_portal/server/load.php"
+    LOAD_PHP     = "/stalker_portal/server/load.php"
+    LOAD_PHP_ALT = "/stalker_portal/portal.php"
 
     def __init__(self, base_url: str, mac: str, log_cb):
         self.base = normalize_base_url(base_url)
@@ -1262,6 +1266,10 @@ class StalkerPortalClient:
     def _load_url(self, **params) -> str:
         from urllib.parse import urlencode
         return f"{self.base}{self.LOAD_PHP}?{urlencode(params)}"
+
+    def _load_url_alt(self, **params) -> str:
+        from urllib.parse import urlencode
+        return f"{self.base}{self.LOAD_PHP_ALT}?{urlencode(params)}"
 
     def _generate_token(self) -> str:
         return ''.join(random.choices(string.ascii_uppercase + string.digits, k=32))
@@ -1408,6 +1416,17 @@ class StalkerPortalClient:
             self.log(f"[STALKER] Categories HTTP {r.status} ({mode.upper()})")
             payload = await safe_json(r)
         cats = normalize_js(payload)
+        # Fallback: try /stalker_portal/portal.php if server/load.php returned nothing
+        if not cats:
+            if mode == "live":
+                alt_url = self._load_url_alt(type="itv", action="get_genres", JsHttpRequest="1-xml")
+            else:
+                alt_url = self._load_url_alt(type="vod", action="get_categories", JsHttpRequest="1-xml")
+            self.log(f"[STALKER] Categories empty — retrying via portal.php ({mode.upper()})")
+            async with self.session.get(alt_url, headers=headers) as r2:
+                self.log(f"[STALKER] Categories (alt) HTTP {r2.status} ({mode.upper()})")
+                payload = await safe_json(r2)
+            cats = normalize_js(payload)
         result = []
         for c in cats:
             if not isinstance(c, dict):
@@ -1442,6 +1461,19 @@ class StalkerPortalClient:
             self.log(f"[STALKER] Items HTTP {r.status} ({mode.upper()} cat={cat_id} p={page})")
             payload = await safe_json(r)
         items = normalize_js(payload)
+        # Fallback: try /stalker_portal/portal.php if server/load.php returned nothing
+        if not items and page == 1:
+            if mode == "live":
+                alt_url = self._load_url_alt(type="itv", action="get_ordered_list",
+                                              genre=cat_id, JsHttpRequest="1-xml", p=page)
+            else:
+                alt_url = self._load_url_alt(type="vod", action="get_ordered_list",
+                                              category=cat_id, JsHttpRequest="1-xml", p=page)
+            self.log(f"[STALKER] Items empty — retrying via portal.php ({mode.upper()} cat={cat_id})")
+            async with self.session.get(alt_url, headers=headers) as r2:
+                self.log(f"[STALKER] Items (alt) HTTP {r2.status} ({mode.upper()} cat={cat_id})")
+                payload = await safe_json(r2)
+            items = normalize_js(payload)
         for it in items:
             if not isinstance(it, dict):
                 continue
@@ -3547,6 +3579,27 @@ def api_epg():
                     if result.get("current") or result.get("next") or result.get("schedule"):
                         return result
                     state.log(f"[EPG] Portal returned no EPG data for this channel")
+                    # Fallback: try alternate path (portal.php ↔ load.php)
+                    if state.is_stalker_portal:
+                        alt_php = "/stalker_portal/portal.php"
+                    else:
+                        alt_php = "/stalker_portal/server/load.php"
+                    if alt_php != php:
+                        alt_epg_url = (f"{base_url}{alt_php}?type=itv&action=get_short_epg"
+                                       f"&ch_id={ch_id}&count=10&JsHttpRequest=1-xml")
+                        state.log(f"[EPG] Retrying via alt path: {alt_epg_url}")
+                        try:
+                            async with client.session.get(alt_epg_url, headers=headers,
+                                                          timeout=aiohttp.ClientTimeout(total=10)) as r2:
+                                state.log(f"[EPG] Alt HTTP {r2.status}")
+                                payload2 = await safe_json(r2)
+                            state.log(f"[EPG] Alt raw: {str(payload2)[:300]}")
+                            result2 = _parse_stalker_epg(payload2, ch_id)
+                            if result2.get("current") or result2.get("next") or result2.get("schedule"):
+                                return result2
+                            state.log(f"[EPG] Alt path also returned no EPG data")
+                        except Exception as _e2:
+                            state.log(f"[EPG] Alt path error: {_e2}")
 
             # External EPG fallback for MAC/Stalker
             if state.ext_epg_url:
@@ -3686,10 +3739,9 @@ def api_find_channel():
                 async with client_cls(state.url, state.mac, state.log) as client:
                     await client.handshake()
 
-                    # ── Attempt 1: get_all_channels via portal.php — retry up to 3× ──
-                    # Some portals return 0 on first call if the token is fresh/cold;
-                    # a short back-off and retry usually resolves it.
-                    for _try in range(1, 4):
+                    # ── Attempt 1: get_all_channels — retry same path 2× before fallback ──
+                    # Some portals return 0 on first call if the token is fresh/cold.
+                    for _try in range(1, 3):
                         try:
                             if is_stalker:
                                 url = client._load_url(
@@ -3709,18 +3761,18 @@ def api_find_channel():
                             state.log(f"[FIND_CH] Attempt 1.{_try} → {len(chans)} channels")
                             if chans:
                                 break
-                            if _try < 3:
+                            if _try < 2:
                                 await asyncio.sleep(1.5)
                         except Exception as e:
                             state.log(f"[FIND_CH] Attempt 1.{_try} error: {e}")
                             chans = []
-                            if _try < 3:
+                            if _try < 2:
                                 await asyncio.sleep(1.5)
 
-                    # ── Attempt 2: try alternate path (load.php ↔ portal.php swap) ──
+                    # ── Attempt 2: try alternate path (portal.php for stalker, load.php for MAC) ──
                     if not chans:
                         try:
-                            alt_base = "/stalker_portal/server/load.php" if is_stalker else "/portal.php"
+                            alt_base = "/stalker_portal/portal.php" if is_stalker else "/stalker_portal/server/load.php"
                             alt_url = (f"{client.base}{alt_base}?type=itv"
                                        f"&action=get_all_channels"
                                        f"&force_ch_link_check=&JsHttpRequest=1-xml")
@@ -4756,16 +4808,23 @@ def api_proxy():
             rewritten = _rewrite_m3u8(text, resp.url)
             return Response(rewritten, content_type="application/vnd.apple.mpegurl", headers=cors)
         def _gen():
-            for chunk in resp.iter_content(chunk_size=16384):
-                yield chunk
+            try:
+                for chunk in resp.iter_content(chunk_size=16384):
+                    yield chunk
+            except Exception:
+                # Portal dropped connection mid-stream (normal for progressive VOD)
+                return
         h = dict(cors)
         h["Content-Type"] = ct
         if "Content-Length" in resp.headers:
             h["Content-Length"] = resp.headers["Content-Length"]
         if "Content-Range" in resp.headers:
             h["Content-Range"] = resp.headers["Content-Range"]
+        if resp.status_code not in (200, 206):
+            state.log(f"[Proxy] HTTP {resp.status_code} ← {url[:80]}")
         return Response(stream_with_context(_gen()), status=resp.status_code, headers=h)
     except Exception as e:
+        state.log(f"[Proxy] Error: {e} ← {url[:80]}")
         return Response(f"Proxy error: {e}", status=502)
 
 
@@ -4935,6 +4994,134 @@ def api_hls_proxy():
 
 
 
+# ===================== OPENSUBTITLES API =====================
+
+OPENSUBTITLES_BASE    = "https://api.opensubtitles.com/api/v1"
+OPENSUBTITLES_UA      = "IPTVPortalPlayer v1.0"
+
+def _os_headers(api_key: str = ""):
+    return {
+        "Api-Key": api_key.strip(),
+        "User-Agent": OPENSUBTITLES_UA,
+        "Content-Type": "application/json",
+    }
+
+
+@flask_app.route("/api/subtitles/search", methods=["POST"])
+def api_subtitles_search():
+    data       = request.get_json(force=True)
+    query      = (data.get("query") or "").strip()
+    lang       = (data.get("lang") or "en").strip()
+    season     = data.get("season")
+    episode    = data.get("episode")
+    max_results = int(data.get("max_results") or 20)
+    api_key    = (data.get("api_key") or "").strip()
+
+    if not query:
+        return jsonify({"error": "No query provided", "results": []}), 400
+    if not api_key:
+        return jsonify({"error": "No OpenSubtitles API key set — add it in ⚙ Settings.", "results": []}), 400
+
+    params = {"query": query, "languages": lang, "per_page": min(max_results, 40)}
+    if season:
+        params["season_number"] = int(season)
+    if episode:
+        params["episode_number"] = int(episode)
+
+    try:
+        r = _requests_lib.get(
+            f"{OPENSUBTITLES_BASE}/subtitles",
+            headers=_os_headers(api_key),
+            params=params,
+            timeout=15,
+        )
+        r.raise_for_status()
+        raw = r.json().get("data", [])
+        # Slim down the payload sent to the browser
+        results = []
+        for item in raw:
+            a    = item.get("attributes", {})
+            feat = a.get("feature_details", {})
+            files = a.get("files", [])
+            if not files:
+                continue
+            results.append({
+                "file_id":      files[0].get("file_id"),
+                "file_name":    files[0].get("file_name", "subtitle"),
+                "title":        feat.get("movie_name") or feat.get("title", "Unknown"),
+                "year":         feat.get("year", ""),
+                "season":       feat.get("season_number"),
+                "episode":      feat.get("episode_number"),
+                "feature_type": feat.get("feature_type", ""),
+                "lang":         a.get("language", "?"),
+                "rating":       a.get("ratings", "?"),
+                "downloads":    a.get("download_count", 0),
+                "uploader":     a.get("uploader", {}).get("name", "anonymous"),
+                "release":      a.get("release", ""),
+            })
+        return jsonify({"results": results, "count": len(results)})
+    except _requests_lib.HTTPError as e:
+        return jsonify({"error": f"OpenSubtitles HTTP error: {e}", "results": []}), 502
+    except Exception as e:
+        return jsonify({"error": str(e), "results": []}), 500
+
+
+@flask_app.route("/api/subtitles/download", methods=["POST"])
+def api_subtitles_download():
+    """Fetch subtitle file from OpenSubtitles and return its content.
+    The client receives the raw subtitle text and creates a Blob URL for <track>."""
+    data    = request.get_json(force=True)
+    file_id = data.get("file_id")
+    api_key = (data.get("api_key") or "").strip()
+    if not file_id:
+        return jsonify({"error": "No file_id provided"}), 400
+    if not api_key:
+        return jsonify({"error": "No OpenSubtitles API key set — add it in ⚙ Settings."}), 400
+    try:
+        r = _requests_lib.post(
+            f"{OPENSUBTITLES_BASE}/download",
+            headers=_os_headers(api_key),
+            json={"file_id": file_id},
+            timeout=15,
+        )
+        r.raise_for_status()
+        info   = r.json()
+        dl_url = info.get("link")
+        if not dl_url:
+            return jsonify({"error": "No download link returned by OpenSubtitles"}), 502
+
+        sub = _requests_lib.get(dl_url, timeout=30)
+        sub.raise_for_status()
+
+        # Detect encoding and decode
+        content_bytes = sub.content
+        # Try UTF-8 first, fall back to latin-1
+        try:
+            content_text = content_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            content_text = content_bytes.decode("latin-1", errors="replace")
+
+        # Determine MIME type from file extension in URL or content
+        fname = info.get("file_name", dl_url.split("?")[0].split("/")[-1])
+        if fname.endswith(".ass") or fname.endswith(".ssa"):
+            mime = "text/x-ssa"
+        elif fname.endswith(".vtt"):
+            mime = "text/vtt"
+        else:
+            mime = "text/srt"
+
+        return jsonify({
+            "content":   content_text,
+            "file_name": fname,
+            "mime":      mime,
+            "remaining": info.get("remaining", "?"),
+        })
+    except _requests_lib.HTTPError as e:
+        return jsonify({"error": f"OpenSubtitles HTTP error: {e}"}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ===================== HTML TEMPLATE =====================
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -5022,7 +5209,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 
 /* ─── conn panel ─────────────────────────────────────────────── */
 #cpanel{overflow:hidden;max-height:0;transition:max-height .35s cubic-bezier(.4,0,.2,1)}
-#cpanel.open{max-height:420px}
+#cpanel.open{max-height:560px}
 #cpi{padding:4px 12px 14px;display:flex;flex-direction:column;gap:8px}
 .ct-row{display:flex;gap:5px}
 .ct-btn{flex:1;height:32px;font-size:12px;padding:0;border-radius:var(--rsm)}
@@ -5433,6 +5620,80 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 @media(max-width:600px){
   #won-modal{width:100vw;max-height:100vh;border-radius:0}
 }
+
+/* ─── subtitle modal ─────────────────────────────────────────── */
+#sub-overlay{position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.75);
+  display:none;align-items:center;justify-content:center;padding:16px}
+#sub-overlay.open{display:flex}
+#sub-modal{background:var(--s1);border:1px solid var(--bdr2);border-radius:var(--r);
+  width:100%;max-width:640px;max-height:88vh;display:flex;flex-direction:column;
+  box-shadow:0 20px 60px rgba(0,0,0,.8);overflow:hidden}
+.sub-hdr{padding:14px 16px;border-bottom:1px solid var(--bdr);
+  display:flex;align-items:center;gap:10px;flex-shrink:0;background:var(--s2)}
+.sub-hdr h3{flex:1;font-size:13px;font-weight:800;letter-spacing:.5px;color:var(--txt)}
+.sub-body{flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:10px}
+.sub-search-row{display:flex;gap:8px;align-items:center}
+.sub-search-row input{flex:1;height:36px;font-size:13px}
+.sub-search-row button{height:36px;padding:0 14px;flex-shrink:0}
+.sub-filters{display:flex;flex-wrap:wrap;gap:10px;padding:8px 10px;
+  background:var(--s3);border-radius:var(--rsm);border:1px solid var(--bdr)}
+.sub-filter-group{display:flex;flex-direction:column;gap:5px}
+.sub-filter-group label.grp-lbl{font-size:10px;font-weight:800;text-transform:uppercase;
+  letter-spacing:1px;color:var(--txt3)}
+.sub-lang-grid{display:flex;flex-wrap:wrap;gap:4px}
+.sub-lang-chip{display:flex;align-items:center;gap:4px;padding:3px 8px;border-radius:20px;
+  font-size:11px;font-weight:600;border:1px solid var(--bdr2);background:var(--s4);
+  color:var(--txt2);cursor:pointer;transition:all .15s;user-select:none;white-space:nowrap}
+.sub-lang-chip input{width:14px;height:14px;cursor:pointer;flex-shrink:0;accent-color:var(--acc)}
+.sub-lang-chip:has(input:checked){background:rgba(124,58,237,.18);
+  border-color:var(--acc);color:var(--txt)}
+.sub-type-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.sub-type-chip{display:flex;align-items:center;gap:4px;padding:3px 10px;border-radius:20px;
+  font-size:11px;font-weight:600;border:1px solid var(--bdr2);background:var(--s4);
+  color:var(--txt2);cursor:pointer;transition:all .15s;user-select:none}
+.sub-type-chip input{width:14px;height:14px;cursor:pointer;flex-shrink:0;accent-color:var(--acc)}
+.sub-type-chip:has(input:checked){background:rgba(124,58,237,.18);
+  border-color:var(--acc);color:var(--txt)}
+.sub-ep-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.sub-ep-row label{font-size:11px;color:var(--txt2);white-space:nowrap}
+.sub-ep-row input{width:60px;height:28px;font-size:12px;text-align:center}
+.sub-results{display:flex;flex-direction:column;gap:6px}
+.sub-result-item{background:var(--s3);border:1px solid var(--bdr);border-radius:var(--rsm);
+  padding:10px 12px;display:flex;gap:10px;align-items:flex-start;transition:border-color .15s}
+.sub-result-item:hover{border-color:var(--bdr2)}
+.sub-result-info{flex:1;min-width:0}
+.sub-result-title{font-size:13px;font-weight:700;color:var(--txt);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sub-result-meta{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.sub-meta-badge{padding:2px 7px;border-radius:20px;font-size:10px;font-weight:700}
+.sub-meta-lang{background:rgba(6,182,212,.12);color:var(--cyan);border:1px solid rgba(6,182,212,.2)}
+.sub-meta-dl{background:rgba(34,197,94,.1);color:var(--green);border:1px solid rgba(34,197,94,.15)}
+.sub-meta-rat{background:rgba(245,158,11,.1);color:var(--orange);border:1px solid rgba(245,158,11,.15)}
+.sub-meta-ep{background:rgba(124,58,237,.12);color:#a78bfa;border:1px solid rgba(124,58,237,.2)}
+.sub-result-release{font-size:10px;color:var(--txt3);margin-top:3px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sub-load-btn{flex-shrink:0;height:34px;padding:0 12px;font-size:12px;align-self:center}
+.sub-load-btn.loaded{background:rgba(34,197,94,.15);color:var(--green);
+  border:1px solid rgba(34,197,94,.3)}
+.sub-empty{text-align:center;padding:36px 20px;color:var(--txt3);font-size:13px}
+.sub-empty span{font-size:36px;display:block;margin-bottom:8px;opacity:.3}
+.sub-status-bar{padding:8px 12px;border-top:1px solid var(--bdr);flex-shrink:0;
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  background:var(--s2);font-size:11px;color:var(--txt3)}
+.sub-active-strip{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.2);
+  border-radius:var(--rss);padding:4px 10px;font-size:11px;color:var(--green);
+  display:flex;align-items:center;gap:6px}
+.sub-delay-row{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--txt2)}
+.sub-delay-row button{width:26px;height:26px;padding:0;font-size:13px;border-radius:var(--rss);
+  border:1px solid var(--bdr2);background:var(--s3);color:var(--txt);cursor:pointer;
+  display:flex;align-items:center;justify-content:center;transition:var(--tr);flex-shrink:0}
+.sub-delay-row button:hover{background:var(--s4);border-color:var(--acc)}
+#sub-delay-val{min-width:52px;text-align:center;font-weight:700;color:var(--acc);font-size:12px;
+  font-variant-numeric:tabular-nums}
+@media(max-width:600px){
+  #sub-modal{max-height:96vh;border-radius:0}
+  #sub-overlay{padding:0;align-items:flex-end}
+}
 </style>
 </head>
 <body>
@@ -5538,6 +5799,18 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
             <option value="copy">Copy URL</option>
           </select>
         </div>
+        <div class="prow" style="position:relative">
+          <span class="plbl" style="white-space:nowrap;font-size:10px">&#x1F4AC; Sub:</span>
+          <input id="o-subkey" type="text"
+            placeholder="OpenSubtitles API key &mdash; free at opensubtitles.com/en/consumers"
+            autocomplete="new-password" autocorrect="off" spellcheck="false"
+            oninput="saveSubKey()" style="height:30px;font-size:12px"
+            title="Your OpenSubtitles Consumer API key. Get one free at opensubtitles.com/en/consumers">
+          <a href="https://www.opensubtitles.com/en/consumers" target="_blank" rel="noopener"
+            class="btn-ghost psug-btn"
+            style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:var(--rss);text-decoration:none;font-size:13px;flex-shrink:0;border:1px solid var(--bdr);background:var(--s3);color:var(--txt2)"
+            title="Get a free API key at opensubtitles.com/en/consumers">&#x1F511;</a>
+        </div>
 
       </div>
     </div>
@@ -5624,6 +5897,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
         <button class="btn-ghost pnav" onclick="playerNext()" title="Next">⏭</button>
         <button class="btn-ghost pnav" id="epgbtn" onclick="showEPG()" title="EPG" style="font-size:14px;opacity:0.35">📅</button>
         <button class="btn-ghost pnav" id="catchupbtn" onclick="showCatchup()" title="Catch-up TV" style="font-size:16px;opacity:0.35">↺</button>
+        <button class="btn-ghost pnav" id="subbtn" onclick="openSubSearch()" title="Subtitles" style="font-size:14px;opacity:0.35">💬</button>
       </div>
       <div style="min-height:16px;padding:0 4px">
         <span id="epg-now" style="font-size:11px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block"></span>
@@ -5843,6 +6117,74 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   </div>
 </div>
 
+
+<!-- SUBTITLE SEARCH MODAL -->
+<div id="sub-overlay" onclick="if(event.target===this)closeSubSearch()">
+  <div id="sub-modal">
+    <div class="sub-hdr">
+      <h3>&#x1F4AC; Subtitle Search</h3>
+      <div id="sub-active-info" style="display:none" class="sub-active-strip">
+        <span>&#x2713;</span><span id="sub-active-name" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+        <button onclick="clearSubtitle()" style="background:none;border:none;color:var(--green);cursor:pointer;padding:0;font-size:12px;margin-left:2px" title="Remove subtitle">&#x2715;</button>
+      </div>
+      <button class="btn-ghost" onclick="closeSubSearch()" style="height:28px;padding:0 10px;font-size:12px;margin-left:6px">&#x2715;</button>
+    </div>
+    <div class="sub-body">
+      <div class="sub-search-row">
+        <input id="sub-query" type="search" placeholder="Title (auto-filled from player)&hellip;"
+          autocomplete="new-password" autocorrect="off" spellcheck="false"
+          onkeydown="if(event.key==='Enter')subSearch()">
+        <button class="btn-acc" onclick="subSearch()" id="sub-search-btn">&#x1F50D; Search</button>
+      </div>
+      <div class="sub-filters">
+        <div class="sub-filter-group" style="flex:1;min-width:200px">
+          <label class="grp-lbl">Language</label>
+          <div class="sub-lang-grid" id="sub-lang-grid"></div>
+        </div>
+        <div class="sub-filter-group" style="min-width:180px">
+          <label class="grp-lbl">Type</label>
+          <div class="sub-type-row">
+            <label class="sub-type-chip"><input type="radio" name="sub-type" value="movie" id="sub-type-movie" checked onchange="subToggleEp()"> &#x1F3AC; Movie</label>
+            <label class="sub-type-chip"><input type="radio" name="sub-type" value="series" id="sub-type-series" onchange="subToggleEp()"> &#x1F4FA; Series</label>
+          </div>
+          <div class="sub-ep-row" id="sub-ep-row" style="display:none;margin-top:6px">
+            <label>Season</label>
+            <input id="sub-season" type="number" min="1" placeholder="S#" oninput="subSeasonChange()">
+            <label>Episode</label>
+            <input id="sub-episode" type="number" min="1" placeholder="Ep#">
+          </div>
+        </div>
+        <div class="sub-filter-group" style="min-width:80px">
+          <label class="grp-lbl">Max results</label>
+          <select id="sub-maxresults" style="height:28px;font-size:12px;background:var(--s4);color:var(--txt);border:1px solid var(--bdr2);border-radius:var(--rss);padding:0 8px">
+            <option value="10">10</option>
+            <option value="20" selected>20</option>
+            <option value="40">40</option>
+          </select>
+        </div>
+      </div>
+      <div id="sub-results-wrap">
+        <div class="sub-empty" id="sub-placeholder">
+          <span>&#x1F4AC;</span>
+          Search for subtitles &mdash; title is auto-filled from what&apos;s playing.
+        </div>
+      </div>
+    </div>
+    <div class="sub-status-bar">
+      <span id="sub-status-msg">Ready</span>
+      <div class="sub-delay-row" id="sub-delay-row" style="display:none">
+        <span>&#9201; Delay:</span>
+        <button onclick="subAdjustDelay(-0.1)" title="-0.1s">&#x2212;</button>
+        <span id="sub-delay-val">0.0s</span>
+        <button onclick="subAdjustDelay(0.1)" title="+0.1s">&#x2b;</button>
+        <button onclick="subAdjustDelay(-subDelayMs/1000)" title="Reset" style="font-size:10px;width:34px">Reset</button>
+        <button id="sub-toggle-btn" onclick="subToggleVisible()" title="Hide/show subtitles" style="width:auto;padding:0 7px;font-size:11px;margin-left:2px">&#x1F441; On</button>
+      </div>
+      <button class="btn-ghost" onclick="closeSubSearch()" style="height:28px;padding:0 12px;font-size:12px">Close</button>
+    </div>
+  </div>
+</div>
+
 <!-- SAVED PLAYLISTS MODAL -->
 <div id="pl-overlay" onclick="if(event.target===this)closePL()">
   <div id="pl-modal">
@@ -5898,6 +6240,344 @@ let allItems=[], filtItems=[], navStack=[], selSet=new Set();
 let pUrl='', pName='', pIdx=-1;
 let hlsObj=null, mpegtsObj=null, recTmr=null, isRec=false, logEs=null, cpOpen=false;
 const vid = document.getElementById('vid');
+
+
+// ── SUBTITLES ──────────────────────────────────────────────
+const SUB_LANGS = [
+  {code:'en',label:'English'},{code:'sr',label:'Serbian'},{code:'hr',label:'Croatian'},
+  {code:'es',label:'Spanish'},{code:'fr',label:'French'},{code:'de',label:'German'},
+  {code:'it',label:'Italian'},{code:'pt',label:'Portuguese'},{code:'ru',label:'Russian'},
+  {code:'nl',label:'Dutch'},{code:'pl',label:'Polish'},{code:'tr',label:'Turkish'},
+  {code:'sv',label:'Swedish'},{code:'hu',label:'Hungarian'},{code:'cs',label:'Czech'},
+  {code:'ro',label:'Romanian'},{code:'bg',label:'Bulgarian'},{code:'uk',label:'Ukrainian'},
+  {code:'el',label:'Greek'},{code:'ar',label:'Arabic'},{code:'zh',label:'Chinese'},
+  {code:'ja',label:'Japanese'},{code:'ko',label:'Korean'},
+];
+
+let _subActiveFile = null;   // {name, content}
+let _subTrackEl    = null;
+let _subVttOriginal = null;  // original VTT string before any delay shift
+let subDelayMs = 0;          // current delay in milliseconds
+
+function _subInitLangGrid(){
+  const grid = document.getElementById('sub-lang-grid');
+  if(!grid || grid.children.length) return;
+  // Default checked: English + Serbian
+  const defaults = new Set(['en','sr']);
+  grid.innerHTML = SUB_LANGS.map(l => `
+    <label class="sub-lang-chip">
+      <input type="checkbox" value="${l.code}" ${defaults.has(l.code)?'checked':''}>
+      ${l.label}
+    </label>`).join('');
+}
+
+function openSubSearch(){
+  _subInitLangGrid();
+  // Auto-fill title from currently playing stream
+  const q = document.getElementById('sub-query');
+  if(pName && !q.value){
+    // Clean up: strip S01E01 / season-episode patterns, quality tags, etc.
+    let cleaned = pName
+      .replace(/\bS\d{1,2}E\d{1,2}\b/gi,'')
+      .replace(/\b(720p|1080p|4k|hevc|h264|h265|hd|sd|fhd|uhd|bluray|webrip|web-dl|xvid|x264|x265)\b/gi,'')
+      .replace(/[._\-\[\]()]+/g,' ')
+      .replace(/\s{2,}/g,' ').trim();
+    q.value = cleaned;
+    // Auto-detect series pattern and pre-select Series radio
+    const epMatch = pName.match(/[Ss](\d{1,2})[Ee](\d{1,2})/);
+    if(epMatch){
+      document.getElementById('sub-type-series').checked = true;
+      document.getElementById('sub-season').value  = epMatch[1];
+      document.getElementById('sub-episode').value = epMatch[2];
+      subToggleEp();
+    }
+  }
+  // Show active subtitle badge
+  const info = document.getElementById('sub-active-info');
+  if(_subActiveFile){
+    document.getElementById('sub-active-name').textContent = _subActiveFile.name;
+    info.style.display = 'flex';
+  } else {
+    info.style.display = 'none';
+  }
+  document.getElementById('sub-overlay').classList.add('open');
+  setTimeout(()=>document.getElementById('sub-query').focus(), 150);
+}
+
+function closeSubSearch(){
+  document.getElementById('sub-overlay').classList.remove('open');
+}
+
+function subToggleEp(){
+  const isSeries = document.getElementById('sub-type-series').checked;
+  document.getElementById('sub-ep-row').style.display = isSeries ? 'flex' : 'none';
+}
+
+function subSeasonChange(){
+  // When user types a season, auto-focus episode field
+  const s = document.getElementById('sub-season').value;
+  if(s) document.getElementById('sub-episode').focus();
+}
+
+function _subGetLangs(){
+  const checks = document.querySelectorAll('#sub-lang-grid input[type=checkbox]:checked');
+  const codes = Array.from(checks).map(c=>c.value);
+  return codes.length ? codes.join(',') : 'en';
+}
+
+async function subSearch(){
+  const query = document.getElementById('sub-query').value.trim();
+  if(!query){ toast('Enter a title to search','err'); return; }
+
+  const isSeries = document.getElementById('sub-type-series').checked;
+  const season   = isSeries ? (document.getElementById('sub-season').value||null) : null;
+  const episode  = isSeries ? (document.getElementById('sub-episode').value||null) : null;
+  const lang     = _subGetLangs();
+  const maxR     = document.getElementById('sub-maxresults').value;
+
+  const btn  = document.getElementById('sub-search-btn');
+  const wrap = document.getElementById('sub-results-wrap');
+  const msg  = document.getElementById('sub-status-msg');
+
+  btn.disabled = true;
+  btn.textContent = '⏳ Searching…';
+  msg.textContent = 'Searching OpenSubtitles…';
+  wrap.innerHTML = '<div class="sub-empty"><span class="spin" style="font-size:28px;display:block;margin-bottom:12px"></span>Searching…</div>';
+
+  try{
+    const r = await fetch('/api/subtitles/search',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({query, lang, season, episode, max_results: parseInt(maxR), api_key: _getSubKey()}),
+    });
+    const d = await r.json();
+    if(d.error){ toast('Search error: '+d.error,'err'); wrap.innerHTML=_subEmpty('Search failed: '+esc(d.error)); return; }
+    if(!d.results || !d.results.length){
+      wrap.innerHTML = _subEmpty('No subtitles found. Try a different title or language.');
+      msg.textContent = 'No results.';
+      return;
+    }
+    msg.textContent = d.count + ' result(s) found';
+    _subRenderResults(d.results);
+  } catch(e){
+    wrap.innerHTML = _subEmpty('Network error: '+esc(String(e)));
+    msg.textContent = 'Error.';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🔍 Search';
+  }
+}
+
+function _subEmpty(msg){
+  return `<div class="sub-empty"><span>&#x1F4AC;</span>${msg}</div>`;
+}
+
+function _subRenderResults(results){
+  const wrap = document.getElementById('sub-results-wrap');
+  const parts = results.map((item, i) => {
+    const epStr = (item.season && item.episode)
+      ? ` <span class="sub-meta-badge sub-meta-ep">S${String(item.season).padStart(2,'0')}E${String(item.episode).padStart(2,'0')}</span>`
+      : '';
+    const yearStr = item.year ? ` (${item.year})` : '';
+    return `<div class="sub-result-item">
+      <div class="sub-result-info">
+        <div class="sub-result-title">${esc(item.title)}${yearStr}</div>
+        <div class="sub-result-meta">
+          <span class="sub-meta-badge sub-meta-lang">${esc(item.lang)}</span>
+          ${epStr}
+          <span class="sub-meta-badge sub-meta-dl">&#x2B07; ${item.downloads}</span>
+          <span class="sub-meta-badge sub-meta-rat">&#x2605; ${item.rating}</span>
+        </div>
+        <div class="sub-result-release">${esc(item.file_name || '')} &bull; ${esc(item.uploader)}</div>
+      </div>
+      <button class="btn-ghost sub-load-btn" id="sub-load-${i}"
+        onclick="subLoadSubtitle(${item.file_id}, '${esc(item.file_name||'subtitle')}', ${i})"
+        title="Load into player">&#x25B6; Load</button>
+    </div>`;
+  });
+  wrap.innerHTML = `<div class="sub-results">${parts.join('')}</div>`;
+}
+
+async function subLoadSubtitle(fileId, fileName, btnIdx){
+  const btn = document.getElementById('sub-load-'+btnIdx);
+  const msg = document.getElementById('sub-status-msg');
+  if(btn){ btn.disabled=true; btn.textContent='⏳…'; }
+  msg.textContent = 'Downloading subtitle…';
+
+  try{
+    const r = await fetch('/api/subtitles/download',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({file_id: fileId, api_key: _getSubKey()}),
+    });
+    const d = await r.json();
+    if(d.error){ toast('Download failed: '+d.error,'err'); if(btn){btn.disabled=false;btn.textContent='▶ Load';} return; }
+
+    _subApplyToPlayer(d.content, d.file_name || fileName, d.mime || 'text/srt');
+    _subActiveFile = {name: d.file_name || fileName};
+
+    // Update active badge
+    document.getElementById('sub-active-name').textContent = _subActiveFile.name;
+    document.getElementById('sub-active-info').style.display = 'flex';
+    // Mark button as loaded
+    if(btn){ btn.textContent='✓ Loaded'; btn.classList.add('loaded'); }
+    msg.textContent = 'Loaded: ' + (d.file_name||fileName) + (d.remaining!==undefined ? ' | Quota left: '+d.remaining : '');
+    // Update player subtitle button to show active
+    const subBtn = document.getElementById('subbtn');
+    if(subBtn) subBtn.style.opacity='1';
+    toast('Subtitle loaded','ok');
+  } catch(e){
+    toast('Error: '+e,'err');
+    if(btn){ btn.disabled=false; btn.textContent='▶ Load'; }
+  }
+}
+
+function _subApplyToPlayer(content, fileName, mime){
+  // Remove existing track
+  if(_subTrackEl){ try{_subTrackEl.remove();}catch(e){} _subTrackEl=null; }
+
+  // Convert SRT/SSA/ASS → VTT if needed (browser only natively supports VTT)
+  let vttContent = content;
+  const lower = (fileName||'').toLowerCase();
+  if(lower.endsWith('.srt') || mime==='text/srt'){
+    vttContent = _srtToVtt(content);
+  } else if(lower.endsWith('.ass') || lower.endsWith('.ssa')){
+    vttContent = _assToVtt(content);
+  }
+
+  // Store original for delay re-apply
+  _subVttOriginal = vttContent;
+  subDelayMs = 0;
+  const _dv = document.getElementById('sub-delay-val');
+  if(_dv) _dv.textContent = '0.0s';
+  const _dr = document.getElementById('sub-delay-row');
+  if(_dr) _dr.style.display = 'flex';
+  const _tb2=document.getElementById('sub-toggle-btn'); if(_tb2) _tb2.innerHTML='&#x1F441; On';
+
+  const blob = new Blob([vttContent], {type:'text/vtt'});
+  const url  = URL.createObjectURL(blob);
+
+  const track  = document.createElement('track');
+  track.kind   = 'subtitles';
+  track.label  = fileName || 'Subtitle';
+  track.srclang = 'und';
+  track.src    = url;
+  track.default = true;
+  vid.appendChild(track);
+  _subTrackEl = track;
+
+  // Force the browser to show it
+  // textTracks are activated after a tiny delay once added to video
+  setTimeout(()=>{
+    try{
+      for(let i=0;i<vid.textTracks.length;i++){
+        vid.textTracks[i].mode = i===vid.textTracks.length-1 ? 'showing' : 'disabled';
+      }
+    } catch(e){}
+  }, 200);
+}
+
+function _vttShiftTimestamps(vtt, deltaMs){
+  // Shift all VTT timestamp lines by deltaMs (can be negative)
+  return vtt.replace(
+    /(\d{2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{3})/g,
+    (_,s,e)=>{
+      const _p=t=>{
+        const [h,m,rest]=t.replace(',','.').split(':');
+        return ((+h*3600)+(+m*60)+parseFloat(rest))*1000;
+      };
+      const _f=ms=>{
+        ms=Math.max(0,ms);
+        const h=Math.floor(ms/3600000); ms-=h*3600000;
+        const m=Math.floor(ms/60000);   ms-=m*60000;
+        const sc=Math.floor(ms/1000);   ms-=sc*1000;
+        return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sc).padStart(2,'0')}.${String(ms).padStart(3,'0')}`;
+      };
+      return _f(_p(s)+deltaMs)+' --> '+_f(_p(e)+deltaMs);
+    }
+  );
+}
+
+function subAdjustDelay(deltaSec){
+  if(!_subVttOriginal){ toast('No subtitle loaded','w'); return; }
+  subDelayMs += Math.round(deltaSec * 1000);
+  const shifted = _vttShiftTimestamps(_subVttOriginal, subDelayMs);
+  // Re-apply shifted VTT
+  if(_subTrackEl){ try{_subTrackEl.remove();}catch(e){} _subTrackEl=null; }
+  const blob = new Blob([shifted],{type:'text/vtt'});
+  const url = URL.createObjectURL(blob);
+  const track = document.createElement('track');
+  track.kind='subtitles'; track.srclang='und';
+  track.label=(_subActiveFile?.name||'Subtitle')+' ['+(subDelayMs>=0?'+':'')+subDelayMs+'ms]';
+  track.src=url; track.default=true;
+  vid.appendChild(track);
+  _subTrackEl=track;
+  setTimeout(()=>{
+    try{ for(let i=0;i<vid.textTracks.length;i++)
+      vid.textTracks[i].mode=i===vid.textTracks.length-1?'showing':'disabled';
+    }catch(e){}
+  },200);
+  const dv=document.getElementById('sub-delay-val');
+  if(dv) dv.textContent=(subDelayMs>=0?'+':'')+( subDelayMs/1000).toFixed(1)+'s';
+}
+
+function subToggleVisible(){
+  if(!_subTrackEl) return;
+  const isShowing = [...(vid.textTracks||[])].some(t=>t.mode==='showing');
+  const newMode = isShowing ? 'hidden' : 'showing';
+  try{ for(let i=0;i<vid.textTracks.length;i++) vid.textTracks[i].mode=newMode; } catch(e){}
+  const btn = document.getElementById('sub-toggle-btn');
+  if(btn) btn.innerHTML = newMode==='showing' ? '&#x1F441; On' : '&#x1F648; Off';
+}
+
+function clearSubtitle(){
+  if(_subTrackEl){ try{_subTrackEl.remove();}catch(e){} _subTrackEl=null; }
+  _subActiveFile = null;
+  const info = document.getElementById('sub-active-info');
+  if(info) info.style.display='none';
+  const subBtn = document.getElementById('subbtn');
+  if(subBtn) subBtn.style.opacity='0.35';
+  _subVttOriginal = null; subDelayMs = 0;
+  const _dr = document.getElementById('sub-delay-row');
+  if(_dr) _dr.style.display = 'none';
+  const _tb=document.getElementById('sub-toggle-btn'); if(_tb) _tb.innerHTML='&#x1F441; On';
+  toast('Subtitle removed','info');
+}
+
+// ── SRT → VTT converter ────────────────────────────────────
+function _srtToVtt(srt){
+  let vtt = 'WEBVTT\n\n';
+  // Normalise CRLF
+  vtt += srt.replace(/\r\n/g,'\n').replace(/\r/g,'\n')
+    // Replace SRT timestamp separator (comma for ms) with VTT dot
+    .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2')
+    // Strip HTML-like tags that VTT doesn't handle
+    .replace(/<\/?[^>]+(>|$)/g,'');
+  return vtt;
+}
+
+// ── Basic ASS/SSA → VTT converter ─────────────────────────
+function _assToVtt(ass){
+  let vtt = 'WEBVTT\n\n';
+  const lines = ass.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n');
+  let idx = 1;
+  for(const line of lines){
+    // Dialogue: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+    const m = line.match(/^Dialogue:\s*\d+,(\d+:\d{2}:\d{2}\.\d{2}),(\d+:\d{2}:\d{2}\.\d{2}),[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,(.*)$/);
+    if(!m) continue;
+    // ASS time: H:MM:SS.cs  → convert centiseconds to milliseconds
+    const _ts = t => {
+      const [h,min,sec] = t.split(':');
+      const [s,cs] = sec.split('.');
+      return `${h.padStart(2,'0')}:${min}:${s}.${(parseInt(cs)*10).toString().padStart(3,'0')}`;
+    };
+    // Strip ASS override tags like {\an8}
+    const text = m[3].replace(/\{[^}]*\}/g,'').replace(/\\N/g,'\n').replace(/\\n/g,'\n').trim();
+    if(!text) continue;
+    vtt += `${idx++}\n${_ts(m[1])} --> ${_ts(m[2])}\n${text}\n\n`;
+  }
+  return vtt;
+}
 
 // ── FAVOURITES ─────────────────────────────────────────────
 // Stored per portal hostname: localStorage['favs_hardcoremedia.xyz'] = [{...item}]
@@ -6370,7 +7050,7 @@ async function playItem(i){
   document.getElementById('catchupbtn').style.opacity=(itemMode==='live')?'1':'0.35';
   const name=it.name||it.o_name||it.fname||'Unknown';
   const direct=it._direct_url||it._url;
-  if(direct){doPlay(direct,name);return;}
+  if(direct){doPlay(direct,name,{isLive:itemMode==='live'});return;}
   setNP('⟳ Resolving: '+name+'…');
   forceTab('p-player','t-player');
   try{
@@ -6378,7 +7058,7 @@ async function playItem(i){
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({item:it, mode:itemMode, category:curCat||{}})});
     const d=await r.json();
-    if(d.url) doPlay(d.url, name);
+    if(d.url) doPlay(d.url, name, {isLive: itemMode==='live'});
     else{setNP('✗ Could not resolve: '+name);toast('Could not resolve URL','err');}
   }catch(e){setNP('✗ '+e.message);}
 }
@@ -6396,7 +7076,6 @@ function doPlay(url, name, opts={}){
   pUrl=url; pName=name||url;
   _playerStopped = false;                        // new play — clear stop flag
   window._mseTranscodeFired = false;             // reset MSE transcode guard
-  if(window._ptRetries) window._ptRetries = {}; // reset play_token retry counter
   if(window._mpegRetries) window._mpegRetries = {}; // reset general retry counter
   window._remuxFired = false;                        // reset remux fallback flag
   window._hlsRemuxFired = false;                     // reset HLS remux fallback flag
@@ -6425,7 +7104,15 @@ function doPlay(url, name, opts={}){
                || u.includes('timeshift.php')
                || qs.includes('extension=m3u8');
 
-  const isMpegTs = !isStorageUrl && (
+  // MKV/MP4/AVI etc — browser can play natively, no need for mpegts.js or HLS.js
+  const _qsFull = url.toLowerCase(); // full URL including query string
+  const isDirect = !isHls && !isStorageUrl && (
+               u.endsWith('.mkv') || _qsFull.includes('.mkv&') || _qsFull.includes('.mkv?') || _qsFull.includes('stream=') && _qsFull.match(/stream=[^&]*\.mkv/)
+               || u.endsWith('.mp4') || _qsFull.includes('.mp4&') || _qsFull.includes('.mp4?') || _qsFull.includes('stream=') && _qsFull.match(/stream=[^&]*\.mp4/)
+               || u.endsWith('.avi') || u.endsWith('.mov') || u.endsWith('.webm')
+               || qs.includes('extension=mkv') || qs.includes('extension=mp4'));
+
+  const isMpegTs = !isStorageUrl && !isHls && !isDirect && (
                url.includes('/api/hls_proxy') // server-side transcode proxy
                || qs.includes('play_token=')  // MAC portals: short-lived token = raw MPEG-TS stream
                || u.endsWith('.ts')
@@ -6435,11 +7122,16 @@ function doPlay(url, name, opts={}){
                || qs.includes('extension=ts')
                || qs.includes('output=ts'));
 
-  const playerType = isStorageUrl?'storage':isHls?'HLS':isMpegTs?'MPEG-TS':'direct';
+  const playerType = isStorageUrl?'storage':isHls?'HLS':isDirect?'direct':isMpegTs?'MPEG-TS':'direct';
   const mpegtsOk = isMpegTs && typeof mpegts!=='undefined' && mpegts.isSupported();
   alog('▶ '+pName+' ['+playerType+(isMpegTs&&!mpegtsOk?' → MSE not supported, trying native':'')+']','k');
 
-  if(isStorageUrl){
+  if(isDirect){
+    // ── Direct container (MKV/MP4/AVI) — browser native playback via proxy ──
+    alog('[Direct] Playing natively ('+playerType+'): '+pName,'k');
+    vid.src=px; vid.play().catch(()=>{});
+
+  } else if(isStorageUrl){
     // ── Stalker storage/get.php — direct to video, no proxy ──────
     // Proxying would double-encode the query string (?filename=...&token=...).
     alog('[Storage] Playing direct (no proxy)','k');
@@ -6491,7 +7183,31 @@ function doPlay(url, name, opts={}){
             vid.play().catch(()=>{});
             mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
               if(!_playerStopped){
-                alog('[HLS/remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
+                alog('[HLS/remux] '+(ed2?.msg||String(ed2)),'e');
+              // MSE/codec error (e.g. HEVC) — escalate to ffmpeg transcode
+              const _isMSE2 = (String(et2||'').includes('Media') || String(et2||'')==='MediaError')
+                           && (String(ed2||'').includes('MSE')||String(ed2?.msg||'').includes('MSE')
+                               ||String(ed2||'').includes('Unsupported')||String(ed2?.msg||'').includes('Unsupported'));
+              if(_isMSE2 && !_playerStopped && !window._mseTranscodeFired){
+                window._mseTranscodeFired=true;
+                alog('[HLS/remux] HEVC codec — escalating to ffmpeg transcode…','w');
+                setTimeout(()=>{
+                  if(_playerStopped) return;
+                  if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
+                  vid.pause(); vid.removeAttribute('src'); vid.load();
+                  _playerStopped=false;
+                  const transcodeUrl='/api/hls_proxy?transcode=1&url='+encodeURIComponent(url);
+                  setNP('▶ '+name+' [transcoding HEVC→H.264]');
+                  if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
+                    mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:transcodeUrl,cors:true},{enableWorker:false,liveBufferLatencyChasing:true,liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3});
+                    mpegtsObj.attachMediaElement(vid); mpegtsObj.load(); vid.play().catch(()=>{});
+                    mpegtsObj.on(mpegts.Events.ERROR,(et3,ed3)=>{
+                      if(!_playerStopped){ alog('[HLS/transcode] '+(ed3?.msg||String(ed3)),'e'); setNP('✗ Transcode failed: '+name); document.getElementById('ppbtn').textContent='▶'; }
+                    });
+                  } else { vid.src=transcodeUrl; vid.play().catch(()=>{}); }
+                },0);
+                return;
+              }
                 setNP('✗ Stream unavailable: '+name);
                 document.getElementById('ppbtn').textContent='▶';
               }
@@ -6527,7 +7243,31 @@ function doPlay(url, name, opts={}){
               vid.play().catch(()=>{});
               mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
                 if(!_playerStopped){
-                  alog('[HLS/remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
+                  alog('[HLS/remux] '+(ed2?.msg||String(ed2)),'e');
+                // MSE/codec error (e.g. HEVC) — escalate to ffmpeg transcode
+                const _isMSE2 = (String(et2||'').includes('Media') || String(et2||'')==='MediaError')
+                             && (String(ed2||'').includes('MSE')||String(ed2?.msg||'').includes('MSE')
+                                   ||String(ed2||'').includes('Unsupported')||String(ed2?.msg||'').includes('Unsupported'));
+                if(_isMSE2 && !_playerStopped && !window._mseTranscodeFired){
+                  window._mseTranscodeFired=true;
+                  alog('[HLS/remux] HEVC codec — escalating to ffmpeg transcode…','w');
+                  setTimeout(()=>{
+                    if(_playerStopped) return;
+                    if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
+                    vid.pause(); vid.removeAttribute('src'); vid.load();
+                    _playerStopped=false;
+                    const transcodeUrl='/api/hls_proxy?transcode=1&url='+encodeURIComponent(url);
+                    setNP('▶ '+name+' [transcoding HEVC→H.264]');
+                    if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
+                      mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:transcodeUrl,cors:true},{enableWorker:false,liveBufferLatencyChasing:true,liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3});
+                      mpegtsObj.attachMediaElement(vid); mpegtsObj.load(); vid.play().catch(()=>{});
+                      mpegtsObj.on(mpegts.Events.ERROR,(et3,ed3)=>{
+                        if(!_playerStopped){ alog('[HLS/transcode] '+(ed3?.msg||String(ed3)),'e'); setNP('✗ Transcode failed: '+name); document.getElementById('ppbtn').textContent='▶'; }
+                      });
+                    } else { vid.src=transcodeUrl; vid.play().catch(()=>{}); }
+                  },0);
+                  return;
+                }
                   setNP('✗ Stream unavailable: '+name);
                   document.getElementById('ppbtn').textContent='▶';
                 }
@@ -6575,17 +7315,75 @@ function doPlay(url, name, opts={}){
         vid.play().catch(()=>{});
       });
     }
-    mpegtsObj.on(mpegts.Events.ERROR,(et,ed)=>{
-      const msg=(ed?.msg||JSON.stringify(ed));
+    mpegtsObj.on(mpegts.Events.ERROR,(et,ed,ei)=>{
+      // et=error type, ed=error detail (string), ei=error info object (has httpStatusCode)
+      const msg=(ei?.msg||ed||'');
       const etStr = String(et||'');
       const edStr = String(ed||'');
-      alog('[MPEGTS] '+etStr+': '+msg,'e');
+      const httpCode = ei?.httpStatusCode||ei?.statusCode||ei?.code||0;
+      const _codeTag = httpCode && httpCode>0 ? ' (HTTP '+httpCode+')' : '';
+      alog('[MPEGTS] '+etStr+_codeTag+': '+edStr,'e');
       const hasPlayToken = url.toLowerCase().includes('play_token=');
-      const httpCode = ed?.code || ed?.httpStatusCode || 0;
       // MediaMSEError = codec unsupported by browser (e.g. HEVC/H.265)
       // Match both strict type check AND string fallback from the log: "MediaError: MediaMSEError"
-      const isMSEError = (et===mpegts.ErrorTypes.MEDIA_ERROR || etStr==='MediaError')
-                      && (edStr.includes('MSE') || edStr.includes('mse') || msg.includes('MSE'));
+      // FormatUnsupported = wrong container (e.g. HLS playlist fed to mpegts.js) → try HLS.js
+      // Real MSEError = codec unsupported by browser (e.g. HEVC/H.265) → try ffmpeg transcode
+      const isFormatUnsupported = (et===mpegts.ErrorTypes.MEDIA_ERROR || etStr==='MediaError')
+                      && (edStr.includes('FormatUnsupported') || msg.includes('FormatUnsupported'));
+      const isMSEError = !isFormatUnsupported
+                      && (et===mpegts.ErrorTypes.MEDIA_ERROR || etStr==='MediaError')
+                      && (edStr.includes('MSE') || edStr.includes('mse') || msg.includes('MSE')
+                          || edStr.includes('Unsupported') || msg.includes('Unsupported'));
+      // FormatUnsupported: content is not MPEG-TS at all (portal sent HLS/MP4 with play_token URL)
+      // → try HLS.js on the original URL first; if that also fails, fall back to ffmpeg remux
+      if(isFormatUnsupported){
+        if(!_playerStopped && !window._mseTranscodeFired){
+          window._mseTranscodeFired = true;
+          alog('[MPEGTS] FormatUnsupported — content may be HLS; retrying with HLS.js…','w');
+          setTimeout(()=>{
+            if(_playerStopped) return;
+            if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
+            vid.pause(); vid.removeAttribute('src'); vid.load();
+            _playerStopped = false;
+            const rawUrl = url; // original unproxied URL
+            const pxUrl = rawUrl.startsWith('/api/') ? rawUrl : '/api/proxy?url='+encodeURIComponent(rawUrl);
+            if(typeof Hls !== 'undefined' && Hls.isSupported()){
+              setNP('▶ '+name+' [HLS fallback]');
+              hlsObj = new Hls({
+                enableWorker:false, lowLatencyMode:false,
+                maxBufferLength:60, maxMaxBufferLength:180,
+                fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
+                levelLoadingTimeOut:20000,
+                xhrSetup(xhr){xhr.withCredentials=false;}
+              });
+              hlsObj.loadSource(pxUrl);
+              hlsObj.attachMedia(vid);
+              hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>vid.play().catch(()=>{}));
+              hlsObj.on(Hls.Events.ERROR,(_,d)=>{
+                if(d.fatal && !_playerStopped && !window._remuxFired){
+                  window._remuxFired = true;
+                  alog('[HLS fallback] Failed — trying ffmpeg remux…','w');
+                  if(hlsObj){hlsObj.destroy();hlsObj=null;}
+                  const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(rawUrl);
+                  setTimeout(()=>{
+                    if(_playerStopped) return;
+                    setNP('▶ '+name+' [remux]');
+                    if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
+                      mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{enableWorker:false});
+                      mpegtsObj.attachMediaElement(vid); mpegtsObj.load(); vid.play().catch(()=>{});
+                    } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
+                  },0);
+                }
+              });
+            } else {
+              // No HLS.js — try native src (Safari/iOS handles m3u8 natively)
+              setNP('▶ '+name+' [native HLS fallback]');
+              vid.src=rawUrl; vid.play().catch(()=>{});
+            }
+          }, 0);
+        }
+        return;
+      }
       if(isMSEError){
         if(!_playerStopped && !url.includes('transcode=1') && !window._mseTranscodeFired){
           window._mseTranscodeFired = true; // guard: only fire once per play session
@@ -6683,6 +7481,10 @@ function doPlay(url, name, opts={}){
           document.getElementById('ppbtn').textContent='\u25b6';
           window._mpegRetries[_mk]=0;
         }
+      } else if(!isLiveStream && et===mpegts.ErrorTypes.NETWORK_ERROR){
+        alog('[MPEGTS] VOD stream unavailable'+_codeTag+' — '+msg,'e');
+        setNP('✗ Stream unavailable'+_codeTag+': '+name);
+        document.getElementById('ppbtn').textContent='▶';
       } else if(!isLiveStream && fallbackUrl && et===mpegts.ErrorTypes.NETWORK_ERROR){
         // Catchup path-based .ts failed → try query-string format via HLS.js
         alog('[MPEGTS] Catchup .ts failed — retrying with fallback URL via HLS.js','w');
@@ -7335,6 +8137,12 @@ function saveFP(){
 function saveExtPlayer(){
   try{localStorage.setItem('ext_player',document.getElementById('o-extplayer').value);}catch(e){}
 }
+function saveSubKey(){
+  try{localStorage.setItem('opensubtitles_key',document.getElementById('o-subkey').value.trim());}catch(e){}
+}
+function _getSubKey(){
+  try{return localStorage.getItem('opensubtitles_key')||'';}catch(e){return '';}
+}
 function saveMobilePlayer(){
   try{localStorage.setItem('mobile_player',document.getElementById('o-mobile-player').value);}catch(e){}
 }
@@ -7557,6 +8365,8 @@ document.addEventListener('DOMContentLoaded',()=>{
     else document.getElementById('o-m3u').value='/sdcard/Download/playlist.m3u';}catch(e){}
   try{const se=localStorage.getItem('ext_player');
     if(se) document.getElementById('o-extplayer').value=se;}catch(e){}
+  try{const sk=localStorage.getItem('opensubtitles_key');
+    if(sk) document.getElementById('o-subkey').value=sk;}catch(e){}
   if(_isMobile){
     document.getElementById('extplayer-row-desktop').style.display='none';
     document.getElementById('extplayer-row-mobile').style.display='flex';
