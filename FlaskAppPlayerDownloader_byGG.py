@@ -7379,16 +7379,6 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
              style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;
              padding:5px 14px;background:var(--s2);user-select:none">
 
-          <div style="display:flex;align-items:center;gap:7px">
-            <span id="pctrl-arrow"
-              style="font-size:10px;color:var(--txt3);transition:transform .2s;display:inline-block">▲</span>
-
-            <h3 style="font-size:10px;font-weight:800;text-transform:uppercase;
-                letter-spacing:1.5px;color:var(--txt2);margin:0">
-                Player Controls
-            </h3>
-          </div>
-
           <!-- RIGHT BUTTON GROUP -->
           <div style="display:flex;align-items:center;gap:6px">
 
