@@ -13,6 +13,8 @@ Added support for /stalker_portal/ type of MAC portals.
 Added support for EPG.
 Added support for CatchUp (where avialaible and supported by portal).
 Added support for external EPG url, to cover channels where portal does not provide EPG.
+Added tag bar above categories.
+Varius UI fixes.
 """
 
 import base64
@@ -4129,6 +4131,13 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
   background:var(--s3);color:var(--txt2);border:1px solid var(--bdr);transition:var(--tr)}
 .mt.on{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
   border-color:transparent;box-shadow:0 2px 12px var(--glow2)}
+.tag-bar{display:flex;gap:5px;overflow-x:auto;padding:4px 10px 2px;flex-shrink:0;scrollbar-width:none}
+.tag-bar::-webkit-scrollbar{display:none}
+.tag-pill{padding:3px 10px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.4px;
+  cursor:pointer;white-space:nowrap;border:1px solid var(--bdr2);background:var(--s3);
+  color:var(--txt2);transition:all .15s;flex-shrink:0}
+.tag-pill:hover{border-color:var(--acc);color:var(--acc)}
+.tag-pill.on{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;border-color:transparent}
 
 /* ─── search bar ─────────────────────────────────────────────── */
 .sbar{position:relative;flex-shrink:0}
@@ -4156,9 +4165,27 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
 .citem:hover .c-arr{color:var(--acc);transform:translateX(3px)}
 
 /* ─── skeleton ───────────────────────────────────────────────── */
-.skel{height:42px;border-radius:var(--rsm);margin-bottom:4px;
-  background:linear-gradient(90deg,var(--s2) 25%,var(--s3) 50%,var(--s2) 75%);
-  background-size:200% 100%;animation:shimmer 1.5s infinite}
+.skel{height:52px;border-radius:var(--rsm);margin-bottom:4px;display:flex;
+  align-items:center;gap:10px;padding:0 12px;
+  background:var(--s2);border:1px solid var(--bdr)}
+.skel::before{content:'';width:32px;height:32px;border-radius:6px;flex-shrink:0;
+  background:linear-gradient(90deg,var(--s3) 25%,var(--s4) 50%,var(--s3) 75%);
+  background-size:200% 100%;animation:shimmer 1.4s infinite}
+.skel::after{content:'';flex:1;height:14px;border-radius:4px;
+  background:linear-gradient(90deg,var(--s3) 25%,var(--s4) 50%,var(--s3) 75%);
+  background-size:200% 100%;animation:shimmer 1.4s infinite .1s}
+.skel-sm{height:38px;border-radius:var(--rsm);margin-bottom:3px;display:flex;
+  align-items:center;gap:10px;padding:0 12px;
+  background:var(--s2);border:1px solid var(--bdr)}
+.skel-sm::before{content:'';width:22px;height:22px;border-radius:4px;flex-shrink:0;
+  background:linear-gradient(90deg,var(--s3) 25%,var(--s4) 50%,var(--s3) 75%);
+  background-size:200% 100%;animation:shimmer 1.4s infinite}
+.skel-sm::after{content:'';flex:1;height:11px;border-radius:3px;
+  background:linear-gradient(90deg,var(--s3) 25%,var(--s4) 50%,var(--s3) 75%);
+  background-size:200% 100%;animation:shimmer 1.4s infinite .08s}
+/* loading label in panel header */
+.loading-lbl{font-size:11px;color:var(--acc);display:flex;align-items:center;gap:5px;animation:pulse 1.2s ease infinite}
+@keyframes pulse{0%,100%{opacity:.5}50%{opacity:1}}
 
 /* ─── item list ──────────────────────────────────────────────── */
 .bcrum{font-size:11px;color:var(--txt3);margin-bottom:8px;display:flex;
@@ -4473,6 +4500,7 @@ button:disabled{opacity:.3;cursor:not-allowed;transform:none!important}
       </button>
     </div>
     <div style="padding:8px 10px 0;flex-shrink:0;display:flex;flex-direction:column;gap:6px">
+      <div class="tag-bar" id="tag-bar" style="display:none"></div>
       <div class="sbar"><span class="sico">🔍</span>
         <input id="csrch" type="search" placeholder="Search categories…" oninput="filterCats()">
       </div>
@@ -4772,6 +4800,10 @@ function toggleCP(){
   cpOpen=!cpOpen;
   document.getElementById('cpanel').classList.toggle('open',cpOpen);
 }
+function closeCP(){
+  cpOpen=false;
+  document.getElementById('cpanel').classList.remove('open');
+}
 
 function setCT(t){
   CT=t;
@@ -4801,7 +4833,7 @@ async function doConnect(){
   };
   const saveBtn = document.getElementById('save-profile-chk');
   const saveToProfile = saveBtn._on || false;
-  setBusy(true); setStatus('Connecting…'); toggleCP();
+  setBusy(true); setStatus('Connecting…'); closeCP();
   try{
     const r=await fetch('/api/connect',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -4810,7 +4842,10 @@ async function doConnect(){
       document.getElementById('cdot').classList.add('on');
       setStatus('Connected: '+d.ident+(d.exp&&d.exp!=='unknown'?' · exp '+d.exp:''));
       catsCache=d.categories||{};
-      switchMode(mode, catsCache[mode]||[]);
+      // Always land on Live categories after any connect
+      mode='live';
+      switchMode('live', catsCache['live']||[]);
+      showT('p-cats','t-cats');
       toast('✓ Connected!','ok');
       // Save to profiles if toggle was active
       if(saveToProfile){
@@ -4843,7 +4878,7 @@ async function doConnect(){
       setStatus('Error: '+(d.error||'Unknown'));
       toast(d.error||'Connection failed','err');
       alog('❌ '+(d.error||''),'e');
-      toggleCP();
+      toggleCP(); // re-open so user can fix credentials
     }
   }catch(e){setStatus('Error: '+e.message);toast(e.message,'err');}
   finally{setBusy(false);}
@@ -4858,13 +4893,48 @@ function setMode(m){
 function switchMode(m, cats){
   mode=m;
   document.querySelectorAll('.mt').forEach(b=>b.classList.toggle('on',b.dataset.m===m));
-  allCats=cats; filterCats();
+  allCats=cats; _activeTag=''; _buildTagBar(cats); filterCats();
   document.getElementById('catlist').scrollTop=0;
 }
 
 function filterCats(){
   const q=document.getElementById('csrch').value.toLowerCase();
-  renderCats(q?allCats.filter(c=>c.title.toLowerCase().includes(q)):allCats);
+  const tag=_activeTag;
+  let cats=allCats;
+  if(tag) cats=cats.filter(c=>_catTag(c.title)===tag);
+  if(q)   cats=cats.filter(c=>c.title.toLowerCase().includes(q));
+  renderCats(cats);
+}
+
+// ── TAG BAR ────────────────────────────────────────────────────
+let _activeTag='';
+
+function _catTag(title){
+  if(!title) return '';
+  // With hard separator (|  -  :) — allow longer tags like SPORTS, PUNJABI
+  let m=title.match(/^([A-Z0-9]{2,12})\s*[\|\-\:]\s*\S/);
+  if(m) return m[1];
+  // Without separator — only short country/region codes (2-5 chars) e.g. US UK DE URDU
+  m=title.match(/^([A-Z]{2,5})\s+/);
+  return m ? m[1] : '';
+}
+
+function _buildTagBar(cats){
+  const bar=document.getElementById('tag-bar');
+  if(!bar) return;
+  const counts={};
+  cats.forEach(c=>{ const t=_catTag(c.title); if(t) counts[t]=(counts[t]||0)+1; });
+  const tags=Object.keys(counts).sort();
+  if(!tags.length){ bar.style.display='none'; _activeTag=''; return; }
+  bar.style.display='flex';
+  bar.innerHTML='<span class="tag-pill on" data-tag="" onclick="setTag(this,\'\')">All</span>'
+    +tags.map(t=>`<span class="tag-pill" data-tag="${t}" onclick="setTag(this,'${t}')">${t} <span style="opacity:.55;font-size:9px">${counts[t]}</span></span>`).join('');
+}
+
+function setTag(el, tag){
+  _activeTag=tag;
+  document.querySelectorAll('#tag-bar .tag-pill').forEach(p=>p.classList.toggle('on',p.dataset.tag===tag));
+  filterCats();
 }
 
 // store rendered cats for index lookup
@@ -4953,21 +5023,35 @@ async function dlSelCats(type){
 // ── BROWSE ─────────────────────────────────────────────────
 function browseC(cj){
   const cat=(typeof cj==='string')?JSON.parse(cj):cj; curCat=cat;
-  navStack=[]; setBusy(true); setStatus("Loading '"+cat.title+"'…"); showSkels();
+  navStack=[]; setBusy(true);
+  _setLoadingHeader(cat.title);
+  setStatus("Loading '"+cat.title+"'…");
+  showSkels(12); showT('p-items','t-items');
   fetch('/api/items',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({mode, category:cat, browse:true})})
   .then(r=>r.json()).then(d=>{
+    _setLoadingHeader(null);
     if(d.error){toast(d.error,'err');setStatus('Error: '+d.error);return;}
     allItems=d.items||[];
     setStatus("'"+cat.title+"' — "+allItems.length+' items');
     showItems(cat.title, allItems);
-    showT('p-items','t-items');
-  }).catch(e=>toast(e.message,'err')).finally(()=>setBusy(false));
+  }).catch(e=>{_setLoadingHeader(null);toast(e.message,'err');}).finally(()=>setBusy(false));
 }
 
-function showSkels(){
+function showSkels(count=10, small=false){
+  const cls=small?'skel-sm':'skel';
   document.getElementById('ilist').innerHTML=
-    Array(8).fill('<div class="skel"></div>').join('');
+    `<div style="padding:4px 0">`+Array(count).fill(`<div class="${cls}" style="--d:${0}s"></div>`).map((s,i)=>
+      `<div class="${cls}" style="animation-delay:${i*0.04}s"></div>`).join('')+`</div>`;
+}
+
+function _setLoadingHeader(text){
+  const el=document.getElementById('ittitle');
+  if(!text){el.innerHTML='Browse';return;}
+  el.innerHTML=`<span style="display:flex;align-items:center;gap:6px">`
+    +`<span style="width:12px;height:12px;border-radius:50%;border:2px solid var(--acc);`
+    +`border-top-color:transparent;animation:spin .7s linear infinite;flex-shrink:0"></span>`
+    +esc(text)+`</span>`;
 }
 
 function showItems(label, items){
@@ -5073,16 +5157,20 @@ function drillGrp(i){
 
 function drillShow(i){
   const it=filtItems[i]; if(!it) return;
-  setBusy(true); setStatus("Loading eps for '"+it.name+"'…");
+  setBusy(true);
+  _setLoadingHeader(it.name);
+  setStatus("Loading eps for '"+it.name+"'…");
+  showSkels(8, true);
   fetch('/api/episodes',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({item:it, mode, cat_id:curCat?.id||'', cat_title:curCat?.title||''})})
   .then(r=>r.json()).then(d=>{
-    if(d.error||!d.episodes?.length){toast('No episodes found','warn');return;}
+    _setLoadingHeader(null);
+    if(d.error||!d.episodes?.length){toast('No episodes found','warn');showItems(it.name||'',allItems);return;}
     navStack.push({label:'Browse',items:[...allItems]});
     setStatus(it.name+' — '+d.episodes.length+' episodes');
     showItems(it.name, d.episodes);
     document.getElementById('backbtn').disabled=false;
-  }).catch(e=>toast(e.message,'err')).finally(()=>setBusy(false));
+  }).catch(e=>{_setLoadingHeader(null);toast(e.message,'err');}).finally(()=>setBusy(false));
 }
 
 function goBack(){
@@ -5855,7 +5943,6 @@ async function plConnect(i){
   closePL();
   // Fill in the connection form
   setCT(p.type||'mac');
-  toggleCP();
   document.getElementById('i-url').value=p.url||'';
   document.getElementById('i-mac').value=p.mac||'';
   document.getElementById('i-xu').value=p.url_xtream||p.url||'';
