@@ -3484,21 +3484,21 @@ def api_resolve():
             # Apply transcode if needed
             if needs_transcode:
                 vod_flag = "1" if is_vod else "0"
+                transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}&url={quote(url, safe='')}"
                 if is_multiview:
+                    # For HEVC-video-only issues the multiview_addon can handle transcoding
+                    # internally via its own ffmpeg. But for audio codec problems (AC3/EAC3/DTS)
+                    # the addon's stream-copy audio path doesn't help — route through the same
+                    # hls_proxy transcode URL as the main player so audio is re-encoded to AAC.
                     audio_only_issue = (transcode_reason or "").startswith("incompatible audio")
                     if audio_only_issue:
-                        # Audio-only transcode: return raw URL with flag so JS passes
-                        # &audio_only=1 to multiview_addon, which runs -c:v copy -c:a aac.
-                        # Everything stays in the addon's MPEG-TS pipeline — no hls_proxy.
-                        state.log(f"[RESOLVE] MV audio-only transcode: {transcode_reason}")
-                        return jsonify({"url": url, "hevc": False, "audio_transcode": True})
+                        state.log(f"[RESOLVE] MV audio transcode → hls_proxy: {transcode_reason}")
+                        return jsonify({"url": transcode_url, "hevc": False})
                     else:
-                        # HEVC video: addon handles via &transcode=1 (libx264 + aac)
-                        state.log(f"[RESOLVE] MV HEVC transcode: {transcode_reason}")
+                        # HEVC video: let multiview_addon handle it natively
                         return jsonify({"url": url, "hevc": True})
                 else:
                     state.log(f"[RESOLVE] Routing to transcode proxy: {transcode_reason}")
-                    transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}&url={quote(url, safe='')}"
                     return jsonify({"url": transcode_url, "hevc": True})
                     
         return jsonify({"url": url})
@@ -6541,8 +6541,15 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   .mt-txt{display:inline}
   .mt-ico{display:inline;margin-right:4px}
 }
-.tag-bar{display:flex;gap:5px;overflow-x:auto;padding:4px 10px 2px;flex-shrink:0;scrollbar-width:none}
+.tag-bar{display:flex;flex-direction:column;gap:3px;padding:4px 10px 2px;flex-shrink:0}
 .tag-bar::-webkit-scrollbar{display:none}
+.tag-row{display:flex;gap:5px;overflow-x:auto;flex-wrap:nowrap;scrollbar-width:none;
+  cursor:grab;user-select:none;-webkit-user-select:none}
+.tag-row::-webkit-scrollbar{display:none}
+.tag-row.dragging{cursor:grabbing}
+.tag-row.dragging .tag-pill{pointer-events:none}
+.tag-row-lbl{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.8px;
+  color:var(--txt3);padding:0 2px;flex-shrink:0;align-self:center}
 .tag-pill{padding:3px 10px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.4px;
   cursor:pointer;white-space:nowrap;border:1px solid var(--bdr2);background:rgba(255,255,255,.03);
   color:var(--txt2);transition:all .15s;flex-shrink:0}
@@ -6628,7 +6635,10 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   border:none;box-shadow:none;padding:0;background:none}
 .ilogo{width:36px;height:24px;object-fit:contain;border-radius:3px;flex-shrink:0;
   background:var(--s4)}
-.iname{flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.iname{flex:1;font-size:12px;overflow:hidden;white-space:nowrap;position:relative;cursor:default}
+.iname-inner{display:inline-block;white-space:nowrap;padding-right:24px}
+.iname.scrolling .iname-inner{animation:iname-scroll var(--scroll-dur,6s) linear infinite}
+@keyframes iname-scroll{0%{transform:translateX(0)}100%{transform:translateX(var(--scroll-dist,-100%))}}
 .ibtns{display:flex;gap:3px;flex-shrink:0}
 .ibtns button{height:27px;padding:0 9px;font-size:11px;border-radius:var(--rss)}
 /* ── item context menu ── */
@@ -7438,7 +7448,9 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .mv-ch-logo{width:32px;height:22px;object-fit:contain;border-radius:3px;
   background:var(--s3);flex-shrink:0}
 .mv-ch-name{font-size:12px;font-weight:600;color:var(--txt);
-  flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  flex:1;overflow:hidden;white-space:nowrap;position:relative}
+.mv-ch-name .iname-inner{display:inline-block;white-space:nowrap;padding-right:20px}
+.mv-ch-name.scrolling .iname-inner{animation:iname-scroll var(--scroll-dur,6s) linear infinite}
 /* Action buttons always visible in the multiview channel selector */
 .mv-ch-row .mv-item-btns{display:flex;gap:3px;flex-shrink:0;align-items:center}
 .mv-item-btns .btn-ghost{height:24px;padding:0 7px;font-size:11px;font-weight:700}
@@ -7991,7 +8003,8 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   <button class="imenu-btn" id="imenu-epg"      onclick="iMenuEPG()">     <span class="imenu-ico">📅</span>EPG / Programme Info</button>
   <button class="imenu-btn" id="imenu-catchup"  onclick="iMenuCatchup()"> <span class="imenu-ico">↺</span>Catch-up TV</button>
   <div class="imenu-sep" id="imenu-sep2"></div>
-  <button class="imenu-btn" id="imenu-imdb"     onclick="iMenuIMDB()">    <span class="imenu-ico">🎬</span>Open TMDB/IMDB</button>
+  <button class="imenu-btn" id="imenu-ext"      onclick="iMenuExternal()"><span class="imenu-ico">🎬</span>External Player</button>
+  <button class="imenu-btn" id="imenu-imdb"     onclick="iMenuIMDB()">    <span class="imenu-ico">🔍</span>Open TMDB/IMDB</button>
   <button class="imenu-btn" id="imenu-rec"      onclick="iMenuRec()">     <span class="imenu-ico">⏺</span>Record</button>
   <button class="imenu-btn" id="imenu-mkv"      onclick="iMenuMKV()">     <span class="imenu-ico">⬇</span>Download MKV</button>
 </div>
@@ -9097,14 +9110,87 @@ function filterCats(){
 // ── TAG BAR ────────────────────────────────────────────────────
 let _activeTag='';
 
+// Known tag prefixes recognised when a category name has NO separator.
+// Only tags in this set are extracted from bare-prefix names like "US Sports".
+// Tags with an explicit separator (US | ..., SPORTS - ...) are always extracted
+// regardless of this list. Add entries here if a portal uses an unlisted prefix.
+const _KNOWN_TAG_PREFIXES = new Set([
+  // ── ISO 3166-1 alpha-2 country codes ────────────────────────────────────
+  'AF','AL','DZ','AD','AO','AG','AR','AM','AU','AT','AZ',
+  'BS','BH','BD','BB','BY','BE','BZ','BJ','BT','BO','BA','BW','BR','BN','BG','BF','BI',
+  'CV','KH','CM','CA','CF','TD','CL','CN','CO','KM','CG','CD','CR','HR','CU','CY','CZ',
+  'DK','DJ','DM','DO',
+  'EC','EG','SV','GQ','ER','EE','SZ','ET',
+  'FJ','FI','FR',
+  'GA','GM','GE','DE','GH','GR','GD','GT','GN','GW','GY',
+  'HK','HT','HN','HU',                        // HK = Hong Kong
+  'IS','IN','ID','IR','IQ','IE','IL','IT',
+  'JM','JP','JO',
+  'KZ','KE','KI','KP','KR','KW','KG',
+  'LA','LV','LB','LS','LR','LY','LI','LT','LU',
+  'MG','MW','MY','MV','ML','MT','MH','MR','MU','MX','FM','MD','MC','MN','ME','MA','MZ','MO',
+  'MM','NA','NR','NP','NL','NZ','NI','NE','NG','NO',
+  'OM',
+  'PK','PW','PS','PA','PG','PY','PE','PH','PL','PT',
+  'QA',
+  'RO','RU','RW',
+  'KN','LC','VC','WS','SM','ST','SA','SN','RS','SC','SL','SG','SK','SI','SB','SO','ZA',
+  'SS','ES','LK','SD','SR','SE','CH','SY',
+  'TW','TJ','TZ','TH','TL','TG','TO','TT','TN','TR','TM','TV',
+  'UG','UA','AE','GB','UK','US','UY','UZ',
+  'VI','VU','VE','VN',                         // VI = Virgin Islands
+  'YE',
+  'ZM','ZW',
+  // ── Regional blocs & groupings ───────────────────────────────────────────
+  'EU','XK',                                   // Kosovo, European Union
+  'EXYU','EXUSSR',                             // Former Yugoslavia / Soviet bloc
+  'ASIA',                                      // Asia regional
+  'AFR',                                       // Africa regional
+  'ARAB','MENA',                               // Arab world / Middle East & North Africa
+  'LATAM','LAT',                               // Latin America
+  'SCAN','SCA',                                // Scandinavia
+  'BALK',                                      // Balkans regional
+  'CIS',                                       // Commonwealth of Independent States
+  // ── Kurdistan ────────────────────────────────────────────────────────────
+  'KU','KURD',                                 // Kurdish channels (very common in IPTV)
+  // ── 3–5 letter country/language abbreviations used by IPTV providers ─────
+  'USA','GBR','GER','FRA','ITA','ESP','POR','TUR','ARA','RUS',
+  'NED','BEL','SUI','AUS','MEX','BRA','ARG','POL','CZE','SVK',
+  'HUN','SWE','NOR','DEN','FIN','GRE','PER','COL','CHI','URU',
+  'IND','PAK','BAN','SRI','NEP','AFG','KAZ','UZB','AZE','GEO',
+  'ARM','ALB','KOS','BOS','MNE','SRB','MKD','CRO','SLO','BUL',
+  'ROM','MOL','UKR','BLR','BAL','SCO','IRL','WAL','ENG',
+  'JAP','KOR','CHN','VIE','THA','MYS','IDN','PHI','HKG','TWN','MAC',
+  'THAI','VIET','INDO','SING','MALAY','PAKI','IRAN','IRAQ',
+  'IRN','SAU','UAE','KUW','QAT','BHR','OMN','YEM','JOR',
+  'LEB','SYR','PAL','EGY','LIB','MAR','ALG','TUN',
+  'NIG','GHA','KEN','ETH','SEN','CMR','CIV','ZAF','NAM',
+  'ICE','LAT','LIT','EST','CAN','MKD',
+]);
+
 function _catTag(title){
   if(!title) return '';
-  // With hard separator (|  -  :) — allow longer tags like SPORTS, PUNJABI
-  let m=title.match(/^([A-Z0-9]{2,12})\s*[\|\-\:]\s*\S/);
-  if(m) return m[1];
-  // Without separator — only short country/region codes (2-5 chars) e.g. US UK DE URDU
-  m=title.match(/^([A-Z]{2,5})\s+/);
-  return m ? m[1] : '';
+  const t = title.trim();
+
+  // Normalise common EX-YU / EXYU variants to a single canonical tag before matching
+  const normalised = t
+    .replace(/^EX[-_\s]?YU\b/i, 'EXYU')
+    .replace(/^EX[-_\s]?USSR\b/i, 'EXUSSR');
+
+  // With hard separator (|  -  :) — e.g. "US | News", "SPORTS - HD", "EXYU: Movies"
+  // This is reliable because the portal explicitly structured the name this way.
+  let m = normalised.match(/^([A-Z0-9]{2,12})\s*[\|\:]\s*\S/i);
+  if(m) return m[1].toUpperCase();
+
+  // Without separator — ONLY recognise the prefix if it is a known country/region tag.
+  // This prevents random 2-letter channel name prefixes (RM, RX, SU, TS…) from being
+  // treated as tags just because they happen to be followed by a space.
+  m = normalised.match(/^([A-Z]{2,6})\s+/i);
+  if(m){
+    const candidate = m[1].toUpperCase();
+    if(_KNOWN_TAG_PREFIXES.has(candidate)) return candidate;
+  }
+  return '';
 }
 
 function _buildTagBar(cats){
@@ -9114,9 +9200,58 @@ function _buildTagBar(cats){
   cats.forEach(c=>{ const t=_catTag(c.title); if(t) counts[t]=(counts[t]||0)+1; });
   const tags=Object.keys(counts).sort();
   if(!tags.length){ bar.style.display='none'; _activeTag=''; return; }
+
+  // Country classifier: reuse the module-level _KNOWN_TAG_PREFIXES set as the
+  // single source of truth. Quality/format tags override it via NOT_COUNTRY.
+  const NOT_COUNTRY = new Set(['4K','8K','UHD','FHD','HD','SD','HQ','4G','VIP','FOR','NEW','TOP','HOT','ALL']);
+
+  function isCountryTag(t){
+    if(NOT_COUNTRY.has(t)) return false;
+    return _KNOWN_TAG_PREFIXES.has(t);
+  }
+
+  const countryTags = tags.filter(t => isCountryTag(t));
+  const generalTags = tags.filter(t => !isCountryTag(t));
+
+  function pill(t){
+    return `<span class="tag-pill" data-tag="${t}" onclick="setTag(this,'${t}')">${t} <span style="opacity:.55;font-size:9px">${counts[t]}</span></span>`;
+  }
+  const allPill = '<span class="tag-pill on" data-tag="" onclick="setTag(this,\'\')">All</span>';
+
+  let html = '';
+  if(generalTags.length && countryTags.length){
+    html  = `<div class="tag-row">${allPill}${generalTags.map(pill).join('')}</div>`;
+    html += `<div class="tag-row">${countryTags.map(pill).join('')}</div>`;
+  } else {
+    // Only one type — single row
+    html = `<div class="tag-row">${allPill}${tags.map(pill).join('')}</div>`;
+  }
+
   bar.style.display='flex';
-  bar.innerHTML='<span class="tag-pill on" data-tag="" onclick="setTag(this,\'\')">All</span>'
-    +tags.map(t=>`<span class="tag-pill" data-tag="${t}" onclick="setTag(this,'${t}')">${t} <span style="opacity:.55;font-size:9px">${counts[t]}</span></span>`).join('');
+  bar.innerHTML = html;
+
+  // Wire drag-scroll on each row (desktop only — touch handles natively)
+  bar.querySelectorAll('.tag-row').forEach(row=>{
+    let isDown=false, didDrag=false, startX=0, scrollLeft=0;
+    row.addEventListener('mousedown', e=>{
+      if(e.button !== 0) return;
+      isDown=true; didDrag=false;
+      startX=e.pageX - row.offsetLeft; scrollLeft=row.scrollLeft;
+    });
+    row.addEventListener('mousemove', e=>{
+      if(!isDown) return;
+      const dx = Math.abs(e.pageX - row.offsetLeft - startX);
+      if(!didDrag && dx < 5) return;   // threshold — ignore tiny jitter
+      didDrag=true;
+      row.classList.add('dragging');
+      e.preventDefault();
+      const x = e.pageX - row.offsetLeft;
+      row.scrollLeft = scrollLeft - (x - startX);
+    });
+    const stopDrag = ()=>{ isDown=false; row.classList.remove('dragging'); };
+    row.addEventListener('mouseup',    stopDrag);
+    row.addEventListener('mouseleave', stopDrag);
+  });
 }
 
 function setTag(el, tag){
@@ -9331,11 +9466,10 @@ function renderItems(items){
       +(logoSrc?'<img class="ilogo" loading="lazy" src="'+esc(logoSrc)+'" onerror="this.style.display=\'none\'">'+'':'<span style="width:36px;height:24px;flex-shrink:0;display:inline-block"></span>')
       +'<button onclick="toggleFav('+i+')" title="Favourite"'
       +' style="background:none;border:none;cursor:pointer;font-size:15px;padding:0 2px;line-height:1;flex-shrink:0;color:'+(isFav(it)?'#f5c518':'rgba(255,255,255,0.25)')+'" >★</button>'
-      +'<span class="iname" title="'+esc(name)+'">'+esc(name)+'</span>'
+      +'<span class="iname"><span class="iname-inner">'+esc(name)+'</span></span>'
       +'<div class="ibtns">'
         +(grp?'<button class="btn-ghost" onclick="drillGrp('+i+')">'+epN+' eps</button>':'')
         +(show&&isSeries?'<button class="btn-ghost" onclick="drillShow('+i+')">Eps</button>':'')
-        +(playable?'<button class="btn-ghost" onclick="openExternal('+i+')" title="Play in external player" style="padding:0 5px;font-size:13px">🎬</button>':'')
         +(playable?'<button class="btn-blue" onclick="playItem('+i+')">▶</button>':'')
         +'<button class="btn-ghost imenu-trigger" onclick="event.stopPropagation();openItemMenu('+i+',this)" title="More options" style="padding:0 6px;font-size:18px;line-height:1;letter-spacing:0">⋮</button>'
       +'</div></div>';
@@ -9382,6 +9516,7 @@ function openItemMenu(i, btn){
   document.getElementById('imenu-epg').style.display      = isLive&&!grp?'flex':'none';
   document.getElementById('imenu-catchup').style.display  = isLive&&!grp?'flex':'none';
   document.getElementById('imenu-sep2').style.display     = !grp?'block':'none';
+  document.getElementById('imenu-ext').style.display      = !grp&&!show?'flex':'none';
   document.getElementById('imenu-imdb').style.display     = (!isLive&&!grp)?'flex':'none';
   document.getElementById('imenu-rec').style.display      = !grp&&!show?'flex':'none';
   document.getElementById('imenu-mkv').style.display      = !grp?'flex':'none';
@@ -9404,6 +9539,11 @@ function openItemMenu(i, btn){
 function closeItemMenu(){
   document.getElementById('item-menu').classList.remove('open');
   document.getElementById('item-menu-bg').style.display = 'none';
+}
+
+function iMenuExternal(){
+  closeItemMenu();
+  openExternal(_iMenuIdx);
 }
 
 function iMenuEPG(){
@@ -11834,6 +11974,32 @@ document.addEventListener('DOMContentLoaded',()=>{
     try{const mp=localStorage.getItem('mobile_player');
       if(mp) document.getElementById('o-mobile-player').value=mp;}catch(e){}
   }
+
+  // ── Item name scroll: hover a row → animate long names left to reveal full text ──
+  const ilist = document.getElementById('ilist');
+  if(ilist){
+    ilist.addEventListener('mouseenter', e=>{
+      const row = e.target.closest('.irow');
+      if(!row) return;
+      const wrap = row.querySelector('.iname');
+      const inner = row.querySelector('.iname-inner');
+      if(!wrap || !inner) return;
+      const overflow = inner.scrollWidth - wrap.clientWidth;
+      if(overflow <= 6) return;   // not truncated — skip
+      // Speed: ~80px/s, min 2s, max 12s
+      const dur = Math.min(12, Math.max(2, overflow / 80));
+      wrap.style.setProperty('--scroll-dist', `-${overflow + 8}px`);
+      wrap.style.setProperty('--scroll-dur', `${dur}s`);
+      wrap.classList.add('scrolling');
+    }, true);
+    ilist.addEventListener('mouseleave', e=>{
+      const row = e.target.closest('.irow');
+      if(!row) return;
+      const wrap = row.querySelector('.iname');
+      if(wrap) wrap.classList.remove('scrolling');
+    }, true);
+  }
+
   startLog();
   alog('IPTV Portal Builder ready.','k');
   alog('Tap ⚙ in the header to enter credentials and connect.','i');
@@ -12838,9 +13004,10 @@ async function _mvPlayChannel(wid, channel, cEl){
     // Need to resolve — same fetch as playItem()
     try {
       // ?mv=1 tells the server this is a multiview resolve.
-      // For HEVC video: server returns raw URL + hevc:true → addon runs libx264+aac (&transcode=1)
-      // For bad audio:  server returns raw URL + audio_transcode:true → addon runs -c:v copy -c:a aac (&audio_only=1)
-      // Both stay in the addon's unified MPEG-TS pipeline — no hls_proxy involvement.
+      // For HEVC video: server returns raw URL + hevc:true so multiview_addon
+      //   can handle transcoding internally via its own ffmpeg.
+      // For incompatible audio (AC3/DTS): server returns hls_proxy URL + hevc:false
+      //   so we play it via HLS.js with AAC audio (same as main player).
       const r = await fetch('/api/resolve?mv=1', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
@@ -12849,9 +13016,10 @@ async function _mvPlayChannel(wid, channel, cEl){
       const d = await r.json();
       resolvedUrl = d.url || '';
       if(d.hevc) channel._mv_transcode = true;
-      // audio_transcode=true: video is already H.264, only audio needs re-encoding.
-      // Pass &audio_only=1 to multiview_addon which runs -c:v copy -c:a aac.
-      if(d.audio_transcode) channel._mv_audio_only = true;
+      // When the server routed through hls_proxy for audio transcoding (AC3→AAC),
+      // d.hevc is false but resolvedUrl points at /api/hls_proxy — mark it so
+      // we use HLS.js below instead of mpegts.js + multiview stream proxy.
+      if(resolvedUrl.includes('/api/hls_proxy')) channel._mv_hls_transcode = true;
     } catch(e){ toast('MV: resolve error: ' + e, 'err'); }
   }
 
@@ -12864,24 +13032,61 @@ async function _mvPlayChannel(wid, channel, cEl){
   mvUrls.set(wid, resolvedUrl);
 
   // ── Record portal metadata for the connection-count badge ─────────────────
+  // Allow caller to override portal info (e.g. when playing a custom URL)
   const portalInfo = channel._portal_override || _mvPortalKeyFromUrl(resolvedUrl);
   mvPortalMeta.set(wid, {
     portalKey:  portalInfo.key,
     portalName: portalInfo.name,
   });
+  // Refresh all badges (connection counts change when this widget starts)
   _mvUpdatePortalBadges();
 
+  // ── Audio-transcoded stream: play hls_proxy MPEG-TS directly via mpegts.js ─
+  // When /api/resolve returned an /api/hls_proxy URL (e.g. EAC3→AAC transcode),
+  // the proxy outputs raw MPEG-TS (-f mpegts). Use mpegts.js directly on that
+  // local URL — no need to pass through the multiview_addon stream proxy, which
+  // expects a portal URL, not a local proxy URL.
+  if(channel._mv_hls_transcode){
+    if(typeof mpegts === 'undefined' || !mpegts.isSupported()){
+      toast('Browser does not support MSE — cannot play transcoded stream', 'err');
+      _mvStopCleanup(wid, true); return;
+    }
+    const player = mpegts.createPlayer({
+      type:   'mse',
+      isLive: false,   // VOD file — expose duration + seekbar
+      url:    resolvedUrl,
+    }, {
+      enableStashBuffer: true,
+      stashInitialSize:  4096,
+    });
+    player.on(mpegts.Events.ERROR, (errType, errDetail)=>{
+      console.error('[MV/transcode] mpegts error wid='+wid, errType, errDetail);
+      if(document.getElementById('p-mv').classList.contains('mv-active'))
+        toast('Stream error: '+(channel.name||wid),'err');
+      _mvStopCleanup(wid, true);
+    });
+    mvPlayers.set(wid, player);
+    player.attachMediaElement(videoEl);
+    player.load();
+    try {
+      await player.play();
+      const muteBtn = cEl.querySelector('.mv-mute-btn');
+      if(mvPlayers.size === 1){ videoEl.muted=false; if(muteBtn) muteBtn.textContent='🔊'; }
+      else if(muteBtn) muteBtn.textContent = videoEl.muted?'🔇':'🔊';
+    } catch(e){ console.warn('[MV/transcode] play() error', e); }
+    _mvUpdateSeekBar(wid);
+    return;
+  }
+
   // ── Build the proxy stream URL ─────────────────────────────────────────────
-  // All cases (stream-copy, HEVC transcode, audio-only transcode) flow through
-  // multiview_addon /api/multiview/stream — a single unified MPEG-TS pipeline.
-  //   &transcode=1   → HEVC video: addon runs libx264 + aac
-  //   &audio_only=1  → bad audio: addon runs -c:v copy -c:a aac
-  //   (neither)      → stream copy at zero cost
+  // mirrors server.js /stream GET handler stream key:
+  //   streamKey = `${userId}::${streamUrl}::${profileId}`
+  // We route through multiview_addon.py /api/multiview/stream which handles
+  // dedup and reference counting server-side.
   const proxyUrl = '/api/multiview/stream?'
     + 'url='        + encodeURIComponent(resolvedUrl)
     + '&client_id=' + encodeURIComponent(mvClientId)
-    + (channel._mv_transcode  ? '&transcode=1'  : '')
-    + (channel._mv_audio_only ? '&audio_only=1' : '');
+    + (channel._mv_transcode ? '&transcode=1' : '');
 
   // ── Create mpegts.js player ────────────────────────────────────────────────
   // mirrors multiview.js mpegts.createPlayer block exactly
@@ -13270,7 +13475,7 @@ function _mvBuildItemRow(it, i, forEpisodes){
 
   return `<div class="mv-ch-row" data-ii="${i}" data-show="${isShow||isGroup?1:0}">
     ${logoHtml}
-    <span class="mv-ch-name" title="${esc(name)}">${esc(name)}</span>
+    <span class="mv-ch-name"><span class="iname-inner">${esc(name)}</span></span>
     <div class="mv-item-btns">${btns}</div>
     ${drillArrow}
   </div>`;
@@ -13511,7 +13716,7 @@ function _mvRenderSel(){
     <div class="mv-ch-row" data-ci="${i}" style="cursor:pointer">
       <span class="mv-ch-logo" style="font-size:18px;background:none;display:flex;align-items:center;justify-content:center">${
         _mvSelContentMode==='vod'?'🎬':_mvSelContentMode==='series'?'📺':'📁'}</span>
-      <span class="mv-ch-name">${esc(c.title||'?')}</span>
+      <span class="mv-ch-name"><span class="iname-inner">${esc(c.title||'?')}</span></span>
       <span style="color:var(--txt3);font-size:14px;flex-shrink:0">›</span>
     </div>`).join('');
   listEl.querySelectorAll('.mv-ch-row').forEach(row=>{
@@ -13782,6 +13987,30 @@ function _mvSetupListeners(){
       }
     }
   });
+
+  // ── Item name scroll in selector — same logic as main ilist ──────────────
+  const mvList = document.getElementById('mv-sel-list');
+  if(mvList){
+    mvList.addEventListener('mouseenter', e=>{
+      const row = e.target.closest('.mv-ch-row');
+      if(!row) return;
+      const wrap  = row.querySelector('.mv-ch-name');
+      const inner = row.querySelector('.mv-ch-name .iname-inner');
+      if(!wrap || !inner) return;
+      const overflow = inner.scrollWidth - wrap.clientWidth;
+      if(overflow <= 6) return;
+      const dur = Math.min(12, Math.max(2, overflow / 80));
+      wrap.style.setProperty('--scroll-dist', `-${overflow + 8}px`);
+      wrap.style.setProperty('--scroll-dur', `${dur}s`);
+      wrap.classList.add('scrolling');
+    }, true);
+    mvList.addEventListener('mouseleave', e=>{
+      const row = e.target.closest('.mv-ch-row');
+      if(!row) return;
+      const wrap = row.querySelector('.mv-ch-name');
+      if(wrap) wrap.classList.remove('scrolling');
+    }, true);
+  }
 }
 
 // ── HOOK INTO EXISTING _switchTab ────────────────────────────────────────────
