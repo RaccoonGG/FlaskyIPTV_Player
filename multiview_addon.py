@@ -152,11 +152,13 @@ class StreamBroadcaster:
 
     def __init__(self, stream_key: str, channel_url: str,
                  user_agent: str = 'Mozilla/5.0',
-                 transcode: bool = False) -> None:
+                 transcode: bool = False,
+                 audio_only: bool = False) -> None:
         self.stream_key:  str   = stream_key
         self.channel_url: str   = channel_url
         self.user_agent:  str   = user_agent
         self.transcode:   bool  = transcode
+        self.audio_only:  bool  = audio_only  # True = copy video, re-encode audio only
         self.references:  int   = 0
         self.last_access: float = time.time()
         self._stopped:    bool  = False
@@ -199,14 +201,30 @@ class StreamBroadcaster:
         ffmpeg = _get_ffmpeg()
 
         if self.transcode:
-            # HEVC → H.264 transcode: mirrors /api/hls_proxy?transcode=1 logic
+            # HEVC → H.264 transcode: re-encode video + audio for full compatibility.
+            # mirrors /api/hls_proxy?transcode=1 logic
             codec_args = [
                 '-c:v', 'libx264',
                 '-preset', 'ultrafast',
                 '-tune', 'zerolatency',
                 '-c:a', 'aac',
+                '-b:a', '128k',
+                '-ac', '2',
+                '-ar', '48000',
             ]
             LOG.info('[MV] Spawning ffmpeg with HEVC→H.264 transcode  key=%s', self.stream_key)
+        elif self.audio_only:
+            # Stream-copy video, re-encode audio only (AC3/EAC3/DTS → AAC).
+            # Used when the video codec is already browser-compatible (H.264)
+            # but the audio codec is not (e.g. EAC3 / AC3 / DTS).
+            codec_args = [
+                '-c:v', 'copy',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-ac', '2',
+                '-ar', '48000',
+            ]
+            LOG.info('[MV] Spawning ffmpeg with audio-only transcode  key=%s', self.stream_key)
         else:
             codec_args = ['-c', 'copy']
 
@@ -408,7 +426,8 @@ def _build_stream_key(client_id: str, channel_url: str) -> str:
 
 def _get_or_create_broadcaster(stream_key: str, channel_url: str,
                                 user_agent: str,
-                                transcode: bool = False) -> Optional[StreamBroadcaster]:
+                                transcode: bool = False,
+                                audio_only: bool = False) -> Optional[StreamBroadcaster]:
     """
     Return existing broadcaster for stream_key (if alive) or create a new one.
 
@@ -440,7 +459,7 @@ def _get_or_create_broadcaster(stream_key: str, channel_url: str,
 
         # No existing broadcaster — spawn a new ffmpeg process
         broadcaster = StreamBroadcaster(stream_key, channel_url, user_agent,
-                                        transcode=transcode)
+                                        transcode=transcode, audio_only=audio_only)
         if broadcaster.process:
             _mv_streams[stream_key] = broadcaster
             return broadcaster
@@ -618,10 +637,11 @@ def register_multiview_routes(app) -> None:
     #   4. On client disconnect → decrement refs (janitor handles eventual kill)
     #
     # Query params:
-    #   url       — the raw IPTV stream URL  (required)
-    #   client_id — UUID from browser localStorage  (required for dedup)
-    #   ua        — User-Agent string to pass to ffmpeg  (optional)
-    #   transcode — '1' to re-encode HEVC→H.264 (for HEVC-only channels)
+    #   url        — the raw IPTV stream URL  (required)
+    #   client_id  — UUID from browser localStorage  (required for dedup)
+    #   ua         — User-Agent string to pass to ffmpeg  (optional)
+    #   transcode  — '1' to re-encode HEVC→H.264 (for HEVC-only channels)
+    #   audio_only — '1' to copy video, re-encode audio only (AC3/EAC3/DTS→AAC)
     #
     @app.route('/api/multiview/stream')
     def multiview_stream():
@@ -629,20 +649,24 @@ def register_multiview_routes(app) -> None:
         client_id   = request.args.get('client_id', '').strip()
         user_agent  = request.args.get('ua', 'Mozilla/5.0').strip()
         transcode   = request.args.get('transcode', '0') == '1'
+        audio_only  = request.args.get('audio_only', '0') == '1' and not transcode
 
         if not channel_url:
             return 'url parameter is required', 400
         if not client_id:
             return 'client_id parameter is required', 400
 
-        # Include transcode flag in the stream key so a transcoded and
-        # non-transcoded stream of the same URL are treated as distinct.
+        # Include mode in stream key so copy/audio-only/full-transcode streams
+        # of the same URL are treated as distinct broadcasters.
         stream_key = _build_stream_key(client_id, channel_url)
         if transcode:
             stream_key += '::transcode'
+        elif audio_only:
+            stream_key += '::audio_only'
 
         broadcaster = _get_or_create_broadcaster(stream_key, channel_url, user_agent,
-                                                 transcode=transcode)
+                                                 transcode=transcode,
+                                                 audio_only=audio_only)
         if not broadcaster:
             return 'Failed to start ffmpeg stream process', 500
 
