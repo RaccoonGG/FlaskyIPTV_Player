@@ -3408,17 +3408,15 @@ def api_resolve():
             is_vod = mode in ('vod', 'series')  # VOD needs different handling than live
             
             # Check both path and query string for container extensions.
-            # Many portals serve files via get.php?stream=movie.mkv&token=xxx —
-            # splitting on '?' would lose the extension from the codec check.
-            url_lower_full = url.lower()                         # full URL inc. query string
-            url_lower      = url_lower_full.split('?')[0]        # path only (for endswith checks)
-            
+            # Many portals serve files via get.php?stream=movie.mkv&mac=xxx —
+            # splitting on '?' loses the extension, skipping the codec probe entirely.
+            url_lower_full = url.lower()
+            url_lower      = url_lower_full.split('?')[0]
+
             # ==== SMART CONTAINER DETECTION ====
-            # Match container extensions whether they appear in path OR query string
             needs_codec_check = (
                 url_lower.endswith('.mp4') or
                 url_lower.endswith('.mkv') or
-                # Query-string patterns: stream=movie.mkv&... or ?file=x.mp4&...
                 re.search(r'\.mp4[?&]', url_lower_full) is not None or
                 re.search(r'\.mkv[?&]', url_lower_full) is not None or
                 re.search(r'\.mp4$',    url_lower_full) is not None or
@@ -3484,21 +3482,22 @@ def api_resolve():
             # Apply transcode if needed
             if needs_transcode:
                 vod_flag = "1" if is_vod else "0"
-                transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}&url={quote(url, safe='')}"
+                audio_only_issue = (transcode_reason or "").startswith("incompatible audio")
                 if is_multiview:
-                    # For HEVC-video-only issues the multiview_addon can handle transcoding
-                    # internally via its own ffmpeg. But for audio codec problems (AC3/EAC3/DTS)
-                    # the addon's stream-copy audio path doesn't help — route through the same
-                    # hls_proxy transcode URL as the main player so audio is re-encoded to AAC.
-                    audio_only_issue = (transcode_reason or "").startswith("incompatible audio")
                     if audio_only_issue:
                         state.log(f"[RESOLVE] MV audio transcode → hls_proxy: {transcode_reason}")
-                        return jsonify({"url": transcode_url, "hevc": False})
+                        audio_url = f"/api/hls_proxy?audio_only=1&vod={vod_flag}&url={quote(url, safe='')}"
+                        return jsonify({"url": audio_url, "hevc": False})
                     else:
                         # HEVC video: let multiview_addon handle it natively
                         return jsonify({"url": url, "hevc": True})
                 else:
                     state.log(f"[RESOLVE] Routing to transcode proxy: {transcode_reason}")
+                    if audio_only_issue:
+                        # Copy video, re-encode audio only — much cheaper than full libx264 re-encode
+                        transcode_url = f"/api/hls_proxy?audio_only=1&vod={vod_flag}&url={quote(url, safe='')}"
+                    else:
+                        transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}&url={quote(url, safe='')}"
                     return jsonify({"url": transcode_url, "hevc": True})
                     
         return jsonify({"url": url})
@@ -6044,8 +6043,9 @@ def api_hls_proxy():
     if not ffmpeg:
         return Response("ffmpeg not available", status=503)
     
-    transcode = request.args.get("transcode", "0") == "1"
-    is_vod = request.args.get("vod", "0") == "1"
+    transcode   = request.args.get("transcode", "0") == "1"
+    audio_only  = request.args.get("audio_only", "0") == "1" and not transcode
+    is_vod      = request.args.get("vod", "0") == "1"
     
     cors = {
         "Access-Control-Allow-Origin": "*",
@@ -6053,38 +6053,44 @@ def api_hls_proxy():
         "Access-Control-Allow-Headers": "*",
     }
 
+    base_input = [
+        ffmpeg, "-hide_banner", "-nostdin",
+        "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "-referer", url.rsplit('/', 1)[0] + "/",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "10",
+        "-fflags", "+genpts+igndts+discardcorrupt",
+        "-i", url,
+    ]
+
     # Build ffmpeg command
     if transcode:
-        # Full transcode: H.264 video + AAC audio (maximum compatibility)
-        cmd = [
-            ffmpeg, "-hide_banner", "-nostdin",
-            "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "-referer", url.rsplit('/', 1)[0] + "/",
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "10",
-            "-fflags", "+genpts+igndts+discardcorrupt",
-            "-i", url,
+        # Full transcode: H.264 video + AAC audio (for HEVC video or combined issues)
+        cmd = base_input + [
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
+            "-f", "mpegts", "-",
         ]
-        
-        # Video: force H.264 if needed, or copy if already compatible
-        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23"]
-        
-        # Audio: always convert to AAC for compatibility
-        cmd += ["-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000"]
-        
-        # Output format
-        cmd += ["-f", "mpegts", "-"]
-        
         mode_str = "transcode"
+    elif audio_only:
+        # Audio-only transcode: copy video stream unchanged, re-encode audio to AAC.
+        # Used when video is already H.264 but audio is AC3/EAC3/DTS/etc.
+        # Much cheaper than full libx264 re-encode and avoids re-encoding artifacts.
+        cmd = base_input + [
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
+            "-f", "mpegts", "-",
+        ]
+        mode_str = "audio-transcode"
     else:
-        # Remux only (copy streams)
+        # Remux only (copy all streams)
         cmd = [
             ffmpeg, "-hide_banner", "-nostdin",
             "-user_agent", "Mozilla/5.0",
             "-i", url,
             "-c", "copy",
-            "-f", "mpegts", "-"
+            "-f", "mpegts", "-",
         ]
         mode_str = "remux"
 
@@ -6124,6 +6130,7 @@ def api_hls_proxy():
 
     def _gen():
         chunk_count = 0
+        killed_by_us = False
         try:
             while True:
                 chunk = proc.stdout.read(8192)
@@ -6137,13 +6144,21 @@ def api_hls_proxy():
                 chunk_count += 1
                 yield chunk
         except GeneratorExit:
-            pass  # Client disconnected
+            killed_by_us = True   # Client disconnected / player switched — expected
         except Exception as e:
             state.log(f"[ffmpeg/{mode_str}] Generator error: {e}")
         finally:
             proc.kill()
             proc.wait()
-            state.log(f"[ffmpeg/{mode_str}] Stopped after {chunk_count} chunks, exit code {proc.returncode}")
+            rc = proc.returncode
+            if killed_by_us:
+                # Normal: browser stopped reading because user switched episode/channel
+                state.log(f"[ffmpeg/{mode_str}] Client disconnected after {chunk_count} chunks — stream stopped")
+            elif rc == 0:
+                state.log(f"[ffmpeg/{mode_str}] Finished cleanly after {chunk_count} chunks")
+            else:
+                state.log(f"[ffmpeg/{mode_str}] Exited with error (exit code {rc}) after {chunk_count} chunks"
+                          + (f" — last stderr: {stderr_lines[-1][:120]}" if stderr_lines else ""))
 
     h = dict(cors)
     h["Content-Type"] = "video/mp2t"
@@ -13004,21 +13019,23 @@ async function _mvPlayChannel(wid, channel, cEl){
     // Need to resolve — same fetch as playItem()
     try {
       // ?mv=1 tells the server this is a multiview resolve.
-      // For HEVC video: server returns raw URL + hevc:true so multiview_addon
-      //   can handle transcoding internally via its own ffmpeg.
+      // For HEVC video: server returns raw URL + hevc:true → addon handles via &transcode=1
       // For incompatible audio (AC3/DTS): server returns hls_proxy URL + hevc:false
-      //   so we play it via HLS.js with AAC audio (same as main player).
+      //   → played directly via mpegts.js (hls_proxy outputs raw MPEG-TS)
+      // Derive mode from the item itself: series/vod items have _is_show_item or _direct_url
+      const _mvResolveMode = (channel.tvg_type==='series'||channel._is_show_item||channel._direct_url)
+        ? (channel.tvg_type||'live') : 'live';
       const r = await fetch('/api/resolve?mv=1', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({item: channel, mode: 'live', category: curCat || {}})
+        body: JSON.stringify({item: channel, mode: _mvResolveMode, category: curCat || {}})
       });
       const d = await r.json();
       resolvedUrl = d.url || '';
       if(d.hevc) channel._mv_transcode = true;
       // When the server routed through hls_proxy for audio transcoding (AC3→AAC),
-      // d.hevc is false but resolvedUrl points at /api/hls_proxy — mark it so
-      // we use HLS.js below instead of mpegts.js + multiview stream proxy.
+      // hls_proxy outputs raw MPEG-TS. Flag it so we play via mpegts.js directly,
+      // bypassing the multiview_addon stream proxy (which expects a raw portal URL).
       if(resolvedUrl.includes('/api/hls_proxy')) channel._mv_hls_transcode = true;
     } catch(e){ toast('MV: resolve error: ' + e, 'err'); }
   }
@@ -13051,9 +13068,11 @@ async function _mvPlayChannel(wid, channel, cEl){
       toast('Browser does not support MSE — cannot play transcoded stream', 'err');
       _mvStopCleanup(wid, true); return;
     }
+    // isLive: true for live channels, false for VOD/series (enables seek bar + finite duration)
+    const _hlsIsLive = channel._is_live !== false && !channel._direct_url && channel.tvg_type !== 'movie' && channel.tvg_type !== 'series';
     const player = mpegts.createPlayer({
       type:   'mse',
-      isLive: false,   // VOD file — expose duration + seekbar
+      isLive: _hlsIsLive,
       url:    resolvedUrl,
     }, {
       enableStashBuffer: true,
