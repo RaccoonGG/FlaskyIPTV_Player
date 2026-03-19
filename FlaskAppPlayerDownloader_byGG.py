@@ -3484,21 +3484,21 @@ def api_resolve():
             # Apply transcode if needed
             if needs_transcode:
                 vod_flag = "1" if is_vod else "0"
-                transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}&url={quote(url, safe='')}"
                 if is_multiview:
-                    # For HEVC-video-only issues the multiview_addon can handle transcoding
-                    # internally via its own ffmpeg. But for audio codec problems (AC3/EAC3/DTS)
-                    # the addon's stream-copy audio path doesn't help — route through the same
-                    # hls_proxy transcode URL as the main player so audio is re-encoded to AAC.
                     audio_only_issue = (transcode_reason or "").startswith("incompatible audio")
                     if audio_only_issue:
-                        state.log(f"[RESOLVE] MV audio transcode → hls_proxy: {transcode_reason}")
-                        return jsonify({"url": transcode_url, "hevc": False})
+                        # Audio-only transcode: return raw URL with flag so JS passes
+                        # &audio_only=1 to multiview_addon, which runs -c:v copy -c:a aac.
+                        # Everything stays in the addon's MPEG-TS pipeline — no hls_proxy.
+                        state.log(f"[RESOLVE] MV audio-only transcode: {transcode_reason}")
+                        return jsonify({"url": url, "hevc": False, "audio_transcode": True})
                     else:
-                        # HEVC video: let multiview_addon handle it natively
+                        # HEVC video: addon handles via &transcode=1 (libx264 + aac)
+                        state.log(f"[RESOLVE] MV HEVC transcode: {transcode_reason}")
                         return jsonify({"url": url, "hevc": True})
                 else:
                     state.log(f"[RESOLVE] Routing to transcode proxy: {transcode_reason}")
+                    transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}&url={quote(url, safe='')}"
                     return jsonify({"url": transcode_url, "hevc": True})
                     
         return jsonify({"url": url})
@@ -12838,10 +12838,9 @@ async function _mvPlayChannel(wid, channel, cEl){
     // Need to resolve — same fetch as playItem()
     try {
       // ?mv=1 tells the server this is a multiview resolve.
-      // For HEVC video: server returns raw URL + hevc:true so multiview_addon
-      //   can handle transcoding internally via its own ffmpeg.
-      // For incompatible audio (AC3/DTS): server returns hls_proxy URL + hevc:false
-      //   so we play it via HLS.js with AAC audio (same as main player).
+      // For HEVC video: server returns raw URL + hevc:true → addon runs libx264+aac (&transcode=1)
+      // For bad audio:  server returns raw URL + audio_transcode:true → addon runs -c:v copy -c:a aac (&audio_only=1)
+      // Both stay in the addon's unified MPEG-TS pipeline — no hls_proxy involvement.
       const r = await fetch('/api/resolve?mv=1', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
@@ -12850,10 +12849,9 @@ async function _mvPlayChannel(wid, channel, cEl){
       const d = await r.json();
       resolvedUrl = d.url || '';
       if(d.hevc) channel._mv_transcode = true;
-      // When the server routed through hls_proxy for audio transcoding (AC3→AAC),
-      // d.hevc is false but resolvedUrl points at /api/hls_proxy — mark it so
-      // we use HLS.js below instead of mpegts.js + multiview stream proxy.
-      if(resolvedUrl.includes('/api/hls_proxy')) channel._mv_hls_transcode = true;
+      // audio_transcode=true: video is already H.264, only audio needs re-encoding.
+      // Pass &audio_only=1 to multiview_addon which runs -c:v copy -c:a aac.
+      if(d.audio_transcode) channel._mv_audio_only = true;
     } catch(e){ toast('MV: resolve error: ' + e, 'err'); }
   }
 
@@ -12866,61 +12864,24 @@ async function _mvPlayChannel(wid, channel, cEl){
   mvUrls.set(wid, resolvedUrl);
 
   // ── Record portal metadata for the connection-count badge ─────────────────
-  // Allow caller to override portal info (e.g. when playing a custom URL)
   const portalInfo = channel._portal_override || _mvPortalKeyFromUrl(resolvedUrl);
   mvPortalMeta.set(wid, {
     portalKey:  portalInfo.key,
     portalName: portalInfo.name,
   });
-  // Refresh all badges (connection counts change when this widget starts)
   _mvUpdatePortalBadges();
 
-  // ── Audio-transcoded stream: play hls_proxy MPEG-TS directly via mpegts.js ─
-  // When /api/resolve returned an /api/hls_proxy URL (e.g. EAC3→AAC transcode),
-  // the proxy outputs raw MPEG-TS (-f mpegts). Use mpegts.js directly on that
-  // local URL — no need to pass through the multiview_addon stream proxy, which
-  // expects a portal URL, not a local proxy URL.
-  if(channel._mv_hls_transcode){
-    if(typeof mpegts === 'undefined' || !mpegts.isSupported()){
-      toast('Browser does not support MSE — cannot play transcoded stream', 'err');
-      _mvStopCleanup(wid, true); return;
-    }
-    const player = mpegts.createPlayer({
-      type:   'mse',
-      isLive: false,   // VOD file — expose duration + seekbar
-      url:    resolvedUrl,
-    }, {
-      enableStashBuffer: true,
-      stashInitialSize:  4096,
-    });
-    player.on(mpegts.Events.ERROR, (errType, errDetail)=>{
-      console.error('[MV/transcode] mpegts error wid='+wid, errType, errDetail);
-      if(document.getElementById('p-mv').classList.contains('mv-active'))
-        toast('Stream error: '+(channel.name||wid),'err');
-      _mvStopCleanup(wid, true);
-    });
-    mvPlayers.set(wid, player);
-    player.attachMediaElement(videoEl);
-    player.load();
-    try {
-      await player.play();
-      const muteBtn = cEl.querySelector('.mv-mute-btn');
-      if(mvPlayers.size === 1){ videoEl.muted=false; if(muteBtn) muteBtn.textContent='🔊'; }
-      else if(muteBtn) muteBtn.textContent = videoEl.muted?'🔇':'🔊';
-    } catch(e){ console.warn('[MV/transcode] play() error', e); }
-    _mvUpdateSeekBar(wid);
-    return;
-  }
-
   // ── Build the proxy stream URL ─────────────────────────────────────────────
-  // mirrors server.js /stream GET handler stream key:
-  //   streamKey = `${userId}::${streamUrl}::${profileId}`
-  // We route through multiview_addon.py /api/multiview/stream which handles
-  // dedup and reference counting server-side.
+  // All cases (stream-copy, HEVC transcode, audio-only transcode) flow through
+  // multiview_addon /api/multiview/stream — a single unified MPEG-TS pipeline.
+  //   &transcode=1   → HEVC video: addon runs libx264 + aac
+  //   &audio_only=1  → bad audio: addon runs -c:v copy -c:a aac
+  //   (neither)      → stream copy at zero cost
   const proxyUrl = '/api/multiview/stream?'
     + 'url='        + encodeURIComponent(resolvedUrl)
     + '&client_id=' + encodeURIComponent(mvClientId)
-    + (channel._mv_transcode ? '&transcode=1' : '');
+    + (channel._mv_transcode  ? '&transcode=1'  : '')
+    + (channel._mv_audio_only ? '&audio_only=1' : '');
 
   // ── Create mpegts.js player ────────────────────────────────────────────────
   // mirrors multiview.js mpegts.createPlayer block exactly
