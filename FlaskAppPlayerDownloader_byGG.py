@@ -3239,6 +3239,22 @@ def api_categories():
     return jsonify({"categories": cats, "mode": mode})
 
 
+@flask_app.route("/api/clear_cache", methods=["POST"])
+def api_clear_cache():
+    """Clear server-side caches without disconnecting.
+    Called by the Refresh Playlist button: wipes logo cache, item cache hints,
+    and the proxy image cache, then the JS side re-runs doConnect() to refetch
+    categories and reconnect with fresh data."""
+    global _proxy_img_cache
+    with _proxy_img_cache_lock:
+        _proxy_img_cache = {}
+    state._logo_cache_live = None
+    state._logo_cache_vod  = {}
+    state.cats_cache        = {}
+    state.log("[CACHE] Server-side caches cleared — ready for reconnect")
+    return jsonify({"ok": True})
+
+
 @flask_app.route("/api/items", methods=["POST"])
 def api_items():
     data = request.get_json(force=True)
@@ -3391,14 +3407,22 @@ def api_resolve():
             transcode_reason = None
             is_vod = mode in ('vod', 'series')  # VOD needs different handling than live
             
-            url_lower = url.lower().split('?')[0]
+            # Check both path and query string for container extensions.
+            # Many portals serve files via get.php?stream=movie.mkv&token=xxx —
+            # splitting on '?' would lose the extension from the codec check.
+            url_lower_full = url.lower()                         # full URL inc. query string
+            url_lower      = url_lower_full.split('?')[0]        # path only (for endswith checks)
             
             # ==== SMART CONTAINER DETECTION ====
+            # Match container extensions whether they appear in path OR query string
             needs_codec_check = (
-                url_lower.endswith('.mp4') or 
+                url_lower.endswith('.mp4') or
                 url_lower.endswith('.mkv') or
-                '.mp4?' in url_lower or
-                '.mkv?' in url_lower or
+                # Query-string patterns: stream=movie.mkv&... or ?file=x.mp4&...
+                re.search(r'\.mp4[?&]', url_lower_full) is not None or
+                re.search(r'\.mkv[?&]', url_lower_full) is not None or
+                re.search(r'\.mp4$',    url_lower_full) is not None or
+                re.search(r'\.mkv$',    url_lower_full) is not None or
                 any(ext in url_lower for ext in ['.hevc', '.265', '.h265'])
             )
             
@@ -3459,13 +3483,22 @@ def api_resolve():
             
             # Apply transcode if needed
             if needs_transcode:
+                vod_flag = "1" if is_vod else "0"
+                transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}&url={quote(url, safe='')}"
                 if is_multiview:
-                    return jsonify({"url": url, "hevc": True})
+                    # For HEVC-video-only issues the multiview_addon can handle transcoding
+                    # internally via its own ffmpeg. But for audio codec problems (AC3/EAC3/DTS)
+                    # the addon's stream-copy audio path doesn't help — route through the same
+                    # hls_proxy transcode URL as the main player so audio is re-encoded to AAC.
+                    audio_only_issue = (transcode_reason or "").startswith("incompatible audio")
+                    if audio_only_issue:
+                        state.log(f"[RESOLVE] MV audio transcode → hls_proxy: {transcode_reason}")
+                        return jsonify({"url": transcode_url, "hevc": False})
+                    else:
+                        # HEVC video: let multiview_addon handle it natively
+                        return jsonify({"url": url, "hevc": True})
                 else:
                     state.log(f"[RESOLVE] Routing to transcode proxy: {transcode_reason}")
-                    # Pass vod flag for better handling
-                    vod_flag = "1" if is_vod else "0"
-                    transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}&url={quote(url, safe='')}"
                     return jsonify({"url": transcode_url, "hevc": True})
                     
         return jsonify({"url": url})
@@ -5558,11 +5591,42 @@ _proxy_img_cache_lock = threading.Lock()
 _PROXY_IMG_CACHE_MAX = 1500           # ~150 MB at ~100 kB average logo size
 
 
+# 1×1 transparent PNG returned instead of a 403 when a logo host blocks hotlinking.
+# This lets the browser's onerror handler hide the <img> cleanly, avoids broken-image
+# icons, and stops the log from being spammed with expected 403s.
+_TRANSPARENT_PNG = (
+    b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01'
+    b'\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01'
+    b'\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
+)
+
+# Hosts that are known to use cookie/session-based hotlink protection.
+# Browser UA + Referer alone will never work for these — we serve the transparent
+# PNG immediately without even attempting a network fetch, saving a round-trip.
+_HOTLINK_BLOCKED_HOSTS = frozenset({
+    "www.lyngsat.com",
+    "lyngsat.com",
+    "lyngsat-logo.com",
+    "www.lyngsat-logo.com",
+})
+
+
 @flask_app.route("/api/proxy")
 def api_proxy():
     url = request.args.get("url", "").strip()
     if not url or not url.startswith(("http://", "https://")):
         return Response("Invalid URL", status=400)
+
+    # Normalise double-slashes in the path that some portals embed in logo URLs
+    # (e.g. "https://www.lyngsat.com//logo/tv/…" → single slash after the host).
+    try:
+        _p = urlparse(url)
+        _clean_path = re.sub(r'/{2,}', '/', _p.path)
+        if _clean_path != _p.path:
+            # ParseResult is a namedtuple — _replace() + geturl() rebuilds the URL
+            url = _p._replace(path=_clean_path).geturl()
+    except Exception:
+        pass
 
     # Cache key = URL with query string stripped.
     # Portals append random ?{number} version tokens to logo URLs; stripping
@@ -5575,6 +5639,18 @@ def api_proxy():
         "Access-Control-Allow-Methods": "GET, OPTIONS",
         "Access-Control-Allow-Headers": "*",
     }
+
+    # ── Known hotlink-blocked hosts: return transparent PNG immediately ───
+    if is_img_url:
+        try:
+            _host = urlparse(url).netloc.lower()
+        except Exception:
+            _host = ""
+        if _host in _HOTLINK_BLOCKED_HOSTS:
+            hdrs = dict(cors)
+            hdrs["Content-Type"] = "image/png"
+            hdrs["Cache-Control"] = "public, max-age=86400"
+            return Response(_TRANSPARENT_PNG, status=200, headers=hdrs)
 
     # ── Cache read ────────────────────────────────────────────────────────
     if is_img_url and "Range" not in request.headers:
@@ -5591,9 +5667,9 @@ def api_proxy():
 
     try:
         # Image requests need a browser-like User-Agent and a matching Referer.
-        # Many logo CDNs (lyngsat.com, tmdb.org, fanart.tv, etc.) actively block
-        # VLC/curl UAs and requests that arrive with no Referer, returning 403.
-        # Stream requests keep VLC/3.0 so the portal recognises the player.
+        # Many logo CDNs (tmdb.org, fanart.tv, etc.) block VLC/curl UAs and
+        # requests with no Referer. Stream requests keep VLC/3.0 so portals
+        # recognise the player.
         if is_img_url:
             parsed_logo = urlparse(url)
             logo_origin = f"{parsed_logo.scheme}://{parsed_logo.netloc}"
@@ -5647,16 +5723,24 @@ def api_proxy():
                             for k in keys[:len(keys) // 2]:
                                 del _proxy_img_cache[k]
                         _proxy_img_cache[norm_url] = (ct, data)
-            hdrs = dict(cors)
-            hdrs["Content-Type"] = ct
-            hdrs["Content-Length"] = str(len(data))
-            hdrs["Cache-Control"] = "public, max-age=86400"
-            hdrs["X-Cache"] = "MISS"
-            if resp.status_code == 403:
-                state.log(f"[Proxy] 403 logo (hotlink blocked?) ← {url[:80]}")
-            elif resp.status_code not in (200, 206):
+                hdrs = dict(cors)
+                hdrs["Content-Type"] = ct
+                hdrs["Content-Length"] = str(len(data))
+                hdrs["Cache-Control"] = "public, max-age=86400"
+                hdrs["X-Cache"] = "MISS"
+                return Response(data, status=200, headers=hdrs)
+            elif resp.status_code == 403:
+                # Hotlink-blocked — serve transparent PNG so the browser's
+                # onerror handler hides the <img> cleanly with no log spam.
+                hdrs = dict(cors)
+                hdrs["Content-Type"] = "image/png"
+                hdrs["Cache-Control"] = "public, max-age=3600"
+                return Response(_TRANSPARENT_PNG, status=200, headers=hdrs)
+            else:
                 state.log(f"[Proxy] HTTP {resp.status_code} ← {url[:80]}")
-            return Response(data, status=resp.status_code, headers=hdrs)
+                hdrs = dict(cors)
+                hdrs["Content-Type"] = ct
+                return Response(data, status=resp.status_code, headers=hdrs)
 
         # ── Non-image: stream as before ───────────────────────────────────
         def _gen():
@@ -7355,8 +7439,25 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   background:var(--s3);flex-shrink:0}
 .mv-ch-name{font-size:12px;font-weight:600;color:var(--txt);
   flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Action buttons always visible in the multiview channel selector */
+.mv-ch-row .mv-item-btns{display:flex;gap:3px;flex-shrink:0;align-items:center}
+.mv-item-btns .btn-ghost{height:24px;padding:0 7px;font-size:11px;font-weight:700}
+/* Small inline context dropdown inside the selector — fixed so it escapes overflow:hidden */
+.mv-item-ctx{position:fixed;z-index:2100;background:var(--s2);border:1px solid var(--bdr2);
+  border-radius:var(--rsm);box-shadow:0 4px 16px rgba(0,0,0,.45);min-width:170px;padding:4px 0;display:none}
+.mv-item-ctx.open{display:block}
+.mv-item-ctx button{display:flex;align-items:center;gap:8px;width:100%;padding:7px 14px;
+  background:none;border:none;color:var(--txt);font-size:12px;cursor:pointer;text-align:left;white-space:nowrap}
+.mv-item-ctx button:hover{background:rgba(124,58,237,.12)}
+/* Tabs row — explicit row layout so it never stacks vertically */
+#mv-sel-tabs{display:flex;flex-flow:row nowrap;gap:4px;padding:6px 10px 0;flex-shrink:0;width:100%;box-sizing:border-box}
 .mv-sel-footer{padding:8px 10px;border-top:1px solid var(--bdr);flex-shrink:0;
   display:flex;justify-content:flex-end}
+.mv-sel-tab{flex:1;height:26px;font-size:11px;font-weight:700;border-radius:var(--rss);
+  border:1px solid var(--bdr2);background:var(--s3);color:var(--txt2);cursor:pointer;
+  transition:var(--tr);white-space:nowrap;
+  display:flex;align-items:center;justify-content:center;text-align:center}
+.mv-sel-tab.active{background:var(--acc);color:#fff;border-color:var(--acc)}
 
 /* Save layout modal */
 #mv-save-overlay{
@@ -7403,6 +7504,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       {{ tags_html | safe }}
       <button class="btn-ghost hdr-ico" id="stopbtn" onclick="doStop()" disabled title="Stop">⏹</button>
       <button class="btn-ghost hdr-ico" onclick="openWhatsOn()" title="What's on Now">📺</button>
+      <button class="btn-ghost hdr-ico" onclick="refreshPlaylist()" title="Refresh playlist — clear cache &amp; reconnect" id="refresh-btn">🔄</button>
       <button class="btn-ghost hdr-ico" onclick="openPL()" title="Saved Playlists">📋</button>
       <button class="btn-ghost hdr-ico" id="cast-fab" title="Cast to TV / speaker" style="position:relative">
         <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M1 18v3h3c0-1.66-1.34-3-3-3zm0-4v2c2.76 0 5 2.24 5 5h2c0-3.87-3.13-7-7-7zm18-7H5c-1.1 0-2 .9-2 2v3h2v-3h14v12h-5v2h5c1.1 0 2-.9 2-2V9c0-1.1-.9-2-2-2zm-18 3v2c4.97 0 9 4.03 9 9h2c0-6.08-4.93-11-11-11z"/></svg>
@@ -7840,8 +7942,16 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <button class="btn-ghost" id="mv-sel-close"
         style="height:26px;width:26px;padding:0;font-size:14px;flex-shrink:0">✕</button>
     </div>
+    <!-- Mode tabs — only visible when in category list (cats mode) -->
+    <div id="mv-sel-tabs">
+      <button class="mv-sel-tab active" data-mode="live"   onclick="_mvSelSetMode('live')"  >📡 Live</button>
+      <button class="mv-sel-tab"        data-mode="vod"    onclick="_mvSelSetMode('vod')"   >🎬 VOD</button>
+      <button class="mv-sel-tab"        data-mode="series" onclick="_mvSelSetMode('series')">📺 Series</button>
+    </div>
     <input id="mv-sel-search" type="search" placeholder="Search…"/>
     <div id="mv-sel-list"></div>
+    <!-- Inline context popup for items (submenu ⋮) -->
+    <div id="mv-item-ctx" class="mv-item-ctx"></div>
     <div class="mv-sel-footer">
       <button class="btn-ghost" id="mv-sel-cancel"
         style="height:30px;padding:0 14px;font-size:12px">Cancel</button>
@@ -8876,6 +8986,33 @@ async function doConnect(){
   finally{setBusy(false);}
 }
 
+// ── REFRESH PLAYLIST ────────────────────────────────────────
+// Clears all client-side and server-side caches, then reconnects with the
+// same credentials currently in the input fields. This is equivalent to
+// pressing Connect again but also wipes the proxy image cache and logo caches
+// on the server so logos are re-fetched fresh.
+async function refreshPlaylist(){
+  if(setBusy && typeof setBusy==='function') setBusy(true);
+  const btn = document.getElementById('refresh-btn');
+  if(btn){ btn.style.opacity='0.5'; btn.style.pointerEvents='none'; }
+  toast('Refreshing playlist…','ok');
+  try {
+    // 1. Clear server-side caches (logo cache, proxy image cache, cats cache)
+    await fetch('/api/clear_cache', {method:'POST'});
+    // 2. Clear client-side item + category caches
+    categoryItemsCache = {};
+    catsCache = {};
+    allItems = []; filtItems = []; curCat = null; navStack = [];
+    // 3. Reconnect — re-fetches categories and rebuilds everything
+    await doConnect();
+  } catch(e){
+    toast('Refresh failed: ' + e.message, 'err');
+  } finally {
+    if(btn){ btn.style.opacity=''; btn.style.pointerEvents=''; }
+    if(setBusy && typeof setBusy==='function') setBusy(false);
+  }
+}
+
 // ── PLAY DIRECT URL ────────────────────────────────────────
 function playDirectUrl(){
   const url = (document.getElementById('play-url-inp').value||'').trim();
@@ -9317,7 +9454,8 @@ function iMenuIMDB(){
   _iMenuIMDBOpen(it);
 }
 
-async function _iMenuIMDBOpen(it){
+async function _iMenuIMDBOpen(it, _modeOverride){
+  const _effectiveMode = _modeOverride || mode;
   const _tmdbFields = ['kinopoisk_id','external_id','movie_tmdb_id','series_tmdb_id','tmdb_id','tmdb'];
   // Priority 1: scan ALL fields for tt-prefixed IMDB ID
   let imdbId = it.imdb_id || it.imdb || '';
@@ -9334,8 +9472,8 @@ async function _iMenuIMDBOpen(it){
   }
   // Priority 3: for Xtream VOD/Series, fetch info from portal to get tmdb_id
   const needFetch = !imdbId && !tmdbId && (
-    (it.stream_id && mode === 'vod') ||
-    (it.series_id && mode === 'series')
+    (it.stream_id && _effectiveMode === 'vod') ||
+    (it.series_id && _effectiveMode === 'series')
   );
   if(needFetch){
     try{
@@ -9354,7 +9492,7 @@ async function _iMenuIMDBOpen(it){
   if(imdbId){
     window.open('https://www.imdb.com/title/'+imdbId+'/', '_blank');
   } else if(tmdbId){
-    const section = mode === 'series' ? 'tv' : 'movie';
+    const section = _effectiveMode === 'series' ? 'tv' : 'movie';
     window.open('https://www.themoviedb.org/'+section+'/'+tmdbId, '_blank');
   } else {
     const name = it.name||it.o_name||it.fname||'Unknown';
@@ -12699,10 +12837,11 @@ async function _mvPlayChannel(wid, channel, cEl){
   if(!resolvedUrl && channel.name){
     // Need to resolve — same fetch as playItem()
     try {
-      // ?mv=1 tells the server to return the raw URL even for HEVC streams.
-      // The server also returns hevc:true so we can tell multiview_addon to
-      // transcode the stream internally instead of serving raw HEVC that most
-      // browsers cannot decode via MSE.
+      // ?mv=1 tells the server this is a multiview resolve.
+      // For HEVC video: server returns raw URL + hevc:true so multiview_addon
+      //   can handle transcoding internally via its own ffmpeg.
+      // For incompatible audio (AC3/DTS): server returns hls_proxy URL + hevc:false
+      //   so we play it via HLS.js with AAC audio (same as main player).
       const r = await fetch('/api/resolve?mv=1', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
@@ -12711,6 +12850,10 @@ async function _mvPlayChannel(wid, channel, cEl){
       const d = await r.json();
       resolvedUrl = d.url || '';
       if(d.hevc) channel._mv_transcode = true;
+      // When the server routed through hls_proxy for audio transcoding (AC3→AAC),
+      // d.hevc is false but resolvedUrl points at /api/hls_proxy — mark it so
+      // we use HLS.js below instead of mpegts.js + multiview stream proxy.
+      if(resolvedUrl.includes('/api/hls_proxy')) channel._mv_hls_transcode = true;
     } catch(e){ toast('MV: resolve error: ' + e, 'err'); }
   }
 
@@ -12731,6 +12874,43 @@ async function _mvPlayChannel(wid, channel, cEl){
   });
   // Refresh all badges (connection counts change when this widget starts)
   _mvUpdatePortalBadges();
+
+  // ── Audio-transcoded stream: play hls_proxy MPEG-TS directly via mpegts.js ─
+  // When /api/resolve returned an /api/hls_proxy URL (e.g. EAC3→AAC transcode),
+  // the proxy outputs raw MPEG-TS (-f mpegts). Use mpegts.js directly on that
+  // local URL — no need to pass through the multiview_addon stream proxy, which
+  // expects a portal URL, not a local proxy URL.
+  if(channel._mv_hls_transcode){
+    if(typeof mpegts === 'undefined' || !mpegts.isSupported()){
+      toast('Browser does not support MSE — cannot play transcoded stream', 'err');
+      _mvStopCleanup(wid, true); return;
+    }
+    const player = mpegts.createPlayer({
+      type:   'mse',
+      isLive: false,   // VOD file — expose duration + seekbar
+      url:    resolvedUrl,
+    }, {
+      enableStashBuffer: true,
+      stashInitialSize:  4096,
+    });
+    player.on(mpegts.Events.ERROR, (errType, errDetail)=>{
+      console.error('[MV/transcode] mpegts error wid='+wid, errType, errDetail);
+      if(document.getElementById('p-mv').classList.contains('mv-active'))
+        toast('Stream error: '+(channel.name||wid),'err');
+      _mvStopCleanup(wid, true);
+    });
+    mvPlayers.set(wid, player);
+    player.attachMediaElement(videoEl);
+    player.load();
+    try {
+      await player.play();
+      const muteBtn = cEl.querySelector('.mv-mute-btn');
+      if(mvPlayers.size === 1){ videoEl.muted=false; if(muteBtn) muteBtn.textContent='🔊'; }
+      else if(muteBtn) muteBtn.textContent = videoEl.muted?'🔇':'🔊';
+    } catch(e){ console.warn('[MV/transcode] play() error', e); }
+    _mvUpdateSeekBar(wid);
+    return;
+  }
 
   // ── Build the proxy stream URL ─────────────────────────────────────────────
   // mirrors server.js /stream GET handler stream key:
@@ -13018,176 +13198,401 @@ function _mvApplyPreset(name){
 // mirrors multiview.js populateChannelSelector()
 // ── CHANNEL SELECTOR — FULL CATEGORY BROWSER ─────────────────────────────────
 //
-// mirrors the main UI's browseC() / renderItems() flow:
-//   1. Opens on category list (catsCache['live'])
-//   2. Click a category → fetch items via /api/items (same endpoint as browseC)
-//   3. Click an item   → calls mvSelCallback(item), closes modal
-//   4. Back button     → return to category list
+// Three-level navigation:
+//   cats      → category list (tabs: Live / VOD / Series)
+//   items     → item list for a category (channels / VOD titles / show containers)
+//   episodes  → episode list for a show item (after clicking Eps)
 //
-// This replaces the old allItems-only approach which was limited to
-// whatever category was loaded in the main browse panel.
+// Each level has a Back button that goes up one level.
 
-let _mvSelMode     = 'cats';   // 'cats' | 'items'
-let _mvSelCat      = null;     // current category object when in items mode
-let _mvSelItems    = [];       // items loaded for current category
+let _mvSelNavMode     = 'cats';    // 'cats' | 'items' | 'episodes'
+let _mvSelContentMode = 'live';    // 'live' | 'vod' | 'series'
+let _mvSelCat         = null;      // current category
+let _mvSelItems       = [];        // items for current category
+let _mvSelShowItem    = null;      // show item whose episodes are being browsed
+let _mvSelEpisodes    = [];        // episodes loaded for _mvSelShowItem
+
+// Backward-compat alias
+Object.defineProperty(window, '_mvSelMode', {
+  get(){ return _mvSelNavMode; },
+  set(v){ _mvSelNavMode = v; }
+});
+
+function _mvSelSetMode(mode){
+  if(_mvSelContentMode === mode) return;
+  _mvSelContentMode = mode;
+  _mvSelNavMode = 'cats';
+  _mvSelCat = null; _mvSelItems = []; _mvSelShowItem = null; _mvSelEpisodes = [];
+  document.getElementById('mv-sel-search').value = '';
+  document.querySelectorAll('.mv-sel-tab').forEach(b=>{
+    b.classList.toggle('active', b.dataset.mode === mode);
+  });
+  _mvRenderSel();
+}
 
 function _mvPopulateSelector(){
-  // Reset to category list every time the modal opens
-  _mvSelMode  = 'cats';
-  _mvSelCat   = null;
-  _mvSelItems = [];
+  _mvSelNavMode = 'cats';
+  _mvSelCat = null; _mvSelItems = []; _mvSelShowItem = null; _mvSelEpisodes = [];
   document.getElementById('mv-sel-search').value = '';
+  document.querySelectorAll('.mv-sel-tab').forEach(b=>{
+    b.classList.toggle('active', b.dataset.mode === _mvSelContentMode);
+  });
+  _mvCloseCtxMenu();
   _mvRenderSel();
-
-  // Wire search to re-render current view
   document.getElementById('mv-sel-search').oninput = ()=> _mvRenderSel();
 }
+
+// ── tiny inline context menu helpers ─────────────────────────────────────────
+function _mvCloseCtxMenu(){
+  const m = document.getElementById('mv-item-ctx');
+  if(m){ m.classList.remove('open'); m.innerHTML=''; }
+}
+function _mvOpenCtxMenu(btn, actions){
+  _mvCloseCtxMenu();
+  const m = document.getElementById('mv-item-ctx');
+  if(!m) return;
+  m.innerHTML = actions.map(a=>
+    `<button onclick="${a.fn}">${a.icon} ${esc(a.label)}</button>`
+  ).join('');
+  m.classList.add('open');
+  // Use fixed viewport coords — the menu is position:fixed so it escapes
+  // the modal's overflow:hidden and positions relative to the viewport.
+  const r  = btn.getBoundingClientRect();
+  const mw = 190;
+  const mh = actions.length * 36 + 8;  // estimated height
+  // Right-align to button by default; shift left if it would overflow viewport
+  let left = r.right - mw;
+  let top  = r.bottom + 2;
+  if(left < 8) left = 8;
+  if(top + mh > window.innerHeight - 8) top = r.top - mh - 2;
+  m.style.left = left + 'px';
+  m.style.top  = top  + 'px';
+  // Close on outside click
+  setTimeout(()=> document.addEventListener('click', _mvCtxOutside, {once:true}), 0);
+}
+function _mvCtxOutside(e){
+  const m = document.getElementById('mv-item-ctx');
+  if(m && !m.contains(e.target)) _mvCloseCtxMenu();
+}
+
+// ── shared row builder ────────────────────────────────────────────────────────
+function _mvBuildItemRow(it, i, forEpisodes){
+  const name    = it.name || it.o_name || it.title || 'Unknown';
+  // Logo: check all fields; fallback to parent show logo for episodes
+  const rawLogo = it.logo || it.stream_icon || it.cover || it.screenshot_uri || it.pic || '';
+  const logoSrc = rawLogo && rawLogo.startsWith('http')
+    ? '/api/proxy?url='+encodeURIComponent(rawLogo) : (rawLogo||'');
+  const isShow  = !forEpisodes && (it._is_show_item || it._is_series_group);
+  const isGroup = !forEpisodes && !!it._is_series_group;
+  const epCount = isGroup ? (it._episodes||[]).length : 0;
+  const isSeries = _mvSelContentMode === 'series' || _mvSelContentMode === 'vod';
+
+  const logoHtml = logoSrc
+    ? `<img class="mv-ch-logo" src="${esc(logoSrc)}" loading="lazy" onerror="this.style.display='none'">`
+    : `<span class="mv-ch-logo" style="background:var(--s4);display:flex;align-items:center;justify-content:center;font-size:13px">${isShow?'📺':'🎬'}</span>`;
+
+  // Action buttons (visible on hover)
+  let btns = '';
+  if(isGroup){
+    btns += `<button class="btn-ghost" onclick="event.stopPropagation();_mvSelDrillGrp(${i})" title="Browse episodes">${epCount} eps</button>`;
+  } else if(isShow && isSeries){
+    btns += `<button class="btn-ghost" onclick="event.stopPropagation();_mvSelDrillShow(${i})" title="Browse episodes">Eps</button>`;
+  }
+  if(!isShow && !isGroup){
+    // Directly playable — play button
+    btns += `<button class="btn-blue" style="height:24px;padding:0 8px;font-size:11px" onclick="event.stopPropagation();_mvSelPickItem(${i})" title="Play in Multi-View">▶</button>`;
+  }
+  // Submenu ⋮ — always shown
+  btns += `<button class="btn-ghost" style="padding:0 5px;font-size:16px;line-height:1" onclick="event.stopPropagation();_mvSelOpenItemMenu(${i},this)" title="More options">⋮</button>`;
+
+  const drillArrow = (isShow||isGroup) ? `<span style="color:var(--txt3);font-size:14px;flex-shrink:0">›</span>` : '';
+
+  return `<div class="mv-ch-row" data-ii="${i}" data-show="${isShow||isGroup?1:0}">
+    ${logoHtml}
+    <span class="mv-ch-name" title="${esc(name)}">${esc(name)}</span>
+    <div class="mv-item-btns">${btns}</div>
+    ${drillArrow}
+  </div>`;
+}
+
+// Pick item (play in multiview) — called from play button or clicking a playable row.
+// Index i always refers to the currently-displayed (filtered) list at the active level.
+function _mvSelPickItem(i){
+  let it;
+  if(_mvSelNavMode === 'episodes'){
+    // _mvSelEpisodesFiltered is the filtered subset actually rendered — index matches display
+    it = (_mvSelEpisodesFiltered.length ? _mvSelEpisodesFiltered : _mvSelEpisodes)[i];
+  } else {
+    it = (_mvSelFilteredItems.length ? _mvSelFilteredItems : _mvSelItems)[i];
+  }
+  if(!it) return;
+  _mvCloseCtxMenu();
+  document.getElementById('mv-sel-overlay').classList.remove('open');
+  if(mvSelCallback){ mvSelCallback(it); mvSelCallback=null; }
+}
+
+// Open context submenu for an item
+function _mvSelOpenItemMenu(i, btn){
+  let it;
+  if(_mvSelNavMode === 'episodes'){
+    it = (_mvSelEpisodesFiltered.length ? _mvSelEpisodesFiltered : _mvSelEpisodes)[i];
+  } else {
+    it = (_mvSelFilteredItems.length ? _mvSelFilteredItems : _mvSelItems)[i];
+  }
+  if(!it) return;
+  const isShow  = it._is_show_item || it._is_series_group;
+  const isGroup = !!it._is_series_group;
+  const isSeries = _mvSelContentMode === 'series' || _mvSelContentMode === 'vod';
+  const actions = [];
+  // "Play in Multi-View" is intentionally omitted — the ▶ button in the row
+  // already does this; duplicating it in the submenu adds no value.
+  if(isGroup){
+    actions.push({icon:'📋', label:`Browse ${(it._episodes||[]).length} eps`, fn:`_mvCloseCtxMenu();_mvSelDrillGrp(${i})`});
+  } else if(isShow && isSeries){
+    actions.push({icon:'📋', label:'Browse episodes', fn:`_mvCloseCtxMenu();_mvSelDrillShow(${i})`});
+  }
+  // TMDB/IMDb — same lookup logic as main browse (direct link when ID available,
+  // falls back to name search only when no ID exists anywhere in the item)
+  if(_mvSelContentMode !== 'live'){
+    actions.push({icon:'🎬', label:'Open TMDB/IMDb',
+      fn:`_mvSelIMDb(${i});_mvCloseCtxMenu()`});
+  }
+  _mvOpenCtxMenu(btn, actions);
+}
+
+// TMDB/IMDb lookup for multiview — resolves item by index then delegates to
+// _iMenuIMDBOpen with the current content mode so it behaves identically to
+// the main browse: direct IMDB/TMDB link when an ID is found, name search fallback.
+function _mvSelIMDb(i){
+  let it;
+  if(_mvSelNavMode === 'episodes'){
+    it = (_mvSelEpisodesFiltered.length ? _mvSelEpisodesFiltered : _mvSelEpisodes)[i];
+  } else {
+    it = (_mvSelFilteredItems.length ? _mvSelFilteredItems : _mvSelItems)[i];
+  }
+  if(!it) return;
+  _iMenuIMDBOpen(it, _mvSelContentMode);
+}
+
+// Drill into a _is_series_group (M3U grouped episodes — no network call needed)
+function _mvSelDrillGrp(i){
+  const it = (_mvSelFilteredItems.length ? _mvSelFilteredItems : _mvSelItems)[i];
+  if(!it) return;
+  _mvSelShowItem   = it;
+  _mvSelEpisodes   = it._episodes || [];
+  _mvSelNavMode    = 'episodes';
+  document.getElementById('mv-sel-search').value = '';
+  _mvRenderSel();
+}
+
+// Drill into a _is_show_item (needs /api/episodes fetch)
+async function _mvSelDrillShow(i){
+  const it = (_mvSelFilteredItems.length ? _mvSelFilteredItems : _mvSelItems)[i];
+  if(!it) return;
+  _mvSelShowItem = it;
+  _mvSelNavMode  = 'episodes';
+  _mvSelEpisodes = [];
+  document.getElementById('mv-sel-search').value = '';
+
+  document.getElementById('mv-sel-list').innerHTML =
+    '<div style="text-align:center;padding:24px;color:var(--txt3);font-size:12px">Loading episodes…</div>';
+  document.getElementById('mv-sel-title').textContent = it.name || 'Episodes';
+  document.getElementById('mv-sel-back').style.display = '';
+
+  const parentLogo = it.logo||it.stream_icon||it.cover||it.screenshot_uri||it.pic||
+    _mvSelCat?.logo||_mvSelCat?.screenshot_uri||'';
+
+  try {
+    const r = await fetch('/api/episodes', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({item:it, mode:_mvSelContentMode,
+        cat_id:_mvSelCat?.id||'', cat_title:_mvSelCat?.title||'',
+        parent_logo:parentLogo})
+    });
+    const d = await r.json();
+    _mvSelEpisodes = d.episodes || [];
+    // Propagate parent logo to episodes that have none
+    if(parentLogo){
+      _mvSelEpisodes.forEach(ep=>{
+        if(!ep.logo&&!ep.stream_icon&&!ep.cover&&!ep.screenshot_uri&&!ep.pic)
+          ep.logo = parentLogo;
+      });
+    }
+  } catch(e){
+    _mvSelEpisodes = [];
+    toast('Could not load episodes: ' + (it.name||'?'), 'err');
+  }
+  _mvRenderSel();
+}
+
+// Mutable refs so pick/submenu handlers can reach the current filtered list
+let _mvSelFilteredItems = [];
+let _mvSelEpisodesFiltered = [];
 
 function _mvRenderSel(){
   const listEl  = document.getElementById('mv-sel-list');
   const titleEl = document.getElementById('mv-sel-title');
   const backBtn = document.getElementById('mv-sel-back');
+  const tabsEl  = document.getElementById('mv-sel-tabs');
   const q       = document.getElementById('mv-sel-search').value.trim().toLowerCase();
+  _mvCloseCtxMenu();
 
-  if(_mvSelMode === 'cats'){
-    titleEl.textContent   = 'Browse Categories';
-    backBtn.style.display = 'none';
-    document.getElementById('mv-sel-search').placeholder = 'Search categories…';
-
-    // ── Play URL row (always at top) ─────────────────────────────────────
-    const playUrlRowId = 'mv-sel-play-url-row';
-    let playUrlRow = document.getElementById(playUrlRowId);
-    if(!playUrlRow){
-      playUrlRow = document.createElement('div');
-      playUrlRow.id = playUrlRowId;
-      playUrlRow.className = 'mv-sel-play-url-row';
-      playUrlRow.innerHTML =
-        '<span style="font-size:14px;flex-shrink:0">🔗</span>'
-        +'<input id="mv-sel-play-url-inp" class="mv-sel-play-url-inp" type="text" inputmode="url"'
-        +' placeholder="Paste URL to play directly…" autocomplete="off" autocorrect="off" spellcheck="false">'
-        +'<button id="mv-sel-play-url-btn" style="height:26px;padding:0 9px;font-size:11px;white-space:nowrap;'
-        +'flex-shrink:0;background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.35);'
-        +'border-radius:3px;cursor:pointer">▶ Play</button>';
-      // Insert above the list
-      listEl.parentElement.insertBefore(playUrlRow, listEl);
-
-      const inp = playUrlRow.querySelector('#mv-sel-play-url-inp');
-      const doMvPlayUrl = async ()=>{
-        const url = (inp.value||'').trim();
-        if(!url){ toast('Enter a URL','wrn'); return; }
-        inp.value='';
-        document.getElementById('mv-sel-overlay').classList.remove('open');
-        const ctx = _mvSelWidgetCtx;
-        mvSelCallback = null; _mvSelWidgetCtx = null;
-        if(ctx) await _mvPlayFromUrl(ctx.wid, url, ctx.cEl);
-      };
-      playUrlRow.querySelector('#mv-sel-play-url-btn').addEventListener('click', e=>{ e.stopPropagation(); doMvPlayUrl(); });
-      inp.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.stopPropagation(); doMvPlayUrl(); }});
-      inp.addEventListener('click', e=> e.stopPropagation());
-    }
-    // Always ensure row is visible in cats mode (may have been hidden in items mode)
-    playUrlRow.style.display = '';
-
-    // Use catsCache['live'] populated during connect — same source as main UI
-    const cats = (catsCache && catsCache['live']) ? catsCache['live'] : allCats;
-    if(!cats || !cats.length){
-      listEl.innerHTML = '<div style="text-align:center;padding:24px;color:var(--txt3);font-size:12px">No categories — connect to a portal first</div>';
-      return;
-    }
-    const filtered = q ? cats.filter(c=>(c.title||'').toLowerCase().includes(q)) : cats;
-
-    if(!filtered.length){
-      listEl.innerHTML = '<div style="text-align:center;padding:16px;color:var(--txt3);font-size:12px">No categories match</div>';
-      return;
-    }
-
-    listEl.innerHTML = filtered.map((c,i)=>`
-      <div class="mv-ch-row" data-ci="${i}" style="cursor:pointer">
-        <span class="mv-ch-logo" style="font-size:18px;background:none;display:flex;align-items:center;justify-content:center">📁</span>
-        <span class="mv-ch-name">${esc(c.title||'?')}</span>
-        <span style="color:var(--txt3);font-size:14px;flex-shrink:0">›</span>
-      </div>`).join('');
-
-    listEl.querySelectorAll('.mv-ch-row').forEach(row=>{
-      row.addEventListener('click', ()=>{
-        const cat = filtered[parseInt(row.dataset.ci)];
-        if(cat) _mvSelOpenCat(cat);
-      });
-    });
-
-  } else {
-    // Items mode — hide Play URL row
+  // ── EPISODES level ─────────────────────────────────────────────────────────
+  if(_mvSelNavMode === 'episodes'){
+    titleEl.textContent   = _mvSelShowItem ? (_mvSelShowItem.name||'Episodes') : 'Episodes';
+    backBtn.style.display = '';
+    if(tabsEl) tabsEl.style.display = 'none';
+    document.getElementById('mv-sel-search').placeholder = 'Search episodes…';
     const _pRow = document.getElementById('mv-sel-play-url-row');
     if(_pRow) _pRow.style.display = 'none';
-    titleEl.textContent   = _mvSelCat ? (_mvSelCat.title||'Channels') : 'Channels';
-    backBtn.style.display = '';
-    document.getElementById('mv-sel-search').placeholder = 'Search channels…';
 
-    const playable = _mvSelItems.filter(it=> !it._is_series_group && !it._is_show_item);
-    const filtered = q ? playable.filter(it=>(it.name||it.o_name||'').toLowerCase().includes(q)) : playable;
+    const eps = q ? _mvSelEpisodes.filter(ep=>(ep.name||ep.title||'').toLowerCase().includes(q)) : _mvSelEpisodes;
+    _mvSelEpisodesFiltered = eps;
 
-    if(!filtered.length){
-      listEl.innerHTML = '<div style="text-align:center;padding:16px;color:var(--txt3);font-size:12px">' +
-        (_mvSelItems.length ? 'No channels match' : 'Loading…') + '</div>';
+    if(!eps.length){
+      listEl.innerHTML = '<div style="text-align:center;padding:16px;color:var(--txt3);font-size:12px">'
+        + (_mvSelEpisodes.length ? 'No episodes match' : 'Loading…') + '</div>';
       return;
     }
-
-    listEl.innerHTML = filtered.map((it,i)=>{
-      const name    = it.name || it.o_name || 'Unknown';
-      const logo    = it.logo || it.stream_icon || it.cover || '';
-      const logoSrc = logo && logo.startsWith('http') ? '/api/proxy?url='+encodeURIComponent(logo) : (logo||'');
-      return `<div class="mv-ch-row" data-ii="${i}">
-        ${logoSrc
-          ? `<img class="mv-ch-logo" src="${esc(logoSrc)}" onerror="this.style.display='none'">`
-          : `<span class="mv-ch-logo" style="background:var(--s4)"></span>`}
-        <span class="mv-ch-name">${esc(name)}</span>
-      </div>`;
-    }).join('');
-
+    listEl.innerHTML = eps.map((ep,i)=> _mvBuildItemRow(ep, i, true)).join('');
     listEl.querySelectorAll('.mv-ch-row').forEach(row=>{
-      row.addEventListener('click', ()=>{
-        const it = filtered[parseInt(row.dataset.ii)];
-        if(!it) return;
-        document.getElementById('mv-sel-overlay').classList.remove('open');
-        if(mvSelCallback){ mvSelCallback(it); mvSelCallback=null; }
+      row.addEventListener('click', e=>{
+        if(e.target.closest('.mv-item-btns')) return; // buttons handle their own clicks
+        _mvSelPickItem(parseInt(row.dataset.ii));
       });
     });
+    return;
   }
+
+  // ── ITEMS level ────────────────────────────────────────────────────────────
+  if(_mvSelNavMode === 'items'){
+    const _pRow = document.getElementById('mv-sel-play-url-row');
+    if(_pRow) _pRow.style.display = 'none';
+    if(tabsEl) tabsEl.style.display = 'none';
+    titleEl.textContent   = _mvSelCat ? (_mvSelCat.title||'Items') : 'Items';
+    backBtn.style.display = '';
+    document.getElementById('mv-sel-search').placeholder = 'Search…';
+
+    const filtered = q ? _mvSelItems.filter(it=>(it.name||it.o_name||it.title||'').toLowerCase().includes(q)) : _mvSelItems;
+    _mvSelFilteredItems = filtered;
+
+    if(!filtered.length){
+      listEl.innerHTML = '<div style="text-align:center;padding:16px;color:var(--txt3);font-size:12px">'
+        + (_mvSelItems.length ? 'No items match' : 'Loading…') + '</div>';
+      return;
+    }
+    listEl.innerHTML = filtered.map((it,i)=> _mvBuildItemRow(it, i, false)).join('');
+    listEl.querySelectorAll('.mv-ch-row').forEach(row=>{
+      row.addEventListener('click', e=>{
+        if(e.target.closest('.mv-item-btns')) return;
+        const it = filtered[parseInt(row.dataset.ii)];
+        if(!it) return;
+        const isShow  = it._is_show_item || it._is_series_group;
+        const isSeries = _mvSelContentMode === 'series' || _mvSelContentMode === 'vod';
+        if(it._is_series_group){ _mvSelDrillGrp(parseInt(row.dataset.ii)); return; }
+        if(isShow && isSeries){  _mvSelDrillShow(parseInt(row.dataset.ii)); return; }
+        _mvSelPickItem(parseInt(row.dataset.ii));
+      });
+    });
+    return;
+  }
+
+  // ── CATS level ─────────────────────────────────────────────────────────────
+  const modeLabel = {live:'Live',vod:'VOD',series:'Series'}[_mvSelContentMode]||'';
+  titleEl.textContent   = 'Browse ' + modeLabel + ' Categories';
+  backBtn.style.display = 'none';
+  if(tabsEl) tabsEl.style.display = '';
+  document.getElementById('mv-sel-search').placeholder = 'Search categories…';
+
+  // ── Play URL row (live only) ──────────────────────────────────────────────
+  const playUrlRowId = 'mv-sel-play-url-row';
+  let playUrlRow = document.getElementById(playUrlRowId);
+  if(!playUrlRow){
+    playUrlRow = document.createElement('div');
+    playUrlRow.id = playUrlRowId;
+    playUrlRow.className = 'mv-sel-play-url-row';
+    playUrlRow.innerHTML =
+      '<span style="font-size:14px;flex-shrink:0">🔗</span>'
+      +'<input id="mv-sel-play-url-inp" class="mv-sel-play-url-inp" type="text" inputmode="url"'
+      +' placeholder="Paste URL to play directly…" autocomplete="off" autocorrect="off" spellcheck="false">'
+      +'<button id="mv-sel-play-url-btn" style="height:26px;padding:0 9px;font-size:11px;white-space:nowrap;'
+      +'flex-shrink:0;background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.35);'
+      +'border-radius:3px;cursor:pointer">▶ Play</button>';
+    listEl.parentElement.insertBefore(playUrlRow, listEl);
+    const inp = playUrlRow.querySelector('#mv-sel-play-url-inp');
+    const doMvPlayUrl = async ()=>{
+      const url = (inp.value||'').trim();
+      if(!url){ toast('Enter a URL','wrn'); return; }
+      inp.value='';
+      document.getElementById('mv-sel-overlay').classList.remove('open');
+      const ctx = _mvSelWidgetCtx;
+      mvSelCallback = null; _mvSelWidgetCtx = null;
+      if(ctx) await _mvPlayFromUrl(ctx.wid, url, ctx.cEl);
+    };
+    playUrlRow.querySelector('#mv-sel-play-url-btn').addEventListener('click', e=>{ e.stopPropagation(); doMvPlayUrl(); });
+    inp.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.stopPropagation(); doMvPlayUrl(); }});
+    inp.addEventListener('click', e=> e.stopPropagation());
+  }
+  playUrlRow.style.display = _mvSelContentMode === 'live' ? '' : 'none';
+
+  const cats = (catsCache && catsCache[_mvSelContentMode]) ? catsCache[_mvSelContentMode] : [];
+  if(!cats || !cats.length){
+    listEl.innerHTML = '<div style="text-align:center;padding:24px;color:var(--txt3);font-size:12px">No categories — connect to a portal first</div>';
+    return;
+  }
+  const filtered = q ? cats.filter(c=>(c.title||'').toLowerCase().includes(q)) : cats;
+  if(!filtered.length){
+    listEl.innerHTML = '<div style="text-align:center;padding:16px;color:var(--txt3);font-size:12px">No categories match</div>';
+    return;
+  }
+  listEl.innerHTML = filtered.map((c,i)=>`
+    <div class="mv-ch-row" data-ci="${i}" style="cursor:pointer">
+      <span class="mv-ch-logo" style="font-size:18px;background:none;display:flex;align-items:center;justify-content:center">${
+        _mvSelContentMode==='vod'?'🎬':_mvSelContentMode==='series'?'📺':'📁'}</span>
+      <span class="mv-ch-name">${esc(c.title||'?')}</span>
+      <span style="color:var(--txt3);font-size:14px;flex-shrink:0">›</span>
+    </div>`).join('');
+  listEl.querySelectorAll('.mv-ch-row').forEach(row=>{
+    row.addEventListener('click', ()=>{
+      const cat = filtered[parseInt(row.dataset.ci)];
+      if(cat) _mvSelOpenCat(cat);
+    });
+  });
 }
 
 async function _mvSelOpenCat(cat){
-  _mvSelCat   = cat;
-  _mvSelMode  = 'items';
-  _mvSelItems = [];
+  _mvSelCat     = cat;
+  _mvSelNavMode = 'items';
+  _mvSelItems   = [];
   document.getElementById('mv-sel-search').value = '';
 
-  // Show spinner immediately while fetching / rendering
   document.getElementById('mv-sel-list').innerHTML =
     '<div style="text-align:center;padding:24px;color:var(--txt3);font-size:12px">Loading…</div>';
-  document.getElementById('mv-sel-title').textContent = cat.title || 'Channels';
+  document.getElementById('mv-sel-title').textContent = cat.title || 'Items';
   document.getElementById('mv-sel-back').style.display = '';
+  const tabsEl = document.getElementById('mv-sel-tabs');
+  if(tabsEl) tabsEl.style.display = 'none';
 
-  const key = _categoryKey('live', cat);
-  categoryItemsCache['live'] = categoryItemsCache['live'] || {};
+  const mode = _mvSelContentMode;
+  const key  = _categoryKey(mode, cat);
+  categoryItemsCache[mode] = categoryItemsCache[mode] || {};
 
-  // Serve from cache if present
-  if(categoryItemsCache['live'][key]){
-    _mvSelItems = categoryItemsCache['live'][key];
+  if(categoryItemsCache[mode][key]){
+    _mvSelItems = categoryItemsCache[mode][key];
     _mvRenderSel();
     return;
   }
 
   try {
-    // Same endpoint as the main UI's browseC() function
     const r = await fetch('/api/items', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({category: cat, mode: 'live', browse: true})
+      body: JSON.stringify({category: cat, mode: mode, browse: true})
     });
     const d = await r.json();
     _mvSelItems = d.items || [];
-    // store in cache
-    categoryItemsCache['live'][key] = _mvSelItems;
+    categoryItemsCache[mode][key] = _mvSelItems;
   } catch(e){
     _mvSelItems = [];
     toast('Could not load category: ' + (cat.title||'?'), 'err');
@@ -13354,12 +13759,23 @@ function _mvSetupListeners(){
 
   // Channel selector close/back buttons
   document.getElementById('mv-sel-back').addEventListener('click', ()=>{
-    _mvSelMode  = 'cats';
-    _mvSelCat   = null;
-    _mvSelItems = [];
+    _mvCloseCtxMenu();
+    if(_mvSelNavMode === 'episodes'){
+      // Episodes → Items
+      _mvSelNavMode  = 'items';
+      _mvSelShowItem = null;
+      _mvSelEpisodes = [];
+    } else {
+      // Items → Cats
+      _mvSelNavMode = 'cats';
+      _mvSelCat     = null;
+      _mvSelItems   = [];
+    }
     document.getElementById('mv-sel-search').value = '';
     const _pRow = document.getElementById('mv-sel-play-url-row');
-    if(_pRow) _pRow.style.display = '';
+    if(_pRow) _pRow.style.display = _mvSelNavMode==='cats' && _mvSelContentMode==='live' ? '' : 'none';
+    const tabsEl = document.getElementById('mv-sel-tabs');
+    if(tabsEl) tabsEl.style.display = _mvSelNavMode==='cats' ? '' : 'none';
     _mvRenderSel();
   });
   document.getElementById('mv-sel-close').addEventListener('click', ()=>{
@@ -13390,9 +13806,11 @@ function _mvSetupListeners(){
         document.getElementById('mv-save-overlay').classList.remove('open');
       } else if(document.getElementById('mv-sel-overlay').classList.contains('open')){
         // If browsing items, go back to cats; if at cats level, close modal
-        if(_mvSelMode === 'items'){
-          _mvSelMode = 'cats'; _mvSelCat = null; _mvSelItems = [];
+        if(_mvSelNavMode === 'items'){
+          _mvSelNavMode = 'cats'; _mvSelCat = null; _mvSelItems = [];
           document.getElementById('mv-sel-search').value = '';
+          const tabsEl = document.getElementById('mv-sel-tabs');
+          if(tabsEl) tabsEl.style.display = '';
           _mvRenderSel();
         } else {
           document.getElementById('mv-sel-overlay').classList.remove('open');
