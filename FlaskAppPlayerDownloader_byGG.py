@@ -42,6 +42,10 @@ Fixed external EPG decompression blocking threads, added EPG caching per attempt
 Improved button highlights and added a glossy style to all buttons.
 Fixed some vods and series with mp4/mkv with hevc video or unsuported audio formats not playing in browser.
 Varius UI fixes, adjustments and overall script optimizations.
+Added logo caching for MAC portal (PortalClient): live channels use get_all_channels fallback (one request, cached); VOD/series use a zero-cost in-memory dict built from already-fetched items.
+Extended StalkerPortalClient logo caching to VOD and series modes (was live-only); same zero-cost in-memory dict strategy.
+Fixed Xtream double round-trip: handshake() and account_info() previously both issued GET /player_api.php — account_info() now reads from the cached user_info set by handshake(), saving one network call on every connect.
+Added Xtream logo cache: stream_id → logo URL dict populated during fetch_items_page, fills missing logos without extra requests.
 """
 
 import base64
@@ -348,6 +352,12 @@ class PortalClient:
         self.session = None
         self.token = None
         self.headers = {}
+        # Logo caches — keyed by item id → logo URL.
+        # _ch_logo_cache: populated once via get_all_channels (live fallback).
+        # _vod_logo_cache: built lazily from already-fetched VOD/series items
+        #   (no extra round-trip; avoids the 2-request pattern stalker uses for live).
+        self._ch_logo_cache: dict | None = None
+        self._vod_logo_cache: dict = {}
 
     async def __aenter__(self):
         _timeout = aiohttp.ClientTimeout(total=15, connect=8)
@@ -396,6 +406,43 @@ class PortalClient:
                     or js.get("expiry") or js.get("expired") or "unknown")
         self.log(f"[MAC] Account: MAC={mac}  expiry={phone}")
         return (mac, phone)
+
+    async def _fetch_ch_logo_cache(self) -> dict:
+        """Fetch live-channel logos once via get_all_channels and cache them.
+
+        Uses the same pattern as StalkerPortalClient._fetch_ch_logo_cache.
+        Called lazily only when a page contains channels with missing logos.
+        Subsequent pages reuse the cached dict at zero network cost."""
+        if self._ch_logo_cache is not None:
+            return self._ch_logo_cache
+        self._ch_logo_cache = {}
+
+        def _extract(items: list) -> dict:
+            out = {}
+            for ch in items:
+                if not isinstance(ch, dict):
+                    continue
+                ch_id = str(ch.get("id") or "").strip()
+                logo = str(ch.get("logo") or ch.get("screenshot_uri") or
+                           ch.get("tv_logo") or ch.get("pic") or "").strip()
+                if ch_id and logo:
+                    out[ch_id] = logo
+            return out
+
+        try:
+            url = (f"{self.base}/portal.php?type=itv&action=get_all_channels"
+                   f"&force_ch_link_check=&JsHttpRequest=1-xml")
+            self.log("[MAC] Logo cache: fetching get_all_channels…")
+            async with self.session.get(url, headers=self.headers,
+                                        timeout=aiohttp.ClientTimeout(total=20)) as r:
+                self.log(f"[MAC] Logo cache HTTP {r.status}")
+                payload = await safe_json(r)
+            self._ch_logo_cache = _extract(normalize_js(payload))
+            self.log(f"[MAC] Live logo cache: {len(self._ch_logo_cache)} entries")
+        except Exception as e:
+            self.log(f"[MAC] Logo cache error: {e}")
+
+        return self._ch_logo_cache
 
     async def fetch_categories(self, mode: str):
         assert self.session is not None
@@ -450,6 +497,40 @@ class PortalClient:
             for it in items:
                 if isinstance(it, dict):
                     it["_is_show_item"] = True
+
+        # ── Logo caching ─────────────────────────────────────────────────────
+        # LIVE: use the get_all_channels cache (one-time network call) to fill
+        #       in any channel whose logo field came back empty.
+        if mode == "live":
+            if any(not it.get("logo") for it in items if isinstance(it, dict)):
+                logo_cache = await self._fetch_ch_logo_cache()
+                if logo_cache:
+                    for it in items:
+                        if isinstance(it, dict) and not it.get("logo"):
+                            ch_id = str(it.get("id") or "").strip()
+                            if ch_id and ch_id in logo_cache:
+                                it["logo"] = logo_cache[ch_id]
+        else:
+            # VOD / SERIES: no extra network call needed.
+            # First populate the running in-memory cache from items that DO have
+            # a logo, then use it to fill items that don't.
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                item_id = str(it.get("id") or "").strip()
+                logo = (it.get("logo") or it.get("screenshot_uri") or
+                        it.get("pic") or "").strip()
+                if item_id and logo:
+                    self._vod_logo_cache[item_id] = logo
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                if not (it.get("logo") or it.get("screenshot_uri") or it.get("pic")):
+                    item_id = str(it.get("id") or "").strip()
+                    cached = self._vod_logo_cache.get(item_id, "")
+                    if cached:
+                        it["logo"] = cached
+
         self.log(f"[MAC] {mode.upper()} cat={cat_id} p={page}: {len(items)} items")
         return items
 
@@ -1289,6 +1370,9 @@ class StalkerPortalClient:
         self.device_id = hashlib.sha256(self.mac.encode()).hexdigest().upper()
         # Cache for channel id → logo URL, populated lazily from get_all_channels
         self._ch_logo_cache: dict | None = None
+        # Running in-memory logo cache for VOD / series — populated from items
+        # that already have a logo so we can fill blanks without extra requests.
+        self._vod_logo_cache: dict = {}
 
     # ── context manager ──────────────────────────────────────────────────────
 
@@ -1654,14 +1738,36 @@ class StalkerPortalClient:
                         it[logo_field] = fixed
         # For live channels whose logo field is empty, try get_all_channels as fallback.
         # Only triggered when at least one channel in this page is missing a logo.
-        if mode == "live" and any(not it.get("logo") for it in items if isinstance(it, dict)):
-            logo_cache = await self._fetch_ch_logo_cache()
-            if logo_cache:
-                for it in items:
-                    if isinstance(it, dict) and not it.get("logo"):
-                        ch_id = str(it.get("id") or "").strip()
-                        if ch_id and ch_id in logo_cache:
-                            it["logo"] = logo_cache[ch_id]
+        if mode == "live":
+            if any(not it.get("logo") for it in items if isinstance(it, dict)):
+                logo_cache = await self._fetch_ch_logo_cache()
+                if logo_cache:
+                    for it in items:
+                        if isinstance(it, dict) and not it.get("logo"):
+                            ch_id = str(it.get("id") or "").strip()
+                            if ch_id and ch_id in logo_cache:
+                                it["logo"] = logo_cache[ch_id]
+        else:
+            # VOD / SERIES: no extra network call.
+            # Build the running in-memory cache from items that have a logo,
+            # then use it to fill items that don't — handles portals that return
+            # logos inconsistently across pages.
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                item_id = str(it.get("id") or "").strip()
+                logo = (it.get("logo") or it.get("screenshot_uri") or
+                        it.get("pic") or "").strip()
+                if item_id and logo:
+                    self._vod_logo_cache[item_id] = logo
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                if not (it.get("logo") or it.get("screenshot_uri") or it.get("pic")):
+                    item_id = str(it.get("id") or "").strip()
+                    cached = self._vod_logo_cache.get(item_id, "")
+                    if cached:
+                        it["logo"] = cached
         self.log(f"[STALKER] {mode.upper()} cat={cat_id} p={page}: {len(items)} items")
         return items
 
@@ -2081,6 +2187,14 @@ class XtreamClient:
         self.password = password.strip()
         self.log = log_cb
         self.session = None
+        # Cache the user_info dict returned by the player_api.php auth response.
+        # Both handshake() and account_info() hit the identical URL — storing the
+        # result here lets account_info() skip the second round-trip entirely.
+        self._cached_user_info: dict | None = None
+        # Running logo cache: stream_id (str) → logo URL.
+        # Populated during fetch_items_page so items with missing logos can be
+        # filled from the cache without extra network calls.
+        self._logo_cache: dict = {}
 
     async def __aenter__(self):
         _timeout = aiohttp.ClientTimeout(total=30, connect=10)
@@ -2110,18 +2224,27 @@ class XtreamClient:
             raise RuntimeError(f"Xtream: unexpected response format")
         if str(info.get("auth", "0")) == "0":
             raise RuntimeError(f"Xtream: authentication failed — wrong username/password")
+        # Cache user_info so account_info() can read it without a second request.
+        self._cached_user_info = info
         self.log(f"[XTREAM] Auth OK — status: {info.get('status','?')}  expiry: {info.get('exp_date','?')}")
         return info
 
     async def account_info(self):
-        url = f"{self.base}/player_api.php?username={self.username}&password={self.password}"
-        async with self.session.get(url) as r:
-            data = await safe_json(r)
-        if not isinstance(data, dict):
-            return (self.username, "unknown")
-        info = data.get("user_info", {})
-        if not isinstance(info, dict):
-            return (self.username, "unknown")
+        # Re-use the user_info already fetched by handshake() when available.
+        # This eliminates the duplicate GET /player_api.php that previously
+        # happened whenever handshake() and account_info() were called in sequence.
+        if self._cached_user_info is not None:
+            info = self._cached_user_info
+        else:
+            url = f"{self.base}/player_api.php?username={self.username}&password={self.password}"
+            async with self.session.get(url) as r:
+                data = await safe_json(r)
+            if not isinstance(data, dict):
+                return (self.username, "unknown")
+            info = data.get("user_info", {})
+            if not isinstance(info, dict):
+                return (self.username, "unknown")
+            self._cached_user_info = info
         exp_raw = info.get("exp_date", "")
         exp = "unknown"
         try:
@@ -2178,6 +2301,26 @@ class XtreamClient:
                 if isinstance(it, dict):
                     it["_is_show_item"] = True
         self.log(f"[XTREAM] {mode.upper()} cat={cat_id}: {len(data)} items")
+
+        # ── Logo caching ─────────────────────────────────────────────────────
+        # Pass 1: populate cache from items that carry a logo.
+        for it in data:
+            if not isinstance(it, dict):
+                continue
+            sid = str(it.get("stream_id") or it.get("series_id") or it.get("id") or "").strip()
+            logo = self._item_logo(it)
+            if sid and logo:
+                self._logo_cache[sid] = logo
+        # Pass 2: fill blanks from cache (covers cross-category duplicates).
+        for it in data:
+            if not isinstance(it, dict):
+                continue
+            if not self._item_logo(it):
+                sid = str(it.get("stream_id") or it.get("series_id") or it.get("id") or "").strip()
+                cached = self._logo_cache.get(sid, "")
+                if cached:
+                    it["stream_icon"] = cached
+
         return data
 
     def _stream_url(self, mode: str, item: dict) -> str:
@@ -2757,6 +2900,18 @@ class AppState:
         # repeated handshake/profile calls that cause portal rate-limiting
         self._stalker_client: object = None
         self._stalker_client_lock = threading.Lock()
+        # ── Persistent logo caches ─────────────────────────────────────────
+        # These survive across _make_client() calls (client instances are
+        # short-lived — created and destroyed per request — so any cache on
+        # the client object is useless across requests).
+        #
+        # _logo_cache_live: {ch_id: logo_url} for live channels.
+        #   None  = get_all_channels not yet attempted this session.
+        #   dict  = already fetched (may be empty if portal returned nothing).
+        # _logo_cache_vod: {item_id: logo_url} for VOD / series / Xtream.
+        #   Built lazily from items that arrive with logos; zero extra requests.
+        self._logo_cache_live: dict | None = None
+        self._logo_cache_vod: dict = {}
         # Cache for all-channels list used by What's on Now → Find Channel
         # (timestamp, [{"name", "cmd"/"stream_id"/"url", "tvg_id", ...}])
         self._won_ch_cache: tuple = (0.0, [])
@@ -2796,14 +2951,19 @@ async def _make_client(do_handshake=True):
     conn = state.conn_type
     if conn == "xtream":
         client = XtreamClient(state.url, state.username, state.password, state.log)
+        # _logo_cache is a plain dict — share the same object so mutations
+        # (new entries added during this request) survive after the client exits.
+        client._logo_cache = state._logo_cache_vod
         async with client:
             if do_handshake:
                 await client.handshake()
             yield client
+        # dict is shared by reference; no sync needed
     elif conn == "m3u_url":
         if state.m3u_xtream_override:
             creds = state.m3u_xtream_override
             client = XtreamClient(creds["base"], creds["username"], creds["password"], state.log)
+            client._logo_cache = state._logo_cache_vod
             async with client:
                 if do_handshake:
                     await client.handshake()
@@ -2820,10 +2980,20 @@ async def _make_client(do_handshake=True):
             client = StalkerPortalClient(state.url, state.mac, state.log)
         else:
             client = PortalClient(state.url, state.mac, state.log)
+        # Inject both caches from AppState so this request can read what
+        # previous requests already discovered.
+        # _ch_logo_cache may be None (not yet fetched) or a dict — assign directly.
+        # _vod_logo_cache is always a dict — share by reference.
+        client._ch_logo_cache = state._logo_cache_live
+        client._vod_logo_cache = state._logo_cache_vod
         async with client:
             if do_handshake:
                 await client.handshake()
             yield client
+        # _ch_logo_cache may have been populated (None → dict) this request —
+        # sync it back so the next request starts with the filled dict.
+        state._logo_cache_live = client._ch_logo_cache
+        # _vod_logo_cache is a shared dict object; no re-assignment needed.
 
 
 def run_async(coro):
@@ -3035,6 +3205,9 @@ def api_connect():
         state._won_ch_cache = (0.0, [])
         state.connected = False
         state.stop_flag.clear()
+        # Reset logo caches so a new portal starts fresh
+        state._logo_cache_live = None
+        state._logo_cache_vod = {}
         # Local M3U file: pre-parse content, set flag so _connect_async skips network
         m3u_content = data.get("m3u_content", "").strip()
         if m3u_content and state.conn_type == "m3u_url":
@@ -5367,17 +5540,80 @@ async def _fetch_xmltv_epg(xmltv_url: str, tvg_id: str, log_cb=None,
     return out
 
 
+# ── /api/proxy image cache ────────────────────────────────────────────────────
+# Logos served through /api/proxy are fetched from the origin on every browser
+# request when no cache exists.  Portals also append random ?{number} query
+# strings to logo URLs (e.g. 320/12019.jpg?8392 … ?42491) which defeats the
+# browser's own cache even when we send Cache-Control headers.
+#
+# Solution: server-side in-memory image cache keyed by the URL *without* its
+# query string.  First fetch stores (content_type, bytes); all subsequent
+# requests for the same base path are served from memory instantly, regardless
+# of what query string the portal appended.
+#
+# Cap: _PROXY_IMG_CACHE_MAX entries.  When exceeded we drop the oldest half
+# (insertion-order dict) rather than evicting everything at once.
+_proxy_img_cache: dict = {}           # norm_url → (content_type, bytes)
+_proxy_img_cache_lock = threading.Lock()
+_PROXY_IMG_CACHE_MAX = 1500           # ~150 MB at ~100 kB average logo size
+
+
 @flask_app.route("/api/proxy")
 def api_proxy():
     url = request.args.get("url", "").strip()
     if not url or not url.startswith(("http://", "https://")):
         return Response("Invalid URL", status=400)
+
+    # Cache key = URL with query string stripped.
+    # Portals append random ?{number} version tokens to logo URLs; stripping
+    # them means "320/12019.jpg?8392" and "320/12019.jpg?42491" share one entry.
+    norm_url = url.split("?")[0]
+    is_img_url = bool(re.search(r'\.(jpe?g|png|gif|webp|svg|ico|bmp)$', norm_url, re.I))
+
+    cors = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+    }
+
+    # ── Cache read ────────────────────────────────────────────────────────
+    if is_img_url and "Range" not in request.headers:
+        with _proxy_img_cache_lock:
+            hit = _proxy_img_cache.get(norm_url)
+        if hit:
+            ct, data = hit
+            hdrs = dict(cors)
+            hdrs["Content-Type"] = ct
+            hdrs["Content-Length"] = str(len(data))
+            hdrs["Cache-Control"] = "public, max-age=86400"
+            hdrs["X-Cache"] = "HIT"
+            return Response(data, status=200, headers=hdrs)
+
     try:
-        headers = {
-            "User-Agent": "VLC/3.0.0 LibVLC/3.0.0",
-            "Accept": "*/*",
-            "Connection": "keep-alive",
-        }
+        # Image requests need a browser-like User-Agent and a matching Referer.
+        # Many logo CDNs (lyngsat.com, tmdb.org, fanart.tv, etc.) actively block
+        # VLC/curl UAs and requests that arrive with no Referer, returning 403.
+        # Stream requests keep VLC/3.0 so the portal recognises the player.
+        if is_img_url:
+            parsed_logo = urlparse(url)
+            logo_origin = f"{parsed_logo.scheme}://{parsed_logo.netloc}"
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": logo_origin + "/",
+                "Connection": "keep-alive",
+            }
+        else:
+            headers = {
+                "User-Agent": "VLC/3.0.0 LibVLC/3.0.0",
+                "Accept": "*/*",
+                "Connection": "keep-alive",
+            }
         if "Range" in request.headers:
             headers["Range"] = request.headers["Range"]
         # proxies={} bypasses Windows system proxy (fixes ERR_UNEXPECTED_PROXY_AUTH)
@@ -5385,11 +5621,10 @@ def api_proxy():
                                  allow_redirects=True, verify=False,
                                  proxies={"http": None, "https": None})
         ct = resp.headers.get("Content-Type", "application/octet-stream")
-        cors = {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-        }
+        is_img_ct = ct.split(";")[0].strip().startswith("image/")
+        # Treat as image if either the URL extension or the response CT says so
+        is_img = is_img_url or is_img_ct
+
         is_m3u8 = (re.search(r'\.(m3u8?|m3u)(\?|$)', url.split('?')[0], re.I) or
                    'mpegurl' in ct.lower() or 'x-mpegurl' in ct.lower())
         if is_m3u8:
@@ -5399,6 +5634,31 @@ def api_proxy():
             # wrong absolute URLs if the server redirected the manifest request.
             rewritten = _rewrite_m3u8(text, resp.url)
             return Response(rewritten, content_type="application/vnd.apple.mpegurl", headers=cors)
+
+        # ── Image: read fully, cache, return ─────────────────────────────
+        if is_img and "Range" not in request.headers:
+            data = resp.content  # reads entire body at once — logos are small
+            if resp.status_code == 200 and data:
+                with _proxy_img_cache_lock:
+                    if norm_url not in _proxy_img_cache:
+                        if len(_proxy_img_cache) >= _PROXY_IMG_CACHE_MAX:
+                            # Evict oldest half to stay under the cap
+                            keys = list(_proxy_img_cache.keys())
+                            for k in keys[:len(keys) // 2]:
+                                del _proxy_img_cache[k]
+                        _proxy_img_cache[norm_url] = (ct, data)
+            hdrs = dict(cors)
+            hdrs["Content-Type"] = ct
+            hdrs["Content-Length"] = str(len(data))
+            hdrs["Cache-Control"] = "public, max-age=86400"
+            hdrs["X-Cache"] = "MISS"
+            if resp.status_code == 403:
+                state.log(f"[Proxy] 403 logo (hotlink blocked?) ← {url[:80]}")
+            elif resp.status_code not in (200, 206):
+                state.log(f"[Proxy] HTTP {resp.status_code} ← {url[:80]}")
+            return Response(data, status=resp.status_code, headers=hdrs)
+
+        # ── Non-image: stream as before ───────────────────────────────────
         def _gen():
             try:
                 for chunk in resp.iter_content(chunk_size=16384):
