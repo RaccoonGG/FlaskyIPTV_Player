@@ -341,6 +341,35 @@ def extract_xtream_from_m3u_url(url: str):
     return None
 
 
+# ===================== M3U LINE HELPER =====================
+
+def _extinf_line(name: str, logo: str, tvg_type: str, group: str, item: dict = None) -> str:
+    """Build a single #EXTINF line with all available EPG/matching attributes.
+
+    Writes tvg-id when the portal provides one so EPG players (TiviMate,
+    Kodi, IPTV Smarters…) can match channels to programme data without
+    relying on fuzzy name matching.
+
+    tvg-id priority:
+      1. epg_channel_id  — Xtream live channels
+      2. tvg_id          — M3U items parsed from the source file
+      3. xmltv_id        — some Stalker portals
+      4. (blank)         — no EPG ID available; players fall back to name matching
+    """
+    tvg_id = ""
+    if item:
+        tvg_id = str(
+            item.get("epg_channel_id") or
+            item.get("tvg_id") or
+            item.get("xmltv_id") or
+            ""
+        ).strip()
+    id_attr = f' tvg-id="{tvg_id}"' if tvg_id else ""
+    logo_attr = f' tvg-logo="{logo}"' if logo else ""
+    return (f'#EXTINF:-1{id_attr} tvg-name="{name}" tvg-type="{tvg_type}"'
+            f'{logo_attr} group-title="{group}",{name}\n')
+
+
 # ===================== MAC PORTAL CLIENT =====================
 
 class PortalClient:
@@ -976,7 +1005,7 @@ class PortalClient:
             if resolved and resolved.startswith(("http://", "https://", "rtsp://")):
                 resolved = unquote(resolved)
                 with open(out_path, "a", encoding="utf-8") as f:
-                    f.write(f'#EXTINF:-1 tvg-name="{ep_name}" tvg-type="series" tvg-logo="{ep_logo}" group-title="{ep_cat}",{ep_name}\n{resolved}\n')
+                    f.write(_extinf_line(ep_name, ep_logo, 'series', ep_cat) + f'{resolved}\n')
                 self.log(f"[SERIES] ✓ {ep_name}")
             else:
                 self.log(f"[SERIES] ✗ Could not resolve: {ep_name}")
@@ -1085,7 +1114,7 @@ class PortalClient:
                         except Exception:
                             ep_num_int = 0
                         full_name = f"{series_name} S{season_num} E{ep_num_int:0{ep_width}d}"
-                        f.write(f'#EXTINF:-1 tvg-name="{full_name}" tvg-type="series" tvg-logo="{series_logo}" group-title="{cat_title}",{full_name}\n{resolved}\n')
+                        f.write(_extinf_line(full_name, series_logo, 'series', cat_title, item) + f'{resolved}\n')
 
             elif mode == "vod":
                 name, logo, cmd = self.extract_vod_info(item)
@@ -1108,7 +1137,7 @@ class PortalClient:
                 resolved = unquote(resolved)
                 if resolved not in seen_urls:
                     seen_urls.add(resolved)
-                    f.write(f'#EXTINF:-1 tvg-name="{name}" tvg-type="{tvg_type}" tvg-logo="{logo}" group-title="{cat_title}",{name}\n{resolved}\n')
+                    f.write(_extinf_line(name, logo, tvg_type, cat_title, item) + f'{resolved}\n')
                     self.log(f"[VOD] ✓ Wrote: {name}")
 
             else:  # live
@@ -1140,7 +1169,7 @@ class PortalClient:
                     if resolved in seen_urls:
                         continue
                     seen_urls.add(resolved)
-                    f.write(f'#EXTINF:-1 tvg-name="{name}" tvg-type="{tvg_type}" tvg-logo="{logo}" group-title="{cat_title}",{name}\n{resolved}\n')
+                    f.write(_extinf_line(name, logo, tvg_type, cat_title, item) + f'{resolved}\n')
                     self.log(f"[LIVE] ✓ Wrote: {name}")
 
     async def dump_category_to_file(self, mode: str, category: dict, out_path: str, append=True, stop_flag=None, progress_cb=None):
@@ -1247,7 +1276,7 @@ class PortalClient:
                                 except Exception:
                                     ep_num_int = 0
                                 full_name = f"{series_name} S{season_num} E{ep_num_int:0{ep_width}d}"
-                                f.write(f'#EXTINF:-1 tvg-name="{full_name}" tvg-type="series" tvg-logo="{series_logo}" group-title="{cat_title}",{full_name}\n{resolved}\n')
+                                f.write(_extinf_line(full_name, series_logo, 'series', cat_title, it) + f'{resolved}\n')
                                 lines_written += 1
                                 if progress_cb: progress_cb(lines_written)
                     page += 1
@@ -1286,7 +1315,7 @@ class PortalClient:
                         if resolved in seen_urls:
                             continue
                         seen_urls.add(resolved)
-                        f.write(f'#EXTINF:-1 tvg-name="{name}" tvg-type="{tvg_type}" tvg-logo="{logo}" group-title="{cat_title}",{name}\n{resolved}\n')
+                        f.write(_extinf_line(name, logo, tvg_type, cat_title, it) + f'{resolved}\n')
                         lines_written += 1
                         if progress_cb: progress_cb(lines_written)
                         new_count += 1
@@ -1334,7 +1363,7 @@ class PortalClient:
                         if resolved in seen_urls:
                             continue
                         seen_urls.add(resolved)
-                        f.write(f'#EXTINF:-1 tvg-name="{name}" tvg-type="{tvg_type}" tvg-logo="{logo}" group-title="{cat_title}",{name}\n{resolved}\n')
+                        f.write(_extinf_line(name, logo, tvg_type, cat_title, it) + f'{resolved}\n')
                         lines_written += 1
                         if progress_cb: progress_cb(lines_written)
                         new_count += 1
@@ -2150,7 +2179,7 @@ class StalkerPortalClient:
         if resolved and resolved.startswith(("http://", "https://", "rtsp://")):
             resolved = unquote(resolved)
             with open(out_path, "a", encoding="utf-8") as f:
-                f.write(f'#EXTINF:-1 tvg-name="{name}" tvg-type="{tvg_type}" tvg-logo="{logo}" group-title="{cat_title}",{name}\n{resolved}\n')
+                f.write(_extinf_line(name, logo, tvg_type, cat_title, item) + f'{resolved}\n')
             self.log(f"[STALKER] ✓ {name}")
         else:
             self.log(f"[STALKER] ✗ Could not resolve: {name}")
@@ -2400,7 +2429,7 @@ class XtreamClient:
             ep_cat = item.get("_cat_title") or cat_title
             ep_url = item["_direct_url"]
             with open(out_path, "a", encoding="utf-8") as f:
-                f.write(f'#EXTINF:-1 tvg-name="{ep_name}" tvg-type="series" tvg-logo="{ep_logo}" group-title="{ep_cat}",{ep_name}\n{ep_url}\n')
+                f.write(_extinf_line(ep_name, ep_logo, 'series', ep_cat) + f'{ep_url}\n')
             self.log(f"[SERIES] ✓ {ep_name}")
             return
         if mode == "series":
@@ -2425,7 +2454,7 @@ class XtreamClient:
                         sn = season_num_str.zfill(2)
                         en = str(ep_num).zfill(2)
                         full_name = f"{series_name} S{sn}E{en}"
-                        f.write(f'#EXTINF:-1 tvg-name="{full_name}" tvg-type="series" tvg-logo="{series_logo}" group-title="{cat_title}",{full_name}\n{url}\n')
+                        f.write(_extinf_line(full_name, series_logo, 'series', cat_title, item) + f'{url}\n')
             self.log(f"[SERIES] ✓ Done: {series_name}")
         else:
             name = self._item_name(item)
@@ -2435,7 +2464,7 @@ class XtreamClient:
                 return
             tvg_type = "live" if mode == "live" else "movie"
             with open(out_path, "a", encoding="utf-8") as f:
-                f.write(f'#EXTINF:-1 tvg-name="{name}" tvg-type="{tvg_type}" tvg-logo="{logo}" group-title="{cat_title}",{name}\n{url}\n')
+                f.write(_extinf_line(name, logo, tvg_type, cat_title, item) + f'{url}\n')
             self.log(f"✓ Wrote: {name}")
 
     async def dump_category_to_file(self, mode: str, category: dict, out_path: str, append=True, stop_flag=None, progress_cb=None):
@@ -2463,7 +2492,7 @@ class XtreamClient:
                     url = self._stream_url(mode, item)
                     if not url:
                         continue
-                    f.write(f'#EXTINF:-1 tvg-name="{name}" tvg-type="{tvg_type}" tvg-logo="{logo}" group-title="{cat_title}",{name}\n{url}\n')
+                    f.write(_extinf_line(name, logo, tvg_type, cat_title, item) + f'{url}\n')
                     count += 1
         self.log(f"[XTREAM] Finished {cat_title} (items: {count})")
 
@@ -2756,7 +2785,7 @@ class M3UClient:
                     url = ep.get("_url", "")
                     if not url:
                         continue
-                    f.write(f'#EXTINF:-1 tvg-name="{name}" tvg-type="series" tvg-logo="{logo}" group-title="{cat_title}",{name}\n{url}\n')
+                    f.write(_extinf_line(name, logo, 'series', cat_title, ep) + f'{url}\n')
             return
         name = item.get("name", "Unknown")
         logo = item.get("logo", "")
@@ -2765,7 +2794,7 @@ class M3UClient:
         if not url:
             return
         with open(out_path, "a", encoding="utf-8") as f:
-            f.write(f'#EXTINF:-1 tvg-name="{name}" tvg-type="{tvg_type}" tvg-logo="{logo}" group-title="{cat_title}",{name}\n{url}\n')
+            f.write(_extinf_line(name, logo, tvg_type, cat_title, item) + f'{url}\n')
         self.log(f"✓ Wrote: {name}")
 
     async def dump_category_to_file(self, mode: str, category: dict, out_path: str, append=True, stop_flag=None, progress_cb=None):
@@ -2796,7 +2825,7 @@ class M3UClient:
                             url = ep.get("_url", "")
                             if not url:
                                 continue
-                            f.write(f'#EXTINF:-1 tvg-name="{name}" tvg-type="series" tvg-logo="{logo}" group-title="{cat_title}",{name}\n{url}\n')
+                            f.write(_extinf_line(name, logo, 'series', cat_title, ep) + f'{url}\n')
                             count += 1
                             if progress_cb:
                                 try: progress_cb(count, name)
@@ -2809,7 +2838,7 @@ class M3UClient:
                         url = item.get("_url", "")
                         if not url:
                             continue
-                        f.write(f'#EXTINF:-1 tvg-name="{name}" tvg-type="series" tvg-logo="{logo}" group-title="{cat_title}",{name}\n{url}\n')
+                        f.write(_extinf_line(name, logo, 'series', cat_title, item) + f'{url}\n')
                         count += 1
                         if progress_cb:
                             try: progress_cb(count, name)
@@ -2830,7 +2859,7 @@ class M3UClient:
                 tvg_type = item.get("tvg_type") or ("live" if mode == "live" else "movie")
                 if not url:
                     continue
-                f.write(f'#EXTINF:-1 tvg-name="{name}" tvg-type="{tvg_type}" tvg-logo="{logo}" group-title="{cat_title}",{name}\n{url}\n')
+                f.write(_extinf_line(name, logo, tvg_type, cat_title, item) + f'{url}\n')
                 count += 1
                 if progress_cb:
                     try: progress_cb(count, name)
@@ -3546,8 +3575,33 @@ def api_download_m3u():
         except FileNotFoundError:
             existing = ""
         if not existing:
+            # Build the best available EPG URL for the url-tvg header attribute.
+            # Priority: 1) user-supplied external EPG  2) portal's own xmltv.php
+            #           3) M3U source tvg-url  4) no EPG (plain header)
+            epg_url = ""
+            if state.ext_epg_url:
+                epg_url = state.ext_epg_url
+            elif state.conn_type == "xtream" and state.url and state.username and state.password:
+                from urllib.parse import quote as _qe
+                _base = state.url.rstrip("/")
+                epg_url = (f"{_base}/xmltv.php"
+                           f"?username={_qe(state.username, safe='')}"
+                           f"&password={_qe(state.password, safe='')}")
+            elif state.conn_type == "mac" and state.url:
+                # Standard MAC/Ministra portals serve XMLTV at /xmltv.php
+                epg_url = state.url.rstrip("/") + "/xmltv.php"
+            elif state.conn_type == "m3u_url":
+                # Use the tvg-url scraped from the M3U header at connect time
+                epg_url = getattr(state, "_tvg_url_cache", "") or ""
+
+            if epg_url:
+                state.log(f"[M3U] Writing EPG url-tvg: {epg_url[:80]}")
+                header = f'#EXTM3U url-tvg="{epg_url}"\n'
+            else:
+                header = "#EXTM3U\n"
+
             with open(out_path, "w", encoding="utf-8") as f:
-                f.write("#EXTM3U\n")
+                f.write(header)
 
         async with _make_client() as client:
             if items is None:
@@ -9143,7 +9197,7 @@ const _KNOWN_TAG_PREFIXES = new Set([
   'JM','JP','JO',
   'KZ','KE','KI','KP','KR','KW','KG',
   'LA','LV','LB','LS','LR','LY','LI','LT','LU',
-  'MG','MW','MY','MV','ML','MT','MH','MR','MU','MX','FM','MD','MC','MN','ME','MA','MZ','MO',
+  'MG','MW','MY','MV','ML','MT','MH','MR','MU','MX','FM','MD','MC','MN','ME','MK','MA','MZ','MO',
   'MM','NA','NR','NP','NL','NZ','NI','NE','NG','NO',
   'OM',
   'PK','PW','PS','PA','PG','PY','PE','PH','PL','PT',
@@ -9179,8 +9233,14 @@ const _KNOWN_TAG_PREFIXES = new Set([
   'THAI','VIET','INDO','SING','MALAY','PAKI','IRAN','IRAQ',
   'IRN','SAU','UAE','KUW','QAT','BHR','OMN','YEM','JOR',
   'LEB','SYR','PAL','EGY','LIB','MAR','ALG','TUN',
-  'NIG','GHA','KEN','ETH','SEN','CMR','CIV','ZAF','NAM',
+  'NIG','GHA','KEN','ETH','SEN','CMR','CIV','ZAF','NAM','ZIM',
   'ICE','LAT','LIT','EST','CAN','MKD',
+  // ── Extra regional/cultural tags seen on IPTV providers ──────────────────
+  'DESI','HINDI','URDU','PANJ','PUNJ','BENG','TAMI','TELU','GUJA','MALA','KANA',
+  'AMHA','SOMA','HUSA','SWAH',                 // African languages
+  'PERS','FARS','PASH','DARI','KURD',          // Middle East / Central Asia
+  'PORT','CAST','CATA','GALI','BASK',          // Iberian variants
+  'NETH','FLEM','WALL',                        // Low Countries
 ]);
 
 function _catTag(title){
