@@ -584,7 +584,7 @@ def register_dvr_routes(app, state=None) -> None:
             return jsonify({"error": str(exc)}), 500
 
     # ── GET /api/dvr/timeshift/<job_id>  (transcode in-progress recording) ─────
-    @app.route("/api/dvr/timeshift/<job_id>")
+    @app.route("/api/dvr/timeshift/<job_id>", methods=["GET", "HEAD"])
     def dvr_timeshift(job_id):
         """
         Pipe the partially-written recording .ts file through ffmpeg transcode,
@@ -607,12 +607,15 @@ def register_dvr_routes(app, state=None) -> None:
         if not fp or not os.path.exists(fp):
             return Response("Recording file not available yet", status=404)
 
+        # HEAD probe — just confirm the file exists, don't start ffmpeg
+        if request.method == "HEAD":
+            return Response(status=200)
+
         ffmpeg = _get_ffmpeg()
         cmd = [
             ffmpeg, "-hide_banner", "-nostdin",
             "-fflags", "+genpts+igndts+discardcorrupt",
-            "-re",
-            "-i", fp,
+            "-i", "pipe:0",   # read from stdin — Python feeds the growing file
             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
             "-f", "mpegts", "-",
@@ -621,6 +624,7 @@ def register_dvr_routes(app, state=None) -> None:
         try:
             proc = subprocess.Popen(
                 cmd,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 creationflags=_NO_WINDOW,
@@ -634,6 +638,35 @@ def register_dvr_routes(app, state=None) -> None:
                             for l in proc.stderr],
             daemon=True,
         ).start()
+
+        def _feed_stdin():
+            """Tail-follow the growing .ts file and pipe chunks into ffmpeg stdin.
+            Python controls the pacing — ffmpeg never sees EOF while recording."""
+            try:
+                with open(fp, "rb") as fh:
+                    while True:
+                        chunk = fh.read(65536)
+                        if chunk:
+                            try:
+                                proc.stdin.write(chunk)
+                            except (BrokenPipeError, OSError):
+                                break  # client disconnected
+                        else:
+                            # No new data yet — check if recording is still active
+                            current = _get_job(job_id)
+                            if current and current.get("status") == "recording":
+                                time.sleep(0.3)   # wait for more data to be written
+                            else:
+                                break  # recording finished — let ffmpeg drain & exit
+            except Exception as exc:
+                LOG.debug("[DVR] Timeshift feed error: %s", exc)
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_feed_stdin, daemon=True, name=f"dvr-ts-feed-{job_id[:8]}").start()
 
         def _gen():
             try:
