@@ -9757,7 +9757,7 @@ function openItemMenu(i, btn){
   document.getElementById('imenu-ext').style.display      = !grp&&!show?'flex':'none';
   document.getElementById('imenu-imdb').style.display     = (!isLive&&!grp)?'flex':'none';
   document.getElementById('imenu-rec').style.display      = isLive&&!grp&&!show?'flex':'none';   // live only
-  document.getElementById('imenu-mkv').style.display      = !isLive&&!grp?'flex':'none';          // vod/series only
+  document.getElementById('imenu-mkv').style.display      = !isLive&&!grp&&!show?'flex':'none';   // vod/series playable items only
 
   // Position menu near button
   const menu = document.getElementById('item-menu');
