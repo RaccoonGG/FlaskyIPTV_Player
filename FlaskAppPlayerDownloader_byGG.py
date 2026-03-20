@@ -12822,11 +12822,11 @@ async function _mvPlayFromUrl(wid, rawUrl, cEl){
       channelName = d.title || '';
       isLive      = d.is_live !== false;
       if(d.duration) cEl._mvKnownDuration = d.duration;
-      if(d.audio_url) cEl._mvAudioUrl = d.audio_url;
-      else cEl._mvAudioUrl = '';
-      // For YouTube VOD: flag to use video_proxy for direct seekable playback
-      if(!isLive && d.via === 'yt-dlp') cEl._mvUseVideoProxy = true;
-      else cEl._mvUseVideoProxy = false;
+      // video_proxy only works for pre-muxed formats (single URL has both video+audio).
+      // Merged formats (separate video+audio) need the multiview ffmpeg proxy to merge them.
+      cEl._mvUseVideoProxy = (!isLive && d.via === 'yt-dlp' && !d.audio_url);
+      // For merged formats, pass audio_url to the multiview proxy
+      cEl._mvAudioUrl = d.audio_url || '';
     } catch(e){
       toast('Could not resolve URL: ' + e, 'err');
       if(titleEl) titleEl.textContent = 'No Channel';
@@ -13383,7 +13383,6 @@ function _mvAttachListeners(cEl, wid){
       e.stopPropagation();
       const rawUrl = cEl._mvRawUrl;
       if(!rawUrl){ toast('Quality only applies to YouTube/external URLs','wrn'); return; }
-      console.log('[MV/quality] changing to', qualSel.value, 'rawUrl=', rawUrl.slice(0,60));
       _mvPlayFromUrl(wid, rawUrl, cEl);
     });
     // Start hidden — _mvPlayChannel shows it for external/YouTube URLs
@@ -13537,12 +13536,6 @@ async function _mvPlayChannel(wid, channel, cEl){
   if(_bb){
     _bb.classList.toggle('mv-bb-visible', true);
     if(_recBtn){ _recBtn.classList.remove('mv-recording'); _recBtn.textContent='⏺ Record'; }
-  }
-
-  // Show seek bar immediately for known VOD content (portal VOD/series)
-  if(!_isLive){
-    const _seekW = cEl.querySelector('.mv-seek-wrap');
-    if(_seekW) _seekW.classList.add('mv-seek-visible');
   }
 
   // Show/hide quality selector — only relevant for YouTube/external URLs
