@@ -5,6 +5,30 @@ A self-contained Flask web app for browsing and playing MAC/Xtream/M3U IPTV port
 
 ---
 
+## Screenshots
+
+<!-- Replace the placeholders below with your actual screenshot paths or URLs -->
+
+**Main player — desktop**
+![Main player desktop](screenshots/main_desktop.png)
+
+**Main player — mobile**
+![Main player mobile](screenshots/main_mobile.png)
+
+**Multi-View grid**
+![Multi-View](screenshots/multiview.png)
+
+**EPG / TV Guide**
+![EPG](screenshots/epg.png)
+
+**DVR — scheduled recordings**
+![DVR](screenshots/dvr.png)
+
+**Cast panel**
+![Cast](screenshots/cast.png)
+
+---
+
 ## ⚠️ Legal Disclaimer
 
 **This tool does not provide, host, stream, or distribute any media content whatsoever.**
