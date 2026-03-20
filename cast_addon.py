@@ -1708,57 +1708,48 @@ except ImportError:
 
 
 class AirPlayCaster(_BaseCaster):
+    """AirPlay via pyatv — same pattern as ChromecastCaster/DLNACaster.
+    No raw sockets, no custom HTTP: just pyatv.connect() + stream.play_url()."""
+
     def __init__(self):
         if not _HAS_AIRPLAY:
-            raise CastError(
-                "pyatv not installed — run: pip install pyatv"
-            )
-        self._atv = None
+            raise CastError("pyatv not installed — run: pip install pyatv")
+        self._atv         = None
+        self._device_conf = None
 
     async def discover(self, timeout: float = 5.0) -> List[CastDevice]:
         devices = []
-
         def _log(msg):
             LOG.warning(msg)
             if _app_state_ref:
-                try:
-                    _app_state_ref.log(msg)
-                except Exception:
-                    pass
-
-        _log(f"[CAST][AP] AirPlay discovery starting (timeout={int(timeout)}s)…")
+                try: _app_state_ref.log(msg)
+                except Exception: pass
+        _log(f"[CAST][AP] AirPlay discovery starting (timeout={int(timeout)}s)\u2026")
         try:
-            # Pass loop= explicitly — required for pyatv <0.14; harmlessly ignored in 0.14+.
-            # Without it, pyatv calls asyncio.get_event_loop() internally which returns
-            # the wrong loop when running from a non-main background thread.
-            atvs = await _pyatv.scan(
-                loop=asyncio.get_event_loop(),
-                timeout=int(timeout),
-            )
+            atvs = await _pyatv.scan(loop=asyncio.get_event_loop(),
+                                     timeout=int(timeout))
             _log(f"[CAST][AP] pyatv scan returned {len(atvs)} raw device(s): {[a.name for a in atvs]}")
             for atv in atvs:
-                # Try AirPlay 2 first, fall back to RAOP (AirPlay 1) so that
-                # third-party AirCast / AirPlay-1-only receivers are also detected.
                 svc = atv.get_service(_pyatv_conf.Protocol.AirPlay)
+                svc_proto = "AirPlay"
                 if not svc:
                     try:
                         svc = atv.get_service(_pyatv_conf.Protocol.RAOP)
+                        svc_proto = "RAOP"
                     except AttributeError:
-                        pass  # pyatv version does not expose RAOP
+                        pass
                 if not svc:
-                    _log(f"[CAST][AP] Skipping {atv.name!r} — no AirPlay/RAOP service")
                     continue
+                host = str(atv.address) if atv.address else ""
+                _log(f"[CAST][AP] Found {atv.name!r} via {svc_proto} on {host}:{svc.port}")
                 devices.append(CastDevice(
-                    name=atv.name,
-                    protocol=CastProtocol.AIRPLAY,
-                    identifier=atv.identifier,
-                    host=str(atv.address) if atv.address else "",
-                    port=svc.port,
+                    name=atv.name, protocol=CastProtocol.AIRPLAY,
+                    identifier=atv.identifier, host=host, port=svc.port,
                     metadata={"conf": atv},
                 ))
         except Exception as exc:
-            _log(f"[CAST][AP] AirPlay discovery error ({type(exc).__name__}): {exc}")
-        _log(f"[CAST][AP] Discovery complete — {len(devices)} device(s): {[d.name for d in devices]}")
+            LOG.warning("[CAST][AP] Discovery error: %s", exc)
+        _log(f"[CAST][AP] Discovery complete \u2014 {len(devices)} device(s): {[d.name for d in devices]}")
         return devices
 
     async def connect(self, device: CastDevice,
@@ -1768,11 +1759,10 @@ class AirPlayCaster(_BaseCaster):
         async def _try(cfg):
             if credentials:
                 cfg.set_credentials(_pyatv_conf.Protocol.AirPlay, credentials)
-            return await _pyatv.connect(cfg, loop=asyncio.get_event_loop())
+            atv = await _pyatv.connect(cfg, loop=asyncio.get_event_loop())
+            self._device_conf = cfg
+            return atv
 
-        # Try with cached config first — only if we actually have it.
-        # config will be None after a JSON round-trip (to_dict strips the pyatv
-        # conf object), so we go straight to the re-scan in that case.
         if config:
             try:
                 self._atv = await _try(config)
@@ -1780,40 +1770,28 @@ class AirPlayCaster(_BaseCaster):
             except CastConnectionError:
                 raise
             except Exception as exc:
-                LOG.debug("[CAST][AP] Initial connect failed (%s), re-scanning…", exc)
+                LOG.debug("[CAST][AP] Initial connect failed (%s), re-scanning\u2026", exc)
 
-        # conf was None (JSON round-trip) or initial connect failed → re-scan.
-        # This is the normal path when connecting from the UI after discovery.
         try:
-            LOG.info("[CAST][AP] Re-scanning for %s…", device.identifier)
-            atvs = await _pyatv.scan(
-                identifier=device.identifier,
-                loop=asyncio.get_event_loop(),
-                timeout=3,
-            )
+            LOG.warning("[CAST][AP] Re-scanning for %s\u2026", device.identifier)
+            atvs = await _pyatv.scan(identifier=device.identifier,
+                                     loop=asyncio.get_event_loop(), timeout=3)
             if atvs:
                 config = atvs[0]
                 device.metadata["conf"] = config
             if not config:
-                raise CastConnectionError(
-                    f"AirPlay device {device.name!r} not found during re-scan"
-                )
+                raise CastConnectionError(f"AirPlay device {device.name!r} not found")
             self._atv = await _try(config)
         except CastConnectionError:
             raise
         except Exception as exc:
-            raise CastConnectionError(
-                f"Failed to connect to {device.name}: {exc}"
-            ) from exc
+            raise CastConnectionError(f"Failed to connect to {device.name}: {exc}") from exc
 
     async def start_pairing(self, device: CastDevice):
         config = device.metadata.get("conf")
         try:
-            atvs = await _pyatv.scan(
-                identifier=device.identifier,
-                loop=asyncio.get_event_loop(),
-                timeout=3,
-            )
+            atvs = await _pyatv.scan(identifier=device.identifier,
+                                     loop=asyncio.get_event_loop(), timeout=3)
             if atvs:
                 config = atvs[0]
                 device.metadata["conf"] = config
@@ -1822,69 +1800,48 @@ class AirPlayCaster(_BaseCaster):
         if not config:
             raise CastError("Missing AirPlay configuration")
         config.set_credentials(_pyatv_conf.Protocol.AirPlay, None)
-        return await _pyatv.pair(
-            config,
-            _pyatv_conf.Protocol.AirPlay,
-            loop=asyncio.get_event_loop(),
-        )
+        return await _pyatv.pair(config, _pyatv_conf.Protocol.AirPlay,
+                                 loop=asyncio.get_event_loop())
 
     async def play(self, url: str, title: str = "IPTV Stream",
                    content_type: str = "video/mp2t",
                    headers: Optional[Dict] = None) -> None:
-        """AirPlay: pyatv does not support custom HTTP headers.
-
-        The proxy is intentionally skipped — the resolved portal URL already
-        has authentication embedded (token in query-string for MAC/Xtream).
-        """
         if not self._atv:
             raise CastConnectionError("Not connected to an AirPlay device")
+        LOG.warning("[CAST][AP] play_url \u2192 %s", url[:80])
+        if _app_state_ref:
+            try: _app_state_ref.log(f"[CAST][AP] play_url \u2192 {url[:80]}")
+            except Exception: pass
         try:
-            LOG.info("[CAST][AP] play_url: %s", url[:80])
             await self._atv.stream.play_url(url, position=0)
         except Exception as exc:
-            if (_HAS_AIRPLAY and
-                    isinstance(exc, _pyatv.exceptions.NotSupportedError)):
-                raise PlaybackError(
-                    "AirPlay device does not support play_url "
-                    "(audio-only device or limited protocol)"
-                )
+            if _HAS_AIRPLAY and isinstance(exc, _pyatv.exceptions.NotSupportedError):
+                raise PlaybackError("AirPlay device does not support play_url")
             raise PlaybackError(f"AirPlay playback failed: {exc}") from exc
 
     async def stop(self) -> None:
         if self._atv:
-            try:
-                await self._atv.remote_control.stop()
-                LOG.info("[CAST][AP] Stop sent OK")
-            except Exception as exc:
-                LOG.warning("[CAST][AP] Stop failed: %s", exc)
+            try: await self._atv.remote_control.stop()
+            except Exception: pass
 
     async def pause(self) -> None:
         if self._atv:
-            try:
-                await self._atv.remote_control.pause()
-                LOG.info("[CAST][AP] Pause sent OK")
-            except Exception as exc:
-                LOG.warning("[CAST][AP] Pause failed: %s", exc)
+            try: await self._atv.remote_control.pause()
+            except Exception: pass
 
     async def resume(self) -> None:
         if self._atv:
-            try:
-                await self._atv.remote_control.play()
-                LOG.info("[CAST][AP] Resume sent OK")
-            except Exception as exc:
-                LOG.warning("[CAST][AP] Resume failed: %s", exc)
+            try: await self._atv.remote_control.play()
+            except Exception: pass
 
     async def set_volume(self, level: float) -> None:
         if self._atv:
-            try:
-                await self._atv.audio.set_volume(level * 100)
-            except Exception as exc:
-                LOG.debug("[CAST][AP] set_volume error: %s", exc)
+            try: await self._atv.audio.set_volume(level * 100)
+            except Exception: pass
 
     async def disconnect(self) -> None:
         if self._atv:
             try:
-                # close() is sync in pyatv but may be awaitable in future versions
                 result = self._atv.close()
                 if asyncio.iscoroutine(result):
                     await result
@@ -1895,8 +1852,6 @@ class AirPlayCaster(_BaseCaster):
     def is_connected(self) -> bool:
         return self._atv is not None
 
-
-# ── CastingManager ────────────────────────────────────────────────────────────
 
 class CastingManager:
     """Manages casters and an active cast session on a private asyncio loop.
@@ -1968,8 +1923,8 @@ class CastingManager:
 
     async def _discover_all_async(self, timeout: float) -> List[CastDevice]:
         unique = list({id(c): c for c in self.casters.values()}.values())
-        LOG.warning("[CAST] Running %d caster(s): %s",
-                    len(unique), [type(c).__name__ for c in unique])
+        LOG.info("[CAST] Running %d caster(s): %s",
+                 len(unique), [type(c).__name__ for c in unique])
         results = await asyncio.gather(
             *[c.discover(timeout) for c in unique],
             return_exceptions=True,
@@ -2016,6 +1971,29 @@ class CastingManager:
         if not self.active_caster:
             raise CastConnectionError("No active cast device")
         await self.active_caster.play(url, title, headers=headers)
+
+    def reconnect_airplay(self) -> None:
+        """Drop and re-establish the AirPlay connection using the saved config.
+        Called from play_direct after FFmpeg warms up, so play_url gets a fresh
+        connection rather than one that aged during the FFmpeg wait."""
+        self.dispatch(self._reconnect_airplay_async())
+
+    async def _reconnect_airplay_async(self) -> None:
+        caster = self.active_caster
+        if not isinstance(caster, AirPlayCaster):
+            return
+        if not caster._device_conf:
+            raise CastError("No saved AirPlay config for reconnect")
+        LOG.warning("[CAST][AP] Reconnecting before play_url…")
+        try:
+            caster._atv.close()
+        except Exception:
+            pass
+        caster._atv = None
+        caster._atv = await _pyatv.connect(
+            caster._device_conf, loop=asyncio.get_event_loop()
+        )
+        LOG.warning("[CAST][AP] Reconnected OK")
 
     def stop_playback(self) -> None:
         if self.active_caster:
@@ -2321,37 +2299,13 @@ def register_cast_routes(flask_app, app_state, run_async_fn, make_client_fn):
         # it reaches the IPTV server exactly as Flask's /api/proxy would send it.
         _vlc_ua = {"User-Agent": "VLC/3.0.0 LibVLC/3.0.0", "Accept": "*/*"}
 
-        # AirPlay: transcode to HLS and serve via Flask /cast/hls/ on port 5000.
-        # Sending the raw IPTV URL to the Apple device causes two problems:
-        #   1. The Apple device connects to the IPTV server from its own IP with
-        #      no custom headers — server sees it as a second connection and blocks.
-        #   2. HEVC sources play black/silent on older Apple TV models that only
-        #      support H.264 (same issue Chromecast had).
-        # Using the same Flask-proxied HLS approach as Chromecast fixes both.
+        # AirPlay: pass the raw URL directly to pyatv (same approach as casting.py).
+        # pyatv sends it to the device; the device fetches it.
+        # If the device can't reach it, try the Flask proxy URL as fallback.
         if isinstance(manager.active_caster, AirPlayCaster):
-            proxy_url_raw = proxy.get_transcoded_url(source_url, _vlc_ua, profile="chromecast")
-            browser_url   = None
-
-            import re as _re_ap
-            _ap_match = _re_ap.search(r"/transcode/([a-f0-9]+)/stream\.m3u8", proxy_url_raw)
-            ap_session = _ap_match.group(1) if _ap_match else None
-
-            if ap_session:
-                ap_converter = proxy.get_converter(ap_session)
-                if ap_converter:
-                    app_state.log("[CAST][AP] ⏳ Waiting for FFmpeg to produce first segment…")
-                    ap_ready = ap_converter.wait_for_playlist(timeout=15)
-                    if ap_ready:
-                        app_state.log("[CAST][AP] ✓ FFmpeg ready — sending to AirPlay device")
-                    else:
-                        app_state.log("[CAST][AP] ⚠ FFmpeg took too long — sending anyway")
-                lan_ip_ap     = proxy.host
-                flask_port_ap = request.environ.get("SERVER_PORT", 5000)
-                proxy_url     = f"http://{lan_ip_ap}:{flask_port_ap}/cast/hls/{ap_session}/stream.m3u8"
-                LOG.info("[CAST][AP] Flask-served HLS URL: %s", proxy_url)
-            else:
-                proxy_url = proxy_url_raw
-                LOG.warning("[CAST][AP] Could not extract session from %s, using raw proxy URL", proxy_url_raw[:80])
+            proxy_url   = source_url
+            browser_url = None
+            app_state.log(f"[CAST][AP] → {proxy_url[:80]}")
         elif mime.startswith("audio/"):
             proxy_url   = proxy.get_audio_url(source_url, headers)
             browser_url = None  # audio proxy is a streaming pipe, can't share
@@ -3234,13 +3188,28 @@ _CAST_UI_JS = r"""
                      || (url && url.includes('/stream?'))      // audio proxy path
                      || (url && url.includes('/relay?'));       // relay proxy path
 
+    // For HEVC channels, Flask returns /api/hls_proxy?...&url=REAL_URL as the doPlay
+    // URL. The raw portal URL is embedded in the query-string — extract it so AirPlay
+    // can send it directly to the device (Android handles HEVC natively).
+    let castUrl = url;
+    if (isProxyUrl && url && url.includes('/api/hls_proxy')) {
+      try {
+        const _params = new URLSearchParams(url.includes('?') ? url.split('?')[1] : '');
+        const _raw = _params.get('url');
+        if (_raw && _raw.match(/^https?:\/\//i)) {
+          castUrl = _raw;
+        }
+      } catch(_e) {}
+    }
+    const isCastable = castUrl && castUrl.match(/^https?:\/\//i);
+
     // Only track a URL as castable if it's an absolute castable URL
-    if (!isProxyUrl && url) {
-      _castUrl   = url;
-      _castTitle = title || url;
+    if (isCastable) {
+      _castUrl   = castUrl;
+      _castTitle = title || castUrl;
     }
 
-    if (_autoCast && _connected && url && !isProxyUrl && !_castInProgress) {
+    if (_autoCast && _connected && isCastable && !_castInProgress) {
       // Do NOT call _origDoPlay when auto-casting.
       // Calling it would open a browser MPEG-TS connection to the IPTV server
       // at the same moment FFmpeg opens its own connection → 2 connections →
@@ -3252,7 +3221,7 @@ _CAST_UI_JS = r"""
         window._hlsRemuxFired     = false;
         window._remuxFired        = false;
       } catch(_e) {}
-      setTimeout(() => window.castPlayDirect(url, title), 0);
+      setTimeout(() => window.castPlayDirect(castUrl, title), 0);
       return;
     }
 
