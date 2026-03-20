@@ -988,17 +988,18 @@ def register_multiview_routes(app) -> None:
 
             duration_secs = None if is_live else info.get('duration')
 
-            LOG.info('[MV][resolve_url] resolved  title=%r  live=%s  quality=%s  height=%s  audio=%s  via=yt-dlp',
+            LOG.info('[MV][resolve_url] resolved  title=%r  live=%s  quality=%s  height=%s  merged=%s  via=yt-dlp',
                      title, is_live, quality, actual_h, 'yes' if (not is_live and resolved_audio) else 'no')
             resp = {
-                'url':       resolved,
-                'title':     title,
-                'is_live':   is_live,
-                'quality':   quality,
-                'height':    actual_h,
-                'duration':  duration_secs,
-                'via':       'yt-dlp',
+                'url':      resolved,
+                'title':    title,
+                'is_live':  is_live,
+                'quality':  quality,
+                'height':   actual_h,
+                'duration': duration_secs,
+                'via':      'yt-dlp',
             }
+            # Include separate audio URL for merged formats (e.g. YouTube 720p+)
             if not is_live and resolved_audio:
                 resp['audio_url'] = resolved_audio
             return jsonify(resp)
