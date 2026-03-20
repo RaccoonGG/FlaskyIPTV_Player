@@ -1717,12 +1717,27 @@ class AirPlayCaster(_BaseCaster):
 
     async def discover(self, timeout: float = 5.0) -> List[CastDevice]:
         devices = []
+        LOG.info("[CAST][AP] AirPlay discovery starting (timeout=%ds)…", int(timeout))
         try:
-            # loop= param deprecated and ignored in pyatv 0.14+
-            atvs = await _pyatv.scan(timeout=int(timeout))
+            # Pass loop= explicitly — required for pyatv <0.14; harmlessly ignored in 0.14+.
+            # Without it, pyatv calls asyncio.get_event_loop() internally which returns
+            # the wrong loop when running from a non-main background thread.
+            atvs = await _pyatv.scan(
+                loop=asyncio.get_event_loop(),
+                timeout=int(timeout),
+            )
+            LOG.info("[CAST][AP] pyatv scan returned %d raw device(s)", len(atvs))
             for atv in atvs:
+                # Try AirPlay 2 first, fall back to RAOP (AirPlay 1) so that
+                # third-party AirCast / AirPlay-1-only receivers are also detected.
                 svc = atv.get_service(_pyatv_conf.Protocol.AirPlay)
                 if not svc:
+                    try:
+                        svc = atv.get_service(_pyatv_conf.Protocol.RAOP)
+                    except AttributeError:
+                        pass  # pyatv version does not expose RAOP
+                if not svc:
+                    LOG.debug("[CAST][AP] Skipping %r — no AirPlay/RAOP service", atv.name)
                     continue
                 devices.append(CastDevice(
                     name=atv.name,
@@ -1733,7 +1748,10 @@ class AirPlayCaster(_BaseCaster):
                     metadata={"conf": atv},
                 ))
         except Exception as exc:
-            LOG.warning("AirPlay discovery error: %s", exc)
+            LOG.warning("[CAST][AP] AirPlay discovery error (%s): %s",
+                        type(exc).__name__, exc)
+        LOG.info("[CAST][AP] Discovery complete — %d device(s): %s",
+                 len(devices), [d.name for d in devices])
         return devices
 
     async def connect(self, device: CastDevice,
@@ -1743,7 +1761,7 @@ class AirPlayCaster(_BaseCaster):
         async def _try(cfg):
             if credentials:
                 cfg.set_credentials(_pyatv_conf.Protocol.AirPlay, credentials)
-            return await _pyatv.connect(cfg)
+            return await _pyatv.connect(cfg, loop=asyncio.get_event_loop())
 
         # Try with cached config first — only if we actually have it.
         # config will be None after a JSON round-trip (to_dict strips the pyatv
@@ -1761,7 +1779,11 @@ class AirPlayCaster(_BaseCaster):
         # This is the normal path when connecting from the UI after discovery.
         try:
             LOG.info("[CAST][AP] Re-scanning for %s…", device.identifier)
-            atvs = await _pyatv.scan(identifier=device.identifier, timeout=3)
+            atvs = await _pyatv.scan(
+                identifier=device.identifier,
+                loop=asyncio.get_event_loop(),
+                timeout=3,
+            )
             if atvs:
                 config = atvs[0]
                 device.metadata["conf"] = config
@@ -1780,7 +1802,11 @@ class AirPlayCaster(_BaseCaster):
     async def start_pairing(self, device: CastDevice):
         config = device.metadata.get("conf")
         try:
-            atvs = await _pyatv.scan(identifier=device.identifier, timeout=3)
+            atvs = await _pyatv.scan(
+                identifier=device.identifier,
+                loop=asyncio.get_event_loop(),
+                timeout=3,
+            )
             if atvs:
                 config = atvs[0]
                 device.metadata["conf"] = config
@@ -1789,7 +1815,11 @@ class AirPlayCaster(_BaseCaster):
         if not config:
             raise CastError("Missing AirPlay configuration")
         config.set_credentials(_pyatv_conf.Protocol.AirPlay, None)
-        return await _pyatv.pair(config, _pyatv_conf.Protocol.AirPlay)
+        return await _pyatv.pair(
+            config,
+            _pyatv_conf.Protocol.AirPlay,
+            loop=asyncio.get_event_loop(),
+        )
 
     async def play(self, url: str, title: str = "IPTV Stream",
                    content_type: str = "video/mp2t",
@@ -1931,14 +1961,19 @@ class CastingManager:
 
     async def _discover_all_async(self, timeout: float) -> List[CastDevice]:
         unique = list({id(c): c for c in self.casters.values()}.values())
+        LOG.info("[CAST] Running %d caster(s): %s",
+                 len(unique), [type(c).__name__ for c in unique])
         results = await asyncio.gather(
             *[c.discover(timeout) for c in unique],
             return_exceptions=True,
         )
         devices = []
-        for res in results:
+        for caster, res in zip(unique, results):
             if isinstance(res, list):
                 devices.extend(res)
+            else:
+                LOG.warning("[CAST] %s.discover() raised %s: %s",
+                            type(caster).__name__, type(res).__name__, res)
         return sorted(devices, key=lambda d: d.name)
 
     def connect(self, device: CastDevice,
