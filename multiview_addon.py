@@ -1,850 +1,971 @@
 """
-dvr_addon.py  —  DVR (scheduled recording) addon for FlaskAppPlayerDownloader_byGG.py
-======================================================================================
+multiview_addon.py  —  Multi-View stream management for FlaskAppPlayerDownloader_byGG.py
+=========================================================================================
 
-Adds a full DVR tab to the Flask IPTV portal:
-  • Scheduled recordings (future start time)
-  • Manual recordings (channel + time range)
-  • In-progress recordings with timeshift playback
-  • Completed recordings library with playback + delete
-  • Storage usage bar
-  • Per-job state: scheduled → recording → completed | error | cancelled
+Adds multi-view (picture-in-picture grid) streaming to the Flask IPTV portal.
 
-All job state persists to dvr_jobs.json next to the script.
-Completed recording files are .ts files written to the configured DVR folder.
+Design mirrors the Node.js server.js stream management exactly:
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  server.js concept              →  this file equivalent             │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │  activeStreamProcesses (Map)    →  _mv_streams (dict)               │
+  │  streamKey format               →  "{client_id}::{channel_url}"     │
+  │  references counter             →  StreamBroadcaster.references     │
+  │  lastAccess timestamp           →  StreamBroadcaster.last_access    │
+  │  STREAM_INACTIVITY_TIMEOUT      →  STREAM_INACTIVITY_TIMEOUT = 30   │
+  │  cleanupInactiveStreams()        →  _janitor() thread                │
+  │  /stream GET — dedup+ref count  →  GET /api/multiview/stream        │
+  │  /api/stream/stop POST          →  POST /api/multiview/stream/stop  │
+  │  multiview_layouts SQLite table →  multiview_layouts.json file      │
+  └─────────────────────────────────────────────────────────────────────┘
 
-INTEGRATION  (two lines in FlaskAppPlayerDownloader_byGG.py)
-─────────────────────────────────────────────────────────────
-STEP 1 — add import after the multiview_addon import block:
+Key design difference vs Node.js:
+  Node.js uses readable.pipe(writable) which fans out to multiple writables
+  in flowing mode.  Python subprocess.stdout is a single-consumer file object,
+  so we use a reader thread that broadcasts chunks to per-client queues.
+  Each Flask response generator consumes its own queue.
+  Late-joining clients receive only bytes produced after they connected —
+  acceptable for live TV (same behaviour as the Node.js app).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTEGRATION  (two small changes to FlaskAppPlayerDownloader_byGG.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STEP 1 — add import after the cast_addon import block:
 
     try:
-        from dvr_addon import register_dvr_routes
-        _DVR_AVAILABLE = True
+        from multiview_addon import register_multiview_routes
+        _MULTIVIEW_AVAILABLE = True
     except ImportError:
-        _DVR_AVAILABLE = False
-        def register_dvr_routes(*a, **kw): pass
+        _MULTIVIEW_AVAILABLE = False
+        def register_multiview_routes(*a, **kw): pass
 
-STEP 2 — register routes after multiview registration:
+STEP 2 — register routes right after the cast_routes registration:
 
-    register_dvr_routes(flask_app, state)
+    register_multiview_routes(flask_app)
 
-That's it.
+That's it — no other files required.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Standard library
+# ─────────────────────────────────────────────────────────────────────────────
 import json
 import logging
 import os
+import queue
 import shutil
 import subprocess
 import sys
 import threading
 import time
-import uuid
-from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from flask import jsonify, request, Response, send_from_directory
+from flask import jsonify, request, Response
 
 LOG = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────────────
 
-DVR_JOBS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dvr_jobs.json")
-_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — CONSTANTS
+# All values mirror server.js unless noted.
+# ═════════════════════════════════════════════════════════════════════════════
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ffmpeg resolution (mirrors multiview_addon pattern)
-# ─────────────────────────────────────────────────────────────────────────────
+# server.js: const STREAM_INACTIVITY_TIMEOUT = 30000;  (ms → s here)
+STREAM_INACTIVITY_TIMEOUT: int = 30
 
-def _get_ffmpeg() -> str:
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        bundled = os.path.join(sys._MEIPASS, "ffmpeg.exe")
-        if os.path.exists(bundled):
-            return bundled
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(sys.executable)
-        for candidate in (
-            os.path.join(base, "_internal", "ffmpeg.exe"),
-            os.path.join(base, "ffmpeg.exe"),
-        ):
-            if os.path.exists(candidate):
-                return candidate
-    if os.path.exists("ffmpeg.exe"):
-        return os.path.abspath("ffmpeg.exe")
-    return shutil.which("ffmpeg") or "ffmpeg"
+# multiview.js: const MAX_PLAYERS = 9;
+MAX_PLAYERS: int = 9
+
+# Internal tuning — not in server.js, chosen for MPEG-TS chunk alignment
+_FFMPEG_CHUNK_BYTES: int = 65536       # 64 KB read size from ffmpeg stdout
+_CLIENT_QUEUE_MAXSIZE: int = 64        # chunks buffered per client before drop
+
+# Layout persistence — JSON file alongside the Flask app script
+LAYOUTS_FILE: str = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'multiview_layouts.json'
+)
+
+# Suppress a new console window on Windows (same flag used in cast_addon.py)
+_NO_WINDOW: int = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Job persistence
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — FFMPEG RESOLUTION
+# Try to import from cast_addon first (avoids duplication).
+# Falls back to a local copy of the same logic if cast_addon is not present.
+# ═════════════════════════════════════════════════════════════════════════════
 
-_jobs_lock = threading.Lock()
-
-
-def _load_jobs() -> List[dict]:
-    if not os.path.exists(DVR_JOBS_FILE):
-        return []
-    try:
-        with open(DVR_JOBS_FILE, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data.get("jobs", [])
-    except Exception as exc:
-        LOG.error("[DVR] Failed to load jobs file: %s", exc)
-        return []
-
-
-def _save_jobs(jobs: List[dict]) -> None:
-    try:
-        with open(DVR_JOBS_FILE, "w", encoding="utf-8") as fh:
-            json.dump({"jobs": jobs}, fh, indent=2, ensure_ascii=False)
-    except Exception as exc:
-        LOG.error("[DVR] Failed to save jobs file: %s", exc)
-
-
-def _get_job(job_id: str) -> Optional[dict]:
-    with _jobs_lock:
-        jobs = _load_jobs()
-    return next((j for j in jobs if j["id"] == job_id), None)
-
-
-def _update_job(job_id: str, updates: dict) -> bool:
-    with _jobs_lock:
-        jobs = _load_jobs()
-        for j in jobs:
-            if j["id"] == job_id:
-                j.update(updates)
-                _save_jobs(jobs)
-                return True
-    return False
+try:
+    from cast_addon import _get_ffmpeg  # type: ignore
+except ImportError:
+    def _get_ffmpeg() -> str:
+        """
+        Resolve ffmpeg binary path.
+        Direct copy of cast_addon._get_ffmpeg() — kept in sync manually.
+        The Flask app itself uses shutil.which("ffmpeg") everywhere; we mirror
+        that but also handle the PyInstaller frozen-bundle case from cast_addon.
+        """
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            bundled = os.path.join(sys._MEIPASS, 'ffmpeg.exe')
+            if os.path.exists(bundled):
+                return bundled
+        if getattr(sys, 'frozen', False):
+            base = os.path.dirname(sys.executable)
+            for candidate in (
+                os.path.join(base, '_internal', 'ffmpeg.exe'),
+                os.path.join(base, 'ffmpeg.exe'),
+            ):
+                if os.path.exists(candidate):
+                    return candidate
+        if os.path.exists('ffmpeg.exe'):
+            return os.path.abspath('ffmpeg.exe')
+        # Same fallback used throughout the Flask app
+        return shutil.which('ffmpeg') or 'ffmpeg'
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Scheduler thread — wakes every 15 s, fires recordings that are due
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — STREAM BROADCASTER
+#
+# Wraps ONE ffmpeg process and fans its stdout to N per-client queues.
+#
+# Node.js analogue (server.js):
+#   activeStreamInfo.process.stdout.pipe(res)   ← first client
+#   activeStreamInfo.references++               ← subsequent clients
+#   activeStreamInfo.process.stdout.pipe(res2)  ← pipes same readable again
+#
+# Python cannot pipe the same stdout to multiple consumers, so a dedicated
+# reader thread reads chunks and puts them into every registered client queue.
+# ═════════════════════════════════════════════════════════════════════════════
 
-_scheduler_thread: Optional[threading.Thread] = None
-_scheduler_stop = threading.Event()
-_active_recordings: Dict[str, subprocess.Popen] = {}  # job_id → ffmpeg Popen
-_active_lock = threading.Lock()
+class StreamBroadcaster:
+    """
+    One ffmpeg process → N HTTP streaming clients via per-client queues.
 
-_app_state = None  # set at register time
+    Attribute mapping to server.js activeStreamProcesses entry:
+        references  → activeStreamInfo.references
+        last_access → activeStreamInfo.lastAccess  (epoch seconds, not ms)
+        stream_key  → streamKey
+        process     → activeStreamInfo.process
+    """
 
+    def __init__(self, stream_key: str, channel_url: str,
+                 user_agent: str = 'Mozilla/5.0',
+                 transcode: bool = False,
+                 audio_only: bool = False) -> None:
+        self.stream_key:  str   = stream_key
+        self.channel_url: str   = channel_url
+        self.user_agent:  str   = user_agent
+        self.transcode:   bool  = transcode
+        self.audio_only:  bool  = audio_only  # True = copy video, re-encode audio only
+        self.references:  int   = 0
+        self.last_access: float = time.time()
+        self._stopped:    bool  = False
 
-def _scheduler_loop():
-    LOG.info("[DVR] Scheduler started")
-    while not _scheduler_stop.wait(15):
+        self._lock:          threading.Lock      = threading.Lock()
+        self._client_queues: List[queue.Queue]   = []
+
+        self.process: Optional[subprocess.Popen] = self._spawn()
+
+        if self.process:
+            # Drain stderr in background so the pipe never blocks ffmpeg
+            threading.Thread(
+                target=self._drain_stderr,
+                daemon=True,
+                name=f'mv-stderr-{stream_key[:20]}',
+            ).start()
+            # Reader thread fans stdout to all client queues
+            threading.Thread(
+                target=self._read_loop,
+                daemon=True,
+                name=f'mv-reader-{stream_key[:20]}',
+            ).start()
+            LOG.info('[MV] Broadcaster started  key=%s  pid=%s',
+                     stream_key, self.process.pid)
+        else:
+            LOG.error('[MV] Broadcaster failed to spawn ffmpeg  key=%s', stream_key)
+
+    # ── ffmpeg process ────────────────────────────────────────────────────────
+
+    def _spawn(self) -> Optional[subprocess.Popen]:
+        """
+        Spawn ffmpeg with reconnect flags, outputting raw MPEG-TS to stdout.
+
+        When self.transcode is True (HEVC streams), re-encode video to H.264
+        so the browser's MSE can decode it via mpegts.js. Audio is kept as
+        AAC. Uses ultrafast + zerolatency presets for minimal latency.
+
+        When self.transcode is False, stream-copy at zero cost.
+        """
+        ffmpeg = _get_ffmpeg()
+
+        if self.transcode:
+            # HEVC → H.264 transcode: re-encode video + audio for full compatibility.
+            # mirrors /api/hls_proxy?transcode=1 logic
+            codec_args = [
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-ac', '2',
+                '-ar', '48000',
+            ]
+            LOG.info('[MV] Spawning ffmpeg with HEVC→H.264 transcode  key=%s', self.stream_key)
+        elif self.audio_only:
+            # Stream-copy video, re-encode audio only (AC3/EAC3/DTS → AAC).
+            # Used when the video codec is already browser-compatible (H.264)
+            # but the audio codec is not (e.g. EAC3 / AC3 / DTS).
+            codec_args = [
+                '-c:v', 'copy',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-ac', '2',
+                '-ar', '48000',
+            ]
+            LOG.info('[MV] Spawning ffmpeg with audio-only transcode  key=%s', self.stream_key)
+        else:
+            codec_args = ['-c', 'copy']
+
+        cmd = [
+            ffmpeg,
+            '-hide_banner',
+            '-loglevel', 'error',
+            '-user_agent', self.user_agent,
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '5',
+            '-i', self.channel_url,
+        ] + codec_args + [
+            '-f', 'mpegts',
+            'pipe:1',
+        ]
         try:
-            _tick()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                creationflags=_NO_WINDOW,
+            )
+            return proc
         except Exception as exc:
-            LOG.error("[DVR] Scheduler tick error: %s", exc)
-    LOG.info("[DVR] Scheduler stopped")
+            LOG.error('[MV] ffmpeg spawn failed  key=%s  error=%s', self.stream_key, exc)
+            return None
 
+    def _drain_stderr(self) -> None:
+        """
+        Consume and log ffmpeg stderr so the pipe buffer never fills and
+        blocks the ffmpeg process.
+        Mirrors cast_addon._HLSConverter._log_stderr().
+        """
+        try:
+            for raw_line in self.process.stderr:
+                line = raw_line.decode('utf-8', errors='replace').rstrip()
+                if line:
+                    LOG.debug('[MV][ffmpeg] %s', line)
+        except Exception:
+            pass
 
-def _tick():
-    now = datetime.now(timezone.utc)
+    def _read_loop(self) -> None:
+        """
+        Read chunks from ffmpeg stdout and distribute to all registered client
+        queues.
 
-    # ── Phase 1: check completed recordings (no lock held during poll) ────────
-    finished = []  # (job_id, returncode)
-    with _active_lock:
-        for job_id, proc in list(_active_recordings.items()):
-            if proc.poll() is not None:
-                finished.append((job_id, proc.returncode))
-                del _active_recordings[job_id]
+        Node.js equivalent:
+            activeStreamInfo.process.stdout.pipe(res)
+            // Node.js Readable emits 'data' to all piped Writables
 
-    # ── Phase 2: update job state (brief lock, no I/O inside) ─────────────────
-    with _jobs_lock:
-        jobs = _load_jobs()
-        changed = False
-
-        # Mark finished recordings
-        for job_id, rc in finished:
-            for job in jobs:
-                if job["id"] == job_id and job["status"] == "recording":
-                    if rc == 0 or rc == -15 or rc == 1:
-                        job["status"] = "completed"
-                        fp = job.get("filePath", "")
-                        if fp and os.path.exists(fp):
-                            job["fileSizeBytes"] = os.path.getsize(fp)
-                            start_t = datetime.fromisoformat(job["startTime"].replace("Z", "+00:00"))
-                            end_t   = datetime.fromisoformat(job["endTime"].replace("Z", "+00:00"))
-                            job["durationSeconds"] = int((end_t - start_t).total_seconds())
-                        LOG.info("[DVR] Completed: %s (rc=%d)", job.get("programTitle"), rc)
-                    else:
-                        job["status"] = "error"
-                        job["errorMessage"] = f"ffmpeg exited with code {rc}"
-                        LOG.error("[DVR] Error recording %s (rc=%d)", job.get("programTitle"), rc)
-                    changed = True
-
-        # Collect jobs that need to start (don't spawn inside lock)
-        to_start = []
-        for job in jobs:
-            if job["status"] != "scheduled":
-                continue
-            start_dt = datetime.fromisoformat(job["startTime"].replace("Z", "+00:00"))
-            end_dt   = datetime.fromisoformat(job["endTime"].replace("Z", "+00:00"))
-            if now > end_dt:
-                job["status"] = "error"
-                job["errorMessage"] = "Recording missed — start time passed before it could begin."
-                changed = True
-                LOG.warning("[DVR] Missed recording: %s", job.get("programTitle"))
-            elif now >= start_dt:
-                to_start.append(job)
-
-        if changed or to_start:
-            _save_jobs(jobs)
-
-    # ── Phase 3: spawn ffmpeg outside the lock ────────────────────────────────
-    for job in to_start:
-        _start_recording_unlocked(job)
-        # Re-save after spawn so filePath/status are persisted
-        with _jobs_lock:
-            jobs2 = _load_jobs()
-            for j2 in jobs2:
-                if j2["id"] == job["id"]:
-                    j2.update({k: job[k] for k in ("status", "filePath", "filename") if k in job})
-            _save_jobs(jobs2)
-
-
-def _start_recording_unlocked(job: dict):
-    """Spawn ffmpeg for this job. Must be called with _jobs_lock held."""
-    ffmpeg = _get_ffmpeg()
-    if not os.path.exists(ffmpeg) and not shutil.which("ffmpeg"):
-        job["status"] = "error"
-        job["errorMessage"] = "ffmpeg not found"
-        return
-
-    # Resolve the stream URL from the job
-    stream_url = job.get("streamUrl", "")
-    if not stream_url:
-        job["status"] = "error"
-        job["errorMessage"] = "No stream URL stored for this job"
-        return
-
-    # Output folder — use state.mkv_folder or ~/Downloads
-    out_dir = ""
-    if _app_state:
-        out_dir = getattr(_app_state, "mkv_folder", "") or getattr(_app_state, "dvr_folder", "")
-    if not out_dir:
-        out_dir = os.path.join(os.path.expanduser("~"), "Downloads", "DVR")
-    os.makedirs(out_dir, exist_ok=True)
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe = _safe_fname(job.get("programTitle", "recording"))
-    fname = f"{safe}_{ts}.ts"
-    out_path = os.path.join(out_dir, fname)
-
-    # Duration in seconds
-    start_dt = datetime.fromisoformat(job["startTime"].replace("Z", "+00:00"))
-    end_dt   = datetime.fromisoformat(job["endTime"].replace("Z", "+00:00"))
-    duration = max(10, int((end_dt - start_dt).total_seconds()))
-
-    cmd = [
-        ffmpeg, "-hide_banner", "-nostdin",
-        "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
-        "-i", stream_url,
-        "-t", str(duration),
-        "-c", "copy",
-        "-f", "mpegts",
-        out_path,
-    ]
-
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            creationflags=_NO_WINDOW,
-        )
-    except Exception as exc:
-        job["status"] = "error"
-        job["errorMessage"] = f"Failed to spawn ffmpeg: {exc}"
-        LOG.error("[DVR] Spawn failed for %s: %s", job.get("programTitle"), exc)
-        return
-
-    with _active_lock:
-        _active_recordings[job["id"]] = proc
-
-    job["status"] = "recording"
-    job["filePath"] = out_path
-    job["filename"] = fname
-    LOG.info("[DVR] ⏺ Started recording PID %d → %s", proc.pid, fname)
-    if _app_state:
-        _app_state.log(f"[DVR] ⏺ Recording started: {fname}")
-
-
-def _safe_fname(name: str) -> str:
-    import re
-    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)[:80].strip("._") or "recording"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Route registration
-# ─────────────────────────────────────────────────────────────────────────────
-
-def register_dvr_routes(app, state=None) -> None:
-    global _app_state, _scheduler_thread
-    _app_state = state
-
-    # ── Clean up ghost jobs from previous crashed sessions ────────────────────
-    # Any job stuck in 'recording' status on startup means ffmpeg died without
-    # us catching it (crash, restart). Mark them as error so the UI doesn't
-    # show stale Watch buttons pointing to files that may no longer exist.
-    with _jobs_lock:
-        jobs = _load_jobs()
-        changed = False
-        for job in jobs:
-            if job.get("status") == "recording":
-                fp = job.get("filePath", "")
-                # If the file exists, mark completed; otherwise mark error
-                if fp and os.path.exists(fp):
-                    job["status"] = "completed"
+        Here we explicitly copy each chunk into every client's queue.
+        Slow clients whose queue is full have chunks silently dropped —
+        the same behaviour as TCP backpressure in the Node.js pipe model.
+        """
+        try:
+            while not self._stopped:
+                chunk = self.process.stdout.read(_FFMPEG_CHUNK_BYTES)
+                if not chunk:
+                    # ffmpeg exited or pipe closed
+                    break
+                with self._lock:
+                    for q in list(self._client_queues):
+                        try:
+                            q.put_nowait(chunk)
+                        except queue.Full:
+                            # Drop for this client only — matches Node.js backpressure
+                            pass
+        except Exception as exc:
+            LOG.error('[MV] _read_loop error  key=%s  %s', self.stream_key, exc)
+        finally:
+            # Signal every waiting client generator that the stream has ended
+            with self._lock:
+                for q in self._client_queues:
                     try:
-                        job["fileSizeBytes"] = os.path.getsize(fp)
+                        q.put(None)
                     except Exception:
                         pass
-                    LOG.info("[DVR] Recovered completed recording on startup: %s", job.get("programTitle"))
-                else:
-                    job["status"] = "error"
-                    job["errorMessage"] = "Recording interrupted (app restarted)"
-                    LOG.warning("[DVR] Ghost recording cleared on startup: %s", job.get("programTitle"))
-                changed = True
-        if changed:
-            _save_jobs(jobs)
+            LOG.info('[MV] _read_loop ended  key=%s', self.stream_key)
 
-    # Start scheduler
-    _scheduler_stop.clear()
-    _scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True, name="dvr-scheduler")
-    _scheduler_thread.start()
+    # ── Client queue management ───────────────────────────────────────────────
 
-    # ── POST /api/dvr/set_folder  (persist DVR output folder) ─────────────────
-    @app.route("/api/dvr/set_folder", methods=["POST"])
-    def dvr_set_folder():
-        d = request.get_json(force=True)
-        folder = (d.get("folder") or "").strip()
-        if not folder:
-            return jsonify({"error": "folder is required"}), 400
-        if state:
-            state.dvr_folder = folder
-            # Also update mkv_folder as fallback so existing logic picks it up
-            if not getattr(state, "mkv_folder", ""):
-                state.mkv_folder = folder
-        LOG.info("[DVR] Output folder set: %s", folder)
-        return jsonify({"ok": True, "folder": folder})
-
-    # ── GET /api/dvr/jobs ─────────────────────────────────────────────────────
-    @app.route("/api/dvr/jobs")
-    def dvr_list_jobs():
-        jobs = _load_jobs()
-        # Separate scheduled/recording/error from completed (completed go to recordings endpoint)
-        active = [j for j in jobs if j["status"] != "completed"]
-        return jsonify(active)
-
-    # ── POST /api/dvr/schedule  (from EPG) ────────────────────────────────────
-    @app.route("/api/dvr/schedule", methods=["POST"])
-    def dvr_schedule():
-        d = request.get_json(force=True)
-        channel_id   = (d.get("channelId") or "").strip()
-        channel_name = (d.get("channelName") or "Unknown").strip()
-        title        = (d.get("programTitle") or "Recording").strip()
-        start_iso    = d.get("programStart") or d.get("startTime") or ""
-        stop_iso     = d.get("programStop")  or d.get("endTime")   or ""
-        stream_url   = (d.get("streamUrl") or "").strip()
-
-        if not start_iso or not stop_iso:
-            return jsonify({"error": "startTime and endTime are required"}), 400
-
-        job = {
-            "id":            str(uuid.uuid4()),
-            "channelId":     channel_id,
-            "channelName":   channel_name,
-            "programTitle":  title,
-            "startTime":     start_iso,
-            "endTime":       stop_iso,
-            "streamUrl":     stream_url,
-            "status":        "scheduled",
-            "filePath":      "",
-            "filename":      "",
-            "fileSizeBytes": 0,
-            "durationSeconds": 0,
-            "errorMessage":  "",
-            "createdAt":     datetime.now(timezone.utc).isoformat(),
-        }
-
-        with _jobs_lock:
-            jobs = _load_jobs()
-            jobs.append(job)
-            _save_jobs(jobs)
-
-        LOG.info("[DVR] Scheduled: %s  %s → %s", title, start_iso, stop_iso)
-        if state:
-            state.log(f"[DVR] Scheduled: {title}")
-        return jsonify(job), 201
-
-    # ── POST /api/dvr/schedule/manual ─────────────────────────────────────────
-    @app.route("/api/dvr/schedule/manual", methods=["POST"])
-    def dvr_schedule_manual():
-        d = request.get_json(force=True)
-        channel_id   = (d.get("channelId") or "").strip()
-        channel_name = (d.get("channelName") or "Unknown").strip()
-        start_iso    = d.get("startTime") or ""
-        end_iso      = d.get("endTime")   or ""
-        stream_url   = (d.get("streamUrl") or "").strip()
-        title        = (d.get("programTitle") or f"Manual – {channel_name}").strip()
-
-        if not start_iso or not end_iso:
-            return jsonify({"error": "startTime and endTime are required"}), 400
-
-        try:
-            s = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-            e = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-            if e <= s:
-                return jsonify({"error": "endTime must be after startTime"}), 400
-        except ValueError as exc:
-            return jsonify({"error": f"Invalid datetime: {exc}"}), 400
-
-        job = {
-            "id":            str(uuid.uuid4()),
-            "channelId":     channel_id,
-            "channelName":   channel_name,
-            "programTitle":  title,
-            "startTime":     start_iso,
-            "endTime":       end_iso,
-            "streamUrl":     stream_url,
-            "status":        "scheduled",
-            "filePath":      "",
-            "filename":      "",
-            "fileSizeBytes": 0,
-            "durationSeconds": 0,
-            "errorMessage":  "",
-            "createdAt":     datetime.now(timezone.utc).isoformat(),
-        }
-
-        with _jobs_lock:
-            jobs = _load_jobs()
-            jobs.append(job)
-            _save_jobs(jobs)
-
-        LOG.info("[DVR] Manual scheduled: %s", title)
-        if state:
-            state.log(f"[DVR] Manual scheduled: {title}")
-        return jsonify(job), 201
-
-    # ── PUT /api/dvr/jobs/<id>  (edit time) ───────────────────────────────────
-    @app.route("/api/dvr/jobs/<job_id>", methods=["PUT"])
-    def dvr_edit_job(job_id):
-        d = request.get_json(force=True)
-        updates = {}
-        if "startTime" in d:
-            updates["startTime"] = d["startTime"]
-        if "endTime" in d:
-            updates["endTime"] = d["endTime"]
-        if not updates:
-            return jsonify({"error": "Nothing to update"}), 400
-        if _update_job(job_id, updates):
-            return jsonify({"ok": True})
-        return jsonify({"error": "Job not found"}), 404
-
-    # ── DELETE /api/dvr/jobs/<id>  (cancel or remove from history) ────────────
-    @app.route("/api/dvr/jobs/<job_id>", methods=["DELETE"])
-    def dvr_cancel_job(job_id):
-        with _jobs_lock:
-            jobs = _load_jobs()
-            job = next((j for j in jobs if j["id"] == job_id), None)
-            if not job:
-                return jsonify({"error": "Job not found"}), 404
-
-            if job["status"] == "recording":
-                # Kill the ffmpeg process
-                with _active_lock:
-                    proc = _active_recordings.pop(job_id, None)
-                if proc:
-                    try:
-                        proc.terminate()
-                        proc.wait(timeout=5)
-                    except Exception:
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-
-            jobs = [j for j in jobs if j["id"] != job_id]
-            _save_jobs(jobs)
-
-        LOG.info("[DVR] Cancelled/deleted job %s", job_id)
-        return jsonify({"ok": True})
-
-    # ── POST /api/dvr/jobs/<id>/stop  (stop active recording) ─────────────────
-    @app.route("/api/dvr/jobs/<job_id>/stop", methods=["POST"])
-    def dvr_stop_job(job_id):
-        with _active_lock:
-            proc = _active_recordings.pop(job_id, None)
-        if proc:
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
-        with _jobs_lock:
-            jobs = _load_jobs()
-            for j in jobs:
-                if j["id"] == job_id:
-                    j["status"] = "completed"
-                    fp = j.get("filePath", "")
-                    if fp and os.path.exists(fp):
-                        j["fileSizeBytes"] = os.path.getsize(fp)
-                    break
-            _save_jobs(jobs)
-
-        return jsonify({"ok": True})
-
-    # ── DELETE /api/dvr/jobs/<id>/history  (remove from history, keep file) ───
-    @app.route("/api/dvr/jobs/<job_id>/history", methods=["DELETE"])
-    def dvr_remove_history(job_id):
-        with _jobs_lock:
-            jobs = _load_jobs()
-            jobs = [j for j in jobs if j["id"] != job_id]
-            _save_jobs(jobs)
-        return jsonify({"ok": True})
-
-    # ── DELETE /api/dvr/jobs/all  (clear all non-recording jobs) ──────────────
-    @app.route("/api/dvr/jobs/all", methods=["DELETE"])
-    def dvr_clear_jobs():
-        with _jobs_lock:
-            jobs = _load_jobs()
-            # Keep only actively recording jobs
-            jobs = [j for j in jobs if j["status"] == "recording"]
-            _save_jobs(jobs)
-        return jsonify({"ok": True})
-
-    # ── GET /api/dvr/recordings  (completed recordings) ───────────────────────
-    @app.route("/api/dvr/recordings")
-    def dvr_list_recordings():
-        jobs = _load_jobs()
-        completed = [j for j in jobs if j["status"] == "completed"]
-        return jsonify(completed)
-
-    # ── DELETE /api/dvr/recordings/<id>  (delete file + job) ──────────────────
-    @app.route("/api/dvr/recordings/<job_id>", methods=["DELETE"])
-    def dvr_delete_recording(job_id):
-        with _jobs_lock:
-            jobs = _load_jobs()
-            job = next((j for j in jobs if j["id"] == job_id), None)
-            if not job:
-                return jsonify({"error": "Recording not found"}), 404
-            fp = job.get("filePath", "")
-            if fp and os.path.exists(fp):
-                try:
-                    os.remove(fp)
-                except Exception as exc:
-                    LOG.warning("[DVR] Could not delete file %s: %s", fp, exc)
-            jobs = [j for j in jobs if j["id"] != job_id]
-            _save_jobs(jobs)
-        return jsonify({"ok": True})
-
-    # ── DELETE /api/dvr/recordings/all  (delete all completed recordings + files)
-    @app.route("/api/dvr/recordings/all", methods=["DELETE"])
-    def dvr_clear_recordings():
-        with _jobs_lock:
-            jobs = _load_jobs()
-            to_delete = [j for j in jobs if j["status"] == "completed"]
-            for j in to_delete:
-                fp = j.get("filePath", "")
-                if fp and os.path.exists(fp):
-                    try:
-                        os.remove(fp)
-                    except Exception as exc:
-                        LOG.warning("[DVR] Could not delete file %s: %s", fp, exc)
-            jobs = [j for j in jobs if j["status"] != "completed"]
-            _save_jobs(jobs)
-        return jsonify({"ok": True})
-
-    # ── GET /api/dvr/storage  (disk usage for DVR folder) ─────────────────────
-    @app.route("/api/dvr/storage")
-    def dvr_storage():
-        out_dir = ""
-        if state:
-            out_dir = getattr(state, "dvr_folder", "") or getattr(state, "mkv_folder", "")
-        if not out_dir:
-            out_dir = os.path.join(os.path.expanduser("~"), "Downloads", "DVR")
-
-        try:
-            usage = shutil.disk_usage(out_dir if os.path.exists(out_dir) else os.path.expanduser("~"))
-            total = usage.total
-            used  = usage.used
-            pct   = round(used / total * 100, 1) if total else 0
-            return jsonify({"total": total, "used": used, "free": usage.free, "percentage": pct, "folder": out_dir})
-        except Exception as exc:
-            return jsonify({"error": str(exc)}), 500
-
-    # ── GET /api/dvr/timeshift/<job_id>  (transcode in-progress recording) ─────
-    @app.route("/api/dvr/timeshift/<job_id>", methods=["GET", "HEAD"])
-    def dvr_timeshift(job_id):
+    def add_client(self) -> queue.Queue:
         """
-        Pipe the partially-written recording .ts file through ffmpeg transcode,
-        tail-following the file as ffmpeg writes more data.
+        Register a new HTTP client and increment the reference counter.
 
-        This gives the browser:
-          - Full seeking into already-recorded content
-          - Only 1 portal connection (recording ffmpeg is already capturing)
-          - HEVC/AC3 → H.264/AAC transcode so any browser can play it
-          - True timeshift: pause, rewind to start, seek to any recorded point
-
-        Uses ffmpeg -re -stream_loop -1 on the growing file. The key flags:
-          -re         : read at real-time speed (prevents over-reading past EOF)
-          -fflags     : +genpts to fix timestamps
+        Node.js equivalent (server.js /stream handler):
+            activeStreamInfo.references++;
+            activeStreamInfo.lastAccess = Date.now();
+            activeStreamInfo.process.stdout.pipe(res);
         """
-        job = _get_job(job_id)
-        if not job:
-            return Response("Job not found", status=404)
-        fp = job.get("filePath", "")
-        if not fp or not os.path.exists(fp):
-            return Response("Recording file not available yet", status=404)
+        q: queue.Queue = queue.Queue(maxsize=_CLIENT_QUEUE_MAXSIZE)
+        with self._lock:
+            self._client_queues.append(q)
+            self.references += 1
+            self.last_access = time.time()
+        LOG.info('[MV] Client added  key=%s  refs=%d', self.stream_key, self.references)
+        return q
 
-        # HEAD probe — just confirm the file exists, don't start ffmpeg
-        if request.method == "HEAD":
-            return Response(status=200)
+    def remove_client(self, q: queue.Queue) -> None:
+        """
+        Unregister a client and decrement the reference counter.
 
-        ffmpeg = _get_ffmpeg()
-        cmd = [
-            ffmpeg, "-hide_banner", "-nostdin",
-            "-fflags", "+genpts+igndts+discardcorrupt",
-            "-i", "pipe:0",   # read from stdin — Python feeds the growing file
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
-            "-f", "mpegts", "-",
-        ]
-
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=_NO_WINDOW,
-            )
-        except Exception as exc:
-            LOG.error("[DVR] Timeshift spawn failed: %s", exc)
-            return Response(f"ffmpeg error: {exc}", status=500)
-
-        threading.Thread(
-            target=lambda: [LOG.debug("[DVR/ts] %s", l.decode("utf-8","replace").rstrip())
-                            for l in proc.stderr],
-            daemon=True,
-        ).start()
-
-        def _feed_stdin():
-            """Tail-follow the growing .ts file and pipe chunks into ffmpeg stdin.
-            Python controls the pacing — ffmpeg never sees EOF while recording."""
-            try:
-                with open(fp, "rb") as fh:
-                    while True:
-                        chunk = fh.read(65536)
-                        if chunk:
-                            try:
-                                proc.stdin.write(chunk)
-                            except (BrokenPipeError, OSError):
-                                break  # client disconnected
-                        else:
-                            # No new data yet — check if recording is still active
-                            current = _get_job(job_id)
-                            if current and current.get("status") == "recording":
-                                time.sleep(0.3)   # wait for more data to be written
-                            else:
-                                break  # recording finished — let ffmpeg drain & exit
-            except Exception as exc:
-                LOG.debug("[DVR] Timeshift feed error: %s", exc)
-            finally:
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
-
-        threading.Thread(target=_feed_stdin, daemon=True, name=f"dvr-ts-feed-{job_id[:8]}").start()
-
-        def _gen():
-            try:
-                while True:
-                    chunk = proc.stdout.read(65536)
-                    if not chunk:
-                        break
-                    yield chunk
-            except GeneratorExit:
-                pass
-            finally:
-                proc.kill()
-                proc.wait()
-                LOG.info("[DVR] Timeshift stream ended  job=%s", job_id)
-
-        return Response(
-            _gen(),
-            mimetype="video/mp2t",
-            headers={
-                "Cache-Control": "no-cache, no-store",
-                "X-Accel-Buffering": "no",
-                "Access-Control-Allow-Origin": "*",
-            },
-        )
-
-    # ── GET /api/dvr/progress  (live stats for active recordings) ─────────────
-    @app.route("/api/dvr/progress")
-    def dvr_progress():
-        """Return live file size and elapsed time for all active recordings."""
-        now = time.time()
-        result = {}
-        jobs = _load_jobs()
-        for job in jobs:
-            if job.get("status") != "recording":
-                continue
-            job_id = job["id"]
-            fp = job.get("filePath", "")
-            size = 0
-            if fp and os.path.exists(fp):
-                try:
-                    size = os.path.getsize(fp)
-                except Exception:
-                    pass
-            # Elapsed from startTime
-            try:
-                start_dt = datetime.fromisoformat(job["startTime"].replace("Z", "+00:00"))
-                elapsed = int((datetime.now(timezone.utc) - start_dt).total_seconds())
-            except Exception:
-                elapsed = 0
-            # Scheduled total duration
-            try:
-                end_dt = datetime.fromisoformat(job["endTime"].replace("Z", "+00:00"))
-                total = int((end_dt - start_dt).total_seconds())
-            except Exception:
-                total = 0
-            result[job_id] = {
-                "fileSizeBytes": size,
-                "elapsedSeconds": max(0, elapsed),
-                "totalSeconds": max(0, total),
+        Node.js equivalent (server.js req.on('close') handler):
+            console.log('[STREAM] Client closed connection...');
+            activeStreamInfo.references--;
+            activeStreamInfo.lastAccess = Date.now();
+            if (activeStreamInfo.references <= 0) {
+                console.log('[STREAM] Last client disconnected...');
             }
-        return jsonify(result)
+        """
+        with self._lock:
+            if q in self._client_queues:
+                self._client_queues.remove(q)
+            self.references = max(0, self.references - 1)
+            self.last_access = time.time()
+        LOG.info('[MV] Client removed  key=%s  refs=%d', self.stream_key, self.references)
 
-    # ── GET /api/dvr/transcode/<job_id>  (transcode .ts file via ffmpeg) ────────
-    # Used when a completed recording contains HEVC — serves H.264+AAC MPEG-TS
-    # so the browser can play it. Reads the file directly from disk (not over HTTP)
-    # so ffmpeg can seek/copy it efficiently without a local loopback.
-    @app.route("/api/dvr/transcode/<job_id>")
-    def dvr_transcode_file(job_id):
-        job = _get_job(job_id)
-        if not job:
-            return Response("Job not found", status=404)
-        fp = job.get("filePath", "")
-        if not fp or not os.path.exists(fp):
-            return Response("Recording file not found", status=404)
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
-        duration_secs = job.get("durationSeconds", 0)
+    def stop(self, wait_timeout: float = 3.0) -> None:
+        """
+        Kill the ffmpeg process, wait for it to fully exit, then signal clients.
 
-        ffmpeg = _get_ffmpeg()
-        cmd = [
-            ffmpeg, "-hide_banner", "-nostdin",
-            "-fflags", "+genpts+igndts",
-            "-i", fp,
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
-            "-f", "mpegts", "-",
-        ]
+        CRITICAL — why we wait:
+        process.kill() sends SIGKILL but returns immediately before the OS has
+        cleaned up the process's file descriptors and TCP sockets.  If the caller
+        (the HTTP stop endpoint) returns *before* the process is dead, the JS
+        `await fetch('/stop')` resolves while the IPTV server still sees the old
+        TCP connection as active.  The new ffmpeg (started immediately after)
+        then creates a second simultaneous connection → provider enforces its
+        1-connection limit and kills one of them.
 
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=_NO_WINDOW,
-            )
-        except Exception as exc:
-            LOG.error("[DVR] Transcode spawn failed: %s", exc)
-            return Response(f"ffmpeg error: {exc}", status=500)
+        Calling process.wait(timeout) blocks until the kernel has reaped the
+        child, guaranteeing the TCP socket to the IPTV server is fully closed
+        before the HTTP response is sent and before the next stream starts.
 
-        threading.Thread(target=lambda: [line for line in proc.stderr], daemon=True).start()
+        Node.js equivalent (server.js cleanupInactiveStreams):
+            streamInfo.process.kill('SIGKILL');
+            activeStreamProcesses.delete(streamKey);
+        Node.js's SIGKILL is also synchronous from the OS perspective — the
+        difference is that Node's libuv event loop reaps child processes quickly,
+        whereas Python needs an explicit .wait() call.
+        """
+        self._stopped = True
+        pid = self.process.pid if self.process else None
+        if self.process:
+            try:
+                self.process.kill()
+                # Block until the OS has fully reaped the child process.
+                # timeout=3s guards against the (extremely rare) unkillable process.
+                try:
+                    self.process.wait(timeout=wait_timeout)
+                    LOG.info('[MV] ffmpeg exited  pid=%s  key=%s', pid, self.stream_key)
+                except subprocess.TimeoutExpired:
+                    LOG.warning('[MV] ffmpeg did not exit within %.1fs  pid=%s  key=%s',
+                                wait_timeout, pid, self.stream_key)
+            except Exception as exc:
+                LOG.warning('[MV] Kill error  key=%s  %s', self.stream_key, exc)
+        # Wake up any generator threads still waiting on their queues
+        with self._lock:
+            for q in self._client_queues:
+                try:
+                    q.put(None)
+                except Exception:
+                    pass
 
-        def _gen():
+    def is_alive(self) -> bool:
+        """True if the underlying ffmpeg process is still running."""
+        return bool(self.process and self.process.poll() is None)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — STREAM REGISTRY
+#
+# Mirrors server.js:
+#   const activeStreamProcesses = new Map();
+#
+# Thread-safety note: every read AND write of _mv_streams must hold
+# _mv_streams_lock.  The lock is always released before any I/O (Flask
+# response streaming runs outside the lock).
+# ═════════════════════════════════════════════════════════════════════════════
+
+_mv_streams: Dict[str, StreamBroadcaster] = {}
+_mv_streams_lock = threading.Lock()
+
+
+def _build_stream_key(client_id: str, channel_url: str) -> str:
+    """
+    Build the deduplication key for the registry.
+
+    Node.js: `${userId}::${streamUrl}::${profileId}`
+    Here we omit profileId because multiview always uses stream-copy.
+    client_id replaces userId (Flask app has no auth system).
+    """
+    return f'{client_id}::{channel_url}'
+
+
+def _get_or_create_broadcaster(stream_key: str, channel_url: str,
+                                user_agent: str,
+                                transcode: bool = False,
+                                audio_only: bool = False) -> Optional[StreamBroadcaster]:
+    """
+    Return existing broadcaster for stream_key (if alive) or create a new one.
+
+    Node.js equivalent (server.js /stream GET handler):
+        const activeStreamInfo = activeStreamProcesses.get(streamKey);
+        if (activeStreamInfo) {
+            activeStreamInfo.references++;
+            activeStreamInfo.lastAccess = Date.now();
+            activeStreamInfo.process.stdout.pipe(res);
+            ...
+            return;
+        }
+        // ── NEW stream ──
+        const ffmpeg = spawn('ffmpeg', args);
+        activeStreamProcesses.set(streamKey, newStreamInfo);
+    """
+    with _mv_streams_lock:
+        existing = _mv_streams.get(stream_key)
+
+        if existing:
+            if existing.is_alive():
+                # Reuse — same as the server.js early-return branch
+                return existing
+            # Dead process left in map — clean it up before creating a fresh one
+            LOG.warning('[MV] Dead broadcaster found in registry  key=%s  — replacing',
+                        stream_key)
+            existing.stop()
+            del _mv_streams[stream_key]
+
+        # No existing broadcaster — spawn a new ffmpeg process
+        broadcaster = StreamBroadcaster(stream_key, channel_url, user_agent,
+                                        transcode=transcode, audio_only=audio_only)
+        if broadcaster.process:
+            _mv_streams[stream_key] = broadcaster
+            return broadcaster
+
+        # Spawn failed
+        return None
+
+
+def _stop_broadcaster(stream_key: str, force: bool = False) -> str:
+    """
+    Stop (or keep-alive) a broadcaster, respecting the reference count.
+
+    IMPORTANT: We must release _mv_streams_lock BEFORE calling broadcaster.stop()
+    because stop() now calls process.wait() (blocks up to 3 s).  Holding the
+    lock during wait() would block every other stream operation for 3 s.
+
+    Node.js equivalent (server.js POST /api/stream/stop):
+        if (activeStreamInfo.references > 1) {
+            return res.json({ success: true,
+                              message: 'Stream kept alive for other active clients.' });
+        }
+        activeStreamInfo.process.kill('SIGKILL');
+        activeStreamProcesses.delete(streamKey);
+
+    Returns one of: 'no_active_stream' | 'kept_alive' | 'stopped'
+    """
+    # Phase 1: check state and remove from registry — all under lock
+    broadcaster_to_stop = None
+    with _mv_streams_lock:
+        broadcaster = _mv_streams.get(stream_key)
+
+        if not broadcaster:
+            return 'no_active_stream'
+
+        if not force and broadcaster.references > 1:
+            LOG.info('[MV] Stop requested  key=%s  refs=%d — keeping alive',
+                     stream_key, broadcaster.references)
+            return 'kept_alive'
+
+        # Remove from registry immediately so new streams for this key can start
+        # as soon as stop() unblocks — no double-registration possible.
+        del _mv_streams[stream_key]
+        broadcaster_to_stop = broadcaster
+        LOG.info('[MV] Broadcaster removed from registry  key=%s', stream_key)
+
+    # Phase 2: kill ffmpeg and wait for it to fully exit — outside the lock
+    # so other threads are not blocked during process.wait()
+    broadcaster_to_stop.stop()
+    return 'stopped'
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — JANITOR THREAD
+#
+# Mirrors server.js:
+#   function cleanupInactiveStreams() { ... }
+#   setInterval(cleanupInactiveStreams, 60000);
+#
+# We run every 30 s because STREAM_INACTIVITY_TIMEOUT is also 30 s —
+# no point waiting 60 s to catch a 30 s timeout.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _janitor() -> None:
+    """
+    Background thread that removes stale or dead broadcasters from the registry.
+
+    Node.js equivalent (server.js cleanupInactiveStreams):
+        activeStreamProcesses.forEach((streamInfo, streamKey) => {
+            if (streamInfo.references <= 0 &&
+                (now - streamInfo.lastAccess > STREAM_INACTIVITY_TIMEOUT)) {
+                streamInfo.process.kill('SIGKILL');
+                activeStreamProcesses.delete(streamKey);
+            }
+        });
+    """
+    LOG.info('[MV][JANITOR] Inactive stream cleanup thread started '
+             '(timeout=%ds, interval=30s)', STREAM_INACTIVITY_TIMEOUT)
+    while True:
+        time.sleep(30)
+        now = time.time()
+        to_stop: List[StreamBroadcaster] = []
+
+        with _mv_streams_lock:
+            for key, broadcaster in list(_mv_streams.items()):
+                idle_secs = now - broadcaster.last_access
+
+                if broadcaster.references <= 0 and idle_secs > STREAM_INACTIVITY_TIMEOUT:
+                    LOG.info('[MV][JANITOR] Stale stream  key=%s  idle=%.1fs  refs=%d',
+                             key, idle_secs, broadcaster.references)
+                    del _mv_streams[key]
+                    to_stop.append(broadcaster)
+                elif not broadcaster.is_alive():
+                    LOG.info('[MV][JANITOR] Dead ffmpeg process  key=%s  — removing', key)
+                    del _mv_streams[key]
+                    to_stop.append(broadcaster)
+
+        # Stop outside the lock — stop() blocks during process.wait()
+        for broadcaster in to_stop:
+            broadcaster.stop()
+
+        if to_stop:
+            LOG.info('[MV][JANITOR] Removed %d stale broadcaster(s)', len(to_stop))
+
+
+# Start the janitor as a daemon thread so it dies when the Flask process exits
+_janitor_thread = threading.Thread(
+    target=_janitor, daemon=True, name='mv-janitor'
+)
+_janitor_thread.start()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 6 — LAYOUT PERSISTENCE
+#
+# Node.js stores layouts in SQLite (multiview_layouts table).
+# The Flask app has no database, so we use a JSON file in the same directory.
+#
+# File schema:
+#   { "layouts": [ { "id": <int>, "name": <str>, "layout_data": [...] } ] }
+#
+# layout_data item schema (mirrors multiview.js saveLayout() exactly):
+#   { "x": int, "y": int, "w": int, "h": int,
+#     "id": str,           ← widget/placeholder DOM id
+#     "channelId": str|null }
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _load_layouts() -> List[dict]:
+    """
+    Load saved layouts from JSON file.
+    Mirrors server.js GET /api/multiview/layouts — returns the array directly.
+    """
+    if not os.path.exists(LAYOUTS_FILE):
+        return []
+    try:
+        with open(LAYOUTS_FILE, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        return data.get('layouts', [])
+    except Exception as exc:
+        LOG.error('[MV] Failed to load layouts file: %s', exc)
+        return []
+
+
+def _save_layouts(layouts: List[dict]) -> None:
+    """Persist the full layouts list back to JSON."""
+    try:
+        with open(LAYOUTS_FILE, 'w', encoding='utf-8') as fh:
+            json.dump({'layouts': layouts}, fh, indent=2, ensure_ascii=False)
+    except Exception as exc:
+        LOG.error('[MV] Failed to save layouts file: %s', exc)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — ROUTE REGISTRATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+def register_multiview_routes(app) -> None:
+    """
+    Register all multiview API routes on the Flask app instance.
+
+    Routes added:
+        GET  /api/multiview/stream           — stream proxy with dedup
+        POST /api/multiview/stream/stop      — reference-aware stop
+        GET  /api/multiview/layouts          — list saved layouts
+        POST /api/multiview/layouts          — save a layout
+        DELETE /api/multiview/layouts/<id>   — delete a layout
+        GET  /api/multiview/status           — debug: active stream info
+    """
+
+    # ── GET /api/multiview/stream ─────────────────────────────────────────────
+    #
+    # Core endpoint.  Mirrors server.js GET /stream handler in full:
+    #   1. Build stream key from client_id + url
+    #   2. If broadcaster exists → reuse (increment refs, pipe to new response)
+    #   3. If not → spawn new ffmpeg, store in registry
+    #   4. On client disconnect → decrement refs (janitor handles eventual kill)
+    #
+    # Query params:
+    #   url        — the raw IPTV stream URL  (required)
+    #   client_id  — UUID from browser localStorage  (required for dedup)
+    #   ua         — User-Agent string to pass to ffmpeg  (optional)
+    #   transcode  — '1' to re-encode HEVC→H.264 (for HEVC-only channels)
+    #   audio_only — '1' to copy video, re-encode audio only (AC3/EAC3/DTS→AAC)
+    #
+    @app.route('/api/multiview/stream')
+    def multiview_stream():
+        channel_url = request.args.get('url', '').strip()
+        client_id   = request.args.get('client_id', '').strip()
+        user_agent  = request.args.get('ua', 'Mozilla/5.0').strip()
+        transcode   = request.args.get('transcode', '0') == '1'
+        audio_only  = request.args.get('audio_only', '0') == '1' and not transcode
+
+        if not channel_url:
+            return 'url parameter is required', 400
+        if not client_id:
+            return 'client_id parameter is required', 400
+
+        # Include mode in stream key so copy/audio-only/full-transcode streams
+        # of the same URL are treated as distinct broadcasters.
+        stream_key = _build_stream_key(client_id, channel_url)
+        if transcode:
+            stream_key += '::transcode'
+        elif audio_only:
+            stream_key += '::audio_only'
+
+        broadcaster = _get_or_create_broadcaster(stream_key, channel_url, user_agent,
+                                                 transcode=transcode,
+                                                 audio_only=audio_only)
+        if not broadcaster:
+            return 'Failed to start ffmpeg stream process', 500
+
+        # Add this HTTP client to the broadcaster's fan-out list.
+        # Mirrors server.js: activeStreamInfo.references++;
+        client_queue = broadcaster.add_client()
+
+        def generate():
+            """
+            Generator that yields chunks from this client's queue.
+
+            The try/finally ensures remove_client() is always called when
+            the HTTP connection closes, mirroring server.js:
+                req.on('close', () => {
+                    activeStreamInfo.references--;
+                    activeStreamInfo.lastAccess = Date.now();
+                    if (activeStreamInfo.references <= 0) {
+                        console.log('[STREAM] Last client disconnected...');
+                    }
+                });
+            """
             try:
                 while True:
-                    chunk = proc.stdout.read(65536)
-                    if not chunk:
+                    try:
+                        chunk = client_queue.get(timeout=30)
+                    except queue.Empty:
+                        # Stream stalled for 30 s — give up
+                        LOG.warning('[MV] Client queue timeout  key=%s', stream_key)
+                        break
+                    if chunk is None:
+                        # Broadcaster signalled end-of-stream
                         break
                     yield chunk
-            except GeneratorExit:
-                pass
             finally:
-                proc.kill()
-                proc.wait()
+                # Decrement ref count — mirrors server.js req.on('close')
+                broadcaster.remove_client(client_queue)
 
         return Response(
-            _gen(),
-            mimetype="video/mp2t",
+            generate(),
+            mimetype='video/mp2t',
             headers={
-                "Cache-Control": "no-cache, no-store",
-                "X-Accel-Buffering": "no",
-                "Access-Control-Allow-Origin": "*",
+                'Cache-Control':      'no-cache, no-store',
+                'X-Accel-Buffering':  'no',    # disable nginx read-ahead buffering
+                'Access-Control-Allow-Origin': '*',
             },
         )
 
-    # ── GET /api/dvr/serve/<filename>  (serve completed .ts file) ─────────────
-    @app.route("/api/dvr/serve/<path:filename>")
-    def dvr_serve_file(filename):
-        """Serve a completed recording file for playback/download."""
-        out_dir = ""
-        if state:
-            out_dir = getattr(state, "dvr_folder", "") or getattr(state, "mkv_folder", "")
-        if not out_dir:
-            out_dir = os.path.join(os.path.expanduser("~"), "Downloads", "DVR")
+    # ── POST /api/multiview/stream/stop ──────────────────────────────────────
+    #
+    # Mirrors server.js POST /api/stream/stop — the critical reference-count
+    # check that keeps shared streams alive when multiple widgets use same URL.
+    #
+    # Body JSON: { "url": str, "client_id": str }
+    #
+    @app.route('/api/multiview/stream/stop', methods=['POST'])
+    def multiview_stream_stop():
+        data        = request.get_json(silent=True) or {}
+        channel_url = (data.get('url') or '').strip()
+        client_id   = (data.get('client_id') or '').strip()
 
-        safe = os.path.basename(filename)  # prevent path traversal
-        return send_from_directory(out_dir, safe, as_attachment=False)
+        if not channel_url:
+            return jsonify({'error': 'url is required'}), 400
 
-    # ── POST /api/dvr/record_now  (start recording immediately) ───────────────
-    @app.route("/api/dvr/record_now", methods=["POST"])
-    def dvr_record_now():
-        """Schedule a recording that starts immediately."""
-        d = request.get_json(force=True)
-        channel_id   = (d.get("channelId") or "").strip()
-        channel_name = (d.get("channelName") or "Unknown").strip()
-        stream_url   = (d.get("streamUrl") or "").strip()
-        duration_min = int(d.get("durationMinutes", 60))
-        title        = (d.get("title") or f"Recording – {channel_name}").strip()
+        stream_key = _build_stream_key(client_id, channel_url)
+        result     = _stop_broadcaster(stream_key)
 
-        if not stream_url:
-            return jsonify({"error": "streamUrl is required"}), 400
+        # Response messages mirror server.js POST /api/stream/stop exactly
+        if result == 'no_active_stream':
+            return jsonify({
+                'success': True,
+                'message': 'No active stream to stop.',
+            })
+        if result == 'kept_alive':
+            return jsonify({
+                'success': True,
+                'message': 'Stream kept alive for other active clients.',
+            })
+        # result == 'stopped'
+        return jsonify({
+            'success': True,
+            'message': f'Stream process terminated for {stream_key}.',
+        })
 
-        now = datetime.now(timezone.utc)
-        from datetime import timedelta
-        end = now + timedelta(minutes=duration_min)
+    # ── GET /api/multiview/layouts ────────────────────────────────────────────
+    #
+    # Mirrors server.js GET /api/multiview/layouts.
+    # Returns the flat array of layout objects.
+    #
+    @app.route('/api/multiview/layouts')
+    def multiview_get_layouts():
+        return jsonify(_load_layouts())
 
-        job = {
-            "id":            str(uuid.uuid4()),
-            "channelId":     channel_id,
-            "channelName":   channel_name,
-            "programTitle":  title,
-            "startTime":     now.isoformat(),
-            "endTime":       end.isoformat(),
-            "streamUrl":     stream_url,
-            "status":        "scheduled",
-            "filePath":      "",
-            "filename":      "",
-            "fileSizeBytes": 0,
-            "durationSeconds": 0,
-            "errorMessage":  "",
-            "createdAt":     now.isoformat(),
+    # ── POST /api/multiview/layouts ───────────────────────────────────────────
+    #
+    # Mirrors server.js POST /api/multiview/layouts.
+    # Body JSON: { "name": str, "layout_data": list }
+    # Returns:   { "success": true, "id": int, "name": str, "layout_data": list }
+    #
+    @app.route('/api/multiview/layouts', methods=['POST'])
+    def multiview_save_layout():
+        data        = request.get_json(silent=True) or {}
+        name        = (data.get('name') or '').strip()
+        layout_data = data.get('layout_data')
+
+        if not name:
+            return jsonify({'error': 'name is required'}), 400
+        if not layout_data or not isinstance(layout_data, list):
+            return jsonify({'error': 'layout_data must be a non-empty list'}), 400
+
+        layouts = _load_layouts()
+
+        # Use millisecond timestamp as ID, matching server.js behaviour where
+        # SQLite AUTOINCREMENT lastID is used — timestamp is unique enough here
+        new_layout: dict = {
+            'id':          int(time.time() * 1000),
+            'name':        name,
+            'layout_data': layout_data,
         }
+        layouts.append(new_layout)
+        _save_layouts(layouts)
 
-        with _jobs_lock:
-            jobs = _load_jobs()
-            jobs.append(job)
-            # Start immediately
-            _start_recording_unlocked(job)
-            _save_jobs(jobs)
+        LOG.info('[MV] Layout saved  name=%r  id=%s', name, new_layout['id'])
 
-        return jsonify(job), 201
+        # Mirror server.js response: res.status(201).json({ success: true, id, name, layout_data })
+        return jsonify({'success': True, **new_layout}), 201
 
-    LOG.info("[DVR] Routes registered  (jobs_file=%s)", DVR_JOBS_FILE)
+    # ── DELETE /api/multiview/layouts/<id> ────────────────────────────────────
+    #
+    # Mirrors server.js DELETE /api/multiview/layouts/:id.
+    #
+    @app.route('/api/multiview/layouts/<int:layout_id>', methods=['DELETE'])
+    def multiview_delete_layout(layout_id: int):
+        layouts     = _load_layouts()
+        new_layouts = [lay for lay in layouts if lay.get('id') != layout_id]
+
+        if len(new_layouts) == len(layouts):
+            # server.js: res.status(404).json({ error: 'Layout not found or...' })
+            return jsonify({'error': 'Layout not found'}), 404
+
+        _save_layouts(new_layouts)
+        LOG.info('[MV] Layout deleted  id=%s', layout_id)
+
+        # server.js: res.json({ success: true })
+        return jsonify({'success': True})
+
+    # ── GET /api/multiview/status ─────────────────────────────────────────────
+    #
+    # Debug/introspection endpoint — no direct server.js equivalent, but useful
+    # for the Flask app's activity log panel and debugging stale streams.
+    #
+    @app.route('/api/multiview/status')
+    def multiview_status():
+        with _mv_streams_lock:
+            streams = [
+                {
+                    'key':        k,
+                    'references': b.references,
+                    'alive':      b.is_alive(),
+                    'pid':        b.process.pid if b.process else None,
+                    'idle_secs':  round(time.time() - b.last_access, 1),
+                }
+                for k, b in _mv_streams.items()
+            ]
+        return jsonify({
+            'active_streams': streams,
+            'count':          len(streams),
+        })
+
+    # ── POST /api/multiview/resolve_url ───────────────────────────────────────
+    #
+    # Resolves a user-supplied URL (YouTube, Twitch, Dailymotion, Vimeo, or any
+    # generic web video URL) to a direct streamable URL using yt-dlp.
+    # Falls back gracefully when yt-dlp is unavailable: returns the original URL
+    # so mpegts.js / ffmpeg can attempt direct playback (works for plain .m3u8 /
+    # .ts / direct-stream URLs without needing yt-dlp at all).
+    #
+    # Body JSON:  { "url": str }
+    # Response:   { "url": str, "title": str, "is_live": bool, "via": str }
+    #             or { "error": str } on failure
+    #
+    @app.route('/api/multiview/resolve_url', methods=['POST'])
+    def multiview_resolve_url():
+        data    = request.get_json(silent=True) or {}
+        raw_url = (data.get('url') or '').strip()
+        # quality: 'best' | '1080' | '720' | '480' | '360'
+        quality = (data.get('quality') or 'best').strip()
+
+        if not raw_url:
+            return jsonify({'error': 'url is required'}), 400
+
+        # ── Build yt-dlp format selector from quality hint ────────────────────
+        def _fmt_selector(q: str) -> str:
+            """Translate a simple quality label to a yt-dlp format string."""
+            if q in ('best', '', None):
+                return 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio/best'
+            # Numeric height — pick the closest available without going over
+            try:
+                h = int(q)
+            except ValueError:
+                return 'best[ext=mp4]/best'
+            # e.g. "best[height<=720][ext=mp4]/best[height<=720]/best"
+            return (
+                f'best[height<={h}][ext=mp4]'
+                f'/best[height<={h}]'
+                f'/bestvideo[height<={h}]+bestaudio'
+                f'/best'
+            )
+
+        # ── Attempt yt-dlp resolution ─────────────────────────────────────────
+        try:
+            import yt_dlp  # type: ignore
+        except ImportError:
+            # yt-dlp not installed — return the URL as-is for direct playback
+            LOG.info('[MV][resolve_url] yt-dlp not available, returning raw URL')
+            return jsonify({
+                'url':     raw_url,
+                'title':   '',
+                'is_live': False,
+                'via':     'direct',
+            })
+
+        try:
+            ydl_opts = {
+                'quiet':            True,
+                'no_warnings':      True,
+                'skip_download':    True,
+                # Format selector respects user's quality choice.
+                # For live streams the HLS lookup below takes precedence anyway.
+                'format':           _fmt_selector(quality),
+                # Hard timeout so the endpoint never hangs indefinitely
+                'socket_timeout':   15,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(raw_url, download=False)
+
+            if not info:
+                return jsonify({'error': 'yt-dlp returned no info'}), 502
+
+            title   = info.get('title') or info.get('id') or ''
+            is_live = bool(info.get('is_live'))
+
+            # Prefer an HLS manifest for live streams (mpegts.js handles it natively)
+            # then fall back to the best direct URL.
+            resolved = None
+            formats  = info.get('formats') or []
+
+            if is_live:
+                # For live streams, select an HLS manifest that matches the
+                # requested height. yt-dlp exposes per-quality HLS URLs in
+                # the formats list — iterate highest-first and pick the best
+                # one that fits within the requested height cap.
+                try:
+                    h_cap = int(quality) if quality not in ('best', '', None) else 99999
+                except (ValueError, TypeError):
+                    h_cap = 99999
+
+                def _hls_formats(fmts):
+                    """All HLS formats sorted best (highest height) first."""
+                    return sorted(
+                        [f for f in fmts
+                         if f.get('protocol') in ('m3u8', 'm3u8_native') and f.get('url')],
+                        key=lambda f: f.get('height') or 0,
+                        reverse=True,
+                    )
+
+                hls_fmts = _hls_formats(formats)
+                # Pick the best HLS that fits within h_cap
+                hls_picked = next(
+                    (f for f in hls_fmts if (f.get('height') or 99999) <= h_cap),
+                    hls_fmts[0] if hls_fmts else None,   # fallback: best available
+                )
+                hls = hls_picked.get('url') if hls_picked else None
+
+                # Last resort: info.get('url') may itself be an HLS manifest
+                resolved = hls or info.get('url') or (formats[-1].get('url') if formats else None)
+                actual_h = hls_picked.get('height') if hls_picked else None
+            else:
+                # For VOD: prefer the resolved single-file URL yt-dlp chose
+                # (already filtered by format selector), then fall back.
+                resolved = info.get('url') or (formats[-1].get('url') if formats else None)
+                actual_h = info.get('height') or (formats[-1].get('height') if formats else None)
+
+            if not resolved:
+                return jsonify({'error': 'yt-dlp could not extract a stream URL'}), 502
+
+            LOG.info('[MV][resolve_url] resolved  title=%r  live=%s  quality=%s  height=%s  via=yt-dlp',
+                     title, is_live, quality, actual_h)
+            return jsonify({
+                'url':     resolved,
+                'title':   title,
+                'is_live': is_live,
+                'quality': quality,
+                'height':  actual_h,
+                'via':     'yt-dlp',
+            })
+
+        except Exception as exc:
+            LOG.error('[MV][resolve_url] yt-dlp error: %s', exc)
+            return jsonify({'error': str(exc)}), 502
+
+    LOG.info('[MV] Multiview routes registered  '
+             '(layouts_file=%s)', LAYOUTS_FILE)
