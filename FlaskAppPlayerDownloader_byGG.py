@@ -13443,9 +13443,17 @@ async function _mvPlayChannel(wid, channel, cEl){
 
   // Store channel + live flag on the element so bottom-bar buttons can access them
   cEl._mvChannel = channel;
-  cEl._mvIsLive  = !mvExternalUrlWidgets.has(wid) || (channel._is_live !== false);
+  // Determine live/VOD: use the mode tag set at pick time (most reliable),
+  // then channel._is_live (set by yt-dlp for external URLs),
+  // then fallback to live for portal channels without a mode tag.
+  const _modeTag = channel._mvMode || '';
+  cEl._mvIsLive  = _modeTag === 'vod' || _modeTag === 'series'
+    ? false   // VOD/Series are always non-live
+    : (channel._is_live !== false) && !mvExternalUrlWidgets.has(wid)
+        ? true  // portal live channel
+        : (channel._is_live !== false);  // external URL: respect yt-dlp flag
 
-  // Update bottom bar visibility: Record=live, MKV=vod/external non-live
+  // Update bottom bar visibility: Record=live only, MKV=VOD/non-live only
   const _bb     = cEl.querySelector('.mv-bottom-bar');
   const _recBtn = cEl.querySelector('.mv-rec-btn');
   const _mkvBtn = cEl.querySelector('.mv-mkv-btn');
@@ -13453,10 +13461,14 @@ async function _mvPlayChannel(wid, channel, cEl){
   if(_recBtn) _recBtn.style.display = _isLive ? '' : 'none';
   if(_mkvBtn) _mkvBtn.style.display = !_isLive ? '' : 'none';
   if(_bb){
-    const hasAny = (_isLive || !_isLive); // always show bar when playing
     _bb.classList.toggle('mv-bb-visible', true);
-    // Reset record button state (new channel)
     if(_recBtn){ _recBtn.classList.remove('mv-recording'); _recBtn.textContent='⏺ Record'; }
+  }
+
+  // Show seek bar immediately for known VOD content (portal VOD/series)
+  if(!_isLive){
+    const _seekW = cEl.querySelector('.mv-seek-wrap');
+    if(_seekW) _seekW.classList.add('mv-seek-visible');
   }
 
   // Store original URL — mirrors multiview.js: playerUrls.set(widgetId, channel.url)
@@ -13482,13 +13494,16 @@ async function _mvPlayChannel(wid, channel, cEl){
       toast('Browser does not support MSE — cannot play transcoded stream', 'err');
       _mvStopCleanup(wid, true); return;
     }
-    // Determine if this is live or VOD — same heuristic as the main player
-    const _hlsIsLive = channel._is_live !== false
-      && !channel._direct_url
-      && !mvExternalUrlWidgets.has(wid)
-      && channel.tvg_type !== 'movie'
-      && channel.tvg_type !== 'series'
-      && !(resolvedUrl.includes('vod=1'));
+    // Determine if this is live or VOD using the mode tag (set at pick time)
+    const _modeTag2 = channel._mvMode || '';
+    const _hlsIsLive = _modeTag2 === 'vod' || _modeTag2 === 'series'
+      ? false
+      : channel._is_live !== false
+          && !channel._direct_url
+          && !mvExternalUrlWidgets.has(wid)
+          && channel.tvg_type !== 'movie'
+          && channel.tvg_type !== 'series'
+          && !(resolvedUrl.includes('vod=1'));
 
     const player = mpegts.createPlayer({
       type:   'mse',
