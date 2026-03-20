@@ -1734,6 +1734,8 @@ class AirPlayCaster(_BaseCaster):
         self._last_url:   Optional[str] = None
         self._last_title: str           = ""
         self._is_paused:  bool          = False
+        self._device_host: str          = ""
+        self._device_port: int          = 0
 
     async def discover(self, timeout: float = 5.0) -> List[CastDevice]:
         devices = []
@@ -1784,6 +1786,8 @@ class AirPlayCaster(_BaseCaster):
         if config:
             try:
                 self._atv = await _try(config)
+                self._device_host = device.host
+                self._device_port = device.port
                 return
             except CastConnectionError:
                 raise
@@ -1800,6 +1804,8 @@ class AirPlayCaster(_BaseCaster):
             if not config:
                 raise CastConnectionError(f"AirPlay device {device.name!r} not found")
             self._atv = await _try(config)
+            self._device_host = device.host
+            self._device_port = device.port
         except CastConnectionError:
             raise
         except Exception as exc:
@@ -1860,53 +1866,97 @@ class AirPlayCaster(_BaseCaster):
         except Exception as exc:
             LOG.warning("[CAST][AP] stop() failed: %s", exc)
 
+    async def _airplay_http_control(self, path: str) -> bool:
+        """Send a command to the device's AirPlay HTTP control server.
+
+        While a stream is playing the device runs an HTTP server on its AirPlay
+        port that accepts the same control commands iTunes/QuickTime use:
+          POST /rate?value=0   → pause  (sets playback rate to 0)
+          POST /rate?value=1   → resume (sets playback rate to 1)
+          GET  /playback-info  → current rate/position
+
+        Returns True if the command was accepted (HTTP 2xx).
+        """
+        if not self._device_host or not self._device_port:
+            return False
+        loop = asyncio.get_running_loop()
+        def _do():
+            try:
+                import http.client as _hc
+                conn = _hc.HTTPConnection(self._device_host, self._device_port, timeout=3)
+                conn.request("POST", path, body=b"",
+                             headers={"Content-Length": "0",
+                                      "User-Agent": "MediaControl/1.0"})
+                resp = conn.getresponse()
+                conn.close()
+                LOG.info("[CAST][AP] HTTP control %s → %s", path, resp.status)
+                return resp.status < 300
+            except Exception as exc:
+                LOG.warning("[CAST][AP] HTTP control %s failed: %s", path, exc)
+                return False
+        return await loop.run_in_executor(None, _do)
+
     async def pause(self) -> None:
-        """Pause AirPlay playback.
+        """Pause via AirPlay HTTP control API (POST /rate?value=0).
 
-        remote_control.pause() sends an MRP keypress that the device ACKs at
-        the protocol level but silently ignores for push-URL streams — play_url()
-        is fire-and-forget with no attached media session for MRP to act on.
-
-        Only reliable approach: stop the stream at the AirPlay level and remember
-        the URL so resume() can re-issue play_url().  Same pattern as DLNA Pause
-        (SOAP Stop) and Chromecast mc.stop() on live streams.
+        Always sends the command — never gates on _is_paused, because the
+        client-side flag easily desynchronises when the HTTP control server
+        drops after a pause or the stream is restarted via play_url().
         """
         if not self._atv:
             raise CastConnectionError("Not connected to an AirPlay device")
         if not self._last_url:
             raise PlaybackError("No stream to pause — play a channel first")
-        if self._is_paused:
-            return  # already paused
 
-        try:
-            await self._atv.remote_control.stop()
-        except Exception as exc:
-            LOG.warning("[CAST][AP] stop during pause failed: %s", exc)
-
-        self._is_paused = True
-        LOG.info("[CAST][AP] pause OK (stream stopped — resume will re-cast)")
-        if _app_state_ref:
-            try: _app_state_ref.log("[CAST][AP] ⏸ Paused (resume will re-cast)")
-            except Exception: pass
+        ok = await self._airplay_http_control("/rate?value=0")
+        self._is_paused = True  # always mark paused so resume knows to re-play
+        if ok:
+            LOG.info("[CAST][AP] pause OK (HTTP /rate?value=0)")
+            if _app_state_ref:
+                try: _app_state_ref.log("[CAST][AP] ⏸ Paused")
+                except Exception: pass
+        else:
+            LOG.info("[CAST][AP] HTTP /rate?value=0 failed — stopping stream")
+            try:
+                await self._atv.remote_control.stop()
+            except Exception as exc:
+                LOG.warning("[CAST][AP] stop fallback failed: %s", exc)
+            if _app_state_ref:
+                try: _app_state_ref.log("[CAST][AP] ⏸ Paused (stream stopped)")
+                except Exception: pass
 
     async def resume(self) -> None:
-        """Resume AirPlay playback by re-issuing play_url() with the last URL."""
+        """Resume via AirPlay HTTP control API (POST /rate?value=1).
+
+        Always re-issues play_url() as the reliable fallback — the HTTP
+        /rate?value=1 command only works if the device still has the stream
+        buffered (i.e. paused via rate=0, not stopped). If HTTP fails or the
+        stream was stopped, play_url() restarts it cleanly.
+        """
         if not self._atv:
             raise CastConnectionError("Not connected to an AirPlay device")
         if not self._last_url:
             raise PlaybackError("No stream to resume — play a channel first")
 
-        LOG.info("[CAST][AP] resume: re-issuing play_url → %s", self._last_url[:80])
-        if _app_state_ref:
-            try: _app_state_ref.log(f"[CAST][AP] ▶ Resuming: {self._last_url[:60]}…")
-            except Exception: pass
-        try:
-            await self._atv.stream.play_url(self._last_url, position=0)
+        ok = await self._airplay_http_control("/rate?value=1")
+        if ok:
             self._is_paused = False
-            LOG.info("[CAST][AP] resume OK")
-        except Exception as exc:
-            LOG.warning("[CAST][AP] play_url during resume raised %s "
-                        "(stream may still be starting): %s", type(exc).__name__, exc)
+            LOG.info("[CAST][AP] resume OK (HTTP /rate?value=1)")
+            if _app_state_ref:
+                try: _app_state_ref.log("[CAST][AP] ▶ Resumed")
+                except Exception: pass
+        else:
+            # HTTP failed (stream was stopped, or control server dropped) — re-play
+            LOG.info("[CAST][AP] HTTP /rate?value=1 failed — re-issuing play_url")
+            if _app_state_ref:
+                try: _app_state_ref.log(f"[CAST][AP] ▶ Resuming via re-cast…")
+                except Exception: pass
+            try:
+                await self._atv.stream.play_url(self._last_url, position=0)
+                LOG.info("[CAST][AP] resume OK (re-play)")
+            except Exception as exc:
+                LOG.warning("[CAST][AP] re-play raised %s (stream may still start): %s",
+                            type(exc).__name__, exc)
             self._is_paused = False
 
     async def set_volume(self, level: float) -> None:
@@ -1917,9 +1967,11 @@ class AirPlayCaster(_BaseCaster):
                 LOG.warning("[CAST][AP] set_volume() failed: %s", exc)
 
     async def disconnect(self) -> None:
-        self._is_paused  = False
-        self._last_url   = None
-        self._last_title = ""
+        self._is_paused   = False
+        self._last_url    = None
+        self._last_title  = ""
+        self._device_host = ""
+        self._device_port = 0
         if self._atv:
             try:
                 result = self._atv.close()
