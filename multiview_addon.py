@@ -153,9 +153,11 @@ class StreamBroadcaster:
     def __init__(self, stream_key: str, channel_url: str,
                  user_agent: str = 'Mozilla/5.0',
                  transcode: bool = False,
-                 audio_only: bool = False) -> None:
+                 audio_only: bool = False,
+                 audio_url: str = '') -> None:
         self.stream_key:  str   = stream_key
         self.channel_url: str   = channel_url
+        self.audio_url:   str   = audio_url   # separate audio stream (e.g. YouTube 720p+)
         self.user_agent:  str   = user_agent
         self.transcode:   bool  = transcode
         self.audio_only:  bool  = audio_only  # True = copy video, re-encode audio only
@@ -201,46 +203,40 @@ class StreamBroadcaster:
         ffmpeg = _get_ffmpeg()
 
         if self.transcode:
-            # HEVC → H.264 transcode: re-encode video + audio for full compatibility.
-            # mirrors /api/hls_proxy?transcode=1 logic
             codec_args = [
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-tune', 'zerolatency',
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-ac', '2',
-                '-ar', '48000',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+                '-c:a', 'aac', '-b:a', '128k', '-ac', '2', '-ar', '48000',
             ]
             LOG.info('[MV] Spawning ffmpeg with HEVC→H.264 transcode  key=%s', self.stream_key)
         elif self.audio_only:
-            # Stream-copy video, re-encode audio only (AC3/EAC3/DTS → AAC).
-            # Used when the video codec is already browser-compatible (H.264)
-            # but the audio codec is not (e.g. EAC3 / AC3 / DTS).
             codec_args = [
-                '-c:v', 'copy',
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-ac', '2',
-                '-ar', '48000',
+                '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-ac', '2', '-ar', '48000',
             ]
             LOG.info('[MV] Spawning ffmpeg with audio-only transcode  key=%s', self.stream_key)
         else:
             codec_args = ['-c', 'copy']
 
-        cmd = [
-            ffmpeg,
-            '-hide_banner',
-            '-loglevel', 'error',
-            '-user_agent', self.user_agent,
-            '-reconnect', '1',
-            '-reconnect_streamed', '1',
-            '-reconnect_delay_max', '5',
-            '-i', self.channel_url,
-        ] + codec_args + [
-            '-f', 'mpegts',
-            'pipe:1',
-        ]
+        ua_args = ['-user_agent', self.user_agent, '-reconnect', '1',
+                   '-reconnect_streamed', '1', '-reconnect_delay_max', '5']
+
+        if self.audio_url:
+            # Two separate streams (e.g. YouTube 720p+): video + audio inputs
+            # Always encode video to H.264 — YouTube separate streams may be VP9/AV1
+            LOG.info('[MV] Spawning ffmpeg with merged video+audio (H.264 encode)  key=%s', self.stream_key)
+            cmd = [
+                ffmpeg, '-hide_banner', '-loglevel', 'error',
+            ] + ua_args + ['-i', self.channel_url,
+            ] + ua_args + ['-i', self.audio_url,
+                '-map', '0:v:0', '-map', '1:a:0',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+                '-c:a', 'aac', '-b:a', '128k', '-ac', '2', '-ar', '48000',
+                '-f', 'mpegts', 'pipe:1',
+            ]
+        else:
+            cmd = [
+                ffmpeg, '-hide_banner', '-loglevel', 'error',
+            ] + ua_args + ['-i', self.channel_url,
+            ] + codec_args + ['-f', 'mpegts', 'pipe:1']
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -427,44 +423,30 @@ def _build_stream_key(client_id: str, channel_url: str) -> str:
 def _get_or_create_broadcaster(stream_key: str, channel_url: str,
                                 user_agent: str,
                                 transcode: bool = False,
-                                audio_only: bool = False) -> Optional[StreamBroadcaster]:
+                                audio_only: bool = False,
+                                audio_url: str = '') -> Optional[StreamBroadcaster]:
     """
     Return existing broadcaster for stream_key (if alive) or create a new one.
-
-    Node.js equivalent (server.js /stream GET handler):
-        const activeStreamInfo = activeStreamProcesses.get(streamKey);
-        if (activeStreamInfo) {
-            activeStreamInfo.references++;
-            activeStreamInfo.lastAccess = Date.now();
-            activeStreamInfo.process.stdout.pipe(res);
-            ...
-            return;
-        }
-        // ── NEW stream ──
-        const ffmpeg = spawn('ffmpeg', args);
-        activeStreamProcesses.set(streamKey, newStreamInfo);
     """
     with _mv_streams_lock:
         existing = _mv_streams.get(stream_key)
 
         if existing:
             if existing.is_alive():
-                # Reuse — same as the server.js early-return branch
+                LOG.info('[MV] Reusing existing broadcaster  key=%s  refs=%d', stream_key, existing.references)
                 return existing
-            # Dead process left in map — clean it up before creating a fresh one
             LOG.warning('[MV] Dead broadcaster found in registry  key=%s  — replacing',
                         stream_key)
             existing.stop()
             del _mv_streams[stream_key]
 
-        # No existing broadcaster — spawn a new ffmpeg process
         broadcaster = StreamBroadcaster(stream_key, channel_url, user_agent,
-                                        transcode=transcode, audio_only=audio_only)
+                                        transcode=transcode, audio_only=audio_only,
+                                        audio_url=audio_url)
         if broadcaster.process:
             _mv_streams[stream_key] = broadcaster
             return broadcaster
 
-        # Spawn failed
         return None
 
 
@@ -650,6 +632,7 @@ def register_multiview_routes(app) -> None:
         user_agent  = request.args.get('ua', 'Mozilla/5.0').strip()
         transcode   = request.args.get('transcode', '0') == '1'
         audio_only  = request.args.get('audio_only', '0') == '1' and not transcode
+        audio_url   = request.args.get('audio_url', '').strip()
 
         if not channel_url:
             return 'url parameter is required', 400
@@ -663,10 +646,13 @@ def register_multiview_routes(app) -> None:
             stream_key += '::transcode'
         elif audio_only:
             stream_key += '::audio_only'
+        elif audio_url:
+            stream_key += '::merged'
 
         broadcaster = _get_or_create_broadcaster(stream_key, channel_url, user_agent,
                                                  transcode=transcode,
-                                                 audio_only=audio_only)
+                                                 audio_only=audio_only,
+                                                 audio_url=audio_url)
         if not broadcaster:
             return 'Failed to start ffmpeg stream process', 500
 
@@ -859,19 +845,25 @@ def register_multiview_routes(app) -> None:
 
         # ── Build yt-dlp format selector from quality hint ────────────────────
         def _fmt_selector(q: str) -> str:
-            """Translate a simple quality label to a yt-dlp format string."""
+            """Translate a simple quality label to a yt-dlp format string.
+            Force H.264 video (vcodec:h264) so the browser can decode it.
+            YouTube's higher qualities often use VP9/AV1 which mpegts.js can't play.
+            """
             if q in ('best', '', None):
-                return 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio/best'
-            # Numeric height — pick the closest available without going over
+                return (
+                    'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]'
+                    '/bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]'
+                    '/best[ext=mp4]/best'
+                )
             try:
                 h = int(q)
             except ValueError:
-                return 'best[ext=mp4]/best'
-            # e.g. "best[height<=720][ext=mp4]/best[height<=720]/best"
+                return 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
             return (
-                f'best[height<={h}][ext=mp4]'
+                f'bestvideo[height<={h}][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]'
+                f'/bestvideo[height<={h}][vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]'
+                f'/best[height<={h}][ext=mp4]'
                 f'/best[height<={h}]'
-                f'/bestvideo[height<={h}]+bestaudio'
                 f'/best'
             )
 
@@ -893,6 +885,7 @@ def register_multiview_routes(app) -> None:
                 'quiet':            True,
                 'no_warnings':      True,
                 'skip_download':    True,
+                'no_cache_dir':     True,   # force fresh URLs, not cached signed URLs
                 # Format selector respects user's quality choice.
                 # For live streams the HLS lookup below takes precedence anyway.
                 'format':           _fmt_selector(quality),
@@ -910,8 +903,9 @@ def register_multiview_routes(app) -> None:
 
             # Prefer an HLS manifest for live streams (mpegts.js handles it natively)
             # then fall back to the best direct URL.
-            resolved = None
-            formats  = info.get('formats') or []
+            resolved       = None
+            resolved_audio = None
+            formats        = info.get('formats') or []
 
             if is_live:
                 # For live streams, select an HLS manifest that matches the
@@ -944,24 +938,70 @@ def register_multiview_routes(app) -> None:
                 resolved = hls or info.get('url') or (formats[-1].get('url') if formats else None)
                 actual_h = hls_picked.get('height') if hls_picked else None
             else:
-                # For VOD: prefer the resolved single-file URL yt-dlp chose
-                # (already filtered by format selector), then fall back.
-                resolved = info.get('url') or (formats[-1].get('url') if formats else None)
-                actual_h = info.get('height') or (formats[-1].get('height') if formats else None)
+                # For VOD: extract video URL and optional separate audio URL
+                video_url = None
+                audio_url_out = None
+                actual_h = None
+
+                # requested_formats: separate video+audio (merged format selection)
+                req_fmts = info.get('requested_formats') or []
+                if len(req_fmts) >= 2:
+                    for rf in req_fmts:
+                        vcodec = rf.get('vcodec', 'none')
+                        acodec = rf.get('acodec', 'none')
+                        if vcodec != 'none' and not video_url:
+                            video_url = rf.get('url')
+                            actual_h  = rf.get('height')
+                        elif acodec != 'none' and not audio_url_out:
+                            audio_url_out = rf.get('url')
+                elif req_fmts:
+                    video_url = req_fmts[0].get('url')
+                    actual_h  = req_fmts[0].get('height')
+
+                # requested_downloads: pre-muxed single file
+                if not video_url:
+                    req_dl = info.get('requested_downloads') or []
+                    if req_dl and req_dl[0].get('url'):
+                        video_url = req_dl[0]['url']
+                        actual_h  = req_dl[0].get('height') or info.get('height')
+
+                # Direct url field (pre-muxed)
+                if not video_url:
+                    video_url = info.get('url')
+                    actual_h  = info.get('height')
+
+                # Last resort: best format from the formats list
+                if not video_url and formats:
+                    by_height = sorted(
+                        [f for f in formats if f.get('url') and f.get('vcodec','none')!='none'],
+                        key=lambda f: f.get('height') or 0, reverse=True
+                    )
+                    if by_height:
+                        video_url = by_height[0]['url']
+                        actual_h  = by_height[0].get('height')
+
+                resolved      = video_url
+                resolved_audio = audio_url_out
 
             if not resolved:
                 return jsonify({'error': 'yt-dlp could not extract a stream URL'}), 502
 
-            LOG.info('[MV][resolve_url] resolved  title=%r  live=%s  quality=%s  height=%s  via=yt-dlp',
-                     title, is_live, quality, actual_h)
-            return jsonify({
-                'url':     resolved,
-                'title':   title,
-                'is_live': is_live,
-                'quality': quality,
-                'height':  actual_h,
-                'via':     'yt-dlp',
-            })
+            duration_secs = None if is_live else info.get('duration')
+
+            LOG.info('[MV][resolve_url] resolved  title=%r  live=%s  quality=%s  height=%s  audio=%s  via=yt-dlp',
+                     title, is_live, quality, actual_h, 'yes' if (not is_live and resolved_audio) else 'no')
+            resp = {
+                'url':       resolved,
+                'title':     title,
+                'is_live':   is_live,
+                'quality':   quality,
+                'height':    actual_h,
+                'duration':  duration_secs,
+                'via':       'yt-dlp',
+            }
+            if not is_live and resolved_audio:
+                resp['audio_url'] = resolved_audio
+            return jsonify(resp)
 
         except Exception as exc:
             LOG.error('[MV][resolve_url] yt-dlp error: %s', exc)
