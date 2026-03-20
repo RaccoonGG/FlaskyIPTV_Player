@@ -1709,13 +1709,31 @@ except ImportError:
 
 class AirPlayCaster(_BaseCaster):
     """AirPlay via pyatv — same pattern as ChromecastCaster/DLNACaster.
-    No raw sockets, no custom HTTP: just pyatv.connect() + stream.play_url()."""
+    No raw sockets, no custom HTTP: just pyatv.connect() + stream.play_url().
+
+    Pause/resume notes
+    ──────────────────
+    pyatv's remote_control.pause() sends an MRP key-press which only works on
+    Apple TV devices with full MRP pairing.  For RAOP/AirPlay-only devices, and
+    even for MRP devices playing a push-URL stream, pyatv has no active media
+    session to attach the command to — play_url() is fire-and-forget.
+
+    Fix (same pattern as Chromecast mc.pause / DLNA SOAP Pause): track the last
+    played URL and implement pause/resume by:
+      • pause  → remote_control.stop() (terminates the AirPlay session cleanly)
+                 then set _is_paused = True
+      • resume → re-issue play_url(_last_url) so the device picks up the live
+                 stream from the current position (live IPTV has no rewind buffer)
+    """
 
     def __init__(self):
         if not _HAS_AIRPLAY:
             raise CastError("pyatv not installed — run: pip install pyatv")
         self._atv         = None
         self._device_conf = None
+        self._last_url:   Optional[str] = None
+        self._last_title: str           = ""
+        self._is_paused:  bool          = False
 
     async def discover(self, timeout: float = 5.0) -> List[CastDevice]:
         devices = []
@@ -1726,7 +1744,7 @@ class AirPlayCaster(_BaseCaster):
                 except Exception: pass
         _log(f"[CAST][AP] AirPlay discovery starting (timeout={int(timeout)}s)\u2026")
         try:
-            atvs = await _pyatv.scan(loop=asyncio.get_event_loop(),
+            atvs = await _pyatv.scan(loop=asyncio.get_running_loop(),
                                      timeout=int(timeout))
             _log(f"[CAST][AP] pyatv scan returned {len(atvs)} raw device(s): {[a.name for a in atvs]}")
             for atv in atvs:
@@ -1759,7 +1777,7 @@ class AirPlayCaster(_BaseCaster):
         async def _try(cfg):
             if credentials:
                 cfg.set_credentials(_pyatv_conf.Protocol.AirPlay, credentials)
-            atv = await _pyatv.connect(cfg, loop=asyncio.get_event_loop())
+            atv = await _pyatv.connect(cfg, loop=asyncio.get_running_loop())
             self._device_conf = cfg
             return atv
 
@@ -1775,7 +1793,7 @@ class AirPlayCaster(_BaseCaster):
         try:
             LOG.warning("[CAST][AP] Re-scanning for %s\u2026", device.identifier)
             atvs = await _pyatv.scan(identifier=device.identifier,
-                                     loop=asyncio.get_event_loop(), timeout=3)
+                                     loop=asyncio.get_running_loop(), timeout=3)
             if atvs:
                 config = atvs[0]
                 device.metadata["conf"] = config
@@ -1791,7 +1809,7 @@ class AirPlayCaster(_BaseCaster):
         config = device.metadata.get("conf")
         try:
             atvs = await _pyatv.scan(identifier=device.identifier,
-                                     loop=asyncio.get_event_loop(), timeout=3)
+                                     loop=asyncio.get_running_loop(), timeout=3)
             if atvs:
                 config = atvs[0]
                 device.metadata["conf"] = config
@@ -1801,7 +1819,7 @@ class AirPlayCaster(_BaseCaster):
             raise CastError("Missing AirPlay configuration")
         config.set_credentials(_pyatv_conf.Protocol.AirPlay, None)
         return await _pyatv.pair(config, _pyatv_conf.Protocol.AirPlay,
-                                 loop=asyncio.get_event_loop())
+                                 loop=asyncio.get_running_loop())
 
     async def play(self, url: str, title: str = "IPTV Stream",
                    content_type: str = "video/mp2t",
@@ -1812,34 +1830,96 @@ class AirPlayCaster(_BaseCaster):
         if _app_state_ref:
             try: _app_state_ref.log(f"[CAST][AP] play_url \u2192 {url[:80]}")
             except Exception: pass
+        # Store URL BEFORE play_url() so pause/resume work even if play_url()
+        # raises — pyatv often raises TimeoutError/ConnectionLostError after the
+        # device receives the URL and drops the push connection (fire-and-forget),
+        # while the stream actually starts playing fine on the device.
+        self._last_url   = url
+        self._last_title = title
+        self._is_paused  = False
         try:
             await self._atv.stream.play_url(url, position=0)
         except Exception as exc:
             if _HAS_AIRPLAY and isinstance(exc, _pyatv.exceptions.NotSupportedError):
                 raise PlaybackError("AirPlay device does not support play_url")
-            raise PlaybackError(f"AirPlay playback failed: {exc}") from exc
+            # Log but don't raise — device likely started playing despite the error
+            LOG.warning("[CAST][AP] play_url raised %s (stream may still be playing): %s",
+                        type(exc).__name__, exc)
+            if _app_state_ref:
+                try: _app_state_ref.log(f"[CAST][AP] ⚠ play_url raised {type(exc).__name__} "
+                                        f"(stream may still be active): {exc}")
+                except Exception: pass
 
     async def stop(self) -> None:
-        if self._atv:
-            try: await self._atv.remote_control.stop()
-            except Exception: pass
+        self._is_paused = False
+        if not self._atv:
+            return
+        try:
+            await self._atv.remote_control.stop()
+            LOG.info("[CAST][AP] stop OK")
+        except Exception as exc:
+            LOG.warning("[CAST][AP] stop() failed: %s", exc)
 
     async def pause(self) -> None:
-        if self._atv:
-            try: await self._atv.remote_control.pause()
+        """Pause AirPlay playback.
+
+        remote_control.pause() sends an MRP keypress that the device ACKs at
+        the protocol level but silently ignores for push-URL streams — play_url()
+        is fire-and-forget with no attached media session for MRP to act on.
+
+        Only reliable approach: stop the stream at the AirPlay level and remember
+        the URL so resume() can re-issue play_url().  Same pattern as DLNA Pause
+        (SOAP Stop) and Chromecast mc.stop() on live streams.
+        """
+        if not self._atv:
+            raise CastConnectionError("Not connected to an AirPlay device")
+        if not self._last_url:
+            raise PlaybackError("No stream to pause — play a channel first")
+        if self._is_paused:
+            return  # already paused
+
+        try:
+            await self._atv.remote_control.stop()
+        except Exception as exc:
+            LOG.warning("[CAST][AP] stop during pause failed: %s", exc)
+
+        self._is_paused = True
+        LOG.info("[CAST][AP] pause OK (stream stopped — resume will re-cast)")
+        if _app_state_ref:
+            try: _app_state_ref.log("[CAST][AP] ⏸ Paused (resume will re-cast)")
             except Exception: pass
 
     async def resume(self) -> None:
-        if self._atv:
-            try: await self._atv.remote_control.play()
+        """Resume AirPlay playback by re-issuing play_url() with the last URL."""
+        if not self._atv:
+            raise CastConnectionError("Not connected to an AirPlay device")
+        if not self._last_url:
+            raise PlaybackError("No stream to resume — play a channel first")
+
+        LOG.info("[CAST][AP] resume: re-issuing play_url → %s", self._last_url[:80])
+        if _app_state_ref:
+            try: _app_state_ref.log(f"[CAST][AP] ▶ Resuming: {self._last_url[:60]}…")
             except Exception: pass
+        try:
+            await self._atv.stream.play_url(self._last_url, position=0)
+            self._is_paused = False
+            LOG.info("[CAST][AP] resume OK")
+        except Exception as exc:
+            LOG.warning("[CAST][AP] play_url during resume raised %s "
+                        "(stream may still be starting): %s", type(exc).__name__, exc)
+            self._is_paused = False
 
     async def set_volume(self, level: float) -> None:
         if self._atv:
-            try: await self._atv.audio.set_volume(level * 100)
-            except Exception: pass
+            try:
+                await self._atv.audio.set_volume(level * 100)
+            except Exception as exc:
+                LOG.warning("[CAST][AP] set_volume() failed: %s", exc)
 
     async def disconnect(self) -> None:
+        self._is_paused  = False
+        self._last_url   = None
+        self._last_title = ""
         if self._atv:
             try:
                 result = self._atv.close()
@@ -1991,7 +2071,7 @@ class CastingManager:
             pass
         caster._atv = None
         caster._atv = await _pyatv.connect(
-            caster._device_conf, loop=asyncio.get_event_loop()
+            caster._device_conf, loop=asyncio.get_running_loop()
         )
         LOG.warning("[CAST][AP] Reconnected OK")
 
@@ -2301,8 +2381,14 @@ def register_cast_routes(flask_app, app_state, run_async_fn, make_client_fn):
 
         # AirPlay: pass the raw URL directly to pyatv (same approach as casting.py).
         # pyatv sends it to the device; the device fetches it.
-        # If the device can't reach it, try the Flask proxy URL as fallback.
+        # Reconnect first to ensure the pyatv session is fresh — stale connections
+        # silently succeed on play_url but fail on later pause/resume calls.
         if isinstance(manager.active_caster, AirPlayCaster):
+            try:
+                manager.reconnect_airplay()
+                app_state.log("[CAST][AP] Reconnected before play_url")
+            except Exception as _rc_exc:
+                LOG.warning("[CAST][AP] reconnect_airplay failed (continuing): %s", _rc_exc)
             proxy_url   = source_url
             browser_url = None
             app_state.log(f"[CAST][AP] → {proxy_url[:80]}")
