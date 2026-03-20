@@ -5836,6 +5836,47 @@ def api_proxy_options():
     })
 
 
+@flask_app.route("/api/video_proxy")
+def api_video_proxy():
+    """Proxy a video URL with Range request support for seeking.
+    Used for YouTube VOD and other direct video URLs that need seek support.
+    Forwards Range headers so the browser can seek by requesting byte ranges.
+    """
+    url = request.args.get("url", "").strip()
+    if not url or not url.startswith(("http://", "https://")):
+        return Response("Invalid URL", status=400)
+
+    range_header = request.headers.get("Range")
+    req_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer":    "https://www.youtube.com/",
+    }
+    if range_header:
+        req_headers["Range"] = range_header
+
+    try:
+        import requests as _req
+        resp = _req.get(url, headers=req_headers, stream=True, timeout=30)
+        status = resp.status_code  # 200 or 206
+
+        forward_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Accept-Ranges": "bytes",
+        }
+        for h in ("Content-Type", "Content-Length", "Content-Range"):
+            if h in resp.headers:
+                forward_headers[h] = resp.headers[h]
+
+        def _stream():
+            for chunk in resp.iter_content(65536):
+                if chunk:
+                    yield chunk
+
+        return Response(_stream(), status=status, headers=forward_headers)
+    except Exception as e:
+        return Response(f"Video proxy error: {e}", status=502)
+
+
 @flask_app.route("/api/browse_exe", methods=["GET"])
 def api_browse_exe():
     """Open a native OS file picker and return the selected executable path."""
@@ -12779,7 +12820,13 @@ async function _mvPlayFromUrl(wid, rawUrl, cEl){
       }
       finalUrl    = d.url;
       channelName = d.title || '';
-      isLive      = d.is_live !== false;   // false = VOD → enable seek bar
+      isLive      = d.is_live !== false;
+      if(d.duration) cEl._mvKnownDuration = d.duration;
+      if(d.audio_url) cEl._mvAudioUrl = d.audio_url;
+      else cEl._mvAudioUrl = '';
+      // For YouTube VOD: flag to use video_proxy for direct seekable playback
+      if(!isLive && d.via === 'yt-dlp') cEl._mvUseVideoProxy = true;
+      else cEl._mvUseVideoProxy = false;
     } catch(e){
       toast('Could not resolve URL: ' + e, 'err');
       if(titleEl) titleEl.textContent = 'No Channel';
@@ -13254,32 +13301,51 @@ function _mvAttachListeners(cEl, wid){
     return m+':'+(ss<10?'0':'')+ss;
   };
   const _syncSeek = () => {
-    if(!isFinite(videoEl.duration)||videoEl.duration<=0){
-      // Live — show indicator, hide the range (no seekable range)
-      seekBar.style.display = 'none';
-      seekTime.textContent  = '🔴 LIVE';
+    // Use video element duration if finite, or fall back to known duration from yt-dlp
+    const dur = (isFinite(videoEl.duration) && videoEl.duration > 0)
+      ? videoEl.duration
+      : (cEl._mvKnownDuration || 0);
+
+    if(dur <= 0){
+      if(cEl._mvIsLive === false){
+        seekBar.style.display = 'none';
+        seekTime.textContent  = videoEl.currentTime > 0
+          ? _fmtTime(videoEl.currentTime) : '▶ VOD';
+        seekTime.style.color  = '';
+      } else {
+        seekBar.style.display = 'none';
+        seekTime.textContent  = '● LIVE';
+        seekTime.style.color  = '#f87171';
+      }
       return;
     }
+    // We have a duration — show full seek bar
     seekBar.style.display = '';
-    seekBar.value = (videoEl.currentTime/videoEl.duration)*100;
-    seekTime.textContent = _fmtTime(videoEl.currentTime)+' / '+_fmtTime(videoEl.duration);
+    seekTime.style.color  = '';
+    seekBar.value = (videoEl.currentTime / dur) * 100;
+    seekTime.textContent = _fmtTime(videoEl.currentTime) + ' / ' + _fmtTime(dur);
   };
   const _tryShowSeek = () => {
-    // External URL widgets: always show (LIVE indicator or VOD seek)
-    // Portal channels: only show for VOD (finite duration)
-    const isExt = mvExternalUrlWidgets.has(wid);
+    const isExt  = mvExternalUrlWidgets.has(wid);
     const hasVod = isFinite(videoEl.duration) && videoEl.duration > 0 && videoEl.duration < 86400;
-    if(isExt || hasVod){
+    const isKnownVod = cEl._mvIsLive === false;
+    if(isExt || hasVod || isKnownVod){
       seekWrap.classList.add('mv-seek-visible');
       _syncSeek();
     }
   };
 
-  // Show immediately if already external (e.g. re-play after quality change)
-  if(mvExternalUrlWidgets.has(wid)){
+  // Show immediately if already external or known VOD
+  if(mvExternalUrlWidgets.has(wid) || cEl._mvIsLive === false){
     seekWrap.classList.add('mv-seek-visible');
     seekBar.style.display = 'none';
-    seekTime.textContent  = '🔴 LIVE';
+    if(cEl._mvIsLive === false){
+      seekTime.textContent = '▶ VOD';
+      seekTime.style.color = '';
+    } else {
+      seekTime.textContent = '● LIVE';
+      seekTime.style.color = '#f87171';
+    }
   }
 
   videoEl.addEventListener('loadedmetadata', _tryShowSeek);
@@ -13291,6 +13357,10 @@ function _mvAttachListeners(cEl, wid){
   videoEl.addEventListener('emptied', () => {
     if(!mvExternalUrlWidgets.has(wid)) seekWrap.classList.remove('mv-seek-visible');
     seekBar.style.display = '';
+    // If this cell is known to be VOD, restore the seek bar
+    if(cEl._mvIsLive === false){
+      seekWrap.classList.add('mv-seek-visible');
+    }
   });
 
   seekBar.addEventListener('click', e => e.stopPropagation());
@@ -13298,8 +13368,10 @@ function _mvAttachListeners(cEl, wid){
   seekBar.addEventListener('touchstart', e => e.stopPropagation(), {passive:true});
   seekBar.addEventListener('input', e => {
     e.stopPropagation();
-    if(isFinite(videoEl.duration) && videoEl.duration>0)
-      videoEl.currentTime = (parseFloat(e.target.value)/100) * videoEl.duration;
+    const dur = (isFinite(videoEl.duration) && videoEl.duration > 0)
+      ? videoEl.duration : (cEl._mvKnownDuration || 0);
+    if(dur > 0)
+      videoEl.currentTime = (parseFloat(e.target.value)/100) * dur;
     _syncSeek();
   });
 
@@ -13311,9 +13383,11 @@ function _mvAttachListeners(cEl, wid){
       e.stopPropagation();
       const rawUrl = cEl._mvRawUrl;
       if(!rawUrl){ toast('Quality only applies to YouTube/external URLs','wrn'); return; }
-      // Re-resolve and re-play with the new quality
+      console.log('[MV/quality] changing to', qualSel.value, 'rawUrl=', rawUrl.slice(0,60));
       _mvPlayFromUrl(wid, rawUrl, cEl);
     });
+    // Start hidden — _mvPlayChannel shows it for external/YouTube URLs
+    qualSel.style.display = 'none';
   }
 
   // Click anywhere on widget → make it the active player
@@ -13471,7 +13545,12 @@ async function _mvPlayChannel(wid, channel, cEl){
     if(_seekW) _seekW.classList.add('mv-seek-visible');
   }
 
-  // Store original URL — mirrors multiview.js: playerUrls.set(widgetId, channel.url)
+  // Show/hide quality selector — only relevant for YouTube/external URLs
+  const _qs = cEl.querySelector('.mv-quality-sel');
+  if(_qs) _qs.style.display = mvExternalUrlWidgets.has(wid) ? '' : 'none';
+
+  // Store the RAW channel URL (not the proxy URL) so _mvStopCleanup can
+  // send the right URL to /api/multiview/stream/stop for key matching.
   mvUrls.set(wid, resolvedUrl);
 
   // ── Record portal metadata for the connection-count badge ─────────────────
@@ -13483,6 +13562,43 @@ async function _mvPlayChannel(wid, channel, cEl){
   });
   // Refresh all badges (connection counts change when this widget starts)
   _mvUpdatePortalBadges();
+
+  // ── YouTube/yt-dlp VOD: play via video_proxy for range-based seeking ────────
+  // The multiview ffmpeg proxy streams linearly — seek jumps are impossible.
+  // For yt-dlp VOD content, use /api/video_proxy which forwards Range headers,
+  // enabling the browser to seek by requesting byte ranges from YouTube directly.
+  // The video proxy also fixes quality — each resolve gets a fresh URL at the
+  // requested quality, and the browser plays it natively.
+  if(cEl._mvUseVideoProxy && !channel._is_live){
+    const proxyVideoUrl = '/api/video_proxy?url=' + encodeURIComponent(resolvedUrl);
+    const dur = cEl._mvKnownDuration || 0;
+
+    if(typeof Hls !== 'undefined' && (resolvedUrl.includes('.m3u8') || resolvedUrl.includes('m3u8'))){
+      // HLS manifest (YouTube live at specific quality)
+      const hlsInst = new Hls({ enableWorker:false, maxBufferLength:60 });
+      hlsInst.loadSource(proxyVideoUrl);
+      hlsInst.attachMedia(videoEl);
+      hlsInst.on(Hls.Events.MANIFEST_PARSED, ()=>{ videoEl.play().catch(()=>{}); });
+      hlsInst.on(Hls.Events.ERROR, (_,d)=>{ if(d.fatal){ toast('Stream error','err'); _mvStopCleanup(wid,true); }});
+      mvPlayers.set(wid, {pause:()=>videoEl.pause(), unload:()=>hlsInst.stopLoad(),
+        detachMediaElement:()=>hlsInst.detachMedia(), destroy:()=>hlsInst.destroy()});
+    } else {
+      // Direct mp4 — use native <video> element with the proxy URL
+      // Native video supports range-based seeking natively
+      videoEl.src = proxyVideoUrl;
+      videoEl.play().catch(()=>{});
+      mvPlayers.set(wid, {pause:()=>videoEl.pause(), unload:()=>{},
+        detachMediaElement:()=>{ videoEl.pause(); videoEl.removeAttribute('src'); },
+        destroy:()=>{ videoEl.pause(); videoEl.removeAttribute('src'); }});
+    }
+    const muteBtn3 = cEl.querySelector('.mv-mute-btn');
+    if(mvPlayers.size <= 1){ videoEl.muted=false; if(muteBtn3) muteBtn3.textContent='🔊'; }
+    // Show seek bar
+    const seekW3 = cEl.querySelector('.mv-seek-wrap');
+    if(seekW3) seekW3.classList.add('mv-seek-visible');
+    if(dur) cEl._mvKnownDuration = dur;
+    return;
+  }
 
   // ── Audio-transcoded stream: play hls_proxy MPEG-TS directly via mpegts.js ─
   // When /api/resolve returned an /api/hls_proxy URL (e.g. EAC3→AAC transcode),
@@ -13550,7 +13666,8 @@ async function _mvPlayChannel(wid, channel, cEl){
   const proxyUrl = '/api/multiview/stream?'
     + 'url='        + encodeURIComponent(resolvedUrl)
     + '&client_id=' + encodeURIComponent(mvClientId)
-    + (channel._mv_transcode ? '&transcode=1' : '');
+    + (channel._mv_transcode ? '&transcode=1' : '')
+    + (cEl._mvAudioUrl ? '&audio_url=' + encodeURIComponent(cEl._mvAudioUrl) : '');
 
   // ── Create mpegts.js player ────────────────────────────────────────────────
   // mirrors multiview.js mpegts.createPlayer block exactly
@@ -13586,6 +13703,11 @@ async function _mvPlayChannel(wid, channel, cEl){
   mvPlayers.set(wid, player);
   player.attachMediaElement(videoEl);
   player.load();
+  // Re-add seek bar for VOD after load (the emptied event fired during load removes it)
+  if(!cEl._mvIsLive){
+    const _sw = cEl.querySelector('.mv-seek-wrap');
+    if(_sw) _sw.classList.add('mv-seek-visible');
+  }
 
   try {
     await player.play();
