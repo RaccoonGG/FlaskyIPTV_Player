@@ -7518,6 +7518,23 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .mv-seek-wrap.mv-seek-visible{display:flex}
 .mv-seek{flex:1;height:3px;cursor:pointer;accent-color:var(--acc);min-width:0}
 .mv-seek-time{font-size:9px;color:rgba(255,255,255,.75);white-space:nowrap;flex-shrink:0;font-variant-numeric:tabular-nums}
+/* MV bottom action bar — sits just above the seek bar */
+.mv-bottom-bar{
+  position:absolute;bottom:22px;left:0;right:0;z-index:6;
+  display:none;align-items:center;gap:4px;padding:3px 5px;
+  background:linear-gradient(transparent,rgba(0,0,0,.5));
+}
+.mv-widget-content:hover .mv-bottom-bar.mv-bb-visible{display:flex}
+.mv-bb-btn{
+  height:20px;padding:0 7px;font-size:9px;font-weight:700;
+  border-radius:3px;border:1px solid rgba(255,255,255,.2);
+  background:rgba(0,0,0,.55);color:rgba(255,255,255,.9);
+  cursor:pointer;white-space:nowrap;flex-shrink:0;
+}
+.mv-bb-btn:hover{background:rgba(255,255,255,.12)}
+.mv-rec-btn{color:#f87171;border-color:rgba(248,113,113,.4)}
+.mv-rec-btn.mv-recording{color:#f87171;animation:dvr-pulse 1.4s ease infinite}
+.mv-widget-content.mv-tiny .mv-bottom-bar{display:none!important}
 /* Quality selector in ctrl area */
 .mv-quality-sel{
   height:22px;font-size:10px;padding:0 2px;background:var(--s3);
@@ -13103,6 +13120,10 @@ function _mvAddWidget(channel, layout){
           <input type="range" class="mv-seek" min="0" max="100" step="0.1" value="0">
           <span class="mv-seek-time">0:00</span>
         </div>
+        <div class="mv-bottom-bar">
+          <button class="mv-rec-btn mv-bb-btn" title="Quick Record">⏺ Record</button>
+          <button class="mv-mkv-btn mv-bb-btn" title="Download MKV">⬇ MKV</button>
+        </div>
       </div>
     </div>`;
 
@@ -13297,6 +13318,58 @@ function _mvAttachListeners(cEl, wid){
 
   // Click anywhere on widget → make it the active player
   cEl.addEventListener('click', ()=> _mvSetActive(wid));
+
+  // ── Bottom bar: Record + MKV ──────────────────────────────────────────────
+  const recBtn  = cEl.querySelector('.mv-rec-btn');
+  const mkvBtn  = cEl.querySelector('.mv-mkv-btn');
+  const bottomBar = cEl.querySelector('.mv-bottom-bar');
+
+  if(recBtn) recBtn.addEventListener('click', async e=>{
+    e.stopPropagation();
+    const ch = cEl._mvChannel;
+    const name = ch ? (ch.name||ch.o_name||'Recording') : 'Recording';
+    const rawUrl = mvUrls.get(wid) || '';
+    if(!rawUrl){ toast('No stream loaded','wrn'); return; }
+    // Strip proxy wrapper so ffmpeg gets the real portal URL
+    let url = rawUrl;
+    if(url.includes('/api/hls_proxy')){
+      try{ const p=new URLSearchParams(url.split('?')[1]||''); url=p.get('url')||url; }catch(e_){}
+    }
+    if(recBtn.classList.contains('mv-recording')){
+      // Stop
+      await fetch('/api/record/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+      recBtn.classList.remove('mv-recording');
+      recBtn.textContent='⏺ Record';
+      toast('Recording stopped','ok');
+    } else {
+      // Start
+      const od = document.getElementById('o-dir')?.value?.trim()||'';
+      const r2 = await fetch('/api/record/start',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({url, name, out_dir:od})});
+      const d2 = await r2.json();
+      if(d2.ok){
+        recBtn.classList.add('mv-recording');
+        recBtn.textContent='⏹ Stop';
+        toast('⏺ Recording: '+name,'ok');
+      } else toast(d2.error||'Record failed','err');
+    }
+  });
+
+  if(mkvBtn) mkvBtn.addEventListener('click', async e=>{
+    e.stopPropagation();
+    const ch = cEl._mvChannel;
+    if(!ch){ toast('No stream loaded','wrn'); return; }
+    const od = document.getElementById('o-dir')?.value?.trim();
+    if(!od){ toast('Set output folder in ⚙ settings first','wrn'); return; }
+    toast('Starting MKV download…','info');
+    try{
+      const r = await fetch('/api/download/mkv',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({items:[ch], mode:'vod', category:{}, out_dir:od})});
+      const d = await r.json();
+      if(d.error) toast(d.error,'err');
+      else toast('MKV download started','ok');
+    }catch(e_){ toast('Download error: '+e_,'err'); }
+  });
 }
 
 // ── PLAY ─────────────────────────────────────────────────────────────────────
@@ -13342,13 +13415,16 @@ async function _mvPlayChannel(wid, channel, cEl){
       // For HEVC video: server returns raw URL + hevc:true → addon handles via &transcode=1
       // For incompatible audio (AC3/DTS): server returns hls_proxy URL + hevc:false
       //   → played directly via mpegts.js (hls_proxy outputs raw MPEG-TS)
-      // Derive mode from the item itself: series/vod items have _is_show_item or _direct_url
-      const _mvResolveMode = (channel.tvg_type==='series'||channel._is_show_item||channel._direct_url)
-        ? (channel.tvg_type||'live') : 'live';
+      // Use the mode the item was picked from (tagged in _mvSelPickItem).
+      // Fall back to heuristics only if the tag is missing (e.g. saved layouts).
+      const _mvResolveMode = channel._mvMode
+        || ((channel.tvg_type==='series'||channel._is_show_item) ? (channel.tvg_type||'series')
+            : channel._direct_url ? 'vod' : 'live');
+      const _mvResolveCat  = channel._mvCat || curCat || {};
       const r = await fetch('/api/resolve?mv=1', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({item: channel, mode: _mvResolveMode, category: curCat || {}})
+        body: JSON.stringify({item: channel, mode: _mvResolveMode, category: _mvResolveCat})
       });
       const d = await r.json();
       resolvedUrl = d.url || '';
@@ -13363,6 +13439,24 @@ async function _mvPlayChannel(wid, channel, cEl){
   if(!resolvedUrl){
     toast('Could not resolve URL for: ' + (channel.name || '?'), 'err');
     _mvStopCleanup(wid, true); return;
+  }
+
+  // Store channel + live flag on the element so bottom-bar buttons can access them
+  cEl._mvChannel = channel;
+  cEl._mvIsLive  = !mvExternalUrlWidgets.has(wid) || (channel._is_live !== false);
+
+  // Update bottom bar visibility: Record=live, MKV=vod/external non-live
+  const _bb     = cEl.querySelector('.mv-bottom-bar');
+  const _recBtn = cEl.querySelector('.mv-rec-btn');
+  const _mkvBtn = cEl.querySelector('.mv-mkv-btn');
+  const _isLive = cEl._mvIsLive;
+  if(_recBtn) _recBtn.style.display = _isLive ? '' : 'none';
+  if(_mkvBtn) _mkvBtn.style.display = !_isLive ? '' : 'none';
+  if(_bb){
+    const hasAny = (_isLive || !_isLive); // always show bar when playing
+    _bb.classList.toggle('mv-bb-visible', true);
+    // Reset record button state (new channel)
+    if(_recBtn){ _recBtn.classList.remove('mv-recording'); _recBtn.textContent='⏺ Record'; }
   }
 
   // Store original URL — mirrors multiview.js: playerUrls.set(widgetId, channel.url)
@@ -13388,15 +13482,27 @@ async function _mvPlayChannel(wid, channel, cEl){
       toast('Browser does not support MSE — cannot play transcoded stream', 'err');
       _mvStopCleanup(wid, true); return;
     }
-    // isLive: true for live channels, false for VOD/series (enables seek bar + finite duration)
-    const _hlsIsLive = channel._is_live !== false && !channel._direct_url && channel.tvg_type !== 'movie' && channel.tvg_type !== 'series';
+    // Determine if this is live or VOD — same heuristic as the main player
+    const _hlsIsLive = channel._is_live !== false
+      && !channel._direct_url
+      && !mvExternalUrlWidgets.has(wid)
+      && channel.tvg_type !== 'movie'
+      && channel.tvg_type !== 'series'
+      && !(resolvedUrl.includes('vod=1'));
+
     const player = mpegts.createPlayer({
       type:   'mse',
       isLive: _hlsIsLive,
       url:    resolvedUrl,
     }, {
-      enableStashBuffer: true,
-      stashInitialSize:  4096,
+      enableStashBuffer:      true,
+      stashInitialSize:       _hlsIsLive ? 4096 : 128 * 1024 * 1024,
+      autoCleanupSourceBuffer: !_hlsIsLive,
+      lazyLoad:               false,
+      seekType:               _hlsIsLive ? 'range' : 'range',
+      liveBufferLatencyChasing:   _hlsIsLive,
+      liveBufferLatencyMaxLatency: _hlsIsLive ? 8 : undefined,
+      liveBufferLatencyMinRemain:  _hlsIsLive ? 2 : undefined,
     });
     player.on(mpegts.Events.ERROR, (errType, errDetail)=>{
       console.error('[MV/transcode] mpegts error wid='+wid, errType, errDetail);
@@ -13413,7 +13519,11 @@ async function _mvPlayChannel(wid, channel, cEl){
       if(mvPlayers.size === 1){ videoEl.muted=false; if(muteBtn) muteBtn.textContent='🔊'; }
       else if(muteBtn) muteBtn.textContent = videoEl.muted?'🔇':'🔊';
     } catch(e){ console.warn('[MV/transcode] play() error', e); }
-    _mvUpdateSeekBar(wid);
+    // For VOD: show seek bar once duration is known
+    if(!_hlsIsLive){
+      const seekWrap2 = cEl.querySelector('.mv-seek-wrap');
+      if(seekWrap2) seekWrap2.classList.add('mv-seek-visible');
+    }
     return;
   }
 
@@ -13757,7 +13867,7 @@ function _mvOpenCtxMenu(btn, actions){
   const m = document.getElementById('mv-item-ctx');
   if(!m) return;
   m.innerHTML = actions.map(a=>
-    `<button onclick="${a.fn}">${a.icon} ${esc(a.label)}</button>`
+    `<button onclick="${a.fn}"><span style="width:18px;text-align:center;flex-shrink:0;font-size:13px">${a.icon}</span>${esc(a.label)}</button>`
   ).join('');
   m.classList.add('open');
   // Use fixed viewport coords — the menu is position:fixed so it escapes
@@ -13833,6 +13943,9 @@ function _mvSelPickItem(i){
     it = (_mvSelFilteredItems.length ? _mvSelFilteredItems : _mvSelItems)[i];
   }
   if(!it) return;
+  // Tag the item with the current selector mode so _mvPlayChannel resolves it correctly
+  it._mvMode = _mvSelContentMode;
+  if(_mvSelCat) it._mvCat = _mvSelCat;
   _mvCloseCtxMenu();
   document.getElementById('mv-sel-overlay').classList.remove('open');
   if(mvSelCallback){ mvSelCallback(it); mvSelCallback=null; }
