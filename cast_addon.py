@@ -1717,7 +1717,16 @@ class AirPlayCaster(_BaseCaster):
 
     async def discover(self, timeout: float = 5.0) -> List[CastDevice]:
         devices = []
-        LOG.info("[CAST][AP] AirPlay discovery starting (timeout=%ds)…", int(timeout))
+
+        def _log(msg):
+            LOG.warning(msg)
+            if _app_state_ref:
+                try:
+                    _app_state_ref.log(msg)
+                except Exception:
+                    pass
+
+        _log(f"[CAST][AP] AirPlay discovery starting (timeout={int(timeout)}s)…")
         try:
             # Pass loop= explicitly — required for pyatv <0.14; harmlessly ignored in 0.14+.
             # Without it, pyatv calls asyncio.get_event_loop() internally which returns
@@ -1726,7 +1735,7 @@ class AirPlayCaster(_BaseCaster):
                 loop=asyncio.get_event_loop(),
                 timeout=int(timeout),
             )
-            LOG.info("[CAST][AP] pyatv scan returned %d raw device(s)", len(atvs))
+            _log(f"[CAST][AP] pyatv scan returned {len(atvs)} raw device(s): {[a.name for a in atvs]}")
             for atv in atvs:
                 # Try AirPlay 2 first, fall back to RAOP (AirPlay 1) so that
                 # third-party AirCast / AirPlay-1-only receivers are also detected.
@@ -1737,7 +1746,7 @@ class AirPlayCaster(_BaseCaster):
                     except AttributeError:
                         pass  # pyatv version does not expose RAOP
                 if not svc:
-                    LOG.debug("[CAST][AP] Skipping %r — no AirPlay/RAOP service", atv.name)
+                    _log(f"[CAST][AP] Skipping {atv.name!r} — no AirPlay/RAOP service")
                     continue
                 devices.append(CastDevice(
                     name=atv.name,
@@ -1748,10 +1757,8 @@ class AirPlayCaster(_BaseCaster):
                     metadata={"conf": atv},
                 ))
         except Exception as exc:
-            LOG.warning("[CAST][AP] AirPlay discovery error (%s): %s",
-                        type(exc).__name__, exc)
-        LOG.info("[CAST][AP] Discovery complete — %d device(s): %s",
-                 len(devices), [d.name for d in devices])
+            _log(f"[CAST][AP] AirPlay discovery error ({type(exc).__name__}): {exc}")
+        _log(f"[CAST][AP] Discovery complete — {len(devices)} device(s): {[d.name for d in devices]}")
         return devices
 
     async def connect(self, device: CastDevice,
@@ -1961,8 +1968,8 @@ class CastingManager:
 
     async def _discover_all_async(self, timeout: float) -> List[CastDevice]:
         unique = list({id(c): c for c in self.casters.values()}.values())
-        LOG.info("[CAST] Running %d caster(s): %s",
-                 len(unique), [type(c).__name__ for c in unique])
+        LOG.warning("[CAST] Running %d caster(s): %s",
+                    len(unique), [type(c).__name__ for c in unique])
         results = await asyncio.gather(
             *[c.discover(timeout) for c in unique],
             return_exceptions=True,
