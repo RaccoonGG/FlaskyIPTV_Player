@@ -87,6 +87,13 @@ except ImportError:
     _MULTIVIEW_AVAILABLE = False
     def register_multiview_routes(*a, **kw): pass
 
+try:
+    from dvr_addon import register_dvr_routes
+    _DVR_AVAILABLE = True
+except ImportError:
+    _DVR_AVAILABLE = False
+    def register_dvr_routes(*a, **kw): pass
+
 # ===================== OPTIONAL DEPS =====================
 
 try:
@@ -3168,6 +3175,8 @@ if _CAST_AVAILABLE:
     register_cast_routes(flask_app, state, run_async, _make_client)
 if _MULTIVIEW_AVAILABLE:
     register_multiview_routes(flask_app)
+if _DVR_AVAILABLE:
+    register_dvr_routes(flask_app, state)
 
 @flask_app.route('/api/multiview/available')
 def multiview_available():
@@ -3193,6 +3202,7 @@ def index():
         "ffmpeg_ok": ffmpeg_ok,
         "ffprobe_ok": ffprobe_ok,
         "ytdlp_ok": YTDLP_AVAILABLE,
+        "dvr_ok": _DVR_AVAILABLE,
     })
     tags = []
     tags.append('<span class="tag tag-ok">✓ ffmpeg</span>' if ffmpeg_ok else '<span class="tag tag-err">✗ ffmpeg</span>')
@@ -5848,26 +5858,43 @@ def api_browse_exe():
         return jsonify({"path": "", "error": str(e)})
 
 
-@flask_app.route("/api/browse_subtitle", methods=["GET"])
-def api_browse_subtitle():
-    """Desktop only: open a native OS file picker for subtitle files."""
+@flask_app.route("/api/browse_folder", methods=["GET"])
+def api_browse_folder():
+    """Desktop only: open a native OS folder picker (askdirectory)."""
     try:
         import tkinter as tk
         from tkinter import filedialog
         root = tk.Tk()
         root.withdraw()
         root.wm_attributes("-topmost", True)
-        path = filedialog.askopenfilename(
-            title="Select Subtitle File",
-            filetypes=[
-                ("Subtitle files", "*.srt *.vtt *.ass *.ssa"),
-                ("All files", "*.*"),
-            ],
-        )
+        path = filedialog.askdirectory(title="Select DVR Output Folder")
         root.destroy()
         return jsonify({"path": path or ""})
     except Exception as e:
         return jsonify({"path": "", "error": str(e)})
+
+
+@flask_app.route("/api/reveal_in_folder", methods=["POST"])
+def api_reveal_in_folder():
+    """Open the folder containing a file and highlight it (Windows Explorer / macOS Finder / Linux)."""
+    data = request.get_json(force=True)
+    path = (data.get("path") or "").strip()
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "File not found"}), 404
+    try:
+        if os.name == "nt":
+            # Windows: open Explorer with the file selected
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)],
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        elif sys.platform == "darwin":
+            # macOS: Finder reveal
+            subprocess.Popen(["open", "-R", path])
+        else:
+            # Linux: open the folder (file managers vary — xdg-open the directory)
+            subprocess.Popen(["xdg-open", os.path.dirname(path)])
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @flask_app.route("/api/load_subtitle_path", methods=["POST"])
@@ -5903,6 +5930,7 @@ def api_browse_dir():
     """List directory contents for the mobile subtitle file browser."""
     data = request.get_json(force=True)
     path = (data.get("path") or "/sdcard/Download").rstrip("/") or "/"
+    dirs_only = data.get("dirs_only", False)
     try:
         entries = os.listdir(path)
     except PermissionError:
@@ -5919,7 +5947,7 @@ def api_browse_dir():
         try:
             if os.path.isdir(full):
                 dirs.append(name)
-            elif os.path.isfile(full) and os.path.splitext(name)[1].lower() in sub_exts:
+            elif not dirs_only and os.path.isfile(full) and os.path.splitext(name)[1].lower() in sub_exts:
                 files.append(name)
         except Exception:
             pass
@@ -6428,6 +6456,7 @@ input[type=checkbox]{width:auto;height:auto;padding:0;accent-color:var(--acc);tr
 /* ─── buttons ────────────────────────────────────────────────── */
 button{cursor:pointer;border:none;border-radius:var(--rsm);padding:9px 16px;font-size:13px;
   font-weight:600;transition:var(--tr);outline:none;white-space:nowrap;
+  display:inline-flex;align-items:center;justify-content:center;gap:5px;
   -webkit-tap-highlight-color:transparent;user-select:none;position:relative;overflow:hidden}
 /* Shine sweep — animates left→right on hover only, resets instantly on release */
 button::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
@@ -7570,6 +7599,29 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 #mv-confirm-msg{font-size:12px;color:var(--txt2);margin-bottom:14px;line-height:1.5}
 .mv-confirm-btns{display:flex;gap:7px;justify-content:flex-end}
 .mv-confirm-btns button{height:32px;padding:0 14px;font-size:12px}
+/* ─── DVR panel ────────────────────────────────────────────────────────────── */
+.dvr-card{display:flex;flex-direction:column;gap:3px;padding:9px 11px;
+  background:rgba(255,255,255,.02);border:1px solid var(--bdr);border-radius:var(--rsm);
+  transition:var(--tr);position:relative;overflow:hidden}
+.dvr-card:hover{border-color:rgba(124,58,237,.25);background:rgba(124,58,237,.04)}
+.dvr-card-top{display:flex;align-items:center;gap:6px;min-width:0}
+.dvr-card-title{flex:1;font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dvr-card-ch{font-size:10px;color:var(--txt3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dvr-card-meta{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:1px}
+.dvr-card-time{font-size:10px;color:var(--txt3)}
+.dvr-badge{display:inline-block;padding:1px 7px;border-radius:20px;font-size:9px;
+  font-weight:800;text-transform:uppercase;letter-spacing:.5px;flex-shrink:0}
+.dvr-badge.scheduled{background:rgba(59,130,246,.15);color:#60a5fa;border:1px solid rgba(59,130,246,.3)}
+.dvr-badge.recording{background:rgba(220,38,38,.2);color:#f87171;border:1px solid rgba(220,38,38,.4);
+  animation:dvr-pulse 1.4s ease infinite}
+@keyframes dvr-pulse{0%,100%{opacity:1}50%{opacity:.55}}
+.dvr-badge.completed{background:rgba(34,197,94,.12);color:#4ade80;border:1px solid rgba(34,197,94,.25)}
+.dvr-badge.error{background:rgba(239,68,68,.15);color:#fca5a5;border:1px solid rgba(239,68,68,.3)}
+.dvr-badge.cancelled{background:rgba(107,114,128,.15);color:#9ca3af;border:1px solid rgba(107,114,128,.25)}
+.dvr-card-btns{display:flex;gap:4px;flex-shrink:0;margin-top:2px;justify-content:flex-end}
+.dvr-card-btns button{height:24px;padding:0 8px;font-size:10px;font-weight:700;border-radius:var(--rss)}
+.dvr-rec-size{font-size:10px;color:var(--txt3)}
+.dvr-rec-dur{font-size:10px;color:var(--txt3)}
 </style>
 </head>
 <body>
@@ -8079,6 +8131,95 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 </div>
 <div id="item-menu-bg" onclick="closeItemMenu()" style="display:none;position:fixed;inset:0;z-index:799"></div>
 
+<div id="item-menu-bg" onclick="closeItemMenu()" style="display:none;position:fixed;inset:0;z-index:799"></div>
+
+<!-- DVR OVERLAY -->
+<div id="dvr-overlay" style="display:none;position:fixed;inset:0;z-index:850;background:rgba(0,0,0,.6);
+  backdrop-filter:blur(3px);align-items:center;justify-content:center">
+<div id="dvr-modal" style="background:var(--bg);border:1px solid var(--bdr);border-radius:var(--r);
+  width:min(440px,96vw);max-height:92vh;display:flex;flex-direction:column;overflow:hidden;
+  box-shadow:0 24px 64px rgba(0,0,0,.7)">
+
+  <!-- Header -->
+  <div style="display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--bdr);flex-shrink:0">
+    <span style="font-size:16px">📹</span>
+    <h3 style="flex:1;font-size:14px;font-weight:700;margin:0">DVR</h3>
+    <span class="badge" id="dvr-badge" style="display:none;margin-right:4px"></span>
+    <button class="btn-ghost" onclick="dvrClose()" style="height:28px;width:28px;padding:0;font-size:15px">✕</button>
+  </div>
+
+  <!-- Storage bar -->
+  <div id="dvr-storage-bar-wrap" style="padding:7px 14px 6px;flex-shrink:0;border-bottom:1px solid var(--bdr)">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">
+      <span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--txt3)">Storage</span>
+      <span id="dvr-storage-text" style="font-size:10px;color:var(--txt3)"></span>
+    </div>
+    <div style="height:5px;background:rgba(255,255,255,.08);border-radius:3px;overflow:hidden;margin-bottom:5px">
+      <div id="dvr-storage-bar" style="height:100%;width:0%;border-radius:3px;transition:width .4s"></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px">
+      <div id="dvr-storage-folder" style="font-size:10px;color:var(--txt3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0"></div>
+      <button class="btn-ghost" onclick="dvrPickFolder()" style="height:22px;padding:0 8px;font-size:10px;flex-shrink:0;display:flex;align-items:center;gap:4px">📂 Change</button>
+    </div>
+    <!-- Mobile inline folder browser (shown by dvrPickFolder on mobile) -->
+    <div id="dvr-fb-wrap" style="display:none;margin-top:6px">
+      <div style="display:flex;align-items:center;gap:5px;margin-bottom:4px">
+        <button class="btn-ghost" id="dvr-fb-up" onclick="dvrFbUp()" style="height:26px;padding:0 8px;font-size:14px">↑</button>
+        <span id="dvr-fb-path" style="font-size:10px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">/sdcard/Download</span>
+        <button class="btn-ghost" onclick="dvrFbConfirm()" style="height:26px;padding:0 8px;font-size:10px;color:#4ade80;border-color:rgba(34,197,94,.3)">✓ Select</button>
+        <button class="btn-ghost" onclick="document.getElementById('dvr-fb-wrap').style.display='none'" style="height:26px;padding:0 8px;font-size:11px">✕</button>
+      </div>
+      <div id="dvr-fb-list" style="max-height:160px;overflow-y:auto;border:1px solid var(--bdr);border-radius:var(--rss);background:var(--s3)"></div>
+    </div>
+  </div>
+
+  <div style="flex:1;overflow-y:auto;padding:10px 12px 12px">
+
+    <!-- Manual recording form -->
+    <div style="background:var(--s2);border:1px solid var(--bdr);border-radius:var(--rsm);padding:10px 12px;margin-bottom:10px">
+      <div style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.7px;color:var(--acc);margin-bottom:8px">⏱ Schedule Recording</div>
+      <div style="display:flex;gap:6px;align-items:center;margin-bottom:7px">
+        <button class="btn-ghost" id="dvr-ch-btn" onclick="dvrPickChannel()" style="height:28px;padding:0 10px;font-size:12px;flex-shrink:0">📺 Channel</button>
+        <span id="dvr-ch-name" style="font-size:12px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">No channel selected</span>
+      </div>
+      <input type="hidden" id="dvr-ch-id">
+      <input type="hidden" id="dvr-stream-url">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:7px">
+        <div>
+          <label style="font-size:10px;color:var(--txt3);display:block;margin-bottom:2px">Start</label>
+          <input type="datetime-local" id="dvr-start" style="width:100%;height:30px;font-size:11px;padding:0 6px;background:var(--s3);border:1px solid var(--bdr2);border-radius:var(--rss);color:var(--txt)">
+        </div>
+        <div>
+          <label style="font-size:10px;color:var(--txt3);display:block;margin-bottom:2px">End</label>
+          <input type="datetime-local" id="dvr-end" style="width:100%;height:30px;font-size:11px;padding:0 6px;background:var(--s3);border:1px solid var(--bdr2);border-radius:var(--rss);color:var(--txt)">
+        </div>
+      </div>
+      <div style="display:flex;gap:6px">
+        <button class="btn-blue" onclick="dvrScheduleManual()" style="flex:1;height:30px;font-size:12px">📅 Schedule</button>
+        <button class="btn-blue" onclick="dvrRecordNow()" style="flex:1;height:30px;font-size:12px;background:linear-gradient(135deg,#dc2626,#991b1b)">⏺ Record Now</button>
+      </div>
+    </div>
+
+    <!-- Scheduled / in-progress jobs -->
+    <div style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.7px;color:var(--txt3);margin-bottom:5px;display:flex;justify-content:space-between;align-items:center">
+      <span>Scheduled &amp; Recording</span>
+      <button class="btn-ghost" onclick="dvrClearJobs()" style="height:22px;padding:0 7px;font-size:10px;opacity:.7">Clear All</button>
+    </div>
+    <div id="dvr-jobs-empty" style="text-align:center;padding:14px;color:var(--txt3);font-size:12px;display:none">No scheduled recordings</div>
+    <div id="dvr-jobs-list" style="display:flex;flex-direction:column;gap:4px;margin-bottom:12px"></div>
+
+    <!-- Completed recordings -->
+    <div style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.7px;color:var(--txt3);margin-bottom:5px;display:flex;justify-content:space-between;align-items:center">
+      <span>Completed Recordings</span>
+      <button class="btn-ghost" onclick="dvrClearRecordings()" style="height:22px;padding:0 7px;font-size:10px;opacity:.7">Clear All</button>
+    </div>
+    <div id="dvr-recs-empty" style="text-align:center;padding:14px;color:var(--txt3);font-size:12px;display:none">No completed recordings</div>
+    <div id="dvr-recs-list" style="display:flex;flex-direction:column;gap:4px"></div>
+
+  </div>
+</div>
+</div><!-- /dvr-overlay -->
+
 <!-- BOTTOM NAV -->
 <nav id="botnav">
   <button class="nt on" id="t-cats" onclick="showT('p-cats','t-cats')">
@@ -8117,6 +8258,19 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
     <div id="adr-rec-section">
       <div class="adr-section-title">⏺ Recording</div>
       <button id="adr-rec-btn" onclick="togRec()">⏺ Record</button>
+      <button id="adr-dvr-btn" onclick="closeDrawer();dvrOpen()"
+        style="margin-top:6px;width:100%;height:auto;padding:8px 12px;font-size:13px;font-weight:700;
+        background:linear-gradient(135deg,rgba(124,58,237,.25),rgba(99,46,188,.25));
+        border:1px solid rgba(124,58,237,.4);border-radius:var(--rsm);cursor:pointer;
+        color:var(--txt);display:flex;align-items:center;gap:7px;flex-direction:column">
+        <span style="display:flex;align-items:center;gap:7px;width:100%;justify-content:center">
+          📹 DVR
+          <span id="dvr-badge-adr" style="display:none;background:var(--acc);
+            color:#fff;border-radius:20px;font-size:10px;padding:1px 6px;font-weight:800"></span>
+        </span>
+        <span id="dvr-adr-status" style="display:none;font-size:10px;font-weight:600;
+          color:#f87171;width:100%;text-align:center"></span>
+      </button>
       <div id="adr-rec-info">
         <div id="adr-rec-timer">00:00:00</div>
         <div id="adr-rec-fname"></div>
@@ -8397,6 +8551,15 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 <script src="https://cdn.jsdelivr.net/npm/gridstack@10.3.1/dist/gridstack-all.min.js"></script>
 <script>
 const CFG = {{ config | safe }};
+const _DVR_OK = CFG.dvr_ok === true;
+
+// Hide DVR button in Actions drawer if addon is not installed
+if(!_DVR_OK){
+  document.addEventListener('DOMContentLoaded', ()=>{
+    const btn = document.getElementById('adr-dvr-btn');
+    if(btn) btn.style.display = 'none';
+  });
+}
 
 // ── STATE ──────────────────────────────────────────────────
 let CT='mac', mode='live', curCat=null;
@@ -9639,6 +9802,70 @@ function iMenuCatchup(){
 
 async function iMenuRec(){
   closeItemMenu();
+  const it = filtItems[_iMenuIdx];
+  if(!it) return;
+
+  // If DVR addon is available, route through it so the recording is tracked,
+  // gets a proper filename, and appears in the DVR completed recordings list.
+  if(_DVR_OK){
+    const name = it.name || it.o_name || it.fname || 'Recording';
+    toast('Resolving stream…', 'info');
+    try{
+      const r = await fetch('/api/resolve', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({item: it, mode, category: curCat || {}})
+      });
+      const d = await r.json();
+      if(!d.url){ toast(d.error || 'Could not resolve stream URL', 'err'); return; }
+      // Strip hls_proxy wrapper — DVR ffmpeg records the raw portal stream.
+      // Proxy URLs like /api/hls_proxy?url=... can't be opened by an external ffmpeg process.
+      let recUrl = d.url;
+      if(recUrl.includes('/api/hls_proxy')){
+        try{
+          const params = new URLSearchParams(recUrl.split('?')[1]||'');
+          recUrl = params.get('url') || recUrl;
+        }catch(e){}
+      }
+      // Use end time from form if available, else default 2h
+      const dvrStart = document.getElementById('dvr-start')?.value;
+      const dvrEnd   = document.getElementById('dvr-end')?.value;
+      let durationMinutes = 120;
+      if(dvrStart && dvrEnd){
+        const diff = (new Date(dvrEnd) - new Date(dvrStart)) / 60000;
+        if(diff > 0) durationMinutes = Math.round(diff);
+      }
+      const rb = await fetch('/api/dvr/record_now', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          channelId:   it.id || it.stream_id || '',
+          channelName: name,
+          streamUrl:   recUrl,
+          title:       name,
+          durationMinutes,
+        })
+      });
+      const rd = await rb.json();
+      if(rb.ok){
+        toast('⏺ DVR recording started: ' + name, 'ok');
+        // Update DVR jobs + badge immediately so the Actions drawer reflects the new recording.
+        // Don't wait for the user to open the DVR modal.
+        try{
+          const j = await fetch('/api/dvr/jobs').then(r=>r.json());
+          if(Array.isArray(j)){
+            _dvrJobs = j;
+            _dvrInited = true;   // mark as initialised so future badge polls work
+            _dvrBadgeUpdate();
+          }
+        }catch(e){}
+        if(_dvrInited) dvrRefresh();
+      } else {
+        toast(rd.error || 'DVR record failed', 'err');
+      }
+    } catch(e){ toast('Record error: ' + e, 'err'); }
+    return;
+  }
+
+  // Fallback: quick record (no DVR addon)
   await playItem(_iMenuIdx);
   setTimeout(()=>{ if(!isRec) startRec(); }, 800);
 }
@@ -10044,7 +10271,10 @@ function doPlay(url, name, opts={}){
                || qs.includes('extension=mkv') || qs.includes('extension=mp4'));
 
   const isMpegTs = !isStorageUrl && !isHls && !isDirect && (
-               url.includes('/api/hls_proxy') // server-side transcode proxy
+               url.includes('/api/hls_proxy')       // server-side transcode proxy
+               || url.includes('/api/dvr/timeshift') // DVR timeshift — raw MPEG-TS live stream
+               || url.includes('/api/dvr/serve')     // DVR completed recording — MPEG-TS file
+               || url.includes('/api/dvr/transcode') // DVR completed recording — transcoded MPEG-TS
                || qs.includes('play_token=')  // MAC portals: short-lived token = raw MPEG-TS stream
                || u.endsWith('.ts')
                || u.endsWith('.mpg')
@@ -12078,6 +12308,36 @@ document.addEventListener('DOMContentLoaded',()=>{
   startLog();
   alog('IPTV Portal Builder ready.','k');
   alog('Tap ⚙ in the header to enter credentials and connect.','i');
+
+  // ── Global close wiring for mv-sel-overlay ───────────────────────────────
+  // These must be wired globally (not just inside _mvSetupListeners) so the
+  // close/cancel/✕ buttons work when the selector is opened from outside
+  // the multiview panel — e.g. DVR channel picker.
+  const _mvsOverlay = document.getElementById('mv-sel-overlay');
+  function _mvsClose(){
+    if(_mvsOverlay) _mvsOverlay.classList.remove('open');
+    if(typeof mvSelCallback !== 'undefined') mvSelCallback = null;
+    // Restore mode tabs visibility (they may have been hidden for DVR live-only mode)
+    const tabsEl = document.getElementById('mv-sel-tabs');
+    if(tabsEl) tabsEl.style.display = '';
+  }
+  const _mvsCloseBtn   = document.getElementById('mv-sel-close');
+  const _mvsCancelBtn  = document.getElementById('mv-sel-cancel');
+  if(_mvsCloseBtn)  _mvsCloseBtn.addEventListener('click',  _mvsClose);
+  if(_mvsCancelBtn) _mvsCancelBtn.addEventListener('click', _mvsClose);
+  if(_mvsOverlay){
+    _mvsOverlay.addEventListener('click', e=>{
+      if(e.target === _mvsOverlay) _mvsClose();
+    });
+  }
+
+  // ── DVR overlay backdrop click ────────────────────────────────────────────
+  const _dvrOvl = document.getElementById('dvr-overlay');
+  if(_dvrOvl){
+    _dvrOvl.addEventListener('click', e=>{
+      if(e.target === _dvrOvl) dvrClose();
+    });
+  }
 });
 // ── WHAT'S ON NOW ──────────────────────────────────────────
 let _wonPrograms = [];
@@ -13547,8 +13807,10 @@ function _mvBuildItemRow(it, i, forEpisodes){
     // Directly playable — play button
     btns += `<button class="btn-blue" style="height:24px;padding:0 8px;font-size:11px" onclick="event.stopPropagation();_mvSelPickItem(${i})" title="Play in Multi-View">▶</button>`;
   }
-  // Submenu ⋮ — always shown
-  btns += `<button class="btn-ghost" style="padding:0 5px;font-size:16px;line-height:1" onclick="event.stopPropagation();_mvSelOpenItemMenu(${i},this)" title="More options">⋮</button>`;
+  // Submenu ⋮ — only for multiview widget context (not DVR channel picker)
+  if(_mvSelWidgetCtx){
+    btns += `<button class="btn-ghost" style="padding:0 5px;font-size:16px;line-height:1" onclick="event.stopPropagation();_mvSelOpenItemMenu(${i},this)" title="More options">⋮</button>`;
+  }
 
   const drillArrow = (isShow||isGroup) ? `<span style="color:var(--txt3);font-size:14px;flex-shrink:0">›</span>` : '';
 
@@ -13779,7 +14041,8 @@ function _mvRenderSel(){
     inp.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.stopPropagation(); doMvPlayUrl(); }});
     inp.addEventListener('click', e=> e.stopPropagation());
   }
-  playUrlRow.style.display = _mvSelContentMode === 'live' ? '' : 'none';
+  // Play URL row: only show for multiview (needs a widget target) and only in live mode
+  playUrlRow.style.display = (_mvSelContentMode === 'live' && _mvSelWidgetCtx) ? '' : 'none';
 
   const cats = (catsCache && catsCache[_mvSelContentMode]) ? catsCache[_mvSelContentMode] : [];
   if(!cats || !cats.length){
@@ -14043,24 +14306,33 @@ function _mvSetupListeners(){
   // (not applicable here since we're a full-overlay panel, but
   //  Escape key is a good UX addition that mirrors the Node.js app behaviour)
   document.addEventListener('keydown', e=>{
-    if(e.key==='Escape' && document.getElementById('p-mv').classList.contains('mv-active')){
-      // Close modals first, then the panel
+    if(e.key !== 'Escape') return;
+
+    // DVR overlay — highest priority, close it first
+    const dvrOvl = document.getElementById('dvr-overlay');
+    if(dvrOvl && dvrOvl.style.display === 'flex'){ dvrClose(); return; }
+
+    // mv-sel-overlay — may be open from DVR channel picker OR from multiview
+    if(document.getElementById('mv-sel-overlay').classList.contains('open')){
+      if(typeof _mvSelNavMode !== 'undefined' && _mvSelNavMode === 'items'){
+        _mvSelNavMode = 'cats'; _mvSelCat = null; _mvSelItems = [];
+        document.getElementById('mv-sel-search').value = '';
+        const tabsEl = document.getElementById('mv-sel-tabs');
+        if(tabsEl) tabsEl.style.display = '';
+        if(typeof _mvRenderSel === 'function') _mvRenderSel();
+      } else {
+        document.getElementById('mv-sel-overlay').classList.remove('open');
+        if(typeof mvSelCallback !== 'undefined') mvSelCallback = null;
+      }
+      return;
+    }
+
+    // Multiview-only modals — only when multiview panel is active
+    if(document.getElementById('p-mv').classList.contains('mv-active')){
       if(document.getElementById('mv-confirm-overlay').classList.contains('open')){
         document.getElementById('mv-confirm-overlay').classList.remove('open');
       } else if(document.getElementById('mv-save-overlay').classList.contains('open')){
         document.getElementById('mv-save-overlay').classList.remove('open');
-      } else if(document.getElementById('mv-sel-overlay').classList.contains('open')){
-        // If browsing items, go back to cats; if at cats level, close modal
-        if(_mvSelNavMode === 'items'){
-          _mvSelNavMode = 'cats'; _mvSelCat = null; _mvSelItems = [];
-          document.getElementById('mv-sel-search').value = '';
-          const tabsEl = document.getElementById('mv-sel-tabs');
-          if(tabsEl) tabsEl.style.display = '';
-          _mvRenderSel();
-        } else {
-          document.getElementById('mv-sel-overlay').classList.remove('open');
-          mvSelCallback = null;
-        }
       } else {
         mvClose();
       }
@@ -14125,6 +14397,574 @@ function mvHide(){
   _mvUpdateTop();
   _mvSyncDesktopBtn();
 })();
+
+// ── DVR ────────────────────────────────────────────────────────────────────
+
+let _dvrInited = false;
+let _dvrJobs = [];
+let _dvrRecs = [];
+
+function dvrOpen(){
+  if(!_DVR_OK){ toast('DVR addon (dvr_addon.py) is not installed','wrn'); return; }
+  document.getElementById('dvr-overlay').style.display = 'flex';
+  dvrInit();
+}
+
+function dvrClose(){
+  document.getElementById('dvr-overlay').style.display = 'none';
+}
+
+async function dvrInit(){
+  if(!_DVR_OK) return;
+  if(_dvrInited){ dvrRefresh(); return; }
+  _dvrInited = true;
+  await dvrRefresh();
+  // Pre-fill start to now + 1 min rounded, end to +1 hour
+  const pad = n => String(n).padStart(2,'0');
+  const toLocal = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const now = new Date(); now.setSeconds(0,0); now.setMinutes(now.getMinutes()+1);
+  const end = new Date(now.getTime() + 60*60*1000);
+  document.getElementById('dvr-start').value = toLocal(now);
+  document.getElementById('dvr-end').value   = toLocal(end);
+}
+
+async function dvrRefresh(){
+  try{
+    const [jr, rr, sr] = await Promise.all([
+      fetch('/api/dvr/jobs').then(r=>r.json()),
+      fetch('/api/dvr/recordings').then(r=>r.json()),
+      fetch('/api/dvr/storage').then(r=>r.json()),
+    ]);
+    _dvrJobs = Array.isArray(jr) ? jr : [];
+    _dvrRecs = Array.isArray(rr) ? rr : [];
+    _dvrRenderJobs();
+    _dvrRenderRecs();
+    _dvrRenderStorage(sr);
+    _dvrBadgeUpdate();
+  }catch(e){ toast('DVR: could not load data','err'); }
+}
+
+function _dvrFmt(iso){
+  if(!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+}
+function _dvrFmtBytes(b){
+  if(!b||b===0) return '';
+  const k=1024, sizes=['B','KB','MB','GB'];
+  const i=Math.floor(Math.log(b)/Math.log(k));
+  return (b/Math.pow(k,i)).toFixed(1)+' '+sizes[i];
+}
+function _dvrFmtDur(s){
+  if(!s) return '';
+  const h=Math.floor(s/3600), m=Math.floor((s%3600)/60);
+  return h>0?`${h}h ${m}m`:`${m}m`;
+}
+
+function _dvrRenderJobs(){
+  const el = document.getElementById('dvr-jobs-list');
+  const em = document.getElementById('dvr-jobs-empty');
+  if(!_dvrJobs.length){ el.innerHTML=''; em.style.display=''; return; }
+  em.style.display='none';
+  el.innerHTML = _dvrJobs.map(j=>{
+    const isRec    = j.status==='recording';
+    const canStop  = isRec;
+    const canEdit  = j.status==='scheduled';
+    const canCancel= j.status==='scheduled';
+    const canRemove= ['error','cancelled','completed'].includes(j.status);
+    // Progress bar for recording jobs — filled by _dvrTickProgress
+    const progressHtml = isRec ? `
+      <div style="margin-top:5px">
+        <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--txt3);margin-bottom:2px">
+          <span id="dvr-prog-time-${esc(j.id)}">Recording…</span>
+          <span id="dvr-prog-size-${esc(j.id)}"></span>
+        </div>
+        <div style="height:3px;background:rgba(255,255,255,.1);border-radius:2px;overflow:hidden">
+          <div id="dvr-prog-bar-${esc(j.id)}" style="height:100%;width:0%;background:#f87171;border-radius:2px;transition:width .5s"></div>
+        </div>
+      </div>` : '';
+    return `<div class="dvr-card" data-job="${esc(j.id)}">
+      <div class="dvr-card-top">
+        <span class="dvr-card-title">${esc(j.programTitle||'Recording')}</span>
+        <span class="dvr-badge ${j.status}">${j.status}</span>
+      </div>
+      <div class="dvr-card-ch">${esc(j.channelName||'')}</div>
+      <div class="dvr-card-meta">
+        <span class="dvr-card-time">${_dvrFmt(j.startTime)} – ${_dvrFmt(j.endTime)}</span>
+      </div>
+      ${progressHtml}
+      ${j.status==='error'&&j.errorMessage?`<div style="font-size:10px;color:#fca5a5;margin-top:2px">${esc(j.errorMessage)}</div>`:''}
+      <div class="dvr-card-btns">
+        ${isRec && j.filePath?`<button class="btn-blue" onclick="dvrTimeshift('${esc(j.id)}')" style="background:rgba(59,130,246,.25);color:#60a5fa">▶ Watch</button>`:
+          isRec?`<button class="btn-ghost" disabled style="opacity:.4;font-size:10px">Starting…</button>`:''}
+        ${canStop?`<button class="btn-ghost" style="color:#f87171" onclick="dvrStopJob('${esc(j.id)}')">⏹ Stop</button>`:''}
+        ${canEdit?`<button class="btn-ghost" onclick="dvrEditJob('${esc(j.id)}')">✏</button>`:''}
+        ${canCancel?`<button class="btn-ghost" style="color:#f87171" onclick="dvrCancelJob('${esc(j.id)}')">✕</button>`:''}
+        ${canRemove?`<button class="btn-ghost" onclick="dvrRemoveHistory('${esc(j.id)}')">🗑</button>`:''}
+      </div>
+    </div>`;
+  }).join('');
+  // Start ticking progress for recording jobs
+  _dvrPollProgress();
+}
+
+// Poll /api/dvr/progress every 3s while DVR overlay is open and a recording is active
+let _dvrProgressTimer = null;
+async function _dvrPollProgress(){
+  clearTimeout(_dvrProgressTimer);
+  const hasActive = _dvrJobs.some(j=>j.status==='recording');
+  if(!hasActive || document.getElementById('dvr-overlay')?.style.display!=='flex') return;
+  try{
+    const prog = await fetch('/api/dvr/progress').then(r=>r.json());
+    for(const [id, p] of Object.entries(prog)){
+      const elapsed = p.elapsedSeconds||0;
+      const total   = p.totalSeconds||0;
+      const size    = p.fileSizeBytes||0;
+      const h=Math.floor(elapsed/3600), m=Math.floor((elapsed%3600)/60), s=elapsed%60;
+      const timeStr = (h>0?`${h}h `:'') + `${String(m).padStart(2,'0')}m ${String(s).padStart(2,'0')}s`;
+      const pct = total>0 ? Math.min(100, Math.round(elapsed/total*100)) : 0;
+      const t = document.getElementById(`dvr-prog-time-${id}`);
+      const sz= document.getElementById(`dvr-prog-size-${id}`);
+      const bar=document.getElementById(`dvr-prog-bar-${id}`);
+      if(t)  t.textContent  = `${timeStr} / ${_dvrFmtDur(total)} (${pct}%)`;
+      if(sz) sz.textContent = size ? _dvrFmtBytes(size) : '';
+      if(bar)bar.style.width= pct+'%';
+    }
+  }catch(e){}
+  _dvrProgressTimer = setTimeout(_dvrPollProgress, 3000);
+}
+
+function _dvrRenderRecs(){
+  const el = document.getElementById('dvr-recs-list');
+  const em = document.getElementById('dvr-recs-empty');
+  if(!_dvrRecs.length){ el.innerHTML=''; em.style.display=''; return; }
+  em.style.display='none';
+  el.innerHTML = _dvrRecs.map(r=>{
+    const meta = [_dvrFmtDur(r.durationSeconds), _dvrFmtBytes(r.fileSizeBytes)].filter(Boolean).join(' · ');
+    return `<div class="dvr-card" data-rec="${esc(r.id)}">
+      <div class="dvr-card-top">
+        <span class="dvr-card-title">${esc(r.programTitle||r.filename||'Recording')}</span>
+        <span class="dvr-badge completed">saved</span>
+      </div>
+      <div class="dvr-card-ch">${esc(r.channelName||'')}</div>
+      <div class="dvr-card-meta">
+        <span class="dvr-card-time">${_dvrFmt(r.startTime)}</span>
+        ${meta?`<span class="dvr-card-time">· ${esc(meta)}</span>`:''}
+      </div>
+      <div class="dvr-card-btns">
+        <button class="btn-blue" onclick="dvrPlayRec('${esc(r.id)}')" style="font-size:10px">▶ Play</button>
+        <button class="btn-ghost" onclick="dvrRevealRec('${esc(r.id)}')" title="Show in folder" style="font-size:11px">📂</button>
+        <button class="btn-ghost" style="color:#f87171" onclick="dvrDeleteRec('${esc(r.id)}')">🗑</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function _dvrRenderStorage(s){
+  if(!s||s.error) return;
+  const pct = s.percentage||0;
+  const bar = document.getElementById('dvr-storage-bar');
+  bar.style.width = pct+'%';
+  bar.style.background = pct>90?'#dc2626':pct>75?'#ca8a04':'var(--acc)';
+  document.getElementById('dvr-storage-text').textContent =
+    `${_dvrFmtBytes(s.used)} of ${_dvrFmtBytes(s.total)} used`;
+  const fl = document.getElementById('dvr-storage-folder');
+  if(fl && s.folder) fl.textContent = s.folder;
+}
+
+function _dvrBadgeUpdate(){
+  const recording  = _dvrJobs.filter(j=>j.status==='recording');
+  const scheduled  = _dvrJobs.filter(j=>j.status==='scheduled');
+  const active     = recording.length;
+  // Modal header badge
+  const badge = document.getElementById('dvr-badge');
+  if(badge){ badge.textContent=active; badge.style.display=active?'':'none'; }
+  // Actions drawer badge
+  const badgeAdr = document.getElementById('dvr-badge-adr');
+  if(badgeAdr){ badgeAdr.textContent=active; badgeAdr.style.display=active?'':'none'; }
+  // Actions drawer status line
+  const statusEl = document.getElementById('dvr-adr-status');
+  if(statusEl){
+    if(recording.length){
+      statusEl.textContent = `⏺ Recording: ${recording.map(j=>j.programTitle||j.channelName).join(', ')}`.slice(0,55);
+      statusEl.style.display='';
+    } else if(scheduled.length){
+      statusEl.textContent = `${scheduled.length} recording${scheduled.length>1?'s':''} scheduled`;
+      statusEl.style.color = 'var(--txt3)';
+      statusEl.style.display='';
+    } else {
+      statusEl.style.display='none';
+    }
+  }
+}
+
+// Poll DVR status every 20s even when modal is closed, to keep Actions drawer current
+setInterval(async ()=>{
+  if(!_DVR_OK || !_dvrInited) return;
+  if(document.getElementById('dvr-overlay')?.style.display==='flex') return; // full refresh handles it
+  try{
+    const j = await fetch('/api/dvr/jobs').then(r=>r.json());
+    if(Array.isArray(j)){ _dvrJobs=j; _dvrBadgeUpdate(); }
+  }catch(e){}
+}, 20000);
+
+// ── Storage folder picker ──────────────────────────────────────────────────
+let _dvrFbCurrentPath = '/sdcard/Download';
+
+async function dvrPickFolder(){
+  if(_isMobile){
+    // Mobile: show inline folder browser
+    document.getElementById('dvr-fb-wrap').style.display = '';
+    await dvrFbNav(_dvrFbCurrentPath);
+  } else {
+    // Desktop: tkinter askdirectory
+    try{
+      const r = await fetch('/api/browse_folder');
+      const d = await r.json();
+      if(d.path){
+        dvrSetFolder(d.path);
+        dvrRefresh();
+      }
+    } catch(e){
+      toast('Folder picker failed: '+e,'err');
+    }
+  }
+}
+
+async function dvrFbNav(path){
+  _dvrFbCurrentPath = path;
+  document.getElementById('dvr-fb-path').textContent = path;
+  const listEl = document.getElementById('dvr-fb-list');
+  const upBtn  = document.getElementById('dvr-fb-up');
+  listEl.innerHTML = '<div style="padding:8px 12px;font-size:11px;color:var(--txt3)">Loading…</div>';
+  try{
+    const r = await fetch('/api/browse_dir',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path, dirs_only: true}),
+    });
+    const d = await r.json();
+    if(upBtn) upBtn.disabled = !d.parent;
+    const rows = (d.dirs||[]).map(name=>{
+      const full = path.replace(/\/+$/,'') + '/' + name;
+      return `<div class="sub-fb-row sub-fb-dir" onclick="dvrFbNav('${esc(full)}')">
+        <span class="sub-fb-icon">📁</span>
+        <span class="sub-fb-name">${esc(name)}</span>
+        <span class="sub-fb-arr">›</span>
+      </div>`;
+    });
+    if(!rows.length) rows.push('<div style="padding:10px 12px;font-size:11px;color:var(--txt3)">No subfolders here</div>');
+    listEl.innerHTML = rows.join('');
+  } catch(e){
+    listEl.innerHTML = `<div style="padding:8px;font-size:11px;color:#f87171">⚠ ${esc(String(e))}</div>`;
+  }
+}
+
+function dvrFbUp(){
+  const cur = _dvrFbCurrentPath;
+  const parent = cur.replace(/\/[^/]+$/, '') || '/';
+  dvrFbNav(parent);
+}
+
+function dvrFbConfirm(){
+  dvrSetFolder(_dvrFbCurrentPath);
+  document.getElementById('dvr-fb-wrap').style.display = 'none';
+  dvrRefresh();
+}
+
+async function dvrSetFolder(path){
+  // Tell the backend about the new DVR folder
+  try{
+    await fetch('/api/dvr/set_folder',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({folder: path}),
+    });
+  } catch(e){}
+  document.getElementById('dvr-storage-folder').textContent = path;
+  toast('DVR folder set: '+path.split(/[\\/]/).pop(),'ok');
+}
+let _dvrPickedItem = null;  // full item object from channel selector
+
+function dvrPickChannel(){
+  if(typeof _mvSelOpen === 'function'){
+    _mvSelOpen(ch => {
+      _dvrPickedItem = ch;
+      document.getElementById('dvr-ch-name').textContent = ch.name||'?';
+      document.getElementById('dvr-ch-id').value = ch.id||ch.stream_id||'';
+      document.getElementById('dvr-stream-url').value = '';
+    }, 'live');  // DVR only needs live channels
+  } else {
+    toast('Connect to a portal first to pick a channel','wrn');
+  }
+}
+
+// ── Schedule manual ────────────────────────────────────────────────────────
+async function dvrScheduleManual(){
+  const chId     = document.getElementById('dvr-ch-id').value.trim();
+  const chName   = document.getElementById('dvr-ch-name').textContent.trim();
+  const startVal = document.getElementById('dvr-start').value;
+  const endVal   = document.getElementById('dvr-end').value;
+
+  if(!chId)    { toast('Pick a channel first','wrn'); return; }
+  if(!startVal || !endVal){ toast('Set start and end time','wrn'); return; }
+  if(new Date(endVal) <= new Date(startVal)){ toast('End must be after start','wrn'); return; }
+
+  // Resolve stream URL — use full picked item so portal client can look it up
+  let url = '';
+  try{
+    const item = _dvrPickedItem || {id:chId, name:chName};
+    const cat  = (typeof curCat !== 'undefined' && curCat) ? curCat : {};
+    const r = await fetch('/api/resolve', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({item, mode:'live', category: cat})
+    });
+    const d = await r.json();
+    url = d.url||'';
+    if(url.includes('/api/hls_proxy')){
+      try{ const p=new URLSearchParams(url.split('?')[1]||''); url=p.get('url')||url; }catch(e){}
+    }
+  }catch(e){ toast('Resolve error: '+e,'err'); return; }
+
+  const body = {
+    channelId: chId, channelName: chName, streamUrl: url,
+    startTime: new Date(startVal).toISOString(),
+    endTime:   new Date(endVal).toISOString(),
+  };
+  try{
+    const r = await fetch('/api/dvr/schedule/manual',{method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    if(r.ok){
+      toast('Recording scheduled ✓','ok');
+      dvrRefresh();
+    } else {
+      const d = await r.json();
+      toast(d.error||'Schedule failed','err');
+    }
+  }catch(e){ toast('Schedule error: '+e,'err'); }
+}
+
+// ── Record Now ────────────────────────────────────────────────────────────
+async function dvrRecordNow(){
+  const chId     = document.getElementById('dvr-ch-id').value.trim();
+  const chName   = document.getElementById('dvr-ch-name').textContent.trim();
+  const startVal = document.getElementById('dvr-start').value;
+  const endVal   = document.getElementById('dvr-end').value;
+
+  if(!chId){ toast('Pick a channel first','wrn'); return; }
+
+  toast('Resolving stream URL…','info');
+  let url = '';
+  try{
+    // Use the full picked item object so the portal client can look it up correctly
+    const item = _dvrPickedItem || {id:chId, name:chName};
+    const cat  = (typeof curCat !== 'undefined' && curCat) ? curCat : {};
+    const r = await fetch('/api/resolve', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({item, mode:'live', category: cat})
+    });
+    const d = await r.json();
+    url = d.url||'';
+    // Strip hls_proxy wrapper — DVR ffmpeg records the raw portal stream directly.
+    // If audio needs re-encoding, ffmpeg handles it via -c:a aac in the dvr_addon.
+    if(url.includes('/api/hls_proxy')){
+      try{
+        const params = new URLSearchParams(url.split('?')[1]||'');
+        url = params.get('url') || url;
+      }catch(e){}
+    }
+  }catch(e){ toast('Resolve error: '+e,'err'); return; }
+
+  if(!url){ toast('Could not resolve stream URL','err'); return; }
+
+  let durationMinutes = 60;
+  if(startVal && endVal){
+    const diff = (new Date(endVal) - new Date(startVal)) / 60000;
+    if(diff > 0) durationMinutes = Math.round(diff);
+  }
+
+  const body = { channelId:chId, channelName:chName, streamUrl:url, title:chName, durationMinutes };
+  try{
+    const r = await fetch('/api/dvr/record_now',{method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    if(r.ok){
+      toast('⏺ Recording started!','ok');
+      dvrRefresh();
+    } else {
+      const d = await r.json();
+      toast(d.error||'Failed to start recording','err');
+    }
+  }catch(e){ toast('Record error: '+e,'err'); }
+}
+
+// ── Job actions ────────────────────────────────────────────────────────────
+async function dvrCancelJob(id){
+  _mvConfirm('Cancel Recording', 'Cancel this scheduled recording?', async ()=>{
+    await fetch(`/api/dvr/jobs/${id}`,{method:'DELETE'});
+    toast('Recording cancelled','ok');
+    dvrRefresh();
+  });
+}
+
+async function dvrStopJob(id){
+  const job = _dvrJobs.find(j=>j.id===id);
+  const name = job ? (job.programTitle||job.channelName||'recording') : 'recording';
+  _mvConfirm('Stop Recording', `Stop recording "${name}" now?`, async ()=>{
+    await fetch(`/api/dvr/jobs/${id}/stop`,{method:'POST'});
+    toast('Recording stopped','ok');
+    dvrRefresh();
+  });
+}
+
+async function dvrRemoveHistory(id){
+  await fetch(`/api/dvr/jobs/${id}/history`,{method:'DELETE'});
+  toast('Removed from history','ok');
+  dvrRefresh();
+}
+
+function dvrEditJob(id){
+  const job = _dvrJobs.find(j=>j.id===id);
+  if(!job) return;
+  const pad = n=>String(n).padStart(2,'0');
+  const toLocal = iso => {
+    const d = new Date(iso);
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+  document.getElementById('dvr-start').value = toLocal(job.startTime);
+  document.getElementById('dvr-end').value   = toLocal(job.endTime);
+  document.getElementById('dvr-ch-name').textContent = job.channelName||'';
+  document.getElementById('dvr-ch-id').value = job.channelId||'';
+  toast('Times loaded — adjust and click Schedule to save','info');
+  _dvrEditingId = id;
+}
+
+let _dvrEditingId = null;
+
+async function dvrClearJobs(){
+  _mvConfirm('Clear All Jobs', 'Remove all scheduled jobs from history? This will not delete recorded files.', async ()=>{
+    await fetch('/api/dvr/jobs/all',{method:'DELETE'});
+    toast('Jobs cleared','ok');
+    dvrRefresh();
+  });
+}
+
+// ── Recording actions ──────────────────────────────────────────────────────
+async function dvrDeleteRec(id){
+  const rec = _dvrRecs.find(r=>r.id===id);
+  const name = rec ? (rec.programTitle||rec.filename||'recording') : 'recording';
+  _mvConfirm('Delete Recording', `Permanently delete "${name}"?`, async ()=>{
+    await fetch(`/api/dvr/recordings/${id}`,{method:'DELETE'});
+    toast('Recording deleted','ok');
+    dvrRefresh();
+  });
+}
+
+async function dvrClearRecordings(){
+  _mvConfirm('Delete All Recordings', 'Permanently delete ALL completed recording files?', async ()=>{
+    await fetch('/api/dvr/recordings/all',{method:'DELETE'});
+    toast('All recordings deleted','ok');
+    dvrRefresh();
+  });
+}
+
+async function dvrRevealRec(id){
+  const rec = _dvrRecs.find(r=>r.id===id);
+  if(!rec||!rec.filePath) return;
+  if(_isMobile){ toast('Show in folder is a desktop feature','wrn'); return; }
+  try{
+    const r = await fetch('/api/reveal_in_folder',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: rec.filePath})});
+    const d = await r.json();
+    if(d.error) toast(d.error,'err');
+  }catch(e){ toast('Could not open folder: '+e,'err'); }
+}
+
+// ── Playback ───────────────────────────────────────────────────────────────
+async function dvrPlayRec(id){
+  const rec = _dvrRecs.find(r=>r.id===id);
+  if(!rec) return;
+  const name = rec.programTitle||rec.filename||'Recording';
+  dvrClose();
+
+  // Try playing the served .ts file first. If the browser hits a MSE/codec error
+  // (HEVC) the normal doPlay escalation path will try hls_proxy with the same
+  // local URL — but ffmpeg can't open a local Flask URL. So we pre-check: if the
+  // file path ends with .ts we use the dedicated transcode endpoint which reads
+  // the file directly from disk via ffmpeg. This gives us H.264+AAC output that
+  // the browser can always play.
+  // For non-HEVC recordings the transcode is slightly wasteful but the only
+  // reliable way to handle HEVC transparently without a separate probe round-trip.
+  const transcodeUrl = `/api/dvr/transcode/${encodeURIComponent(id)}`;
+  const serveUrl     = `/api/dvr/serve/${encodeURIComponent(rec.filename)}`;
+
+  // Use serve (direct) if content is likely not HEVC, transcode otherwise.
+  // Heuristic: recordings from MAC/Xtream portals that were HEVC will have
+  // been recorded as-is (no re-encoding during recording). We check if the
+  // job's original stream URL is known to be HEVC by checking the filename
+  // suffix — all our recordings are .ts so we always use the transcode path
+  // to be safe. Future improvement: store a hevc flag in the job.
+  alog('[DVR] Playing recording via transcode: '+name,'k');
+  doPlay(transcodeUrl, name, {isLive: false});
+}
+
+async function dvrTimeshift(id){
+  const job = _dvrJobs.find(j=>j.id===id);
+  if(!job) return;
+  const name = (job.programTitle||job.channelName||'Recording')+' (Recording…)';
+  dvrClose();
+
+  const url = `/api/dvr/timeshift/${encodeURIComponent(id)}`;
+
+  // Poll until the recording file exists on disk (ffmpeg may take a few seconds
+  // to create it after the job starts). Check every second for up to 15s.
+  let ready = false;
+  for(let i = 0; i < 15; i++){
+    try{
+      const probe = await fetch(url, {method:'HEAD'});
+      if(probe.ok){ ready = true; break; }
+    }catch(e){}
+    if(i === 0) toast('Waiting for recording to start…','info');
+    await new Promise(r=>setTimeout(r, 1000));
+  }
+
+  if(!ready){ toast('Recording file not ready — try again in a moment','err'); return; }
+
+  alog('[DVR] Timeshifting via recording file: '+name,'k');
+  doPlay(url, name, {isLive: false});
+}
+
+// ── Auto-refresh DVR while overlay is open ────────────────────────────────
+setInterval(()=>{
+  if(_dvrInited && document.getElementById('dvr-overlay')?.style.display==='flex'){
+    dvrRefresh();
+  }
+}, 15000);
+
+// Public API: open the MV channel selector with a custom callback.
+// Used by DVR channel picker and any other feature needing channel selection.
+function _mvSelOpen(callback, forcedMode){
+  if(typeof _mvPopulateSelector !== 'function'){
+    toast('Connect to a portal first','wrn'); return;
+  }
+  mvSelCallback = (ch)=>{ callback(ch); mvSelCallback=null; };
+  _mvSelWidgetCtx = null;
+  if(forcedMode){
+    _mvSelContentMode = forcedMode;
+    // Force the mode state without the early-return guard
+    _mvSelNavMode = 'cats';
+    _mvSelCat = null; _mvSelItems = []; _mvSelShowItem = null; _mvSelEpisodes = [];
+    document.getElementById('mv-sel-search').value = '';
+    document.querySelectorAll('.mv-sel-tab').forEach(b=>{
+      b.classList.toggle('active', b.dataset.mode === forcedMode);
+    });
+  }
+  _mvPopulateSelector();
+  document.getElementById('mv-sel-overlay').classList.add('open');
+  // Hide tabs AFTER populate so they aren't restored by _mvPopulateSelector
+  if(forcedMode){
+    const tabsEl = document.getElementById('mv-sel-tabs');
+    if(tabsEl) tabsEl.style.display = 'none';
+  }
+}
 </script>
 </body>
 </html>
