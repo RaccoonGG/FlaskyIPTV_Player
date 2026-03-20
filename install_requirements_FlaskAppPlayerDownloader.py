@@ -256,7 +256,7 @@ def check_dvr_addon():
         info("Install ffmpeg (see system dependencies section above)")
 
 
-
+# ── Port availability check ───────────────────────────────────────────────────
 def check_port(port: int = 5000):
     import socket
     try:
