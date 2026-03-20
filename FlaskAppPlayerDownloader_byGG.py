@@ -7557,7 +7557,35 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   display:none;align-items:center;gap:4px;
 }
 .mv-seek-wrap.mv-seek-visible{display:flex}
-.mv-seek{flex:1;height:3px;cursor:pointer;accent-color:var(--acc);min-width:0}
+/* Seek track — three-zone gradient (played / buffered / empty) via CSS vars.
+   --mv-played and --mv-buffered are set in JS so the gradient lives on the
+   track pseudo-element itself — nothing can cover it. */
+.mv-seek-track{flex:1;min-width:0;display:flex;align-items:center;height:14px}
+.mv-seek{
+  -webkit-appearance:none;appearance:none;
+  width:100%;height:14px;margin:0;cursor:pointer;min-width:0;
+  background:transparent;
+  --mv-played:0%;--mv-buffered:0%;
+}
+/* Three-zone gradient: accent=played · semi-white=buffered · dim=unbuffered */
+.mv-seek::-webkit-slider-runnable-track{
+  height:3px;border-radius:2px;
+  background:linear-gradient(to right,
+    var(--acc) 0%,               var(--acc) var(--mv-played),
+    rgba(255,255,255,.4) var(--mv-played), rgba(255,255,255,.4) var(--mv-buffered),
+    rgba(255,255,255,.13) var(--mv-buffered), rgba(255,255,255,.13) 100%);
+}
+.mv-seek::-moz-range-track{
+  height:3px;border-radius:2px;
+  background:linear-gradient(to right,
+    var(--acc) 0%,               var(--acc) var(--mv-played),
+    rgba(255,255,255,.4) var(--mv-played), rgba(255,255,255,.4) var(--mv-buffered),
+    rgba(255,255,255,.13) var(--mv-buffered), rgba(255,255,255,.13) 100%);
+}
+.mv-seek::-webkit-slider-thumb{
+  -webkit-appearance:none;width:10px;height:10px;border-radius:50%;
+  background:var(--acc);margin-top:-3.5px;box-shadow:0 0 3px rgba(0,0,0,.6);cursor:pointer}
+.mv-seek::-moz-range-thumb{width:10px;height:10px;border-radius:50%;background:var(--acc);border:none;cursor:pointer}
 .mv-seek-time{font-size:9px;color:rgba(255,255,255,.75);white-space:nowrap;flex-shrink:0;font-variant-numeric:tabular-nums}
 /* MV bottom action bar — sits just above the seek bar */
 .mv-bottom-bar{
@@ -13164,7 +13192,9 @@ function _mvAddWidget(channel, layout){
         </div>
         <video class="mv-video mv-hidden" muted playsinline></video>
         <div class="mv-seek-wrap">
-          <input type="range" class="mv-seek" min="0" max="100" step="0.1" value="0">
+          <div class="mv-seek-track">
+            <input type="range" class="mv-seek" min="0" max="100" step="0.1" value="0">
+          </div>
           <span class="mv-seek-time">0:00</span>
         </div>
         <div class="mv-bottom-bar">
@@ -13300,6 +13330,27 @@ function _mvAttachListeners(cEl, wid){
     const m=Math.floor(s/60), ss=Math.floor(s%60);
     return m+':'+(ss<10?'0':'')+ss;
   };
+
+  // Update the three-zone gradient on the track pseudoelement via CSS variables.
+  // --mv-played  → where accent colour ends (current position)
+  // --mv-buffered → where the lighter "buffered" zone ends
+  // Both live on seekBar itself so they cascade into ::-webkit-slider-runnable-track.
+  const _syncBuf = (playedPct, dur) => {
+    seekBar.style.setProperty('--mv-played', playedPct.toFixed(1) + '%');
+    const buf = videoEl.buffered;
+    if(!buf || !buf.length || !(dur > 0)){
+      seekBar.style.setProperty('--mv-buffered', playedPct.toFixed(1) + '%');
+      return;
+    }
+    let bufEnd = videoEl.currentTime;
+    for(let i = 0; i < buf.length; i++){
+      if(buf.start(i) <= videoEl.currentTime + 0.5)
+        bufEnd = Math.max(bufEnd, buf.end(i));
+    }
+    const bufPct = Math.min(100, (bufEnd / dur) * 100);
+    seekBar.style.setProperty('--mv-buffered', bufPct.toFixed(1) + '%');
+  };
+
   const _syncSeek = () => {
     // Use video element duration if finite, or fall back to known duration from yt-dlp
     const dur = (isFinite(videoEl.duration) && videoEl.duration > 0)
@@ -13322,8 +13373,10 @@ function _mvAttachListeners(cEl, wid){
     // We have a duration — show full seek bar
     seekBar.style.display = '';
     seekTime.style.color  = '';
-    seekBar.value = (videoEl.currentTime / dur) * 100;
+    const playedPct = (videoEl.currentTime / dur) * 100;
+    seekBar.value = playedPct;
     seekTime.textContent = _fmtTime(videoEl.currentTime) + ' / ' + _fmtTime(dur);
+    _syncBuf(playedPct, dur);
   };
   const _tryShowSeek = () => {
     const isExt  = mvExternalUrlWidgets.has(wid);
@@ -13354,9 +13407,20 @@ function _mvAttachListeners(cEl, wid){
     _tryShowSeek();
     if(seekWrap.classList.contains('mv-seek-visible')) _syncSeek();
   });
+  // 'progress' fires as the MSE/browser buffer grows — refresh the buffered zone
+  videoEl.addEventListener('progress', () => {
+    const dur = (isFinite(videoEl.duration) && videoEl.duration > 0)
+      ? videoEl.duration : (cEl._mvKnownDuration || 0);
+    if(dur > 0 && seekWrap.classList.contains('mv-seek-visible')){
+      const pp = (videoEl.currentTime / dur) * 100;
+      _syncBuf(pp, dur);
+    }
+  });
   videoEl.addEventListener('emptied', () => {
     if(!mvExternalUrlWidgets.has(wid)) seekWrap.classList.remove('mv-seek-visible');
     seekBar.style.display = '';
+    seekBar.style.setProperty('--mv-played',   '0%');
+    seekBar.style.setProperty('--mv-buffered', '0%');
     // If this cell is known to be VOD, restore the seek bar
     if(cEl._mvIsLive === false){
       seekWrap.classList.add('mv-seek-visible');
