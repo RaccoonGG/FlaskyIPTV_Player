@@ -232,7 +232,31 @@ def check_multiview_addon():
         info("Direct IPTV stream URLs and .m3u8 links still work without yt-dlp")
 
 
-# ── Port availability check ───────────────────────────────────────────────────
+# ── dvr_addon check ───────────────────────────────────────────────────────────
+def check_dvr_addon():
+    hdr("Checking dvr_addon.py …")
+
+    dvr_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dvr_addon.py")
+    if not os.path.isfile(dvr_file):
+        warn("dvr_addon.py not found in this directory — DVR feature will be disabled")
+        info("Place dvr_addon.py alongside the Flask app to enable scheduled/manual recordings")
+        return
+
+    ok("dvr_addon.py found")
+    print()
+    print(f"  {BOLD}DVR requirements:{RESET}")
+    print(f"  • ffmpeg  — required (stream-copy recording, timeshift transcode)")
+    print(f"  • No extra Python packages needed beyond the core requirements")
+    print()
+
+    if shutil.which("ffmpeg"):
+        ok("ffmpeg available — DVR recording and timeshift playback will work")
+    else:
+        warn("ffmpeg NOT found — DVR will not be able to record or play back recordings")
+        info("Install ffmpeg (see system dependencies section above)")
+
+
+
 def check_port(port: int = 5000):
     import socket
     try:
@@ -287,6 +311,7 @@ def main():
 
     check_cast_addon()
     check_multiview_addon()
+    check_dvr_addon()
     check_system_deps()
     check_port(5000)
 
