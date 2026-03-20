@@ -6747,7 +6747,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 #item-menu-hdr{padding:8px 12px 6px;font-size:10px;font-weight:800;text-transform:uppercase;
   letter-spacing:1.2px;color:var(--txt3);border-bottom:1px solid var(--bdr);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
-.imenu-btn{display:flex;align-items:center;gap:9px;padding:9px 14px;
+.imenu-btn{display:flex;align-items:center;justify-content:flex-start;gap:9px;padding:9px 14px;
   font-size:12px;font-weight:600;color:var(--txt);background:none;border:none;
   cursor:pointer;text-align:left;transition:background .12s;width:100%}
 .imenu-btn:hover{background:var(--s4)}
@@ -7556,7 +7556,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .mv-item-ctx{position:fixed;z-index:2100;background:var(--s2);border:1px solid var(--bdr2);
   border-radius:var(--rsm);box-shadow:0 4px 16px rgba(0,0,0,.45);min-width:170px;padding:4px 0;display:none}
 .mv-item-ctx.open{display:block}
-.mv-item-ctx button{display:flex;align-items:center;gap:8px;width:100%;padding:7px 14px;
+.mv-item-ctx button{display:flex;align-items:center;justify-content:flex-start;gap:8px;width:100%;padding:7px 14px;
   background:none;border:none;color:var(--txt);font-size:12px;cursor:pointer;text-align:left;white-space:nowrap}
 .mv-item-ctx button:hover{background:rgba(124,58,237,.12)}
 /* Tabs row — explicit row layout so it never stacks vertically */
@@ -9756,8 +9756,8 @@ function openItemMenu(i, btn){
   document.getElementById('imenu-sep2').style.display     = !grp?'block':'none';
   document.getElementById('imenu-ext').style.display      = !grp&&!show?'flex':'none';
   document.getElementById('imenu-imdb').style.display     = (!isLive&&!grp)?'flex':'none';
-  document.getElementById('imenu-rec').style.display      = !grp&&!show?'flex':'none';
-  document.getElementById('imenu-mkv').style.display      = !grp?'flex':'none';
+  document.getElementById('imenu-rec').style.display      = isLive&&!grp&&!show?'flex':'none';   // live only
+  document.getElementById('imenu-mkv').style.display      = !isLive&&!grp?'flex':'none';          // vod/series only
 
   // Position menu near button
   const menu = document.getElementById('item-menu');
@@ -13850,21 +13850,135 @@ function _mvSelOpenItemMenu(i, btn){
   const isShow  = it._is_show_item || it._is_series_group;
   const isGroup = !!it._is_series_group;
   const isSeries = _mvSelContentMode === 'series' || _mvSelContentMode === 'vod';
+  const isLive   = _mvSelContentMode === 'live';
   const actions = [];
-  // "Play in Multi-View" is intentionally omitted — the ▶ button in the row
-  // already does this; duplicating it in the submenu adds no value.
+
+  // Browse episodes (series/group drill)
   if(isGroup){
     actions.push({icon:'📋', label:`Browse ${(it._episodes||[]).length} eps`, fn:`_mvCloseCtxMenu();_mvSelDrillGrp(${i})`});
   } else if(isShow && isSeries){
     actions.push({icon:'📋', label:'Browse episodes', fn:`_mvCloseCtxMenu();_mvSelDrillShow(${i})`});
   }
-  // TMDB/IMDb — same lookup logic as main browse (direct link when ID available,
-  // falls back to name search only when no ID exists anywhere in the item)
+
+  // External Player — available for directly playable items
+  if(!isShow && !isGroup){
+    actions.push({icon:'🎬', label:'External Player', fn:`_mvCloseCtxMenu();_mvSelExternalPlay(${i})`});
+  }
+
+  // Record (via DVR) — live only, directly playable
+  if(isLive && !isShow && !isGroup && typeof _DVR_OK !== 'undefined' && _DVR_OK){
+    actions.push({icon:'⏺', label:'Record', fn:`_mvCloseCtxMenu();_mvSelRecord(${i})`});
+  }
+
+  // Download MKV — VOD/Series episodes (not show headers)
+  if(isSeries && !isShow && !isGroup){
+    actions.push({icon:'⬇', label:'Download MKV', fn:`_mvCloseCtxMenu();_mvSelMKV(${i})`});
+  }
+
+  // TMDB/IMDb — VOD and Series only
   if(_mvSelContentMode !== 'live'){
-    actions.push({icon:'🎬', label:'Open TMDB/IMDb',
+    actions.push({icon:'🔍', label:'Open TMDB/IMDb',
       fn:`_mvSelIMDb(${i});_mvCloseCtxMenu()`});
   }
+
+  if(!actions.length){
+    // Fallback so the menu isn't empty
+    actions.push({icon:'ℹ', label:'No actions available', fn:`_mvCloseCtxMenu()`});
+  }
+
   _mvOpenCtxMenu(btn, actions);
+}
+
+// ── MV submenu action helpers ──────────────────────────────────────────────
+
+async function _mvSelExternalPlay(i){
+  let it;
+  if(_mvSelNavMode === 'episodes'){
+    it = (_mvSelEpisodesFiltered.length ? _mvSelEpisodesFiltered : _mvSelEpisodes)[i];
+  } else {
+    it = (_mvSelFilteredItems.length ? _mvSelFilteredItems : _mvSelItems)[i];
+  }
+  if(!it) return;
+  const name = it.name||it.o_name||'?';
+  const cat  = _mvSelCat || {};
+  const m    = _mvSelContentMode;
+
+  if(_isMobile){
+    toast('Resolving stream…','info');
+    try{
+      const r = await fetch('/api/resolve_url',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({item:it, mode:m, category:cat})});
+      const d = await r.json();
+      if(d.error){ toast('Error: '+d.error,'err'); return; }
+      const player = localStorage.getItem('mobile_player')||'ask';
+      if(player==='copy'){
+        try{ await navigator.clipboard.writeText(d.url); toast('URL copied!','ok'); }
+        catch(e){ prompt('Copy URL:',d.url); }
+        return;
+      }
+      window.location.href = `intent:${d.url}#Intent;type=video/*;S.browser_fallback_url=about:blank;end`;
+    }catch(e){ toast('Failed: '+e,'err'); }
+    return;
+  }
+  const exe = (localStorage.getItem('ext_player')||'').trim();
+  if(!exe){ toast('Set external player path in ⚙ settings first','wrn'); return; }
+  toast('Opening in external player…','info');
+  try{
+    const r = await fetch('/api/open_external',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({exe, item:it, mode:m, category:cat})});
+    const d = await r.json();
+    if(d.error) toast('Error: '+d.error,'err');
+    else toast('Launched: '+name,'ok');
+  }catch(e){ toast('Failed: '+e,'err'); }
+}
+
+async function _mvSelRecord(i){
+  const it = (_mvSelFilteredItems.length ? _mvSelFilteredItems : _mvSelItems)[i];
+  if(!it) return;
+  const name = it.name||it.o_name||'Recording';
+  const cat  = _mvSelCat || {};
+  toast('Resolving stream…','info');
+  try{
+    const r = await fetch('/api/resolve',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({item:it, mode:'live', category:cat})});
+    const d = await r.json();
+    if(!d.url){ toast(d.error||'Could not resolve URL','err'); return; }
+    let url = d.url;
+    if(url.includes('/api/hls_proxy')){
+      try{ const p=new URLSearchParams(url.split('?')[1]||''); url=p.get('url')||url; }catch(e){}
+    }
+    const rb = await fetch('/api/dvr/record_now',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({channelId:it.id||it.stream_id||'', channelName:name,
+        streamUrl:url, title:name, durationMinutes:120})});
+    const rd = await rb.json();
+    if(rb.ok){
+      toast('⏺ DVR recording started: '+name,'ok');
+      try{ const j=await fetch('/api/dvr/jobs').then(r=>r.json());
+        if(Array.isArray(j)){ _dvrJobs=j; _dvrInited=true; _dvrBadgeUpdate(); } }catch(e){}
+    } else { toast(rd.error||'DVR record failed','err'); }
+  }catch(e){ toast('Record error: '+e,'err'); }
+}
+
+async function _mvSelMKV(i){
+  let it;
+  if(_mvSelNavMode === 'episodes'){
+    it = (_mvSelEpisodesFiltered.length ? _mvSelEpisodesFiltered : _mvSelEpisodes)[i];
+  } else {
+    it = (_mvSelFilteredItems.length ? _mvSelFilteredItems : _mvSelItems)[i];
+  }
+  if(!it) return;
+  const od = document.getElementById('o-dir')?.value?.trim();
+  if(!od){ toast('Set output folder in ⚙ settings first','wrn'); return; }
+  const cat = _mvSelCat || {};
+  const m   = _mvSelContentMode;
+  toast('Starting MKV download…','info');
+  try{
+    const r = await fetch('/api/download/mkv',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({items:[it], mode:m, category:cat, out_dir:od})});
+    const d = await r.json();
+    if(d.error) toast(d.error,'err');
+    else toast('MKV download started','ok');
+  }catch(e){ toast('Download error: '+e,'err'); }
 }
 
 // TMDB/IMDb lookup for multiview — resolves item by index then delegates to
