@@ -4152,7 +4152,7 @@ def _rewrite_m3u8(content: str, base_url: str) -> str:
                 if not uri.startswith(('http://', 'https://')):
                     uri = urljoin(base_url, uri)
                 return 'URI="/api/proxy?url=' + quote(uri, safe='') + '"'
-            result.append(re.sub(r'URI="([^"]*)"', _repl, line))
+            result.append(_RE_M3U8_KEY_URI.sub(_repl, line))
         else:
             result.append(line)
     return '\n'.join(result)
@@ -4506,6 +4506,58 @@ def api_whats_on():
     return jsonify({"programs": results, "count": len(results), "status": "ok"})
 
 
+# ── Channel fuzzy-match constants — moved out of api_find_channel so they are
+# built once at startup instead of on every call to that route.
+_FCH_QUALITY_TAGS = ["hevc", "h265", "h.265", "hvc1", "hvc", "av1",
+                     "hd", "sd", "fhd", "uhd", "4k", "h264", "h.264",
+                     "avc", "av1", "1080p", "720p", "480p"]
+_FCH_HEVC_TAGS    = {"hevc", "h265", "h.265", "hvc1", "hvc", "h.265"}
+_FCH_COUNTRY_SYNONYMS = {
+    "sr": "rs", "rs": "rs", "hr": "hr", "ba": "ba", "si": "si", "mk": "mk",
+    "me": "me", "al": "al", "bg": "bg", "ro": "ro", "hu": "hu", "sk": "sk",
+    "cz": "cz", "pl": "pl", "uk": "uk", "us": "us", "de": "de", "fr": "fr",
+    "it": "it", "es": "es", "pt": "pt", "nl": "nl", "tr": "tr", "gr": "gr",
+    "at": "at", "ch": "ch",
+}
+_FCH_CC_PAT = "|".join(_FCH_COUNTRY_SYNONYMS.keys())
+_FCH_RE_CC_PREFIX  = re.compile(r"^([A-Za-z]{2,3})\s*[:|]\s*")
+_FCH_RE_CC_SUFFIX1 = re.compile(rf"\.({_FCH_CC_PAT})$", re.I)
+_FCH_RE_CC_SUFFIX2 = re.compile(rf"\s+\(?({_FCH_CC_PAT})\)?$", re.I)
+_FCH_RE_WORDS      = re.compile(r"[a-z0-9]+")
+_FCH_RE_SPACES     = re.compile(r"\s+")
+
+def _fch_strip_prefix(s):
+    m = _FCH_RE_CC_PREFIX.match(s)
+    if m and m.group(1).lower() in _FCH_COUNTRY_SYNONYMS:
+        return s[m.end():].strip(), m.group(1).lower()
+    return s.strip(), None
+
+def _fch_strip_suffix(s):
+    s = _FCH_RE_CC_SUFFIX1.sub("", s)
+    s = _FCH_RE_CC_SUFFIX2.sub("", s)
+    return s.strip()
+
+def _fch_strip_quality(s):
+    s = (s or "").lower().strip()
+    for tag in _FCH_QUALITY_TAGS:
+        s = s.replace(f" {tag}", "").replace(f"({tag})", "").replace(f"[{tag}]", "")
+    return _FCH_RE_SPACES.sub(" ", s).strip()
+
+def _fch_core(s):
+    stripped, _ = _fch_strip_prefix(s)
+    stripped = _fch_strip_suffix(stripped)
+    return _fch_strip_quality(stripped)
+
+def _fch_core_words(s):
+    return set(_FCH_RE_WORDS.findall(_fch_core(s)))
+
+def _fch_norm_code(code):
+    return _FCH_COUNTRY_SYNONYMS.get((code or "").lower(), (code or "").lower())
+
+def _fch_has_hevc(s):
+    sl = (s or "").lower()
+    return any(t in sl for t in _FCH_HEVC_TAGS)
+
 @flask_app.route("/api/find_channel", methods=["POST"])
 def api_find_channel():
     """Fuzzy-match an EPG channel name against the currently connected portal's live channels.
@@ -4639,71 +4691,18 @@ def api_find_channel():
     if not channels:
         return jsonify({"found": False, "error": "No live channels on portal"})
 
-    # ── Fuzzy scoring ─────────────────────────────────────────────────────────
-    QUALITY_TAGS = ["hevc", "h265", "h.265", "hvc1", "hvc", "av1",
-                    "hd", "sd", "fhd", "uhd", "4k", "h264", "h.264",
-                    "avc", "av1", "1080p", "720p", "480p"]
-    # Tags that indicate a stream the browser likely can't play (HEVC/H265)
-    HEVC_TAGS = {"hevc", "h265", "h.265", "hvc1", "hvc", "h.265"}
-
-    # Country code synonyms — portals use these interchangeably as prefixes/suffixes
-    COUNTRY_SYNONYMS = {
-        "sr": "rs",   # Serbia: SR (srpski) ↔ RS (ISO 3166)
-        "rs": "rs",
-        "hr": "hr",   "ba": "ba",  "si": "si",  "mk": "mk",
-        "me": "me",   "al": "al",  "bg": "bg",  "ro": "ro",
-        "hu": "hu",   "sk": "sk",  "cz": "cz",  "pl": "pl",
-        "uk": "uk",   "us": "us",  "de": "de",  "fr": "fr",
-        "it": "it",   "es": "es",  "pt": "pt",  "nl": "nl",
-        "tr": "tr",   "gr": "gr",  "at": "at",  "ch": "ch",
-    }
-    _CC_PATTERN = '|'.join(COUNTRY_SYNONYMS.keys())
-
-    def _strip_country_prefix(s):
-        m = re.match(r'^([A-Za-z]{2,3})\s*[:\|]\s*', s)
-        if m:
-            code = m.group(1).lower()
-            if code in COUNTRY_SYNONYMS:
-                return s[m.end():].strip(), code
-        return s.strip(), None
-
-    def _strip_country_suffix(s):
-        s = re.sub(rf'\.({_CC_PATTERN})$', '', s, flags=re.I)
-        s = re.sub(rf'\s+\(?({_CC_PATTERN})\)?$', '', s, flags=re.I)
-        return s.strip()
-
-    def _norm_code(code):
-        return COUNTRY_SYNONYMS.get((code or "").lower(), (code or "").lower())
-
-    def _strip_quality(s):
-        s = (s or "").lower().strip()
-        for tag in QUALITY_TAGS:
-            s = s.replace(f" {tag}", "").replace(f"({tag})", "").replace(f"[{tag}]", "")
-        return re.sub(r"\s+", " ", s).strip()
-
-    def _core(s):
-        """Strip country prefix + suffix + quality tags → pure channel name."""
-        stripped, _ = _strip_country_prefix(s)
-        stripped = _strip_country_suffix(stripped)
-        return _strip_quality(stripped)
-
-    def _core_words(s):
-        return set(re.findall(r"[a-z0-9]+", _core(s)))
-
-    def _has_hevc(s):
-        sl = (s or "").lower()
-        return any(t in sl for t in HEVC_TAGS)
+    # ── Fuzzy scoring — uses module-level pre-compiled constants (_fch_*) ──────
 
     # Pre-process EPG side
     epg_name_l    = epg_channel_name.lower().strip()
-    epg_core      = _core(epg_channel_name)
-    epg_cwords    = _core_words(epg_channel_name)
-    _, epg_cc_raw = _strip_country_prefix(epg_channel_name)
+    epg_core      = _fch_core(epg_channel_name)
+    epg_cwords    = _fch_core_words(epg_channel_name)
+    _, epg_cc_raw = _fch_strip_prefix(epg_channel_name)
     if not epg_cc_raw:
         m = re.search(rf'\.({_CC_PATTERN})$', epg_channel_name, re.I)
         if m:
             epg_cc_raw = m.group(1)
-    epg_cc = _norm_code(epg_cc_raw)   # canonical country code or ""
+    epg_cc = _fch_norm_code(epg_cc_raw)   # canonical country code or ""
 
     state.log(f"[FIND_CH] EPG core={epg_core!r} country={epg_cc!r} words={epg_cwords}")
 
@@ -4715,10 +4714,10 @@ def api_find_channel():
         ch_name_l   = ch_name.lower()
         score = 0
 
-        ch_core_str, ch_cc_raw = _strip_country_prefix(ch_name)
-        ch_core_str = _strip_country_suffix(ch_core_str)
-        ch_core_str = _strip_quality(ch_core_str)
-        ch_cc = _norm_code(ch_cc_raw)
+        ch_core_str, ch_cc_raw = _fch_strip_prefix(ch_name)
+        ch_core_str = _fch_strip_suffix(ch_core_str)
+        ch_core_str = _fch_strip_quality(ch_core_str)
+        ch_cc = _fch_norm_code(ch_cc_raw)
 
         # ── Country conflict check ────────────────────────────────────────────
         # If BOTH sides have explicit country codes and they differ → hard cap at 45
@@ -4756,7 +4755,7 @@ def api_find_channel():
 
         # ── Word overlap on core words ────────────────────────────────────────
         if epg_cwords and ch_core_str:
-            ch_cw = _core_words(ch_name)
+            ch_cw = _fch_core_words(ch_name)
             if ch_cw:
                 overlap = len(epg_cwords & ch_cw)
                 if overlap:
@@ -4778,7 +4777,7 @@ def api_find_channel():
             score = min(score, 45)
 
         # ── HEVC penalty — deprioritize when non-HEVC alternatives likely exist
-        if _has_hevc(ch_name):
+        if _fch_has_hevc(ch_name):
             score = max(0, score - 10)
 
         scored.append((score, ch_name, ch))
@@ -5691,6 +5690,20 @@ _proxy_img_cache: dict = {}           # norm_url → (content_type, bytes)
 _proxy_img_cache_lock = threading.Lock()
 _PROXY_IMG_CACHE_MAX = 1500           # ~150 MB at ~100 kB average logo size
 
+# Pre-compiled patterns and constants for /api/proxy and _rewrite_m3u8.
+# /api/proxy is called once per channel logo — potentially hundreds of times
+# when a channel list loads — so every allocation avoided here matters.
+_RE_IMG_EXT      = re.compile(r'\.(jpe?g|png|gif|webp|svg|ico|bmp)$', re.I)
+_RE_DOUBLE_SLASH = re.compile(r'/{2,}')
+_RE_M3U8_KEY_URI = re.compile(r'URI="([^"]*)"')
+_RE_M3U8_URL     = re.compile(r'\.(m3u8?|m3u)(\?|$)', re.I)
+# CORS headers are identical on every proxy response — allocate once, copy when needed
+_CORS_HEADERS: dict = {
+    "Access-Control-Allow-Origin":  "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+}
+
 
 # 1×1 transparent PNG returned instead of a 403 when a logo host blocks hotlinking.
 # This lets the browser's onerror handler hide the <img> cleanly, avoids broken-image
@@ -5722,7 +5735,7 @@ def api_proxy():
     # (e.g. "https://www.lyngsat.com//logo/tv/…" → single slash after the host).
     try:
         _p = urlparse(url)
-        _clean_path = re.sub(r'/{2,}', '/', _p.path)
+        _clean_path = _RE_DOUBLE_SLASH.sub('/', _p.path)
         if _clean_path != _p.path:
             # ParseResult is a namedtuple — _replace() + geturl() rebuilds the URL
             url = _p._replace(path=_clean_path).geturl()
@@ -5733,13 +5746,9 @@ def api_proxy():
     # Portals append random ?{number} version tokens to logo URLs; stripping
     # them means "320/12019.jpg?8392" and "320/12019.jpg?42491" share one entry.
     norm_url = url.split("?")[0]
-    is_img_url = bool(re.search(r'\.(jpe?g|png|gif|webp|svg|ico|bmp)$', norm_url, re.I))
+    is_img_url = bool(_RE_IMG_EXT.search(norm_url))
 
-    cors = {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Headers": "*",
-    }
+    cors = _CORS_HEADERS  # module-level constant — no allocation per request
 
     # ── Known hotlink-blocked hosts: return transparent PNG immediately ───
     if is_img_url:
@@ -5802,7 +5811,7 @@ def api_proxy():
         # Treat as image if either the URL extension or the response CT says so
         is_img = is_img_url or is_img_ct
 
-        is_m3u8 = (re.search(r'\.(m3u8?|m3u)(\?|$)', url.split('?')[0], re.I) or
+        is_m3u8 = (_RE_M3U8_URL.search(url.split('?')[0]) or
                    'mpegurl' in ct.lower() or 'x-mpegurl' in ct.lower())
         if is_m3u8:
             text = resp.text
@@ -6230,11 +6239,7 @@ def api_hls_proxy():
     audio_only  = request.args.get("audio_only", "0") == "1" and not transcode
     is_vod      = request.args.get("vod", "0") == "1"
     
-    cors = {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Headers": "*",
-    }
+    cors = _CORS_HEADERS  # module-level constant
 
     base_input = [
         ffmpeg, "-hide_banner", "-nostdin",
