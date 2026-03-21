@@ -6611,7 +6611,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 
 /* ─── header ─────────────────────────────────────────────────── */
 #hdr{flex-shrink:0;z-index:200;position:relative;overflow:hidden;
-  background:rgba(8,8,20,.94);backdrop-filter:blur(20px);
+  background:rgba(8,8,20,.97);
   border-bottom:1px solid rgba(124,58,237,.25);
   box-shadow:0 2px 20px rgba(0,0,0,.6),0 0 40px rgba(124,58,237,.06),inset 0 1px 0 rgba(255,255,255,.06)}
 /* static gradient line at bottom of header — was animated (4s infinite repaint) */
@@ -6691,7 +6691,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 
 /* ─── panel header ───────────────────────────────────────────── */
 .ph{background:linear-gradient(90deg,rgba(11,11,26,.9),rgba(16,16,30,.9));
-  border-bottom:1px solid rgba(124,58,237,.15);backdrop-filter:blur(12px);
+  border-bottom:1px solid rgba(124,58,237,.15);
   padding:10px 14px;display:flex;align-items:center;gap:8px;flex-shrink:0;position:relative}
 .ph::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px;
   background:linear-gradient(90deg,transparent,rgba(124,58,237,.3),rgba(6,182,212,.2),transparent)}
@@ -6701,7 +6701,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 /* ─── bottom nav ─────────────────────────────────────────────── */
 #botnav{display:flex;background:rgba(8,8,20,.97);border-top:1px solid rgba(124,58,237,.2);
   flex-shrink:0;z-index:100;padding-bottom:env(safe-area-inset-bottom);
-  backdrop-filter:blur(20px);box-shadow:0 -4px 20px rgba(0,0,0,.5),0 0 30px rgba(124,58,237,.05)}
+  box-shadow:0 -4px 20px rgba(0,0,0,.5),0 0 30px rgba(124,58,237,.05)}
 .nt{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
   padding:8px 4px 10px;gap:3px;border:none;background:none;color:var(--txt3);
   font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;
@@ -8300,7 +8300,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 
 <!-- DVR OVERLAY -->
 <div id="dvr-overlay" style="display:none;position:fixed;inset:0;z-index:850;background:rgba(0,0,0,.6);
-  backdrop-filter:blur(3px);align-items:center;justify-content:center">
+  align-items:center;justify-content:center">
 <div id="dvr-modal" style="background:var(--bg);border:1px solid var(--bdr);border-radius:var(--r);
   width:min(440px,96vw);max-height:92vh;display:flex;flex-direction:column;overflow:hidden;
   box-shadow:0 24px 64px rgba(0,0,0,.7)">
