@@ -6565,10 +6565,10 @@ button{cursor:pointer;border:none;border-radius:var(--rsm);padding:9px 16px;font
   display:inline-flex;align-items:center;justify-content:center;gap:5px;
   -webkit-tap-highlight-color:transparent;user-select:none;position:relative;overflow:hidden}
 /* Shine sweep — animates left→right on hover only, resets instantly on release */
-button::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+button::before{content:'';position:absolute;top:0;left:0;width:100%;height:100%;
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.18),transparent);
-  transition:none;pointer-events:none}
-button:hover:not(:disabled)::before{left:100%;transition:left .45s ease}
+  transform:translateX(-100%);transition:none;pointer-events:none}
+button:hover:not(:disabled)::before{transform:translateX(100%);transition:transform .45s ease}
 /* Scale on active for regular buttons only — .nt tabs must not scale (breaks selection visual) */
 button:not(.nt):active:not(:disabled){transform:scale(.94)}
 button:disabled{opacity:.3;cursor:not-allowed}
@@ -6725,10 +6725,10 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .mt{padding:5px 11px;font-size:12px;font-weight:700;border-radius:20px;
   background:rgba(255,255,255,.03);color:var(--txt2);border:1px solid var(--bdr);
   transition:var(--tr);position:relative;overflow:hidden}
-.mt::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+.mt::before{content:'';position:absolute;top:0;left:0;width:100%;height:100%;
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.1),transparent);
-  transition:left .4s ease;pointer-events:none}
-.mt:hover::before{left:100%}
+  transform:translateX(-100%);transition:transform .4s ease;pointer-events:none}
+.mt:hover::before{transform:translateX(100%)}
 .mt:hover:not(.on){border-color:var(--bdr2);color:var(--txt);background:rgba(255,255,255,.06)}
 .mt.on{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
   border-color:transparent;box-shadow:0 2px 14px var(--glow2),0 0 28px rgba(124,58,237,.2),
@@ -6779,10 +6779,10 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   transform:translateX(3px);box-shadow:0 0 14px rgba(124,58,237,.1),inset 0 1px 0 rgba(255,255,255,.04)}
 .citem:active{transform:scale(.97) translateX(2px)}
 /* shine sweep */
-.citem::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+.citem::before{content:'';position:absolute;top:0;left:0;width:100%;height:100%;
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.06),transparent);
-  transition:left .5s ease;pointer-events:none;z-index:0}
-.citem:hover::before{left:100%}
+  transform:translateX(-100%);transition:transform .5s ease;pointer-events:none;z-index:0}
+.citem:hover::before{transform:translateX(100%)}
 .citem::after{content:'';position:absolute;inset:0;opacity:0;transition:opacity .2s;
   background:linear-gradient(90deg,rgba(124,58,237,.06),transparent);pointer-events:none}
 .citem:hover::after{opacity:1}
@@ -6824,12 +6824,12 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .irow{display:flex;align-items:center;gap:7px;padding:8px 10px;border-radius:var(--rsm);
   margin-bottom:3px;background:rgba(255,255,255,.02);border:1px solid transparent;
   animation:fade-up var(--d,.25s) ease both;transition:var(--tr);position:relative;overflow:hidden}
-.irow::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+.irow::before{content:'';position:absolute;top:0;left:0;width:100%;height:100%;
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.05),transparent);
-  transition:left .45s ease;pointer-events:none}
+  transform:translateX(-100%);transition:transform .45s ease;pointer-events:none}
 .irow:hover{background:rgba(124,58,237,.07);border-color:rgba(124,58,237,.22);
   box-shadow:0 0 12px rgba(124,58,237,.08)}
-.irow:hover::before{left:100%}
+.irow:hover::before{transform:translateX(100%)}
 .irow.now{background:linear-gradient(90deg,rgba(124,58,237,.15),rgba(124,58,237,.04));
   border-color:rgba(124,58,237,.4);box-shadow:inset 3px 0 0 var(--acc),0 0 18px rgba(124,58,237,.12)}
 .irow.now .iname{color:var(--acc)}
@@ -6888,10 +6888,10 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   background:var(--s1);flex-shrink:0;
   display:flex;flex-direction:column;align-items:center;justify-content:center;
   gap:3px;padding:4px 5px;cursor:pointer;transition:var(--tr);overflow:hidden;position:relative}
-.epg-ch-cell::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+.epg-ch-cell::before{content:'';position:absolute;top:0;left:0;width:100%;height:100%;
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.15),transparent);
-  transition:left .45s ease;pointer-events:none}
-.epg-ch-cell:hover::before{left:100%}
+  transform:translateX(-100%);transition:transform .45s ease;pointer-events:none}
+.epg-ch-cell:hover::before{transform:translateX(100%)}
 .epg-ch-cell:hover{background:rgba(124,58,237,.15)}
 .epg-ch-logo{width:48px;height:30px;object-fit:contain;border-radius:3px;flex-shrink:0}
 .epg-ch-logo-ph{width:48px;height:30px;background:var(--s3);border-radius:3px;
@@ -7036,10 +7036,10 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   margin-bottom:5px;background:rgba(255,255,255,.025);border:1px solid var(--bdr);transition:var(--tr);
   animation:fade-up .2s ease both;border-left:3px solid var(--pli-accent,var(--bdr));
   position:relative;overflow:hidden;box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}
-.pli::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+.pli::before{content:'';position:absolute;top:0;left:0;width:100%;height:100%;
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.06),transparent);
-  transition:left .5s ease;pointer-events:none}
-.pli:hover::before{left:100%}
+  transform:translateX(-100%);transition:transform .5s ease;pointer-events:none}
+.pli:hover::before{transform:translateX(100%)}
 .pli:hover{background:rgba(255,255,255,.05);border-color:var(--bdr2);
   box-shadow:0 0 12px rgba(var(--pli-accent,124,58,237),.08),inset 0 1px 0 rgba(255,255,255,.06)}
 .pli-type-badge{font-size:9px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;
@@ -7114,10 +7114,11 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .adr-prog-bar{height:100%;border-radius:8px;width:0%;transition:width .35s ease;
   background:linear-gradient(90deg,var(--acc2),var(--acc),var(--cyan));
   box-shadow:0 0 10px rgba(124,58,237,.5);position:relative;overflow:hidden}
-.adr-prog-bar::after{content:'';position:absolute;top:0;left:-120%;width:100%;height:100%;
+.adr-prog-bar::after{content:'';position:absolute;top:0;left:0;width:100%;height:100%;
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.45),transparent);
+  transform:translateX(-120%);will-change:transform;
   animation:progSweep 1.6s ease infinite}
-@keyframes progSweep{to{left:120%}}
+@keyframes progSweep{to{transform:translateX(120%)}}
 @keyframes adr-indeterminate{
   0%{transform:translateX(-110%)}
   100%{transform:translateX(200%)}
@@ -7166,10 +7167,10 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
   border:none;cursor:pointer;flex-shrink:0;overflow:hidden;
   box-shadow:0 2px 10px var(--glow2),inset 0 1px 0 rgba(255,255,255,.15);transition:var(--tr)}
-.ph-act-btn::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+.ph-act-btn::before{content:'';position:absolute;top:0;left:0;width:100%;height:100%;
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.18),transparent);
-  transition:left .5s ease;pointer-events:none}
-.ph-act-btn:hover::before{left:100%}
+  transform:translateX(-100%);transition:transform .5s ease;pointer-events:none}
+.ph-act-btn:hover::before{transform:translateX(100%)}
 .ph-act-btn:hover{filter:brightness(1.12);transform:scale(1.03);box-shadow:var(--glow-acc)}
 .ph-act-btn:active{transform:scale(.96)}
 .ph-act-badge{background:var(--green);color:#fff;font-size:9px;font-weight:800;
@@ -7235,12 +7236,12 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .won-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;
   cursor:pointer;transition:var(--tr);border:1px solid transparent;
   position:relative;overflow:hidden}
-.won-item::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+.won-item::before{content:'';position:absolute;top:0;left:0;width:100%;height:100%;
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.05),transparent);
-  transition:left .45s ease;pointer-events:none}
+  transform:translateX(-100%);transition:transform .45s ease;pointer-events:none}
 .won-item:hover{background:rgba(124,58,237,.08);border-color:rgba(124,58,237,.2);
   box-shadow:0 0 10px rgba(124,58,237,.07)}
-.won-item:hover::before{left:100%}
+.won-item:hover::before{transform:translateX(100%)}
 .won-item:active{transform:scale(.98)}
 .won-item-info{flex:1;min-width:0}
 .won-item-title{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
