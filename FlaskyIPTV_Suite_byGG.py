@@ -120,7 +120,7 @@ _size_re    = re.compile(r"size=\s*(\d+)kB")
 
 
 def probe_stream_codecs(url: str, pre_input_args=None, timeout=15):
-    ffprobe = shutil.which("ffprobe") or "ffprobe"
+    ffprobe = _FFPROBE_PATH
     cmd = [ffprobe, "-v", "error", "-print_format", "json", "-show_streams", "-show_format"]
     if pre_input_args:
         cmd = [ffprobe, "-v", "error", "-print_format", "json",
@@ -157,7 +157,7 @@ def probe_stream_codecs(url: str, pre_input_args=None, timeout=15):
 
 def run_ffmpeg_download(url: str, out_path: str, pre_input_args=None, post_input_args=None,
                         on_progress=None, stop_event: threading.Event = None, set_proc=None):
-    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    ffmpeg = _FFMPEG_PATH
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y"]
     if pre_input_args:
         cmd += pre_input_args
@@ -3222,22 +3222,20 @@ def multiview_available():
 
 @flask_app.route("/")
 def index():
-    ffmpeg_ok = shutil.which("ffmpeg") is not None
-    ffprobe_ok = shutil.which("ffprobe") is not None
-    config = json.dumps({
-        "ffmpeg_ok": ffmpeg_ok,
-        "ffprobe_ok": ffprobe_ok,
-        "ytdlp_ok": YTDLP_AVAILABLE,
-        "dvr_ok": _DVR_AVAILABLE,
-    })
-    tags = []
-    tags.append('<span class="tag tag-ok">✓ ffmpeg</span>' if ffmpeg_ok else '<span class="tag tag-err">✗ ffmpeg</span>')
-    if not ffprobe_ok:
-        tags.append('<span class="tag tag-warn">✗ ffprobe</span>')
-    if YTDLP_AVAILABLE:
-        tags.append('<span class="tag tag-ok">✓ yt-dlp</span>')
-    tags_html = "".join(tags)
-    return render_template_string(HTML_TEMPLATE, config=config, tags_html=tags_html)
+    # Serve pre-rendered, pre-gzip-compressed HTML cached at startup.
+    # Avoids 40ms Jinja2 recompile on every page load.
+    from flask import make_response
+    if "gzip" in request.headers.get("Accept-Encoding", "").lower():
+        resp = make_response(_HTML_BYTES_GZ)
+        resp.headers["Content-Encoding"] = "gzip"
+        resp.headers["Content-Type"]     = "text/html; charset=utf-8"
+        resp.headers["Content-Length"]   = len(_HTML_BYTES_GZ)
+        resp.headers["Vary"]             = "Accept-Encoding"
+        return resp
+    # Fallback for clients that don't accept gzip (rare)
+    resp = make_response(_HTML_BYTES)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    return resp
 
 
 @flask_app.route("/api/connect", methods=["POST"])
@@ -3688,7 +3686,7 @@ def api_download_mkv():
         return jsonify({"error": "No items selected"}), 400
     if not out_dir:
         return jsonify({"error": "No output folder specified"}), 400
-    if not shutil.which("ffmpeg"):
+    if not _FFMPEG_AVAILABLE:
         return jsonify({"error": "ffmpeg not found on PATH"}), 400
     if state.busy:
         return jsonify({"error": "Another operation is in progress"}), 409
@@ -3981,7 +3979,7 @@ def api_record_start():
 
     if not stream_url:
         return jsonify({"error": "No stream URL"}), 400
-    if not shutil.which("ffmpeg"):
+    if not _FFMPEG_AVAILABLE:
         return jsonify({"error": "ffmpeg not found"}), 400
     if state.recording:
         return jsonify({"error": "Already recording"}), 409
@@ -3994,7 +3992,7 @@ def api_record_start():
     fname = safe_filename(stream_name) + f"_{ts}.mkv"
     out_path = os.path.join(out_dir, fname)
 
-    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    ffmpeg = _FFMPEG_PATH
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y",
            "-protocol_whitelist", "file,http,https,tcp,tls,crypto,rtsp,rtmp",
            "-i", stream_url, "-c", "copy", out_path]
@@ -4072,6 +4070,17 @@ def api_stop():
     return jsonify({"ok": True})
 
 
+# Resolve ffmpeg/ffprobe once at startup — shutil.which() does a filesystem
+# PATH search and was previously called on every /api/status poll and on every
+# resolve/record/probe request. Caching to module-level variables means the
+# search runs exactly once per process lifetime.
+_FFMPEG_WHICH      = shutil.which("ffmpeg")
+_FFPROBE_WHICH     = shutil.which("ffprobe")
+_FFMPEG_PATH       = _FFMPEG_WHICH or "ffmpeg"   # ready-to-use binary path
+_FFPROBE_PATH      = _FFPROBE_WHICH or "ffprobe"
+_FFMPEG_AVAILABLE  = _FFMPEG_WHICH is not None
+_FFPROBE_AVAILABLE = _FFPROBE_WHICH is not None
+
 @flask_app.route("/api/status", methods=["GET"])
 def api_status():
     return jsonify({
@@ -4080,7 +4089,7 @@ def api_status():
         "status": state.status,
         "recording": state.recording,
         "conn_type": state.conn_type,
-        "ffmpeg": shutil.which("ffmpeg") is not None,
+        "ffmpeg": _FFMPEG_AVAILABLE,
         "task_type":       state.task_type,
         "task_label":      state.task_label,
         "task_item_names": list(state.task_item_names),
@@ -4102,12 +4111,15 @@ def api_logs():
         yield "data: Connected to log stream\n\n"
         while True:
             try:
-                msg = state.log_queue.get(timeout=1.0)
+                # 30-second timeout: sends a heartbeat every 30s instead of
+                # every 1s. Keeps the connection alive without waking up a
+                # server thread 60 times per minute when the app is idle.
+                msg = state.log_queue.get(timeout=30.0)
                 # Escape newlines for SSE
                 safe_msg = msg.replace("\n", " ").replace("\r", "")
                 yield f"data: {safe_msg}\n\n"
             except queue.Empty:
-                # Heartbeat
+                # Heartbeat — only fires every 30s now
                 yield ": heartbeat\n\n"
 
     return Response(stream_with_context(generate()),
@@ -6210,7 +6222,7 @@ def api_hls_proxy():
     url = request.args.get("url", "").strip()
     if not url or not url.startswith(("http://", "https://", "rtsp://")):
         return Response("Invalid URL", status=400)
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = _FFMPEG_WHICH
     if not ffmpeg:
         return Response("ffmpeg not available", status=503)
     
@@ -6597,11 +6609,10 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   background:rgba(8,8,20,.94);backdrop-filter:blur(20px);
   border-bottom:1px solid rgba(124,58,237,.25);
   box-shadow:0 2px 20px rgba(0,0,0,.6),0 0 40px rgba(124,58,237,.06),inset 0 1px 0 rgba(255,255,255,.06)}
-/* animated gradient scan-line at bottom of header */
+/* static gradient line at bottom of header — was animated (4s infinite repaint) */
 #hdr::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px;
   background:linear-gradient(90deg,transparent,var(--acc),var(--cyan),var(--acc),transparent);
-  animation:hdrScan 4s ease-in-out infinite;opacity:.7}
-@keyframes hdrScan{0%,100%{opacity:.35;transform:scaleX(.6)}50%{opacity:.9;transform:scaleX(1)}}
+  opacity:.6}
 #hdr-bar{display:flex;align-items:center;gap:8px;padding:8px 12px;min-height:52px}
 #cdot{width:9px;height:9px;border-radius:50%;background:var(--txt3);flex-shrink:0;transition:var(--tr)}
 #cdot.on{background:var(--green);box-shadow:0 0 8px var(--green),0 0 20px rgba(34,197,94,.3);
@@ -6943,7 +6954,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   justify-content:center;gap:12px;pointer-events:none;
   background:radial-gradient(ellipse at 50% 55%,var(--s2) 0%,#000 70%);
   transition:opacity .35s;color:var(--txt3);font-size:13px}
-#vph-ico{font-size:52px;opacity:.18;animation:float 3.5s ease infinite}
+#vph-ico{font-size:52px;opacity:.18}
 
 .pinfo{background:linear-gradient(180deg,var(--s1),var(--s2));padding:11px 14px;
   border-bottom:1px solid var(--bdr);flex-shrink:0}
@@ -6958,13 +6969,9 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .ctrl-r{display:flex;align-items:center;gap:7px}
 .ctrl-r.ctr{justify-content:center}
 .pbig{width:54px;height:54px;font-size:22px;border-radius:50%;
-  background:linear-gradient(135deg,
-    #a855f7 0%,#7c3aed 20%,#c084fc 40%,#6d28d9 55%,#a78bfa 70%,#7c3aed 85%,#4c1d95 100%);
-  background-size:200% 200%;
-  animation:metallicShift 3s ease-in-out infinite;
+  background:linear-gradient(135deg,#a855f7 0%,#7c3aed 30%,#c084fc 60%,#6d28d9 100%);
   box-shadow:0 4px 22px var(--glow),0 0 0 1px rgba(168,85,247,.3),inset 0 1px 0 rgba(255,255,255,.25),inset 0 -2px 4px rgba(0,0,0,.4);
   color:#fff;flex-shrink:0;position:relative}
-@keyframes metallicShift{0%,100%{background-position:0% 50%}50%{background-position:100% 50%}}
 .pbig::after{content:'';position:absolute;top:6px;left:10px;right:20px;height:8px;
   background:linear-gradient(180deg,rgba(255,255,255,.35),transparent);
   border-radius:50%;pointer-events:none}
@@ -6974,12 +6981,12 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 #pctrl-panel{position:relative}
 #pctrl-panel::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
   background:linear-gradient(90deg,transparent,var(--acc),var(--cyan),var(--acc),transparent);
-  animation:hdrScan 3.5s ease-in-out infinite;opacity:.6;pointer-events:none}
+  opacity:.6;pointer-events:none}
 /* Animated line above player controls (below video area) */
 #p-player .panel-divider-line{height:1px;flex-shrink:0;position:relative;overflow:visible}
 #p-player .panel-divider-line::after{content:'';position:absolute;inset:0;
   background:linear-gradient(90deg,transparent,var(--cyan),var(--acc),var(--cyan),transparent);
-  animation:hdrScan 5s ease-in-out infinite 1s;opacity:.5}
+  opacity:.5}
 .pnav{width:42px;height:42px;border-radius:50%;font-size:16px;padding:0;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}
 .btn-vol-group{display:flex;flex-direction:column;gap:4px;flex:1;align-items:center;}
 .vrow{display:flex;align-items:center;gap:9px}
@@ -7015,7 +7022,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
 .pl-list{flex:1;overflow-y:auto;padding:10px;min-height:60px}
 .pl-empty{text-align:center;padding:32px 16px;color:var(--txt3);font-size:12px}
-.pl-empty span{font-size:40px;display:block;margin-bottom:8px;opacity:.2;animation:float 3s ease infinite}
+.pl-empty span{font-size:40px;display:block;margin-bottom:8px;opacity:.2}
 .pli{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:var(--rsm);
   margin-bottom:5px;background:rgba(255,255,255,.025);border:1px solid var(--bdr);transition:var(--tr);
   animation:fade-up .2s ease both;border-left:3px solid var(--pli-accent,var(--bdr));
@@ -7191,7 +7198,6 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 @keyframes fade-up{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 @keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
 @keyframes spin{to{transform:rotate(360deg)}}
-@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
 @keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.35}}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
 @keyframes rec-glow{0%,100%{box-shadow:0 0 6px rgba(239,68,68,.4)}
@@ -7945,7 +7951,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
     </div>
     <div style="flex:1;overflow-y:auto;padding:6px 10px 10px;position:relative" id="catlist">
       <div style="text-align:center;padding:48px 20px;color:var(--txt3)">
-        <div id="cat-ph-ico" style="font-size:52px;opacity:.13;margin-bottom:12px;animation:float 3s ease infinite">📡</div>
+        <div id="cat-ph-ico" style="font-size:52px;opacity:.13;margin-bottom:12px">📡</div>
         <div style="font-size:13px">Connect to load categories</div>
       </div>
     </div>
@@ -8699,12 +8705,13 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js" crossorigin="anonymous"></script>
-<script>if(typeof Hls==='undefined'){document.write('<scr'+'ipt src="https://unpkg.com/hls.js@1.5.7/dist/hls.min.js"><\/scr'+'ipt>');}</script>
-<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js"></script>
+<!-- defer: downloads in parallel, executes after HTML parsed — never blocks rendering.
+     These libs are only needed on user interaction (play/multiview), not at load time. -->
+<script defer src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js" crossorigin="anonymous"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridstack@10.3.1/dist/gridstack.min.css"/>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridstack@10.3.1/dist/gridstack-extra.min.css"/>
-<script src="https://cdn.jsdelivr.net/npm/gridstack@10.3.1/dist/gridstack-all.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/gridstack@10.3.1/dist/gridstack-all.min.js"></script>
 <script>
 const CFG = {{ config | safe }};
 const _DVR_OK = CFG.dvr_ok === true;
@@ -11856,9 +11863,14 @@ function updateTaskProgress(d){
     // Never auto-hide here — only pollBusy (Done state) and dismissProgress (✕) hide the panel.
   });
 }
-setInterval(async()=>{
-  const r=await fetch('/api/status').catch(()=>null); if(!r) return;
-  const d=await r.json().catch(()=>null); if(!d) return;
+// Adaptive status poll: 4s when busy or recording, 15s when idle.
+// Replaces the old fixed 5s setInterval which hammered /api/status
+// even when nothing was happening.
+let _statusPollTimer = null;
+async function _statusPoll(){
+  clearTimeout(_statusPollTimer);
+  const r=await fetch('/api/status').catch(()=>null); if(!r){ _statusPollTimer=setTimeout(_statusPoll,15000); return; }
+  const d=await r.json().catch(()=>null); if(!d){ _statusPollTimer=setTimeout(_statusPoll,15000); return; }
   if(d.status) setStatus(d.status);
   if(!d.busy) setBusy(false);
   updateTaskProgress(d);
@@ -11897,7 +11909,11 @@ setInterval(async()=>{
     document.getElementById('rfname').textContent='';
     if(recTmr){clearInterval(recTmr);recTmr=null;}
   }
-},5000);
+  // Schedule next poll: fast (4s) when active, slow (15s) when idle
+  const _nextPoll = (d.busy || d.recording) ? 4000 : 15000;
+  _statusPollTimer = setTimeout(_statusPoll, _nextPoll);
+}
+_statusPoll(); // kick off immediately on page load
 
 // ── SSE LOGS ───────────────────────────────────────────────
 function startLog(){
@@ -14923,16 +14939,21 @@ async function dvrInit(){
 
 async function dvrRefresh(){
   try{
-    const [jr, rr, sr] = await Promise.all([
+    const overlayOpen = document.getElementById('dvr-overlay')?.style.display==='flex';
+    // Only fetch storage when the modal is open — it's a disk syscall and the
+    // result is cached 60s on the backend anyway, so no need to hit it from
+    // background badge polls where the storage bar isn't even visible.
+    const fetches = [
       fetch('/api/dvr/jobs').then(r=>r.json()),
       fetch('/api/dvr/recordings').then(r=>r.json()),
-      fetch('/api/dvr/storage').then(r=>r.json()),
-    ]);
+      overlayOpen ? fetch('/api/dvr/storage').then(r=>r.json()) : Promise.resolve(null),
+    ];
+    const [jr, rr, sr] = await Promise.all(fetches);
     _dvrJobs = Array.isArray(jr) ? jr : [];
     _dvrRecs = Array.isArray(rr) ? rr : [];
     _dvrRenderJobs();
     _dvrRenderRecs();
-    _dvrRenderStorage(sr);
+    if(sr) _dvrRenderStorage(sr);
     _dvrBadgeUpdate();
   }catch(e){ toast('DVR: could not load data','err'); }
 }
@@ -15088,6 +15109,7 @@ function _dvrTickCountdowns(){
   const spans = document.querySelectorAll('[id^="dvr-cd-"]');
   if(!spans.length) return;
   const now = Date.now();
+  let minDiffSec = Infinity;
   spans.forEach(el => {
     const startIso = el.dataset.start;
     if(!startIso) return;
@@ -15101,6 +15123,7 @@ function _dvrTickCountdowns(){
       return;
     }
     const totalSec = diffMs / 1000;
+    if(totalSec < minDiffSec) minDiffSec = totalSec;
     const h = Math.floor(totalSec / 3600);
     const m = Math.floor((totalSec % 3600) / 60);
     const s = Math.floor(totalSec % 60);
@@ -15115,7 +15138,10 @@ function _dvrTickCountdowns(){
       bar.style.width = Math.max(0, (totalSec / capSec * 100)).toFixed(1) + '%';
     }
   });
-  _dvrCdTimer = setTimeout(_dvrTickCountdowns, 1000);
+  // Tick every 1s when any job is starting in <5 min, else every 10s.
+  // Avoids 60 DOM reads/writes per minute when recordings are hours away.
+  const nextTick = minDiffSec < 300 ? 1000 : 10000;
+  _dvrCdTimer = setTimeout(_dvrTickCountdowns, nextTick);
 }
 
 function _dvrRenderRecs(){
@@ -15182,10 +15208,13 @@ function _dvrBadgeUpdate(){
   }
 }
 
-// Poll DVR status every 20s even when modal is closed, to keep Actions drawer current
+// Poll DVR badge every 20s when modal is closed — but only when there are
+// active or scheduled jobs worth tracking. When idle, skip the fetch entirely.
 setInterval(async ()=>{
   if(!_DVR_OK || !_dvrInited) return;
-  if(document.getElementById('dvr-overlay')?.style.display==='flex') return; // full refresh handles it
+  if(document.getElementById('dvr-overlay')?.style.display==='flex') return;
+  // No active/scheduled jobs → nothing to update, skip the round-trip
+  if(!_dvrJobs.some(j=>j.status==='recording'||j.status==='scheduled')) return;
   try{
     const j = await fetch('/api/dvr/jobs').then(r=>r.json());
     if(Array.isArray(j)){ _dvrJobs=j; _dvrBadgeUpdate(); }
@@ -15612,11 +15641,25 @@ async function dvrTimeshift(id){
 }
 
 // ── Auto-refresh DVR while overlay is open ────────────────────────────────
-setInterval(()=>{
-  if(_dvrInited && document.getElementById('dvr-overlay')?.style.display==='flex'){
-    dvrRefresh();
-  }
-}, 15000);
+// 15s when a recording is active (need live size/status updates),
+// 60s when idle (scheduled jobs or empty — no urgency).
+let _dvrAutoRefreshTimer = null;
+function _dvrScheduleAutoRefresh(){
+  clearTimeout(_dvrAutoRefreshTimer);
+  const interval = _dvrJobs.some(j=>j.status==='recording') ? 15000 : 60000;
+  _dvrAutoRefreshTimer = setTimeout(async ()=>{
+    if(_dvrInited && document.getElementById('dvr-overlay')?.style.display==='flex'){
+      await dvrRefresh();
+    }
+    _dvrScheduleAutoRefresh();
+  }, interval);
+}
+// Kick off after first successful init
+const _origDvrRefresh = dvrRefresh;
+dvrRefresh = async function(){
+  await _origDvrRefresh();
+  _dvrScheduleAutoRefresh();
+};
 
 // Public API: open the MV channel selector with a custom callback.
 // Used by DVR channel picker and any other feature needing channel selection.
@@ -15649,6 +15692,40 @@ function _mvSelOpen(callback, forcedMode){
 </html>
 """
 
+# ── Pre-render the page once at startup ──────────────────────────────────────
+# render_template_string() recompiles the entire 424 KB Jinja2 template on
+# EVERY request (≈40 ms CPU per page load). The two substitutions
+# ({{ config }} and {{ tags_html }}) are derived purely from module-level
+# constants that never change after startup — so the rendered output is
+# identical on every call. Pre-render once and cache the bytes.
+# We also pre-compress with gzip (105 KB vs 438 KB uncompressed) so the
+# browser receives 76% less data and has proportionally less JS/CSS to parse.
+import gzip as _gzip_mod
+_pre_config_json = json.dumps({
+    "ffmpeg_ok":  _FFMPEG_AVAILABLE,
+    "ffprobe_ok": _FFPROBE_AVAILABLE,
+    "ytdlp_ok":   YTDLP_AVAILABLE,
+    "dvr_ok":     _DVR_AVAILABLE,
+})
+_pre_tags: list = []
+_pre_tags.append(
+    '<span class="tag tag-ok">\u2713 ffmpeg</span>' if _FFMPEG_AVAILABLE
+    else '<span class="tag tag-err">\u2717 ffmpeg</span>'
+)
+if not _FFPROBE_AVAILABLE:
+    _pre_tags.append('<span class="tag tag-warn">\u2717 ffprobe</span>')
+if YTDLP_AVAILABLE:
+    _pre_tags.append('<span class="tag tag-ok">\u2713 yt-dlp</span>')
+_pre_tags_html = "".join(_pre_tags)
+
+# Plain Python string replace — avoids Jinja2 parse+compile entirely
+_HTML_BYTES: bytes = (
+    HTML_TEMPLATE
+    .replace("{{ tags_html | safe }}", _pre_tags_html)
+    .replace("{{ config | safe }}", _pre_config_json)
+).encode("utf-8")
+_HTML_BYTES_GZ: bytes = _gzip_mod.compress(_HTML_BYTES, compresslevel=6)
+
 # ===================== ENTRY POINT =====================
 
 if __name__ == "__main__":
@@ -15656,7 +15733,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"🚀  IPTV Portal Builder starting on http://{host}:{port}")
     print(f"    Open this address in your browser or WebView.")
-    print(f"    ffmpeg: {'found ✓' if shutil.which('ffmpeg') else 'NOT FOUND ✗'}")
+    print(f"    ffmpeg: {'found ✓' if _FFMPEG_AVAILABLE else 'NOT FOUND ✗'}")
     print(f"    yt-dlp: {'found ✓' if YTDLP_AVAILABLE else 'not available'}")
     # Use threaded=True for SSE support
     flask_app.run(host=host, port=port, threaded=True, debug=False)
