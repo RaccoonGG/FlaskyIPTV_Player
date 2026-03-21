@@ -3047,16 +3047,25 @@ _CAST_UI_JS = r"""
       btn.onclick = () => {
         btn.disabled = true;
         btn.textContent = workingLabel || '⏳';
+
+        // Safety timer — AirPlay play_url() is fire-and-forget: the device starts
+        // playing immediately but pyatv can take several seconds to raise its
+        // connection-drop exception, blocking the Flask thread and leaving the
+        // button stuck on the working label.  Reset after 4 s regardless.
+        const _safetyTimer = setTimeout(() => {
+          btn.textContent = label;
+          btn.disabled = false;
+        }, 4000);
+
         _api('/api/cast/control', {action})
           .then(d => {
+            clearTimeout(_safetyTimer);
             if (d.error) {
               _toast('Error: ' + d.error, 'err');
-              btn.textContent = label;
-              btn.disabled = false;
-            } else {
-              btn.textContent = label;
-              btn.disabled = false;
-              if (action === 'stop') {
+            }
+            btn.textContent = label;
+            btn.disabled = false;
+            if (action === 'stop') {
                 _castTitle = '';
                 _castUrl   = '';
                 const el = document.getElementById('cast-now-title');
@@ -3065,9 +3074,9 @@ _CAST_UI_JS = r"""
                 // Re-render so play/pause/stop disable correctly
                 _renderConnected();
               }
-            }
           })
           .catch(e => {
+            clearTimeout(_safetyTimer);
             _toast('Error: ' + e, 'err');
             btn.textContent = label;
             btn.disabled = false;
