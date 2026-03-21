@@ -6792,24 +6792,26 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .citem:hover .c-arr{color:var(--acc);transform:translateX(3px)}
 
 /* ─── skeleton ───────────────────────────────────────────────── */
-.skel{height:52px;border-radius:var(--rsm);margin-bottom:4px;display:flex;
+/* ::before = icon placeholder, ::after = text placeholder — both STATIC.
+   The shimmer sweep is a single .skel-wave child div animated via
+   transform:translateX() which is fully GPU-composited (zero CPU repaint).
+   Previous approach: background-position animation on 2 pseudo-elements per
+   row × 12 rows = 24 simultaneous CPU repaints at 60 fps. */
+.skel,.skel-sm{position:relative;overflow:hidden;display:flex;
   align-items:center;gap:10px;padding:0 12px;
   background:var(--s2);border:1px solid var(--bdr)}
-.skel::before{content:'';width:32px;height:32px;border-radius:6px;flex-shrink:0;
-  background:linear-gradient(90deg,var(--s3) 25%,var(--s4) 50%,var(--s3) 75%);
-  background-size:200% 100%;animation:shimmer 1.4s infinite}
-.skel::after{content:'';flex:1;height:14px;border-radius:4px;
-  background:linear-gradient(90deg,var(--s3) 25%,var(--s4) 50%,var(--s3) 75%);
-  background-size:200% 100%;animation:shimmer 1.4s infinite .1s}
-.skel-sm{height:38px;border-radius:var(--rsm);margin-bottom:3px;display:flex;
-  align-items:center;gap:10px;padding:0 12px;
-  background:var(--s2);border:1px solid var(--bdr)}
-.skel-sm::before{content:'';width:22px;height:22px;border-radius:4px;flex-shrink:0;
-  background:linear-gradient(90deg,var(--s3) 25%,var(--s4) 50%,var(--s3) 75%);
-  background-size:200% 100%;animation:shimmer 1.4s infinite}
-.skel-sm::after{content:'';flex:1;height:11px;border-radius:3px;
-  background:linear-gradient(90deg,var(--s3) 25%,var(--s4) 50%,var(--s3) 75%);
-  background-size:200% 100%;animation:shimmer 1.4s infinite .08s}
+.skel{height:52px;border-radius:var(--rsm);margin-bottom:4px}
+.skel-sm{height:38px;border-radius:var(--rsm);margin-bottom:3px}
+.skel::before{content:'';width:32px;height:32px;border-radius:6px;flex-shrink:0;background:var(--s3)}
+.skel::after{content:'';flex:1;height:14px;border-radius:4px;background:var(--s3)}
+.skel-sm::before{content:'';width:22px;height:22px;border-radius:4px;flex-shrink:0;background:var(--s3)}
+.skel-sm::after{content:'';flex:1;height:11px;border-radius:3px;background:var(--s3)}
+/* Single GPU-composited sweep per row */
+.skel-wave{position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent 0%,rgba(255,255,255,.06) 50%,transparent 100%);
+  transform:translateX(-100%);will-change:transform;pointer-events:none;
+  animation:skel-sweep 1.4s ease-in-out infinite}
+@keyframes skel-sweep{to{transform:translateX(200%)}}
 /* loading label in panel header */
 .loading-lbl{font-size:11px;color:var(--acc);display:flex;align-items:center;gap:5px;animation:pulse 1.2s ease infinite}
 @keyframes pulse{0%,100%{opacity:.5}50%{opacity:1}}
@@ -6923,15 +6925,17 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   border-bottom:1px solid var(--bdr2);display:flex;align-items:center;justify-content:center}
 .epg-grid-hdr-times{flex:1;position:relative;overflow:hidden;height:28px}
 .epg-prog-loading{position:absolute;inset:2px;border-radius:5px;
-  background:var(--s3);animation:shimmer 1.4s infinite linear;background-size:200% 100%;
-  background-image:linear-gradient(90deg,var(--s3) 25%,var(--s4) 50%,var(--s3) 75%)}
+  background:var(--s3);overflow:hidden}
+.epg-prog-loading::after{content:'';position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent 0%,rgba(255,255,255,.06) 50%,transparent 100%);
+  transform:translateX(-100%);will-change:transform;
+  animation:skel-sweep 1.4s ease-in-out infinite}
 .epg-layout-btn{display:flex;align-items:center;gap:4px;padding:4px 9px;
   font-size:11px;font-weight:700;border-radius:14px;border:1.5px solid var(--bdr2);
   background:var(--s2);color:var(--txt2);cursor:pointer;transition:var(--tr);flex-shrink:0;
   white-space:nowrap}
 .epg-layout-btn:hover{border-color:var(--acc);color:var(--acc)}
 .epg-layout-btn.active{background:rgba(139,92,246,.15);border-color:var(--acc);color:var(--acc)}
-@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
 
 /* ─── paths area ─────────────────────────────────────────────── */
 #paths{padding:8px 0 4px;border-top:1px solid var(--bdr);flex-shrink:0;display:none}
@@ -7201,7 +7205,6 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 
 /* ─── animations ─────────────────────────────────────────────── */
 @keyframes fade-up{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
-@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
 @keyframes spin{to{transform:rotate(360deg)}}
 @keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.35}}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
@@ -9801,9 +9804,13 @@ function browseC(cj){
 function showSkels(count=10, small=false){
   document.getElementById('main').classList.add('items-open');
   const cls=small?'skel-sm':'skel';
-  document.getElementById('ilist').innerHTML=
-    `<div style="padding:4px 0">`+Array(count).fill(`<div class="${cls}" style="--d:${0}s"></div>`).map((s,i)=>
-      `<div class="${cls}" style="animation-delay:${i*0.04}s"></div>`).join('')+`</div>`;
+  // .skel-wave is the GPU-composited shimmer sweep (transform:translateX).
+  // Stagger delay applied directly to the wave div — parent animation-delay
+  // does not propagate to ::before/::after pseudo-elements.
+  const rows = Array.from({length:count},(_,i)=>
+    `<div class="${cls}"><div class="skel-wave" style="animation-delay:${(i*0.07).toFixed(2)}s"></div></div>`
+  ).join('');
+  document.getElementById('ilist').innerHTML=`<div style="padding:4px 0">${rows}</div>`;
 }
 
 function _setLoadingHeader(text){
