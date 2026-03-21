@@ -6201,7 +6201,7 @@ def api_hls_proxy():
 
     base_input = [
         ffmpeg, "-hide_banner", "-nostdin",
-        "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "-user_agent", "VLC/3.0.0 LibVLC/3.0.0",
         "-referer", url.rsplit('/', 1)[0] + "/",
         "-reconnect", "1",
         "-reconnect_streamed", "1",
@@ -6233,7 +6233,7 @@ def api_hls_proxy():
         # Remux only (copy all streams)
         cmd = [
             ffmpeg, "-hide_banner", "-nostdin",
-            "-user_agent", "Mozilla/5.0",
+            "-user_agent", "VLC/3.0.0 LibVLC/3.0.0",
             "-i", url,
             "-c", "copy",
             "-f", "mpegts", "-",
