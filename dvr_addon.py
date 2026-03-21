@@ -40,7 +40,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 from flask import jsonify, request, Response, send_from_directory
@@ -80,27 +80,43 @@ def _get_ffmpeg() -> str:
 # Job persistence
 # ─────────────────────────────────────────────────────────────────────────────
 
-_jobs_lock = threading.Lock()
+_jobs_lock  = threading.Lock()
+_jobs_cache: Optional[List[dict]] = None   # in-memory mirror of dvr_jobs.json
+_jobs_dirty: bool = True                    # True = cache invalid, must read disk
 
 
 def _load_jobs() -> List[dict]:
+    """Return the job list. Reads from disk only when the cache is stale.
+    All callers hold _jobs_lock, so no extra locking needed here."""
+    global _jobs_cache, _jobs_dirty
+    if not _jobs_dirty and _jobs_cache is not None:
+        return _jobs_cache          # fast path — no disk I/O
     if not os.path.exists(DVR_JOBS_FILE):
-        return []
+        _jobs_cache = []
+        _jobs_dirty = False
+        return _jobs_cache
     try:
         with open(DVR_JOBS_FILE, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        return data.get("jobs", [])
+        _jobs_cache = data.get("jobs", [])
+        _jobs_dirty = False
+        return _jobs_cache
     except Exception as exc:
         LOG.error("[DVR] Failed to load jobs file: %s", exc)
-        return []
+        _jobs_cache = []
+        return _jobs_cache
 
 
 def _save_jobs(jobs: List[dict]) -> None:
+    global _jobs_cache, _jobs_dirty
     try:
         with open(DVR_JOBS_FILE, "w", encoding="utf-8") as fh:
             json.dump({"jobs": jobs}, fh, indent=2, ensure_ascii=False)
+        _jobs_cache = jobs
+        _jobs_dirty = False
     except Exception as exc:
         LOG.error("[DVR] Failed to save jobs file: %s", exc)
+        _jobs_dirty = True          # force re-read next time
 
 
 def _get_job(job_id: str) -> Optional[dict]:
@@ -134,7 +150,7 @@ _app_state = None  # set at register time
 
 def _scheduler_loop():
     LOG.info("[DVR] Scheduler started")
-    while not _scheduler_stop.wait(15):
+    while not _scheduler_stop.wait(5):
         try:
             _tick()
         except Exception as exc:
@@ -180,6 +196,31 @@ def _tick():
         # Collect jobs that need to start (don't spawn inside lock)
         to_start = []
         for job in jobs:
+            if job["status"] == "recording":
+                # Belt-and-suspenders: if a recording is still marked "recording"
+                # but its scheduled end time has passed by >30s AND it is no longer
+                # in _active_recordings (proc was never detected or was missed),
+                # promote it to completed if the output file exists, else error.
+                try:
+                    end_dt_chk = datetime.fromisoformat(job["endTime"].replace("Z", "+00:00"))
+                    if now > end_dt_chk + timedelta(seconds=30):
+                        with _active_lock:
+                            still_active = job["id"] in _active_recordings
+                        if not still_active:
+                            fp = job.get("filePath", "")
+                            if fp and os.path.exists(fp):
+                                job["status"] = "completed"
+                                job["fileSizeBytes"] = os.path.getsize(fp)
+                                LOG.info("[DVR] Rescued completed recording: %s", job.get("programTitle"))
+                            else:
+                                job["status"] = "error"
+                                job["errorMessage"] = "Recording ended without output file."
+                                LOG.warning("[DVR] Rescued error recording: %s", job.get("programTitle"))
+                            changed = True
+                except Exception:
+                    pass
+                continue
+
             if job["status"] != "scheduled":
                 continue
             start_dt = datetime.fromisoformat(job["startTime"].replace("Z", "+00:00"))
@@ -215,8 +256,21 @@ def _start_recording_unlocked(job: dict):
         job["errorMessage"] = "ffmpeg not found"
         return
 
-    # Resolve the stream URL from the job
+    # Re-resolve the stream URL right before spawning ffmpeg so that
+    # short-lived CDN tokens (Stalker/MAC portals) are always fresh.
+    # Falls back to the URL stored at schedule time if the resolver is
+    # unavailable or fails.
     stream_url = job.get("streamUrl", "")
+    if _app_state and callable(getattr(_app_state, "dvr_url_resolver", None)):
+        try:
+            fresh = _app_state.dvr_url_resolver(job)
+            if fresh:
+                LOG.info("[DVR] Refreshed stream URL for %s", job.get("programTitle"))
+                stream_url = fresh
+                job["streamUrl"] = fresh   # persist so stop/restart also uses fresh URL
+        except Exception as _re:
+            LOG.warning("[DVR] URL refresh failed, using stored URL: %s", _re)
+
     if not stream_url:
         job["status"] = "error"
         job["errorMessage"] = "No stream URL stored for this job"
@@ -263,6 +317,17 @@ def _start_recording_unlocked(job: dict):
         job["errorMessage"] = f"Failed to spawn ffmpeg: {exc}"
         LOG.error("[DVR] Spawn failed for %s: %s", job.get("programTitle"), exc)
         return
+
+    # CRITICAL: drain stderr in a background thread.
+    # ffmpeg writes continuous progress output (frame counts, bitrate, speed)
+    # to stderr. Without a reader the OS pipe buffer fills up (~4 KB on
+    # Windows, ~64 KB on Linux) and ffmpeg BLOCKS — proc.poll() returns None
+    # forever so _tick() never marks the job completed.
+    threading.Thread(
+        target=lambda: [line for line in proc.stderr],
+        daemon=True,
+        name=f"dvr-stderr-{job.get('id','')[:8]}",
+    ).start()
 
     with _active_lock:
         _active_recordings[job["id"]] = proc
@@ -352,6 +417,7 @@ def register_dvr_routes(app, state=None) -> None:
         start_iso    = d.get("programStart") or d.get("startTime") or ""
         stop_iso     = d.get("programStop")  or d.get("endTime")   or ""
         stream_url   = (d.get("streamUrl") or "").strip()
+        channel_item = d.get("channelItem") or {}
 
         if not start_iso or not stop_iso:
             return jsonify({"error": "startTime and endTime are required"}), 400
@@ -364,6 +430,7 @@ def register_dvr_routes(app, state=None) -> None:
             "startTime":     start_iso,
             "endTime":       stop_iso,
             "streamUrl":     stream_url,
+            "channelItem":   channel_item,
             "status":        "scheduled",
             "filePath":      "",
             "filename":      "",
@@ -392,7 +459,8 @@ def register_dvr_routes(app, state=None) -> None:
         start_iso    = d.get("startTime") or ""
         end_iso      = d.get("endTime")   or ""
         stream_url   = (d.get("streamUrl") or "").strip()
-        title        = (d.get("programTitle") or f"Manual – {channel_name}").strip()
+        title        = (d.get("programTitle") or f"Scheduled – {channel_name}").strip()
+        channel_item = d.get("channelItem") or {}
 
         if not start_iso or not end_iso:
             return jsonify({"error": "startTime and endTime are required"}), 400
@@ -413,6 +481,7 @@ def register_dvr_routes(app, state=None) -> None:
             "startTime":     start_iso,
             "endTime":       end_iso,
             "streamUrl":     stream_url,
+            "channelItem":   channel_item,
             "status":        "scheduled",
             "filePath":      "",
             "filename":      "",
@@ -566,20 +635,33 @@ def register_dvr_routes(app, state=None) -> None:
         return jsonify({"ok": True})
 
     # ── GET /api/dvr/storage  (disk usage for DVR folder) ─────────────────────
+    # Cache storage result for 60 s — disk_usage is a syscall and can be
+    # slow on Windows/network drives; the value changes slowly anyway.
+    _storage_cache: dict = {}
+
     @app.route("/api/dvr/storage")
     def dvr_storage():
+        nonlocal _storage_cache
         out_dir = ""
         if state:
             out_dir = getattr(state, "dvr_folder", "") or getattr(state, "mkv_folder", "")
         if not out_dir:
             out_dir = os.path.join(os.path.expanduser("~"), "Downloads", "DVR")
 
+        # Return cached result if fresh enough
+        cached = _storage_cache
+        if cached.get("folder") == out_dir and time.time() - cached.get("_ts", 0) < 60:
+            return jsonify({k: v for k, v in cached.items() if k != "_ts"})
+
         try:
             usage = shutil.disk_usage(out_dir if os.path.exists(out_dir) else os.path.expanduser("~"))
             total = usage.total
             used  = usage.used
             pct   = round(used / total * 100, 1) if total else 0
-            return jsonify({"total": total, "used": used, "free": usage.free, "percentage": pct, "folder": out_dir})
+            result = {"total": total, "used": used, "free": usage.free,
+                      "percentage": pct, "folder": out_dir, "_ts": time.time()}
+            _storage_cache = result
+            return jsonify({k: v for k, v in result.items() if k != "_ts"})
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
@@ -710,22 +792,29 @@ def register_dvr_routes(app, state=None) -> None:
                     size = os.path.getsize(fp)
                 except Exception:
                     pass
-            # Elapsed from startTime
+            # Scheduled total duration — compute first so we can cap elapsed
             try:
                 start_dt = datetime.fromisoformat(job["startTime"].replace("Z", "+00:00"))
-                elapsed = int((datetime.now(timezone.utc) - start_dt).total_seconds())
+                end_dt   = datetime.fromisoformat(job["endTime"].replace("Z", "+00:00"))
+                total    = max(0, int((end_dt - start_dt).total_seconds()))
+            except Exception:
+                start_dt = None
+                total    = 0
+            # Elapsed from startTime — capped at total so the counter never
+            # runs past the scheduled end while the scheduler hasn't had its
+            # 15-second tick yet to mark the job completed.
+            try:
+                elapsed = int((datetime.now(timezone.utc) - start_dt).total_seconds()) \
+                          if start_dt else 0
+                if total:
+                    elapsed = min(elapsed, total)
             except Exception:
                 elapsed = 0
-            # Scheduled total duration
-            try:
-                end_dt = datetime.fromisoformat(job["endTime"].replace("Z", "+00:00"))
-                total = int((end_dt - start_dt).total_seconds())
-            except Exception:
-                total = 0
             result[job_id] = {
-                "fileSizeBytes": size,
+                "fileSizeBytes":  size,
                 "elapsedSeconds": max(0, elapsed),
-                "totalSeconds": max(0, total),
+                "totalSeconds":   max(0, total),
+                "openEnded":      bool(job.get("openEnded", False)),
             }
         return jsonify(result)
 
@@ -813,6 +902,8 @@ def register_dvr_routes(app, state=None) -> None:
         stream_url   = (d.get("streamUrl") or "").strip()
         duration_min = int(d.get("durationMinutes", 60))
         title        = (d.get("title") or f"Recording – {channel_name}").strip()
+        channel_item = d.get("channelItem") or {}
+        open_ended   = bool(d.get("openEnded", False))
 
         if not stream_url:
             return jsonify({"error": "streamUrl is required"}), 400
@@ -829,6 +920,8 @@ def register_dvr_routes(app, state=None) -> None:
             "startTime":     now.isoformat(),
             "endTime":       end.isoformat(),
             "streamUrl":     stream_url,
+            "channelItem":   channel_item,
+            "openEnded":     open_ended,
             "status":        "scheduled",
             "filePath":      "",
             "filename":      "",
