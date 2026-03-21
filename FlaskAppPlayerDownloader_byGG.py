@@ -6052,6 +6052,28 @@ def api_browse_m3u():
         return jsonify({"path": "", "error": str(e)})
 
 
+@flask_app.route("/api/browse_subtitle", methods=["GET"])
+def api_browse_subtitle():
+    """Desktop only: open a native OS file picker for subtitle files."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.wm_attributes("-topmost", True)
+        path = filedialog.askopenfilename(
+            title="Select Subtitle File",
+            filetypes=[
+                ("Subtitle files", "*.srt *.vtt *.ass *.ssa"),
+                ("All files", "*.*"),
+            ],
+        )
+        root.destroy()
+        return jsonify({"path": path or ""})
+    except Exception as e:
+        return jsonify({"path": "", "error": str(e)})
+
+
 @flask_app.route("/api/browse_dir_m3u", methods=["POST"])
 def api_browse_dir_m3u():
     """List directory contents for the mobile M3U file browser (.m3u/.m3u8 files only)."""
