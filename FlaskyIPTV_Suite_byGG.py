@@ -6980,7 +6980,17 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .pbig{width:54px;height:54px;font-size:22px;border-radius:50%;
   background:linear-gradient(135deg,#a855f7 0%,#7c3aed 30%,#c084fc 60%,#6d28d9 100%);
   box-shadow:0 4px 22px var(--glow),0 0 0 1px rgba(168,85,247,.3),inset 0 1px 0 rgba(255,255,255,.25),inset 0 -2px 4px rgba(0,0,0,.4);
-  color:#fff;flex-shrink:0;position:relative}
+  color:#fff;flex-shrink:0;position:relative;overflow:hidden}
+/* GPU-composited shine sweep — replaces the old background-position metallicShift.
+   Uses transform:translateX so the compositor handles it with zero CPU repaint. */
+.pbig::before{content:'';position:absolute;inset:0;border-radius:50%;
+  background:linear-gradient(105deg,transparent 20%,rgba(255,255,255,.28) 50%,transparent 80%);
+  transform:translateX(-150%) skewX(-15deg);will-change:transform;pointer-events:none;
+  animation:pbig-shine 3s ease-in-out infinite}
+@keyframes pbig-shine{
+  0%,55%,100%{transform:translateX(-150%) skewX(-15deg)}
+  30%        {transform:translateX(150%)  skewX(-15deg)}
+}
 .pbig::after{content:'';position:absolute;top:6px;left:10px;right:20px;height:8px;
   background:linear-gradient(180deg,rgba(255,255,255,.35),transparent);
   border-radius:50%;pointer-events:none}
