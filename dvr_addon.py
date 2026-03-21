@@ -242,7 +242,7 @@ def _start_recording_unlocked(job: dict):
 
     cmd = [
         ffmpeg, "-hide_banner", "-nostdin",
-        "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "-user_agent", "VLC/3.0.0 LibVLC/3.0.0",
         "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
         "-i", stream_url,
         "-t", str(duration),
