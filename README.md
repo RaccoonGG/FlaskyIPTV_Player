@@ -1,5 +1,5 @@
 # IPTV Portal Player — Flask/WebView Edition
-**by GG_Raccoon** · `FlaskAppPlayerDownloader_byGG.py`
+**by GG_Raccoon** · `FlaskyIPTV_Suite_byGG.py`
 
 A self-contained Flask web app for browsing and playing MAC/Xtream/M3U IPTV portals. Runs locally on Windows, Linux, or Android (Termux) and is accessed through any browser or WebView. No cloud, no ads, no external dependencies beyond what you install yourself.
 
@@ -57,11 +57,13 @@ It is a local player interface — a front-end that connects to IPTV portals and
 
 | File | Required | Purpose |
 |---|---|---|
-| `FlaskAppPlayerDownloaderMultiView.py` | ✓ | Main app |
-| `install_requirements_FlaskAppPlayerDownloader.py` | — | Run once to install dependencies |
+| `FlaskyIPTV_Suite_byGG.py` | ✓ | Main app |
+| `install_requirements_FlaskyIPTV_Suite.py` | — | Run once to install dependencies |
 | `cast_addon.py` | optional | Casting to Chromecast / DLNA / AirPlay |
 | `multiview_addon.py` | optional | Multi-View grid player |
 | `multiview_layouts.json` | auto-created | Saved Multi-View layouts (created on first save) |
+| `dvr_addon.py` | optional | DVR |
+| `dvr_jobs.json` | auto-created | Saved DVR jobs (created on first save) |
 
 ---
 
@@ -70,7 +72,7 @@ It is a local player interface — a front-end that connects to IPTV portals and
 Before starting the app for the first time, run the bundled installer:
 
 ```bash
-python install_requirements_FlaskAppPlayerDownloader.py
+python install_requirements_FlaskyIPTV_Suite.py
 ```
 
 The installer will:
@@ -81,6 +83,7 @@ The installer will:
 - Check if `ffmpeg` and `ffprobe` are available in PATH
 - **Detect `cast_addon.py`** and interactively offer to install each cast protocol package
 - **Detect `multiview_addon.py`** and verify its dependencies (ffmpeg + yt-dlp)
+- **Detect `dvr_addon.py`** and verify its dependencies
 - On **Android/Termux** — automatically installs `ffmpeg` via `pkg install ffmpeg` if missing
 - On **Windows/macOS/Linux** — prints install instructions for your platform if ffmpeg is missing
 - Check that port 5000 is free
@@ -103,7 +106,7 @@ Once the installer finishes with no errors, proceed to running the app.
 ## Running the App
 
 ```bash
-python FlaskAppPlayerDownloaderMultiView.py
+python FlaskyIPTV_Suite_byGG.py
 ```
 
 Then open **http://localhost:5000** in your browser or WebView.
