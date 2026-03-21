@@ -202,22 +202,36 @@ def _channel_http_headers(channel: Optional[Dict]) -> Dict:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _get_ffmpeg() -> str:
-    """Resolve ffmpeg, preferring a PyInstaller-bundled copy over PATH."""
+    """Resolve ffmpeg, preferring a PyInstaller-bundled copy over PATH.
+    Result is cached after the first call so shutil.which() is never
+    called more than once per process lifetime."""
+    if _get_ffmpeg._cached is not None:
+        return _get_ffmpeg._cached
+    result: str
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         bundled = os.path.join(sys._MEIPASS, "ffmpeg.exe")
         if os.path.exists(bundled):
-            return bundled
-    if getattr(sys, "frozen", False):
+            result = bundled
+        else:
+            result = ""
+    else:
+        result = ""
+    if not result and getattr(sys, "frozen", False):
         base = os.path.dirname(sys.executable)
         for candidate in (
             os.path.join(base, "_internal", "ffmpeg.exe"),
             os.path.join(base, "ffmpeg.exe"),
         ):
             if os.path.exists(candidate):
-                return candidate
-    if os.path.exists("ffmpeg.exe"):
-        return os.path.abspath("ffmpeg.exe")
-    return shutil.which("ffmpeg") or "ffmpeg"
+                result = candidate
+                break
+    if not result and os.path.exists("ffmpeg.exe"):
+        result = os.path.abspath("ffmpeg.exe")
+    if not result:
+        result = shutil.which("ffmpeg") or "ffmpeg"
+    _get_ffmpeg._cached = result
+    return result
+_get_ffmpeg._cached = None  # type: ignore[attr-defined]
 
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -2662,15 +2676,22 @@ def register_cast_routes(flask_app, app_state, run_async_fn, make_client_fn):
             return ("Segment read error", 500)
 
     # ── /api/cast/ui.js ───────────────────────────────────────────────────────
+    # Pre-compute the port substitution once at registration time.
+    # The proxy port never changes after startup, so the output is always
+    # identical — no need to call .replace() on 31 KB of JS per request.
+    _cast_ui_js_cached: str = _CAST_UI_JS.replace(
+        "window._castProxyPort = 0;",
+        f"window._castProxyPort = {proxy.port};"
+    )
+    _cast_ui_js_bytes: bytes = _cast_ui_js_cached.encode("utf-8")
 
     @flask_app.route("/api/cast/ui.js")
     def api_cast_ui_js():
-        # Inject the proxy port so JS can detect proxy URLs and avoid re-casting them
-        js = _CAST_UI_JS.replace(
-            "window._castProxyPort = 0;",
-            f"window._castProxyPort = {proxy.port};"
+        return Response(
+            _cast_ui_js_bytes,
+            content_type="application/javascript; charset=utf-8",
+            headers={"Cache-Control": "public, max-age=3600"},
         )
-        return Response(js, content_type="application/javascript; charset=utf-8")
 
     # Global error handler — ensures cast routes always return JSON, never HTML
     @flask_app.errorhandler(Exception)
