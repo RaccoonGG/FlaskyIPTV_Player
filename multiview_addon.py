@@ -1,5 +1,5 @@
 """
-multiview_addon.py  —  Multi-View stream management for FlaskAppPlayerDownloader_byGG.py
+multiview_addon.py  —  Multi-View stream management for FlaskyIPTV_Suite_byGG.py
 =========================================================================================
 
 Adds multi-view (picture-in-picture grid) streaming to the Flask IPTV portal.
@@ -28,7 +28,7 @@ Key design difference vs Node.js:
   acceptable for live TV (same behaviour as the Node.js app).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-INTEGRATION  (two small changes to FlaskAppPlayerDownloader_byGG.py)
+INTEGRATION  (two small changes to FlaskyIPTV_Suite_byGG.py)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 STEP 1 — add import after the cast_addon import block:
