@@ -101,28 +101,31 @@ try:
     from cast_addon import _get_ffmpeg  # type: ignore
 except ImportError:
     def _get_ffmpeg() -> str:
-        """
-        Resolve ffmpeg binary path.
-        Direct copy of cast_addon._get_ffmpeg() — kept in sync manually.
-        The Flask app itself uses shutil.which("ffmpeg") everywhere; we mirror
-        that but also handle the PyInstaller frozen-bundle case from cast_addon.
-        """
+        """Resolve ffmpeg binary path (fallback when cast_addon is absent).
+        Result is cached after the first call — shutil.which() runs once only."""
+        if _get_ffmpeg._cached is not None:
+            return _get_ffmpeg._cached
+        res = ''
         if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
             bundled = os.path.join(sys._MEIPASS, 'ffmpeg.exe')
             if os.path.exists(bundled):
-                return bundled
-        if getattr(sys, 'frozen', False):
+                res = bundled
+        if not res and getattr(sys, 'frozen', False):
             base = os.path.dirname(sys.executable)
             for candidate in (
                 os.path.join(base, '_internal', 'ffmpeg.exe'),
                 os.path.join(base, 'ffmpeg.exe'),
             ):
                 if os.path.exists(candidate):
-                    return candidate
-        if os.path.exists('ffmpeg.exe'):
-            return os.path.abspath('ffmpeg.exe')
-        # Same fallback used throughout the Flask app
-        return shutil.which('ffmpeg') or 'ffmpeg'
+                    res = candidate
+                    break
+        if not res and os.path.exists('ffmpeg.exe'):
+            res = os.path.abspath('ffmpeg.exe')
+        if not res:
+            res = shutil.which('ffmpeg') or 'ffmpeg'
+        _get_ffmpeg._cached = res
+        return res
+    _get_ffmpeg._cached = None  # type: ignore[attr-defined]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
