@@ -1,5 +1,5 @@
 """
-cast_addon.py  —  Casting integration for FlaskAppPlayerDownloaderv29_byGG.py
+cast_addon.py  —  Casting integration for FlaskyIPTV_Suite_byGG.py
 =============================================================================
 Integrates Chromecast, DLNA/UPnP and AirPlay casting into the Flask IPTV portal.
 
@@ -7,7 +7,7 @@ Drop this file in the same directory as your Flask app, then follow the four
 integration steps below.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-INTEGRATION  (four small changes to FlaskAppPlayerDownloaderv29_byGG.py)
+INTEGRATION  (four small changes to FlaskyIPTV_Suite_byGG.py)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 STEP 1 — add import at the top of the Flask app (after all other imports):
