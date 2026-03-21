@@ -3179,6 +3179,31 @@ if _MULTIVIEW_AVAILABLE:
 if _DVR_AVAILABLE:
     register_dvr_routes(flask_app, state)
 
+    # Resolver callback: re-resolve a fresh CDN URL right before ffmpeg spawns.
+    # Stalker / MAC portals return short-lived CDN tokens via create_link; if we
+    # record the URL at schedule-time the token may be expired by start-time.
+    def _dvr_resolve_url(job: dict):
+        channel_item = job.get("channelItem") or {}
+        if not channel_item:
+            return None
+        try:
+            async def _r():
+                async with _make_client() as client:
+                    return await client.resolve_item_url("live", channel_item, {})
+            url = run_async(_r())
+            if url and isinstance(url, str):
+                # Strip hls_proxy wrapper — ffmpeg must hit the raw stream
+                if "/api/hls_proxy" in url:
+                    from urllib.parse import urlparse as _up2, parse_qs as _pqs
+                    _qs = _pqs(_up2(url).query)
+                    url = (_qs.get("url") or [url])[0]
+                return url
+        except Exception as _e:
+            state.log(f"[DVR] URL re-resolve error: {_e}")
+        return None
+
+    state.dvr_url_resolver = _dvr_resolve_url
+
 @flask_app.route('/api/multiview/available')
 def multiview_available():
     """Probe endpoint — returns 200 if multiview_addon is loaded, 404 if not.
@@ -8107,7 +8132,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <span style="font-size:13px;font-weight:700;color:var(--txt1)" id="dvr-epg-ch-name">EPG</span>
           <div style="font-size:10px;color:var(--acc);margin-top:2px;font-weight:600;letter-spacing:.3px">TAP A PROGRAMME TO SET DVR TIMES</div>
         </div>
-        <button class="btn-ghost" onclick="document.getElementById('dvr-epg-overlay').style.display='none'"
+        <button class="btn-ghost" onclick="clearTimeout(_dvrEpgRetryTimer);document.getElementById('dvr-epg-overlay').style.display='none'"
           style="height:28px;width:28px;padding:0;font-size:14px;border-radius:var(--rss)">✕</button>
       </div>
       <div id="dvr-epg-body" style="overflow-y:auto;flex:1">
@@ -9973,6 +9998,7 @@ async function iMenuRec(){
           streamUrl:   recUrl,
           title:       name,
           durationMinutes,
+          channelItem: it,
         })
       });
       const rd = await rb.json();
@@ -12448,7 +12474,8 @@ document.addEventListener('DOMContentLoaded',()=>{
   function _mvsClose(){
     if(_mvsOverlay) _mvsOverlay.classList.remove('open');
     if(typeof mvSelCallback !== 'undefined') mvSelCallback = null;
-    // Restore mode tabs visibility (they may have been hidden for DVR live-only mode)
+    _mvSelForcedMode = null;
+    // Restore mode tabs visibility
     const tabsEl = document.getElementById('mv-sel-tabs');
     if(tabsEl) tabsEl.style.display = '';
   }
@@ -12459,6 +12486,38 @@ document.addEventListener('DOMContentLoaded',()=>{
   if(_mvsOverlay){
     _mvsOverlay.addEventListener('click', e=>{
       if(e.target === _mvsOverlay) _mvsClose();
+    });
+  }
+
+  // ── Back button — wired globally so it works from DVR channel picker
+  // (which opens the selector without ever going through mvOpen/_mvSetupListeners)
+  const _mvsBackBtn = document.getElementById('mv-sel-back');
+  if(_mvsBackBtn){
+    _mvsBackBtn.addEventListener('click', ()=>{
+      if(typeof _mvCloseCtxMenu === 'function') _mvCloseCtxMenu();
+      if(typeof _mvSelNavMode === 'undefined') return;
+      if(_mvSelNavMode === 'episodes'){
+        _mvSelNavMode  = 'items';
+        _mvSelShowItem = null;
+        _mvSelEpisodes = [];
+      } else {
+        _mvSelNavMode = 'cats';
+        _mvSelCat     = null;
+        _mvSelItems   = [];
+      }
+      const srch = document.getElementById('mv-sel-search');
+      if(srch) srch.value = '';
+      const _pRow = document.getElementById('mv-sel-play-url-row');
+      if(_pRow){
+        const showRow = _mvSelNavMode==='cats'
+          && (typeof _mvSelContentMode!=='undefined' && _mvSelContentMode==='live')
+          && (typeof _mvSelWidgetCtx!=='undefined' && _mvSelWidgetCtx);
+        _pRow.style.display = showRow ? '' : 'none';
+      }
+      const tabsEl = document.getElementById('mv-sel-tabs');
+      // In forced-mode (e.g. DVR live-only) keep tabs hidden at all levels
+      if(tabsEl) tabsEl.style.display = (_mvSelNavMode==='cats' && !_mvSelForcedMode) ? '' : 'none';
+      if(typeof _mvRenderSel === 'function') _mvRenderSel();
     });
   }
 
@@ -14475,7 +14534,8 @@ function _mvRenderSel(){
   const modeLabel = {live:'Live',vod:'VOD',series:'Series'}[_mvSelContentMode]||'';
   titleEl.textContent   = 'Browse ' + modeLabel + ' Categories';
   backBtn.style.display = 'none';
-  if(tabsEl) tabsEl.style.display = '';
+  // Keep tabs hidden in forced-mode (e.g. DVR live-only picker) even when searching at cats level
+  if(tabsEl) tabsEl.style.display = _mvSelForcedMode ? 'none' : '';
   document.getElementById('mv-sel-search').placeholder = 'Search categories…';
 
   // ── Play URL row (live only) ──────────────────────────────────────────────
@@ -14731,42 +14791,9 @@ function _mvSetupListeners(){
   document.getElementById('mv-load-btn')     .addEventListener('click', ()=> _mvLoadSelected());
   document.getElementById('mv-delete-btn')   .addEventListener('click', ()=> _mvDeleteSelected());
 
-  // Channel selector close/back buttons
-  document.getElementById('mv-sel-back').addEventListener('click', ()=>{
-    _mvCloseCtxMenu();
-    if(_mvSelNavMode === 'episodes'){
-      // Episodes → Items
-      _mvSelNavMode  = 'items';
-      _mvSelShowItem = null;
-      _mvSelEpisodes = [];
-    } else {
-      // Items → Cats
-      _mvSelNavMode = 'cats';
-      _mvSelCat     = null;
-      _mvSelItems   = [];
-    }
-    document.getElementById('mv-sel-search').value = '';
-    const _pRow = document.getElementById('mv-sel-play-url-row');
-    if(_pRow) _pRow.style.display = _mvSelNavMode==='cats' && _mvSelContentMode==='live' ? '' : 'none';
-    const tabsEl = document.getElementById('mv-sel-tabs');
-    if(tabsEl) tabsEl.style.display = _mvSelNavMode==='cats' ? '' : 'none';
-    _mvRenderSel();
-  });
-  document.getElementById('mv-sel-close').addEventListener('click', ()=>{
-    document.getElementById('mv-sel-overlay').classList.remove('open');
-    mvSelCallback = null;
-  });
-  document.getElementById('mv-sel-cancel').addEventListener('click', ()=>{
-    document.getElementById('mv-sel-overlay').classList.remove('open');
-    mvSelCallback = null;
-  });
-  // Close selector on overlay click
-  document.getElementById('mv-sel-overlay').addEventListener('click', e=>{
-    if(e.target === document.getElementById('mv-sel-overlay')){
-      document.getElementById('mv-sel-overlay').classList.remove('open');
-      mvSelCallback = null;
-    }
-  });
+  // Channel selector back/close/cancel buttons are wired globally in the
+  // DOMContentLoaded block so they work from DVR channel picker without
+  // needing multiview to have been opened first. Nothing to add here.
 
   // mirrors multiview.js: close panel on outside click
   // (not applicable here since we're a full-overlay panel, but
@@ -14940,14 +14967,16 @@ function _dvrRenderJobs(){
     const canCancel= j.status==='scheduled';
     const canRemove= ['error','cancelled','completed'].includes(j.status);
     // Progress bar for recording jobs — filled by _dvrPollProgress
+    // Open-ended (Record Now) jobs show elapsed time only, no total or percentage.
+    const isOpenEnded = !!j.openEnded;
     const progressHtml = isRec ? `
       <div style="margin-top:5px">
         <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--txt3);margin-bottom:2px">
-          <span id="dvr-prog-time-${esc(j.id)}">Recording…</span>
+          <span id="dvr-prog-time-${esc(j.id)}">${isOpenEnded ? 'Recording…' : 'Recording…'}</span>
           <span id="dvr-prog-size-${esc(j.id)}"></span>
         </div>
         <div style="height:3px;background:rgba(255,255,255,.1);border-radius:2px;overflow:hidden">
-          <div id="dvr-prog-bar-${esc(j.id)}" style="height:100%;width:0%;background:#f87171;border-radius:2px;transition:width .5s"></div>
+          <div id="dvr-prog-bar-${esc(j.id)}" style="height:100%;width:${isOpenEnded?'100':'0'}%;background:${isOpenEnded?'var(--acc)':'#f87171'};border-radius:2px;${isOpenEnded?'':'transition:width .5s'}"></div>
         </div>
       </div>` : '';
     // Countdown for scheduled jobs — ticked by _dvrTickCountdowns every second
@@ -14987,29 +15016,69 @@ function _dvrRenderJobs(){
 }
 
 // Poll /api/dvr/progress every 3s while DVR overlay is open and a recording is active
-let _dvrProgressTimer = null;
+let _dvrProgressTimer    = null;
+let _dvrRefreshPending   = false;
+const _dvrEndFired = new Set(); // jobs with a one-shot end-refresh already scheduled
 async function _dvrPollProgress(){
   clearTimeout(_dvrProgressTimer);
-  const hasActive = _dvrJobs.some(j=>j.status==='recording');
-  if(!hasActive || document.getElementById('dvr-overlay')?.style.display!=='flex') return;
+  const activeJobs = _dvrJobs.filter(j=>j.status==='recording');
+  if(!activeJobs.length || document.getElementById('dvr-overlay')?.style.display!=='flex') return;
   try{
     const prog = await fetch('/api/dvr/progress').then(r=>r.json());
+
+    // PRIMARY signal: job gone from progress → backend already marked completed.
+    // Trigger a refresh after a short settle delay.
+    const missingIds = activeJobs.map(j=>j.id).filter(id=>!(id in prog));
+    if(missingIds.length && !_dvrRefreshPending){
+      _dvrRefreshPending = true;
+      setTimeout(()=>{ _dvrRefreshPending=false; dvrRefresh(); }, 1500);
+    }
+
     for(const [id, p] of Object.entries(prog)){
-      const elapsed = p.elapsedSeconds||0;
-      const total   = p.totalSeconds||0;
-      const size    = p.fileSizeBytes||0;
+      const elapsed   = p.elapsedSeconds||0;
+      const total     = p.totalSeconds||0;
+      const size      = p.fileSizeBytes||0;
+      const isOpenEnd = !!p.openEnded;
+
       const h=Math.floor(elapsed/3600), m=Math.floor((elapsed%3600)/60), s=elapsed%60;
-      const timeStr = (h>0?`${h}h `:'') + `${String(m).padStart(2,'0')}m ${String(s).padStart(2,'0')}s`;
-      const pct = total>0 ? Math.min(100, Math.round(elapsed/total*100)) : 0;
-      const t = document.getElementById(`dvr-prog-time-${id}`);
-      const sz= document.getElementById(`dvr-prog-size-${id}`);
-      const bar=document.getElementById(`dvr-prog-bar-${id}`);
-      if(t)  t.textContent  = `${timeStr} / ${_dvrFmtDur(total)} (${pct}%)`;
-      if(sz) sz.textContent = size ? _dvrFmtBytes(size) : '';
-      if(bar)bar.style.width= pct+'%';
+      const elapsedStr = (h>0?`${h}h `:'') + `${String(m).padStart(2,'0')}m ${String(s).padStart(2,'0')}s`;
+
+      const t   = document.getElementById(`dvr-prog-time-${id}`);
+      const sz  = document.getElementById(`dvr-prog-size-${id}`);
+      const bar = document.getElementById(`dvr-prog-bar-${id}`);
+
+      if(isOpenEnd){
+        // Open-ended: show elapsed only, bar stays solid accent
+        if(t)  t.textContent  = elapsedStr;
+        if(sz) sz.textContent = size ? _dvrFmtBytes(size) : '';
+      } else {
+        // Scheduled: cap at total, show percentage
+        const dispElapsed = total>0 ? Math.min(elapsed, total) : elapsed;
+        const dh=Math.floor(dispElapsed/3600), dm=Math.floor((dispElapsed%3600)/60), ds=dispElapsed%60;
+        const timeStr = (dh>0?`${dh}h `:'') + `${String(dm).padStart(2,'0')}m ${String(ds).padStart(2,'0')}s`;
+        const pct = total>0 ? Math.min(100, Math.round(dispElapsed/total*100)) : 0;
+        if(t)  t.textContent  = `${timeStr} / ${_dvrFmtDur(total)} (${pct}%)`;
+        if(sz) sz.textContent = size ? _dvrFmtBytes(size) : '';
+        if(bar)bar.style.width= pct+'%';
+
+        // FALLBACK signal: schedule exactly ONE refresh per job at 100%.
+        // No loop — fires once at 8s (covers 5s backend tick + buffer).
+        // The primary missingIds check handles it faster when backend updates.
+        if(pct>=100 && !_dvrEndFired.has(id)){
+          _dvrEndFired.add(id);
+          setTimeout(()=>{
+            _dvrEndFired.delete(id);
+            if(!_dvrRefreshPending){
+              _dvrRefreshPending = true;
+              dvrRefresh().finally(()=>{ _dvrRefreshPending=false; });
+            }
+          }, 8000);
+        }
+      }
     }
   }catch(e){}
-  _dvrProgressTimer = setTimeout(_dvrPollProgress, 3000);
+  // 5s poll — light on CPU, still responsive enough for elapsed display
+  _dvrProgressTimer = setTimeout(_dvrPollProgress, 5000);
 }
 
 // ── Countdown ticker for scheduled jobs ───────────────────────────────────
@@ -15218,13 +15287,19 @@ function dvrPickChannel(){
 }
 
 // ── DVR EPG browser ───────────────────────────────────────────────────────
-async function dvrOpenEpg(){
+let _dvrEpgRetryTimer = null;
+async function dvrOpenEpg(isRetry){
   if(!_dvrPickedItem){ toast('Pick a channel first','wrn'); return; }
   const ov = document.getElementById('dvr-epg-overlay');
   document.getElementById('dvr-epg-ch-name').textContent = _dvrPickedItem.name || 'EPG';
-  document.getElementById('dvr-epg-body').innerHTML =
-    '<div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Loading\u2026</div>';
-  ov.style.display = 'flex';
+  // On first open show the loading spinner and make overlay visible.
+  // On auto-retries keep the overlay open and just update the body.
+  if(!isRetry){
+    clearTimeout(_dvrEpgRetryTimer);
+    document.getElementById('dvr-epg-body').innerHTML =
+      '<div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Loading\u2026</div>';
+    ov.style.display = 'flex';
+  }
   try{
     const r = await fetch('/api/epg', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({item: _dvrPickedItem})});
@@ -15237,8 +15312,20 @@ async function dvrOpenEpg(){
         ({title:p.title, start:p.start, end:p.end, desc:p.desc||''}));
     }
     if(!programs.length){
-      document.getElementById('dvr-epg-body').innerHTML =
-        '<div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">No EPG data available for this channel</div>';
+      const errMsg = (d.error || '').toLowerCase();
+      const isLoading = errMsg.includes('loading') || errMsg.includes('please try again');
+      if(isLoading){
+        // External EPG is still downloading/decompressing — show feedback and auto-retry
+        document.getElementById('dvr-epg-body').innerHTML =
+          '<div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">' +
+          '\u23f3 External EPG is loading, please wait\u2026' +
+          '<br><span style="font-size:11px;opacity:.7">Retrying automatically in 5 seconds\u2026</span></div>';
+        _dvrEpgRetryTimer = setTimeout(()=>dvrOpenEpg(true), 5000);
+      } else {
+        document.getElementById('dvr-epg-body').innerHTML =
+          '<div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">' +
+          (d.error || 'No EPG data available for this channel') + '</div>';
+      }
       return;
     }
     const now = Date.now() / 1000;
@@ -15323,6 +15410,7 @@ async function dvrScheduleManual(){
     startTime: new Date(startVal).toISOString(),
     endTime:   new Date(endVal).toISOString(),
     ...(_dvrEpgTitle ? {programTitle: _dvrEpgTitle} : {}),
+    channelItem: _dvrPickedItem || {},
   };
   try{
     const r = await fetch('/api/dvr/schedule/manual',{method:'POST',
@@ -15339,10 +15427,8 @@ async function dvrScheduleManual(){
 
 // ── Record Now ────────────────────────────────────────────────────────────
 async function dvrRecordNow(){
-  const chId     = document.getElementById('dvr-ch-id').value.trim();
-  const chName   = document.getElementById('dvr-ch-name').textContent.trim();
-  const startVal = document.getElementById('dvr-start').value;
-  const endVal   = document.getElementById('dvr-end').value;
+  const chId  = document.getElementById('dvr-ch-id').value.trim();
+  const chName= document.getElementById('dvr-ch-name').textContent.trim();
 
   if(!chId){ toast('Pick a channel first','wrn'); return; }
 
@@ -15359,7 +15445,6 @@ async function dvrRecordNow(){
     const d = await r.json();
     url = d.url||'';
     // Strip hls_proxy wrapper — DVR ffmpeg records the raw portal stream directly.
-    // If audio needs re-encoding, ffmpeg handles it via -c:a aac in the dvr_addon.
     if(url.includes('/api/hls_proxy')){
       try{
         const params = new URLSearchParams(url.split('?')[1]||'');
@@ -15370,13 +15455,12 @@ async function dvrRecordNow(){
 
   if(!url){ toast('Could not resolve stream URL','err'); return; }
 
-  let durationMinutes = 60;
-  if(startVal && endVal){
-    const diff = (new Date(endVal) - new Date(startVal)) / 60000;
-    if(diff > 0) durationMinutes = Math.round(diff);
-  }
-
-  const body = { channelId:chId, channelName:chName, streamUrl:url, title:chName, durationMinutes };
+  // Record Now is open-ended: runs until the user hits Stop.
+  // Never read the schedule form fields — they belong to the manual scheduler,
+  // not to Record Now. Use a 12-hour ceiling so ffmpeg has a hard stop in case
+  // the app crashes, but the UI treats the job as having no fixed end time.
+  const body = { channelId:chId, channelName:chName, streamUrl:url, title:chName,
+                 durationMinutes: 720, openEnded: true, channelItem: _dvrPickedItem || {} };
   try{
     const r = await fetch('/api/dvr/record_now',{method:'POST',
       headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
@@ -15536,12 +15620,14 @@ setInterval(()=>{
 
 // Public API: open the MV channel selector with a custom callback.
 // Used by DVR channel picker and any other feature needing channel selection.
+let _mvSelForcedMode = null;  // set when selector is opened in forced mode (e.g. DVR live-only)
 function _mvSelOpen(callback, forcedMode){
   if(typeof _mvPopulateSelector !== 'function'){
     toast('Connect to a portal first','wrn'); return;
   }
   mvSelCallback = (ch)=>{ callback(ch); mvSelCallback=null; };
-  _mvSelWidgetCtx = null;
+  _mvSelWidgetCtx  = null;
+  _mvSelForcedMode = forcedMode || null;
   if(forcedMode){
     _mvSelContentMode = forcedMode;
     // Force the mode state without the early-return guard
@@ -15555,10 +15641,8 @@ function _mvSelOpen(callback, forcedMode){
   _mvPopulateSelector();
   document.getElementById('mv-sel-overlay').classList.add('open');
   // Hide tabs AFTER populate so they aren't restored by _mvPopulateSelector
-  if(forcedMode){
-    const tabsEl = document.getElementById('mv-sel-tabs');
-    if(tabsEl) tabsEl.style.display = 'none';
-  }
+  const tabsEl2 = document.getElementById('mv-sel-tabs');
+  if(tabsEl2) tabsEl2.style.display = forcedMode ? 'none' : '';
 }
 </script>
 </body>
