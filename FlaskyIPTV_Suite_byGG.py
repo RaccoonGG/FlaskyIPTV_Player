@@ -6666,7 +6666,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   #pctrl-panel.expanded #pctrl-body{max-height:300px!important}
 }
 @media(min-width:900px){
-  #main{display:grid!important;grid-template-columns:350px 28px 1fr;height:100%;transition:grid-template-columns .3s ease}
+  #main{display:grid!important;grid-template-columns:350px 30px 1fr;height:100%;transition:grid-template-columns .3s ease}
   #main.items-open{grid-template-columns:350px 350px 1fr}
   #main.items-open #p-items > *{opacity:1;transition:opacity .2s ease .15s}
   #main:not(.items-open) #p-items > *{opacity:0;pointer-events:none;transition:opacity .1s ease}
