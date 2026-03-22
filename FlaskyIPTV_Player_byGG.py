@@ -15562,22 +15562,26 @@ setInterval(async ()=>{
 let _dvrFbCurrentPath = '/sdcard/Download';
 
 async function dvrPickFolder(){
-  if(_isMobile){
-    // Mobile: show inline folder browser
+  // Always try the native desktop picker first (server-side tkinter).
+  // _isMobile is unreliable here — DevTools device emulation and touch-screen
+  // laptops set maxTouchPoints/ontouchstart, wrongly triggering mobile mode.
+  // The real distinction is whether the server can open a tkinter dialog.
+  // If it can't (Android/Termux, headless), d.error is set and we fall back
+  // to the inline folder browser instead.
+  try{
+    const r = await fetch('/api/browse_folder');
+    const d = await r.json();
+    if(d.path){
+      dvrSetFolder(d.path);
+      dvrRefresh();
+      return;
+    }
+    if(d.error) throw new Error(d.error);
+    // d.path==='' with no error: user cancelled native dialog — do nothing
+  } catch(e){
+    // tkinter unavailable (Android/Termux) — show inline folder browser
     document.getElementById('dvr-fb-wrap').style.display = '';
     await dvrFbNav(_dvrFbCurrentPath);
-  } else {
-    // Desktop: tkinter askdirectory
-    try{
-      const r = await fetch('/api/browse_folder');
-      const d = await r.json();
-      if(d.path){
-        dvrSetFolder(d.path);
-        dvrRefresh();
-      }
-    } catch(e){
-      toast('Folder picker failed: '+e,'err');
-    }
   }
 }
 
