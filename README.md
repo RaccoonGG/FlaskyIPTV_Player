@@ -8,31 +8,16 @@ A self-contained Flask web app for browsing and playing MAC/Xtream/M3U IPTV port
 
 ## Screenshots
 
-**Main player — desktop**
-<a href="https://github.com/user-attachments/assets/bfe3b0f4-247e-4cb6-b42a-5f14ae4b8b9f"><img width="300" src="https://github.com/user-attachments/assets/bfe3b0f4-247e-4cb6-b42a-5f14ae4b8b9f" alt="Main player desktop"></a>
-
-**Main player — mobile**
-<a href="https://github.com/user-attachments/assets/9c35f0f8-6642-4789-b8f1-854e88909f65"><img width="100" src="https://github.com/user-attachments/assets/9c35f0f8-6642-4789-b8f1-854e88909f65" alt="Main player mobile"></a>
-
-**Multi-View grid — desktop**
-<a href="https://github.com/user-attachments/assets/f0540bf2-102d-4714-a0e5-6c6ae38f356b"><img width="300" src="https://github.com/user-attachments/assets/f0540bf2-102d-4714-a0e5-6c6ae38f356b" alt="Multi-View desktop"></a>
-
-**Multi-View grid — mobile**
-<a href="https://github.com/user-attachments/assets/9199509b-9d52-4e03-8bd0-b2ce56099b4f"><img width="100" src="https://github.com/user-attachments/assets/9199509b-9d52-4e03-8bd0-b2ce56099b4f" alt="Multi-View mobile"></a>
-
-**EPG / TV Guide — desktop**
-<a href="https://github.com/user-attachments/assets/5b7f8771-a247-4009-a309-c4e7137311b9"><img width="300" src="https://github.com/user-attachments/assets/5b7f8771-a247-4009-a309-c4e7137311b9" alt="EPG Whats on Now"></a>
-<a href="https://github.com/user-attachments/assets/2be30c07-af3a-442e-a288-9efc7c7eeee0"><img width="300" src="https://github.com/user-attachments/assets/2be30c07-af3a-442e-a288-9efc7c7eeee0" alt="EPG per channel"></a>
-<a href="https://github.com/user-attachments/assets/0f3c101f-2193-483a-a40b-022aea4c7e84"><img width="300" src="https://github.com/user-attachments/assets/0f3c101f-2193-483a-a40b-022aea4c7e84" alt="EPG layout"></a>
-
-**EPG / TV Guide — mobile**
-<a href="https://github.com/user-attachments/assets/23f84816-b817-450f-b22d-431fb909ecff"><img width="100" src="https://github.com/user-attachments/assets/23f84816-b817-450f-b22d-431fb909ecff" alt="EPG Whats on Now mobile"></a>
-<a href="https://github.com/user-attachments/assets/ad8eeaa4-61b3-4250-9b4d-d521842d48aa"><img width="100" src="https://github.com/user-attachments/assets/ad8eeaa4-61b3-4250-9b4d-d521842d48aa" alt="EPG per channel mobile"></a>
-<a href="https://github.com/user-attachments/assets/b00921a6-47b2-4031-99ab-861e7332cc93"><img width="100" src="https://github.com/user-attachments/assets/b00921a6-47b2-4031-99ab-861e7332cc93" alt="EPG layout mobile"></a>
-
-**DVR — scheduled recordings**
-![DVR](screenshots/dvr.png)
-
+| Desktop | Mobile |
+|---------|--------|
+| **Main player** | |
+| <a href="https://github.com/user-attachments/assets/bfe3b0f4-247e-4cb6-b42a-5f14ae4b8b9f"><img width="300" src="https://github.com/user-attachments/assets/bfe3b0f4-247e-4cb6-b42a-5f14ae4b8b9f" alt="Main player desktop"></a> | <a href="https://github.com/user-attachments/assets/9c35f0f8-6642-4789-b8f1-854e88909f65"><img width="100" src="https://github.com/user-attachments/assets/9c35f0f8-6642-4789-b8f1-854e88909f65" alt="Main player mobile"></a> |
+| **Multi-View grid** | |
+| <a href="https://github.com/user-attachments/assets/f0540bf2-102d-4714-a0e5-6c6ae38f356b"><img width="300" src="https://github.com/user-attachments/assets/f0540bf2-102d-4714-a0e5-6c6ae38f356b" alt="Multi-View desktop"></a> | <a href="https://github.com/user-attachments/assets/9199509b-9d52-4e03-8bd0-b2ce56099b4f"><img width="100" src="https://github.com/user-attachments/assets/9199509b-9d52-4e03-8bd0-b2ce56099b4f" alt="Multi-View mobile"></a> |
+| **EPG / TV Guide** | |
+| <a href="https://github.com/user-attachments/assets/5b7f8771-a247-4009-a309-c4e7137311b9"><img width="300" src="https://github.com/user-attachments/assets/5b7f8771-a247-4009-a309-c4e7137311b9" alt="EPG Whats on Now desktop"></a> <a href="https://github.com/user-attachments/assets/2be30c07-af3a-442e-a288-9efc7c7eeee0"><img width="300" src="https://github.com/user-attachments/assets/2be30c07-af3a-442e-a288-9efc7c7eeee0" alt="EPG per channel desktop"></a> <a href="https://github.com/user-attachments/assets/0f3c101f-2193-483a-a40b-022aea4c7e84"><img width="300" src="https://github.com/user-attachments/assets/0f3c101f-2193-483a-a40b-022aea4c7e84" alt="EPG layout desktop"></a> | <a href="https://github.com/user-attachments/assets/23f84816-b817-450f-b22d-431fb909ecff"><img width="100" src="https://github.com/user-attachments/assets/23f84816-b817-450f-b22d-431fb909ecff" alt="EPG Whats on Now mobile"></a> <a href="https://github.com/user-attachments/assets/ad8eeaa4-61b3-4250-9b4d-d521842d48aa"><img width="100" src="https://github.com/user-attachments/assets/ad8eeaa4-61b3-4250-9b4d-d521842d48aa" alt="EPG per channel mobile"></a> <a href="https://github.com/user-attachments/assets/b00921a6-47b2-4031-99ab-861e7332cc93"><img width="100" src="https://github.com/user-attachments/assets/b00921a6-47b2-4031-99ab-861e7332cc93" alt="EPG layout mobile"></a> |
+| **DVR — scheduled recordings** | |
+| <a href="https://github.com/user-attachments/assets/e4563bd5-3266-485e-b8ce-471b36d6122a"><img width="300" src="https://github.com/user-attachments/assets/e4563bd5-3266-485e-b8ce-471b36d6122a" alt="DVR desktop"></a> | <a href="https://github.com/user-attachments/assets/671ce34b-01f5-428f-84a8-e331f8d536a2"><img width="100" src="https://github.com/user-attachments/assets/671ce34b-01f5-428f-84a8-e331f8d536a2" alt="DVR mobile"></a> |>
 
 ---
 
