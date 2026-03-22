@@ -1,5 +1,5 @@
 """
-dvr_addon.py  —  DVR (scheduled recording) addon for FlaskyIPTV_Suite_byGG.py
+dvr_addon.py  —  DVR (scheduled recording) addon for FlaskyIPTV_Player_byGG.py
 ======================================================================================
 
 Adds a full DVR tab to the Flask IPTV portal:
@@ -13,7 +13,7 @@ Adds a full DVR tab to the Flask IPTV portal:
 All job state persists to dvr_jobs.json next to the script.
 Completed recording files are .ts files written to the configured DVR folder.
 
-INTEGRATION  (two lines in FlaskyIPTV_Suite_byGG.py)
+INTEGRATION  (two lines in FlaskyIPTV_Player_byGG.py)
 ─────────────────────────────────────────────────────────────
 STEP 1 — add import after the multiview_addon import block:
 
