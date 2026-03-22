@@ -7973,6 +7973,10 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <span id="cdot"></span>
       <span id="hdr-status" style="overflow:hidden;text-overflow:ellipsis">Not connected</span>
     </button>
+    <span id="activity-status" style="
+      font-size:11px;color:var(--txt3);white-space:nowrap;overflow:hidden;
+      text-overflow:ellipsis;max-width:260px;flex-shrink:1;
+      transition:opacity .3s;opacity:1"></span>
     <div class="hdr-r">
       <span id="busy-sp" class="spin hidden"></span>
       <span id="hdr-tags">{{ tags_html | safe }}</span>
@@ -12204,13 +12208,27 @@ function toggleDesktopLog(){
     if(out) setTimeout(()=>{ out.scrollTop = out.scrollHeight; }, 260);
   }
 }
+let _activityStatusTimer=null;
 function setStatus(m){
-  const el=document.getElementById('hdr-status');
-  el.textContent=m;
   const btn=document.getElementById('conn-btn');
   const connected=document.getElementById('cdot').classList.contains('on');
   btn.classList.toggle('connected',connected);
   btn.style.cursor=connected?'pointer':'default';
+  const isConnMsg = m.startsWith('Connected') || m.startsWith('Connecting') ||
+                    m.startsWith('Error') || !connected;
+  if(!isConnMsg){
+    const act=document.getElementById('activity-status');
+    if(act){
+      act.textContent=m; act.style.opacity='1';
+      clearTimeout(_activityStatusTimer);
+      _activityStatusTimer=setTimeout(()=>{act.style.opacity='0';
+        setTimeout(()=>{if(act.style.opacity==='0')act.textContent='';},300);},4000);
+    }
+    return;
+  }
+  document.getElementById('hdr-status').textContent=m;
+  const act=document.getElementById('activity-status');
+  if(act){clearTimeout(_activityStatusTimer);act.textContent='';act.style.opacity='1';}
 }
 function setBusy(v){
   document.getElementById('busy-sp').classList.toggle('hidden',!v);
