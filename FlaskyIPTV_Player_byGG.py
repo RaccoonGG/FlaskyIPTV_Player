@@ -3,10 +3,10 @@
 MAC/Xtream/M3U Portal Builder — Flask/Android WebView Edition by GG_Raccoon.
 Build on the base of Mac2M3UMKV_LiveVodsSeriesGUIPlayer_byGGv5.pyw CustomTkinter by GG_Raccoon.
 Adapted to Flask + HTML5/HLS.js by conversion script.
-Renamed from FlaskAppPlayerDownloader to FlaskyIPTV_Suite.
+Renamed from FlaskAppPlayerDownloader to FlaskyIPTV_Player.
 
 Tested on Windows 10 with Python 3.14 and Termux on Android 16.
-First run install_requirements_FlaskyIPTV_Suite.py to make sure you have everything you need to run this script.
+First run install_requirements_FlaskyIPTV_Player.py to make sure you have everything you need to run this script.
 Run: python app.py,  then open http://localhost:5000 in your WebView/browser.
 
 Updates:
