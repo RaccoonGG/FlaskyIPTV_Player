@@ -5,27 +5,43 @@ A self-contained Flask web app for browsing and playing MAC/Xtream/M3U IPTV port
 
 ---
 
+
 ## Screenshots
 
 <!-- Replace the placeholders below with your actual screenshot paths or URLs -->
 
 **Main player — desktop**
-![Main player desktop](screenshots/main_desktop.png)
+![Main player desktop](<img width="1920" height="850" alt="image" src="https://github.com/user-attachments/assets/bfe3b0f4-247e-4cb6-b42a-5f14ae4b8b9f" />) 
 
 **Main player — mobile**
-![Main player mobile](screenshots/main_mobile.png)
+![Main player mobile](<img width="1290" height="2796" alt="127 0 0 1_5000_(iPhone 14 Pro Max)" src="https://github.com/user-attachments/assets/9c35f0f8-6642-4789-b8f1-854e88909f65" />)
 
-**Multi-View grid**
-![Multi-View](screenshots/multiview.png)
 
-**EPG / TV Guide**
-![EPG](screenshots/epg.png)
+**Multi-View grid - desktop**
+![Multi-View]!(<img width="1920" height="856" alt="image" src="https://github.com/user-attachments/assets/f0540bf2-102d-4714-a0e5-6c6ae38f356b" />)
+
+**Multi-View grid - mobile**
+![Multi-View]!(<img width="1290" height="2796" alt="127 0 0 1_5000_(iPhone 14 Pro Max)" src="https://github.com/user-attachments/assets/9199509b-9d52-4e03-8bd0-b2ce56099b4f" />)
+
+
+**EPG / TV Guide - dekstop**
+![EPG Whats on Now](<img width="1920" height="853" alt="image" src="https://github.com/user-attachments/assets/5b7f8771-a247-4009-a309-c4e7137311b9" />)
+
+![EPG per channel](<img width="1920" height="854" alt="image" src="https://github.com/user-attachments/assets/2be30c07-af3a-442e-a288-9efc7c7eeee0" />)
+
+![EPG layout](<img width="1920" height="849" alt="image" src="https://github.com/user-attachments/assets/0f3c101f-2193-483a-a40b-022aea4c7e84" />)
+
+**EPG / TV Guide - mobile**
+![EPG Whats on Now](<img width="1290" height="2796" alt="127 0 0 1_5000_(iPhone 14 Pro Max)" src="https://github.com/user-attachments/assets/23f84816-b817-450f-b22d-431fb909ecff" />)
+
+![EPG per channel](<img width="1290" height="2796" alt="127 0 0 1_5000_(iPhone 14 Pro Max)" src="https://github.com/user-attachments/assets/ad8eeaa4-61b3-4250-9b4d-d521842d48aa" />)
+
+![EPG layout](<img width="1290" height="2796" alt="127 0 0 1_5000_(iPhone 14 Pro Max)" src="https://github.com/user-attachments/assets/b00921a6-47b2-4031-99ab-861e7332cc93" />)
+
 
 **DVR — scheduled recordings**
 ![DVR](screenshots/dvr.png)
 
-**Cast panel**
-![Cast](screenshots/cast.png)
 
 ---
 
