@@ -443,8 +443,20 @@ class PortalClient:
         mac = str(js.get("mac") or js.get("device_mac") or self.mac or "unknown")
         phone = str(js.get("phone") or js.get("end_date") or js.get("expire_date")
                     or js.get("expiry") or js.get("expired") or "unknown")
-        self.log(f"[MAC] Account: MAC={mac}  expiry={phone}")
-        return (mac, phone)
+        login = str(js.get("login") or js.get("fname") or js.get("username") or "")
+        max_conn = 0
+        try:
+            raw = (js.get("max_connections") or js.get("con_per_device")
+                   or js.get("connections_limit") or js.get("max_con")
+                   or js.get("playback_limit") or 0)
+            max_conn = int(raw) if raw else 0
+        except Exception:
+            pass
+        settings_pwd = str(js.get("settings_password", "") or "")
+        adult_pwd    = str(js.get("parent_password", "") or js.get("adult_password", "") or "")
+        ident = login or mac
+        self.log(f"[MAC] Account: MAC={mac}  login={login}  expiry={phone}")
+        return (ident, phone, max_conn, settings_pwd, adult_pwd)
 
     async def _fetch_ch_logo_cache(self) -> dict:
         """Fetch live-channel logos once via get_all_channels and cache them.
@@ -1622,11 +1634,12 @@ class StalkerPortalClient:
             js = payload.get("js", {})
             if isinstance(js, dict):
                 mac = str(js.get("mac") or js.get("device_mac") or self.mac)
-                exp = str(js.get("phone") or js.get("expire_billing_date") or "unknown")
+                exp = str(js.get("phone") or js.get("end_date") or js.get("expire_billing_date") or "unknown")
                 max_conn = 0
                 try:
-                    raw = (js.get("max_connections") or js.get("con_per_device")
-                           or js.get("max_con") or js.get("connections_limit") or 0)
+                    raw = (js.get("max_online") or js.get("playback_limit") or js.get("max_connections")
+                           or js.get("con_per_device") or js.get("max_con")
+                           or js.get("connections_limit") or 0)
                     max_conn = int(raw) if raw else 0
                 except Exception:
                     pass
@@ -2293,15 +2306,20 @@ class XtreamClient:
             if not isinstance(info, dict):
                 return (self.username, "unknown")
             self._cached_user_info = info
-        exp_raw = info.get("exp_date", "")
+        # exp_date=None means the account has no expiry (unlimited)
+        exp_raw = info.get("exp_date")
         exp = "unknown"
         try:
-            if exp_raw and str(exp_raw).isdigit():
+            if exp_raw is None:
+                exp = "Unlimited"
+            elif str(exp_raw) in ("", "0", "None"):
+                exp = "Unlimited"
+            elif str(exp_raw).isdigit():
                 exp = datetime.fromtimestamp(int(exp_raw)).strftime("%Y-%m-%d")
             else:
                 exp = str(exp_raw)
         except Exception:
-            exp = str(exp_raw)
+            exp = str(exp_raw) if exp_raw else "unknown"
         max_conn_raw = info.get("max_connections", None)
         max_conn_int = 0
         try:
@@ -2311,8 +2329,9 @@ class XtreamClient:
             pass
         active = info.get("active_cons", "?")
         status = info.get("status", "?")
+        password = str(info.get("password", "") or "")
         self.log(f"[XTREAM] Account: user={self.username}  status={status}  expiry={exp}  connections={active}/{max_conn_raw}")
-        return (self.username, exp, max_conn_int)
+        return (self.username, exp, max_conn_int, password)
 
     async def fetch_categories(self, mode: str):
         action_map = {"live": "get_live_categories", "vod": "get_vod_categories", "series": "get_series_categories"}
@@ -3173,14 +3192,22 @@ async def _connect_async():
                 login = prof.get('login') or prof.get('fname') or prof.get('username') or ''
                 if login:
                     ident = login
-                exp_prof = prof.get('expire_billing_date') or prof.get('end_date') or prof.get('phone') or ''
-                if exp_prof and exp_prof != 'unknown':
-                    exp = str(exp_prof)
+                # Use tariff_expired_date from profile only if account_info didn't get a real expiry.
+                # expire_billing_date is a billing timestamp, NOT subscription end — reference code
+                # only uses it as absolute last resort when phone/end_date are also empty.
+                exp_label = 'expiry'
+                if exp == 'unknown':
+                    exp_prof = prof.get('tariff_expired_date') or prof.get('end_date') or prof.get('phone') or ''
+                    if exp_prof and exp_prof != 'unknown':
+                        exp = str(exp_prof)
+                    elif prof.get('expire_billing_date'):
+                        exp = str(prof.get('expire_billing_date'))
+                        exp_label = 'last_billing'
                 # max_conn from get_main_info, but also check profile for it
                 if not max_conn:
                     try:
-                        raw = (prof.get('max_connections') or prof.get('con_per_device')
-                               or prof.get('connections_limit') or 0)
+                        raw = (prof.get('max_online') or prof.get('playback_limit') or prof.get('max_connections')
+                               or prof.get('con_per_device') or prof.get('connections_limit') or 0)
                         max_conn = int(raw) if raw else 0
                     except Exception:
                         pass
@@ -3189,22 +3216,31 @@ async def _connect_async():
                     'mac': client.mac,
                     'login': login or ident,
                     'exp': exp,
+                    'exp_label': exp_label,
                     'status': prof.get('status', ''),
-                    'tariff': prof.get('tariff_plan', '') or prof.get('tariff', ''),
-                    'balance': prof.get('balance', ''),
                     'max_conn': str(max_conn) if max_conn else '',
                     'active_cons': str(prof.get('active_cons') or prof.get('online_streams') or ''),
+                    'settings_password': str(prof.get('settings_password', '') or ''),
+                    'adult_password': str(prof.get('parent_password', '') or prof.get('adult_password', '') or ''),
                 }
             except Exception as e:
                 state.log(f"[CONNECT] Could not fetch Stalker profile details: {e}")
                 state.profile_data = {'type': 'stalker', 'mac': client.mac, 'exp': exp,
                                       'max_conn': str(max_conn) if max_conn else ''}
         elif not state.is_stalker_portal:
+            _is_xtream = (state.conn_type == 'xtream' or
+                          (state.conn_type == 'm3u_url' and state.m3u_xtream_override))
             state.profile_data = {
-                'type': 'mac' if state.conn_type == 'mac' else 'xtream',
+                'type': 'xtream' if _is_xtream else 'mac',
                 'user': ident,
+                'mac': client.mac if hasattr(client, 'mac') else '',
                 'exp': exp,
                 'max_conn': str(max_conn) if max_conn else '',
+                # Xtream returns 4-tuple: (user, exp, max_conn, password)
+                # PortalClient returns 5-tuple: (ident, phone, max_conn, settings_pwd, adult_pwd)
+                'password':          _ai4[3] if _is_xtream and len(_ai4) > 3 else '',
+                'settings_password': _ai4[3] if not _is_xtream and len(_ai4) > 3 else '',
+                'adult_password':    _ai4[4] if not _is_xtream and len(_ai4) > 4 else '',
             }
         state.log(f"[CONNECT] ✓ Connected: {ident} | {exp}")
         for m in ("live", "vod", "series"):
@@ -7196,6 +7232,8 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   box-shadow:0 0 8px rgba(34,197,94,.15)}
 .pli-type-m3u{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3);
   box-shadow:0 0 8px rgba(239,68,68,.15)}
+.pli-type-stalker{background:rgba(168,85,247,.15);color:#a855f7;border:1px solid rgba(168,85,247,.3);
+  box-shadow:0 0 8px rgba(168,85,247,.15)}
 .pli-ico{font-size:20px;flex-shrink:0}
 .pli-info{flex:1;min-width:0}
 .pli-name{font-size:13px;font-weight:600;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -7959,7 +7997,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <div id="cr-mac" class="cr" style="flex-direction:column;align-items:stretch">
         <div style="display:flex;gap:6px;align-items:center">
           <label>URL</label><input id="i-url" type="text" inputmode="url" placeholder="http://portal.host:8080" autocomplete="new-password" autocorrect="off" spellcheck="false">
-          <label>MAC</label><input id="i-mac" placeholder="00:1A:79:XX:XX:XX" style="max-width:200px" autocomplete="new-password" autocorrect="off" spellcheck="false">
+          <label>MAC</label><span style="position:relative;display:inline-flex;align-items:center;max-width:200px;width:200px"><input id="i-mac" type="password" placeholder="00:1A:79:XX:XX:XX" style="width:100%;padding-right:28px" autocomplete="new-password" autocorrect="off" spellcheck="false"><button type="button" onclick="(function(b){var i=document.getElementById('i-mac');var shown=i.getAttribute('data-shown')==='1';if(shown){i.setAttribute('type','password');i.setAttribute('data-shown','0');b.textContent='👁';}else{i.setAttribute('type','text');i.setAttribute('data-shown','1');b.textContent='🙈';};})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button></span>
         </div>
         <div style="display:flex;gap:6px;align-items:center">
           <label title="Optional: external XMLTV EPG URL. Leave blank to use portal's own EPG.">EPG</label><input id="i-mac-epg" type="text" inputmode="url" placeholder="https://… xmltv URL (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false">
@@ -7972,7 +8010,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         </div>
         <div style="display:flex;gap:6px;align-items:center">
           <label title="Optional: external XMLTV EPG URL (e.g. epg.best). Leave blank to use provider's own EPG.">EPG</label><input id="i-epg" type="text" inputmode="url" placeholder="https://epg.best/xmltv.php?… (optional)" style="flex:1" autocomplete="new-password" autocorrect="off" spellcheck="false">
-          <label>Pass</label><input id="i-pw" type="password" placeholder="password" style="max-width:150px" autocomplete="new-password">
+          <label>Pass</label><span style="position:relative;display:inline-flex;align-items:center;max-width:150px;width:150px"><input id="i-pw" type="password" placeholder="password" style="width:100%;padding-right:28px" autocomplete="new-password"><button type="button" onclick="(function(b){var i=document.getElementById('i-pw');i.type=i.type==='password'?'text':'password';b.textContent=i.type==='password'?'👁':'🙈'})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button></span>
         </div>
       </div>
       <div id="cr-m3u" class="cr hidden" style="flex-direction:column;align-items:stretch;gap:5px">
@@ -8858,13 +8896,13 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <div class="pl-row"><label>Name</label><input id="pl-name" placeholder="My Playlist" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
         <div id="plf-mac">
           <div class="pl-row"><label>URL</label><input id="pl-url" type="text" inputmode="url" placeholder="http://portal.host:8080" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
-          <div class="pl-row"><label>MAC</label><input id="pl-mac" placeholder="00:1A:79:XX:XX:XX" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
+          <div class="pl-row"><label>MAC</label><span style="position:relative;display:inline-flex;align-items:center;flex:1"><input id="pl-mac" type="password" placeholder="00:1A:79:XX:XX:XX" autocomplete="new-password" autocorrect="off" spellcheck="false" style="flex:1;padding-right:28px"><button type="button" onclick="(function(b){var i=document.getElementById('pl-mac');var shown=i.getAttribute('data-shown')==='1';if(shown){i.setAttribute('type','password');i.setAttribute('data-shown','0');b.textContent='👁';}else{i.setAttribute('type','text');i.setAttribute('data-shown','1');b.textContent='🙈';};})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button></span></div>
           <div class="pl-row"><label>EPG</label><input id="pl-mac-epg" type="text" inputmode="url" placeholder="External EPG URL (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
         </div>
         <div id="plf-xtream" class="hidden">
           <div class="pl-row"><label>URL</label><input id="pl-xu" type="text" inputmode="url" placeholder="http://server.host:8080" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
           <div class="pl-row"><label>User</label><input id="pl-us" placeholder="username" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
-          <div class="pl-row"><label>Pass</label><input id="pl-pw" type="password" placeholder="password" autocomplete="new-password"></div>
+          <div class="pl-row"><label>Pass</label><span style="position:relative;display:inline-flex;align-items:center;flex:1"><input id="pl-pw" type="password" placeholder="password" autocomplete="new-password" style="flex:1;padding-right:28px"><button type="button" onclick="(function(b){var i=document.getElementById('pl-pw');i.type=i.type==='password'?'text':'password';b.textContent=i.type==='password'?'👁':'🙈'})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button></span></div>
           <div class="pl-row"><label>EPG</label><input id="pl-epg" type="text" inputmode="url" placeholder="External EPG URL (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
         </div>
         <div id="plf-m3u" class="hidden">
@@ -9538,6 +9576,7 @@ async function doConnect(){
           id: Date.now().toString(36),
           name: autoName || 'Profile '+arr.length,
           type: payload.conn_type,
+          is_stalker: d.is_stalker || false,
           url: payload.url,
           mac: payload.mac,
           url_xtream: payload.url,
@@ -12490,22 +12529,40 @@ async function openProfileModal(){
   try{
     const r = await fetch('/api/profile');
     const d = await r.json();
-    const row=(label,val)=>val?`<div style="display:flex;gap:8px;align-items:baseline;border-bottom:1px solid var(--bdr);padding-bottom:6px"><span style="color:var(--txt3);min-width:100px;flex-shrink:0">${label}</span><span style="color:var(--txt);word-break:break-all">${val}</span></div>`:'';
-    let html='';
+    const row=(label,val,extra='')=>val?`<div style="display:flex;gap:8px;align-items:center;border-bottom:1px solid var(--bdr);padding-bottom:6px"><span style="color:var(--txt3);min-width:120px;flex-shrink:0;font-size:11px">${label}</span><span style="color:var(--txt);word-break:break-all;font-size:12px"${extra}>${val}</span></div>`:'';
+    const typeBadge={stalker:'background:rgba(168,85,247,.15);color:#a855f7;border:1px solid rgba(168,85,247,.3)',mac:'background:rgba(59,130,246,.15);color:#3b82f6;border:1px solid rgba(59,130,246,.3)',xtream:'background:rgba(34,197,94,.15);color:#22c55e;border:1px solid rgba(34,197,94,.3)',m3u:'background:rgba(239,68,68,.15);color:#ef4444;border:1px solid rgba(239,68,68,.3)'};
+    const typeLabel={stalker:'STALKER / MAG',mac:'MAC PORTAL',xtream:'XTREAM API',m3u:'M3U'};
+    const tk=d.type==='stalker'?'stalker':d.type==='xtream'?'xtream':d.type==='m3u'?'m3u':'mac';
+    const badgeStyle=typeBadge[tk]||typeBadge.mac;
+    const statusBadge=s=>{
+      const sl=String(s).trim();
+      if(sl==='1'||sl.toLowerCase()==='active') return `<span style="background:rgba(34,197,94,.15);color:#22c55e;border:1px solid rgba(34,197,94,.3);padding:1px 7px;border-radius:20px;font-size:10px;font-weight:700">ACTIVE</span>`;
+      if(sl==='0') return `<span style="background:rgba(245,158,11,.15);color:#f59e0b;border:1px solid rgba(245,158,11,.3);padding:1px 7px;border-radius:20px;font-size:10px;font-weight:700">INACTIVE</span>`;
+      if(sl==='2') return `<span style="background:rgba(239,68,68,.15);color:#ef4444;border:1px solid rgba(239,68,68,.3);padding:1px 7px;border-radius:20px;font-size:10px;font-weight:700">BLOCKED</span>`;
+      return s?`<span style="background:rgba(107,114,128,.15);color:#9ca3af;border:1px solid rgba(107,114,128,.3);padding:1px 7px;border-radius:20px;font-size:10px;font-weight:700">${s}</span>`:'';
+    };
+    const isMacAddr=v=>v&&/^([0-9a-f]{2}[:\-]){5}[0-9a-f]{2}$/i.test(v.trim());
+    const pwdStyle=' style="font-family:monospace;letter-spacing:2px;color:var(--acc)"';
+    let html=`<div style="margin-bottom:10px"><span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:4px;${badgeStyle}">${typeLabel[tk]||tk.toUpperCase()}</span></div>`;
     if(d.type==='stalker'){
-      html+=row('Type','Stalker / MAG');
       html+=row('MAC',d.mac);
       html+=row('Login',d.login);
-      html+=row('Expiry',d.exp);
-      html+=row('Status',d.status);
-      html+=row('Tariff',d.tariff);
-      html+=row('Balance',d.balance);
+      html+=row(d.exp_label==='last_billing'?'Last Billing':'Expiry',d.exp);
+      html+=d.status?`<div style="display:flex;gap:8px;align-items:center;border-bottom:1px solid var(--bdr);padding-bottom:6px"><span style="color:var(--txt3);min-width:120px;flex-shrink:0;font-size:11px">Status</span>${statusBadge(d.status)}</div>`:'';
       html+=row('Active connections',d.active_cons&&d.max_conn?d.active_cons+' / '+d.max_conn:d.active_cons||d.max_conn);
+      html+=row('Settings password',d.settings_password,pwdStyle);
+      html+=row('Adult password',d.adult_password,pwdStyle);
     } else {
-      html+=row('Type',d.type==='xtream'?'Xtream API':'MAC Portal');
-      html+=row('Username',d.user);
+      html+=row('MAC',d.mac);
+      if(!isMacAddr(d.user)) html+=row('Username',d.user);
       html+=row('Expiry',d.exp);
       html+=row('Max connections',d.max_conn);
+      if(d.type==='xtream'){
+        // password intentionally omitted from portal info display
+      } else {
+        html+=row('Settings password',d.settings_password,pwdStyle);
+        html+=row('Adult password',d.adult_password,pwdStyle);
+      }
     }
     body.innerHTML = html || '<span style="color:var(--txt3)">No profile data available.</span>';
   }catch(e){
@@ -12548,12 +12605,13 @@ function renderPLList(){
     el.innerHTML='<div class="pl-empty"><span>📋</span>No saved playlists yet.<br>Add one below.</div>';
     return;
   }
-  const icons={mac:'🔌',xtream:'📡',m3u_url:'📄'};
-  const typeAccent={mac:'#3b82f6',xtream:'#22c55e',m3u_url:'#ef4444'};
-  const typeLbl={mac:'MAC',xtream:'XTREAM',m3u_url:'M3U'};
-  const typeCls={mac:'pli-type-mac',xtream:'pli-type-xtream',m3u_url:'pli-type-m3u'};
+  const icons={mac:'🔌',xtream:'📡',m3u_url:'📄',stalker:'📺'};
+  const typeAccent={mac:'#3b82f6',xtream:'#22c55e',m3u_url:'#ef4444',stalker:'#a855f7'};
+  const typeLbl={mac:'MAC',xtream:'XTREAM',m3u_url:'M3U',stalker:'STALKER'};
+  const typeCls={mac:'pli-type-mac',xtream:'pli-type-xtream',m3u_url:'pli-type-m3u',stalker:'pli-type-stalker'};
   el.innerHTML=arr.map((p,i)=>{
-    const t=p.type||'mac';
+    const raw=p.type||'mac';
+    const t=raw==='mac'&&p.is_stalker?'stalker':raw;
     const ico=icons[t]||'📡';
     const accent=typeAccent[t]||'var(--bdr)';
     const sub=t==='mac'?p.url+' • '+p.mac
@@ -12581,6 +12639,7 @@ function plSave(){
   const entry={
     id: plEditId||Date.now().toString(36),
     name, type:plCT,
+    is_stalker: plCT==='mac' && document.getElementById('pl-url').value.trim().toLowerCase().includes('stalker_portal'),
     url:   document.getElementById('pl-url').value.trim(),
     mac:   document.getElementById('pl-mac').value.trim(),
     url_xtream: document.getElementById('pl-xu').value.trim(),
