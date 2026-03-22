@@ -9541,7 +9541,7 @@ async function doConnect(){
     if(d.success){
       document.getElementById('cdot').classList.add('on');
       document.getElementById('conn-btn').classList.add('connected');
-      setStatus('Connected — click for details');
+      setStatus('Connected — click here');
       isStalker = !!d.is_stalker;
       const _rawUrl = payload.m3u_url || payload.url || '';
       const _portalHost = _rawUrl ? (()=>{try{return new URL(_rawUrl).hostname;}catch(e){return _rawUrl.replace(/https?:\/\//,'').split('/')[0].split(':')[0];}})() : '';
@@ -11970,7 +11970,7 @@ async function doStop(){
 async function pollBusy(){
   const r=await fetch('/api/status').catch(()=>null); if(!r) return;
   const d=await r.json().catch(()=>null); if(!d) return;
-  if(d.status) setStatus(d.status);
+  if(d.status){ const _con=document.getElementById('cdot').classList.contains('on'); if(!_con) setStatus(d.status); }
   updateTaskProgress(d);
   _syncDlState(d);
   if(d.busy){
@@ -12091,7 +12091,7 @@ async function _statusPoll(){
   clearTimeout(_statusPollTimer);
   const r=await fetch('/api/status').catch(()=>null); if(!r){ _statusPollTimer=setTimeout(_statusPoll,15000); return; }
   const d=await r.json().catch(()=>null); if(!d){ _statusPollTimer=setTimeout(_statusPoll,15000); return; }
-  if(d.status) setStatus(d.status);
+  if(d.status){ const _con=document.getElementById('cdot').classList.contains('on'); if(!_con) setStatus(d.status); }
   if(!d.busy) setBusy(false);
   updateTaskProgress(d);
   _syncDlState(d);
