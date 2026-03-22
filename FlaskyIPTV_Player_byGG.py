@@ -11258,10 +11258,27 @@ function _openEpgGrid(){
   const wrap = document.getElementById('epg-tl-col');
   const chCol2 = document.getElementById('epg-ch-col');
   if(wrap && !wrap._dragScrollAttached){
-    // Sync vertical scroll between timeline col and ch col
-    const onTlScroll = () => { if(chCol2) chCol2.scrollTop = wrap.scrollTop; };
-    wrap.addEventListener('scroll', onTlScroll);
-    wrap._syncScrollCleanup = () => wrap.removeEventListener('scroll', onTlScroll);
+    // Sync vertical scroll between timeline col and ch col — bidirectional.
+    // Guard flag prevents mutual updates from triggering an infinite loop.
+    let _syncingScroll = false;
+    const onTlScroll = () => {
+      if(_syncingScroll) return;
+      _syncingScroll = true;
+      if(chCol2) chCol2.scrollTop = wrap.scrollTop;
+      _syncingScroll = false;
+    };
+    const onChScroll = () => {
+      if(_syncingScroll) return;
+      _syncingScroll = true;
+      wrap.scrollTop = chCol2.scrollTop;
+      _syncingScroll = false;
+    };
+    wrap.addEventListener('scroll', onTlScroll, {passive: true});
+    chCol2.addEventListener('scroll', onChScroll, {passive: true});
+    wrap._syncScrollCleanup = () => {
+      wrap.removeEventListener('scroll', onTlScroll);
+      chCol2.removeEventListener('scroll', onChScroll);
+    };
 
     let _isDown = false, _startX = 0, _startY = 0, _scrollLeft = 0, _scrollTop = 0, _dragged = false;
     const onDown = e => {
