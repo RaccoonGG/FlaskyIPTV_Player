@@ -2,7 +2,7 @@
 """
 Installer for MAC/Xtream/M3U Portal Builder — Flask/WebView Edition
 Installs all required Python packages and checks system dependencies.
-Run with:  python install_requirements_FlaskyIPTV_Suite.py
+Run with:  python install_requirements_FlaskyIPTV_Player.py
 """
 
 import subprocess
@@ -26,7 +26,7 @@ def err(msg):  print(f"{RED}  ✗  {msg}{RESET}")
 def info(msg): print(f"{CYAN}  →  {msg}{RESET}")
 def hdr(msg):  print(f"\n{BOLD}{msg}{RESET}")
 
-SCRIPT_NAME = "FlaskyIPTV_Suite.py"
+SCRIPT_NAME = "FlaskyIPTV_Player.py"
 
 # ── Termux detection ──────────────────────────────────────────────────────────
 def is_termux() -> bool:
