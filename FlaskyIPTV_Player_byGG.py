@@ -8550,6 +8550,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
     <div style="display:flex;align-items:center;gap:6px">
       <div id="dvr-storage-folder" style="font-size:10px;color:var(--txt3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0"></div>
       <button class="btn-ghost" onclick="dvrPickFolder()" style="height:22px;padding:0 8px;font-size:10px;flex-shrink:0;display:flex;align-items:center;gap:4px">📂 Change</button>
+      <button class="btn-ghost" onclick="dvrForceFileBrowser()" title="Force inline file browser" style="height:22px;padding:0 8px;font-size:10px;flex-shrink:0;opacity:0.7">📁</button>
     </div>
     <!-- Mobile inline folder browser (shown by dvrPickFolder on mobile) -->
     <div id="dvr-fb-wrap" style="display:none;margin-top:6px">
@@ -15563,19 +15564,12 @@ let _dvrFbCurrentPath = '/sdcard/Download';
 
 async function dvrPickFolder(){
   // Always try the native desktop picker first (server-side tkinter).
-  // _isMobile is unreliable here — DevTools device emulation and touch-screen
+  // _isMobile is unreliable — DevTools device emulation and touch-screen
   // laptops set maxTouchPoints/ontouchstart, wrongly triggering mobile mode.
-  // The real distinction is whether the server can open a tkinter dialog.
-  // If it can't (Android/Termux, headless), d.error is set and we fall back
-  // to the inline folder browser instead.
   try{
     const r = await fetch('/api/browse_folder');
     const d = await r.json();
-    if(d.path){
-      dvrSetFolder(d.path);
-      dvrRefresh();
-      return;
-    }
+    if(d.path){ dvrSetFolder(d.path); dvrRefresh(); return; }
     if(d.error) throw new Error(d.error);
     // d.path==='' with no error: user cancelled native dialog — do nothing
   } catch(e){
@@ -15583,6 +15577,13 @@ async function dvrPickFolder(){
     document.getElementById('dvr-fb-wrap').style.display = '';
     await dvrFbNav(_dvrFbCurrentPath);
   }
+}
+
+async function dvrForceFileBrowser(){
+  // Force the inline folder browser regardless of platform —
+  // mirrors subForceFileBrowser() for the DVR folder picker.
+  document.getElementById('dvr-fb-wrap').style.display = '';
+  await dvrFbNav(_dvrFbCurrentPath);
 }
 
 async function dvrFbNav(path){
