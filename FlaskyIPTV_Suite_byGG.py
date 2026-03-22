@@ -6671,7 +6671,10 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   #main.items-open #p-items > *{opacity:1;transition:opacity .2s ease .15s}
   #main:not(.items-open) #p-items > *{opacity:0;pointer-events:none;transition:opacity .1s ease}
   #main:not(.items-open) #p-items::after{content:'›';position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:16px;color:var(--txt3);pointer-events:none}
+  #main:not(.items-open) #p-items{cursor:pointer}
   #p-items{position:relative}
+  #items-collapse-btn{display:none!important}
+  #main.items-open #items-collapse-btn{display:flex!important;position:absolute;right:6px;top:50%;transform:translateY(-50%);z-index:20;width:24px;height:24px;padding:0;font-size:16px;background:var(--s3);border:1px solid var(--bdr);border-radius:var(--rss);color:var(--txt2);align-items:center;justify-content:center;cursor:pointer;flex-shrink:0}
   .panel{display:flex!important;flex:unset;border-right:1px solid var(--bdr);height:100%}
   #theaterbtn{display:flex!important}
   #main.theater{grid-template-columns:0 0 1fr}
@@ -7980,6 +7983,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 
   <!-- BROWSE -->
   <div class="panel" id="p-items">
+    <button id="items-collapse-btn" onclick="event.stopPropagation();document.getElementById('main').classList.remove('items-open')" title="Collapse">‹</button>
     <div class="ph">
       <h3 id="ittitle">Browse</h3>
       <button class="btn-ghost btn-sm" id="backbtn" onclick="goBack()" disabled>◀ Back</button>
@@ -12457,6 +12461,13 @@ async function plConnect(i){
 // ── INIT ───────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded',()=>{
   setCT('mac'); toggleCP();
+  // Click on collapsed #p-items bar expands it
+  const pItems = document.getElementById('p-items');
+  if(pItems) pItems.addEventListener('click', ()=>{
+    const main = document.getElementById('main');
+    if(main && !main.classList.contains('items-open'))
+      main.classList.add('items-open');
+  });
   // Player controls expanded by default
   const pc = document.getElementById('pctrl-panel');
   if(pc) pc.classList.add('expanded');
