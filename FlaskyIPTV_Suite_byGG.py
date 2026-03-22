@@ -1466,6 +1466,7 @@ class StalkerPortalClient:
     def _cookie_str(self, include_token: bool = True) -> str:
         parts = [
             f"mac={quote(self.mac)}",
+            f"sn={quote(self.serial)}",
             "stb_lang=en",
             f"timezone={quote('Europe/Paris')}",
         ]
@@ -1622,9 +1623,17 @@ class StalkerPortalClient:
             if isinstance(js, dict):
                 mac = str(js.get("mac") or js.get("device_mac") or self.mac)
                 exp = str(js.get("phone") or js.get("expire_billing_date") or "unknown")
-                self.log(f"[STALKER] Account: MAC={mac}  expiry={exp}")
-                return (mac, exp)
-        return (self.mac, "unknown")
+                max_conn = 0
+                try:
+                    raw = (js.get("max_connections") or js.get("con_per_device")
+                           or js.get("max_con") or js.get("connections_limit") or 0)
+                    max_conn = int(raw) if raw else 0
+                except Exception:
+                    pass
+                active = js.get("active_cons") or js.get("online_streams") or "?"
+                self.log(f"[STALKER] Account: MAC={mac}  expiry={exp}  connections={active}/{max_conn or '?'}")
+                return (mac, exp, max_conn)
+        return (self.mac, "unknown", 0)
 
     # ── categories ────────────────────────────────────────────────────────────
 
@@ -2939,6 +2948,7 @@ class AppState:
         # repeated handshake/profile calls that cause portal rate-limiting
         self._stalker_client: object = None
         self._stalker_client_lock = threading.Lock()
+        self.profile_data: dict = {}   # raw profile/account info for display
         # ── Persistent logo caches ─────────────────────────────────────────
         # These survive across _make_client() calls (client instances are
         # short-lived — created and destroyed per request — so any cache on
@@ -3118,6 +3128,7 @@ async def _connect_async():
                             state.cats_cache[m] = []
                     state.connected = True
                     state.set_status(f"Connected (Xtream via M3U): {ident} | {exp}")
+                    state.profile_data = {'type':'xtream','user':ident,'exp':exp,'max_conn':str(max_conn) if max_conn else ''}
                     return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
                             "max_connections": max_conn, "portal_url": detected["base"],
                             "is_stalker": False}
@@ -3143,6 +3154,7 @@ async def _connect_async():
                     state.log(f"[CONNECT] {m.upper()}: {len(state.cats_cache[m])} categories")
         state.connected = True
         state.set_status(f"Connected: {ident} | {exp}")
+        state.profile_data = {'type': 'm3u', 'user': ident, 'exp': exp, 'max_conn': str(max_conn) if max_conn else ''}
         return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
                 "max_connections": max_conn, "portal_url": state.m3u_url,
                 "is_stalker": state.is_stalker_portal}
@@ -3154,6 +3166,46 @@ async def _connect_async():
         _ai4 = await client.account_info()
         ident, exp = _ai4[0], _ai4[1]
         max_conn = _ai4[2] if len(_ai4) > 2 else 0
+        # For Stalker: also pull get_profile for richer display data
+        if state.is_stalker_portal and hasattr(client, 'get_profile'):
+            try:
+                prof = await client.get_profile()
+                login = prof.get('login') or prof.get('fname') or prof.get('username') or ''
+                if login:
+                    ident = login
+                exp_prof = prof.get('expire_billing_date') or prof.get('end_date') or prof.get('phone') or ''
+                if exp_prof and exp_prof != 'unknown':
+                    exp = str(exp_prof)
+                # max_conn from get_main_info, but also check profile for it
+                if not max_conn:
+                    try:
+                        raw = (prof.get('max_connections') or prof.get('con_per_device')
+                               or prof.get('connections_limit') or 0)
+                        max_conn = int(raw) if raw else 0
+                    except Exception:
+                        pass
+                state.profile_data = {
+                    'type': 'stalker',
+                    'mac': client.mac,
+                    'login': login or ident,
+                    'exp': exp,
+                    'status': prof.get('status', ''),
+                    'tariff': prof.get('tariff_plan', '') or prof.get('tariff', ''),
+                    'balance': prof.get('balance', ''),
+                    'max_conn': str(max_conn) if max_conn else '',
+                    'active_cons': str(prof.get('active_cons') or prof.get('online_streams') or ''),
+                }
+            except Exception as e:
+                state.log(f"[CONNECT] Could not fetch Stalker profile details: {e}")
+                state.profile_data = {'type': 'stalker', 'mac': client.mac, 'exp': exp,
+                                      'max_conn': str(max_conn) if max_conn else ''}
+        elif not state.is_stalker_portal:
+            state.profile_data = {
+                'type': 'mac' if state.conn_type == 'mac' else 'xtream',
+                'user': ident,
+                'exp': exp,
+                'max_conn': str(max_conn) if max_conn else '',
+            }
         state.log(f"[CONNECT] ✓ Connected: {ident} | {exp}")
         for m in ("live", "vod", "series"):
             try:
@@ -4103,6 +4155,11 @@ def api_status():
         "task_speed":        state.task_speed,
         "ytdlp": YTDLP_AVAILABLE,
     })
+
+
+@flask_app.route("/api/profile", methods=["GET"])
+def api_profile():
+    return jsonify(state.profile_data if state.connected else {})
 
 
 @flask_app.route("/api/logs")
@@ -6693,13 +6750,17 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   animation:pulse-dot 2.5s infinite}
 #hdr-status{flex:1;font-size:12px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap;min-width:0}
-.hdr-r{display:flex;align-items:center;gap:5px;flex-shrink:0}
+.hdr-r{display:flex;align-items:center;gap:5px;flex-shrink:0;margin-left:auto}
 .tag{display:inline-flex;align-items:center;padding:2px 7px;border-radius:20px;font-size:10px;font-weight:700}
 .tok{background:rgba(34,197,94,.1);color:var(--green);border:1px solid rgba(34,197,94,.2)}
 .terr{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}
 .twrn{background:rgba(245,158,11,.1);color:var(--orange);border:1px solid rgba(245,158,11,.2)}
 .hdr-ico{width:34px;height:34px;padding:0;display:inline-flex;align-items:center;
   justify-content:center;font-size:16px;border-radius:var(--rsm)}
+#conn-btn.connected{background:rgba(34,197,94,.1);border-color:rgba(34,197,94,.3);
+  color:var(--txt);cursor:pointer}
+#conn-btn.connected:hover{background:rgba(34,197,94,.18);border-color:rgba(34,197,94,.5)}
+@media(max-width:899px){#hdr-tags{display:none}}
 
 /* ─── conn panel ─────────────────────────────────────────────── */
 #cpanel{overflow:hidden;max-height:0;transition:max-height .35s cubic-bezier(.4,0,.2,1)}
@@ -7864,11 +7925,19 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 <!-- HEADER -->
 <header id="hdr">
   <div id="hdr-bar">
-    <div id="cdot"></div>
-    <span id="hdr-status">Not connected — tap ⚙ to set up</span>
+    <button id="conn-btn" onclick="openProfileModal()" style="
+      display:inline-flex;align-items:center;gap:6px;
+      height:30px;padding:0 12px;border-radius:20px;
+      background:rgba(255,255,255,.06);border:1px solid var(--bdr);
+      font-size:12px;font-weight:600;color:var(--txt3);
+      cursor:default;flex-shrink:0;transition:var(--tr);outline:none;
+      max-width:200px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">
+      <span id="cdot"></span>
+      <span id="hdr-status" style="overflow:hidden;text-overflow:ellipsis">Not connected</span>
+    </button>
     <div class="hdr-r">
       <span id="busy-sp" class="spin hidden"></span>
-      {{ tags_html | safe }}
+      <span id="hdr-tags">{{ tags_html | safe }}</span>
       <button class="btn-ghost hdr-ico" id="stopbtn" onclick="doStop()" disabled title="Stop">⏹</button>
       <button class="btn-ghost hdr-ico" onclick="openWhatsOn()" title="What's on Now">📺</button>
       <button class="btn-ghost hdr-ico" onclick="refreshPlaylist()" title="Refresh playlist — clear cache &amp; reconnect" id="refresh-btn">🔄</button>
@@ -8202,6 +8271,17 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           font-size:11px;line-height:1.7;color:#4a556a;background:var(--bg);
           white-space:pre-wrap;word-break:break-word"></div>
       </div>
+    </div>
+  </div>
+
+  <!-- PROFILE MODAL -->
+  <div id="profile-modal" style="display:none;position:fixed;inset:0;z-index:950;background:rgba(0,0,0,.7);align-items:center;justify-content:center" onclick="if(event.target===this)closeProfileModal()">
+    <div style="background:var(--s2);border-radius:var(--rs);width:min(420px,92vw);padding:20px;box-shadow:var(--sh);border:1px solid var(--bdr2)">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+        <h3 style="font-size:13px;font-weight:800;text-transform:uppercase;letter-spacing:1.5px;color:var(--txt2);margin:0">Connection Profile</h3>
+        <button class="btn-ghost" onclick="closeProfileModal()" style="height:26px;width:26px;padding:0;font-size:14px">✕</button>
+      </div>
+      <div id="profile-modal-body" style="display:flex;flex-direction:column;gap:8px;font-size:12px"></div>
     </div>
   </div>
 
@@ -9422,7 +9502,8 @@ async function doConnect(){
     const d=await r.json();
     if(d.success){
       document.getElementById('cdot').classList.add('on');
-      setStatus('Connected: '+d.ident+(d.exp&&d.exp!=='unknown'?' · exp '+d.exp:''));
+      document.getElementById('conn-btn').classList.add('connected');
+      setStatus('Connected — click for details');
       isStalker = !!d.is_stalker;
       const _rawUrl = payload.m3u_url || payload.url || '';
       const _portalHost = _rawUrl ? (()=>{try{return new URL(_rawUrl).hostname;}catch(e){return _rawUrl.replace(/https?:\/\//,'').split('/')[0].split(':')[0];}})() : '';
@@ -9479,6 +9560,7 @@ async function doConnect(){
       }
     } else {
       document.getElementById('cdot').classList.remove('on');
+      document.getElementById('conn-btn').classList.remove('connected');
       setStatus('Error: '+(d.error||'Unknown'));
       document.getElementById('portal-name-label').textContent = '—';
       toast(d.error||'Connection failed','err');
@@ -12083,7 +12165,14 @@ function toggleDesktopLog(){
     if(out) setTimeout(()=>{ out.scrollTop = out.scrollHeight; }, 260);
   }
 }
-function setStatus(m){document.getElementById('hdr-status').textContent=m;}
+function setStatus(m){
+  const el=document.getElementById('hdr-status');
+  el.textContent=m;
+  const btn=document.getElementById('conn-btn');
+  const connected=document.getElementById('cdot').classList.contains('on');
+  btn.classList.toggle('connected',connected);
+  btn.style.cursor=connected?'pointer':'default';
+}
 function setBusy(v){
   document.getElementById('busy-sp').classList.toggle('hidden',!v);
   document.getElementById('cbtn').disabled=v;
@@ -12391,6 +12480,41 @@ function closeDrawer(){
 
 // ── SAVED PLAYLISTS ────────────────────────────────────────
 let plEditId = null, plCT = 'mac';
+
+async function openProfileModal(){
+  if(!document.getElementById('cdot').classList.contains('on')) return;
+  const modal = document.getElementById('profile-modal');
+  const body  = document.getElementById('profile-modal-body');
+  body.innerHTML = '<span style="color:var(--txt3)">Loading…</span>';
+  modal.style.display = 'flex';
+  try{
+    const r = await fetch('/api/profile');
+    const d = await r.json();
+    const row=(label,val)=>val?`<div style="display:flex;gap:8px;align-items:baseline;border-bottom:1px solid var(--bdr);padding-bottom:6px"><span style="color:var(--txt3);min-width:100px;flex-shrink:0">${label}</span><span style="color:var(--txt);word-break:break-all">${val}</span></div>`:'';
+    let html='';
+    if(d.type==='stalker'){
+      html+=row('Type','Stalker / MAG');
+      html+=row('MAC',d.mac);
+      html+=row('Login',d.login);
+      html+=row('Expiry',d.exp);
+      html+=row('Status',d.status);
+      html+=row('Tariff',d.tariff);
+      html+=row('Balance',d.balance);
+      html+=row('Active connections',d.active_cons&&d.max_conn?d.active_cons+' / '+d.max_conn:d.active_cons||d.max_conn);
+    } else {
+      html+=row('Type',d.type==='xtream'?'Xtream API':'MAC Portal');
+      html+=row('Username',d.user);
+      html+=row('Expiry',d.exp);
+      html+=row('Max connections',d.max_conn);
+    }
+    body.innerHTML = html || '<span style="color:var(--txt3)">No profile data available.</span>';
+  }catch(e){
+    body.innerHTML = `<span style="color:var(--red)">Failed to load profile: ${e.message}</span>`;
+  }
+}
+function closeProfileModal(){
+  document.getElementById('profile-modal').style.display='none';
+}
 
 function openPL(){
   document.getElementById('pl-overlay').classList.add('open');
