@@ -64,6 +64,8 @@ import threading
 import time
 import queue
 import math
+import warnings
+import logging
 import xml.etree.ElementTree as ET
 import gzip as _gzip
 from datetime import datetime, timezone
@@ -15839,5 +15841,8 @@ if __name__ == "__main__":
     print(f"    Open this address in your browser or WebView.")
     print(f"    ffmpeg: {'found ✓' if _FFMPEG_AVAILABLE else 'NOT FOUND ✗'}")
     print(f"    yt-dlp: {'found ✓' if YTDLP_AVAILABLE else 'not available'}")
+    # Silence urllib3 InsecureRequestWarning — we use verify=False intentionally
+    # for IPTV portals that have self-signed certs.
+    warnings.filterwarnings("ignore", message="Unverified HTTPS request")
     # Use threaded=True for SSE support
     flask_app.run(host=host, port=port, threaded=True, debug=False)
