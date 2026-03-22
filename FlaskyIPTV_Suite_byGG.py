@@ -6666,15 +6666,18 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   #pctrl-panel.expanded #pctrl-body{max-height:300px!important}
 }
 @media(min-width:900px){
-  #main{display:grid!important;grid-template-columns:350px 36px 1fr;height:100%;transition:grid-template-columns .3s ease}
+  #main{display:grid!important;grid-template-columns:350px 28px 1fr;height:100%;transition:grid-template-columns .3s ease}
   #main.items-open{grid-template-columns:350px 350px 1fr}
   #main.items-open #p-items > *{opacity:1;transition:opacity .2s ease .15s}
   #main:not(.items-open) #p-items > *{opacity:0;pointer-events:none;transition:opacity .1s ease}
   #main:not(.items-open) #p-items::after{content:'›';position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:16px;color:var(--txt3);pointer-events:none}
-  #main:not(.items-open) #p-items{cursor:pointer}
+  #main:not(.items-open) #p-items{cursor:pointer;background:var(--s1);border-left:1px solid var(--bdr);overflow:hidden}
+  #main:not(.items-open) #p-items::before{content:'';position:absolute;top:0;left:0;width:100%;height:100%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.18),transparent);transform:translateX(-100%);transition:none;pointer-events:none}
+  #main:not(.items-open) #p-items:hover::before{transform:translateX(100%);transition:transform .45s ease}
   #p-items{position:relative}
   #items-collapse-btn{display:none!important}
-  #main.items-open #items-collapse-btn{display:flex!important;position:absolute;right:6px;top:50%;transform:translateY(-50%);z-index:20;width:24px;height:24px;padding:0;font-size:16px;background:var(--s3);border:1px solid var(--bdr);border-radius:var(--rss);color:var(--txt2);align-items:center;justify-content:center;cursor:pointer;flex-shrink:0}
+  #main.items-open #items-collapse-btn{display:flex!important;position:absolute;right:0;top:0;bottom:0;transform:none;z-index:20;width:28px;height:100%;padding:0;font-size:16px;background:var(--s3);border:1px solid var(--bdr);border-radius:0;color:var(--txt2);align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;border-right:none;border-top:none;border-bottom:none}
+  #main.items-open #p-items{padding-right:28px;box-sizing:border-box}
   .panel{display:flex!important;flex:unset;border-right:1px solid var(--bdr);height:100%}
   #theaterbtn{display:flex!important}
   #main.theater{grid-template-columns:0 0 1fr}
