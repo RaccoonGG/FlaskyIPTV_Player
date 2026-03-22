@@ -6614,10 +6614,11 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   background:rgba(8,8,20,.97);
   border-bottom:1px solid rgba(124,58,237,.25);
   box-shadow:0 2px 20px rgba(0,0,0,.6),0 0 40px rgba(124,58,237,.06),inset 0 1px 0 rgba(255,255,255,.06)}
-/* static gradient line at bottom of header — was animated (4s infinite repaint) */
+/* animated gradient scan-line at bottom of header */
 #hdr::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px;
   background:linear-gradient(90deg,transparent,var(--acc),var(--cyan),var(--acc),transparent);
-  opacity:.6}
+  animation:hdrScan 4s ease-in-out infinite;opacity:.7}
+@keyframes hdrScan{0%,100%{opacity:.35;transform:scaleX(.6)}50%{opacity:.9;transform:scaleX(1)}}
 #hdr-bar{display:flex;align-items:center;gap:8px;padding:8px 12px;min-height:52px}
 #cdot{width:9px;height:9px;border-radius:50%;background:var(--txt3);flex-shrink:0;transition:var(--tr)}
 #cdot.on{background:var(--green);box-shadow:0 0 8px var(--green),0 0 20px rgba(34,197,94,.3);
@@ -7000,12 +7001,12 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 #pctrl-panel{position:relative}
 #pctrl-panel::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
   background:linear-gradient(90deg,transparent,var(--acc),var(--cyan),var(--acc),transparent);
-  opacity:.6;pointer-events:none}
+  animation:hdrScan 3.5s ease-in-out infinite;opacity:.6;pointer-events:none}
 /* Animated line above player controls (below video area) */
 #p-player .panel-divider-line{height:1px;flex-shrink:0;position:relative;overflow:visible}
 #p-player .panel-divider-line::after{content:'';position:absolute;inset:0;
   background:linear-gradient(90deg,transparent,var(--cyan),var(--acc),var(--cyan),transparent);
-  opacity:.5}
+  animation:hdrScan 5s ease-in-out infinite 1s;opacity:.5}
 .pnav{width:42px;height:42px;border-radius:50%;font-size:16px;padding:0;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}
 .btn-vol-group{display:flex;flex-direction:column;gap:4px;flex:1;align-items:center;}
 .vrow{display:flex;align-items:center;gap:9px}
