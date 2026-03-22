@@ -17,7 +17,7 @@ A self-contained Flask web app for browsing and playing MAC/Xtream/M3U IPTV port
 | **EPG / TV Guide** | |
 | <a href="https://github.com/user-attachments/assets/5b7f8771-a247-4009-a309-c4e7137311b9"><img width="300" src="https://github.com/user-attachments/assets/5b7f8771-a247-4009-a309-c4e7137311b9" alt="EPG Whats on Now desktop"></a> <a href="https://github.com/user-attachments/assets/2be30c07-af3a-442e-a288-9efc7c7eeee0"><img width="300" src="https://github.com/user-attachments/assets/2be30c07-af3a-442e-a288-9efc7c7eeee0" alt="EPG per channel desktop"></a> <a href="https://github.com/user-attachments/assets/0f3c101f-2193-483a-a40b-022aea4c7e84"><img width="300" src="https://github.com/user-attachments/assets/0f3c101f-2193-483a-a40b-022aea4c7e84" alt="EPG layout desktop"></a> | <a href="https://github.com/user-attachments/assets/23f84816-b817-450f-b22d-431fb909ecff"><img width="100" src="https://github.com/user-attachments/assets/23f84816-b817-450f-b22d-431fb909ecff" alt="EPG Whats on Now mobile"></a> <a href="https://github.com/user-attachments/assets/ad8eeaa4-61b3-4250-9b4d-d521842d48aa"><img width="100" src="https://github.com/user-attachments/assets/ad8eeaa4-61b3-4250-9b4d-d521842d48aa" alt="EPG per channel mobile"></a> <a href="https://github.com/user-attachments/assets/b00921a6-47b2-4031-99ab-861e7332cc93"><img width="100" src="https://github.com/user-attachments/assets/b00921a6-47b2-4031-99ab-861e7332cc93" alt="EPG layout mobile"></a> |
 | **DVR — scheduled recordings** | |
-| <a href="https://github.com/user-attachments/assets/e4563bd5-3266-485e-b8ce-471b36d6122a"><img width="300" src="https://github.com/user-attachments/assets/e4563bd5-3266-485e-b8ce-471b36d6122a" alt="DVR desktop"></a> | <a href="https://github.com/user-attachments/assets/671ce34b-01f5-428f-84a8-e331f8d536a2"><img width="100" src="https://github.com/user-attachments/assets/671ce34b-01f5-428f-84a8-e331f8d536a2" alt="DVR mobile"></a> |>
+| <a href="https://github.com/user-attachments/assets/e4563bd5-3266-485e-b8ce-471b36d6122a"><img width="300" src="https://github.com/user-attachments/assets/e4563bd5-3266-485e-b8ce-471b36d6122a" alt="DVR desktop"></a> | <a href="https://github.com/user-attachments/assets/671ce34b-01f5-428f-84a8-e331f8d536a2"><img width="100" src="https://github.com/user-attachments/assets/671ce34b-01f5-428f-84a8-e331f8d536a2" alt="DVR mobile"></a> |
 
 ---
 
@@ -37,11 +37,12 @@ It is a local player interface — a front-end that connects to IPTV portals and
 ## Requirements
 
 - Python 3.9+ (tested on 3.14)
-- `ffmpeg` and `ffprobe` in PATH (required for recording, downloading, HEVC proxy, casting, and Multi-View)
+- `ffmpeg` and `ffprobe` in PATH (required for recording, downloading, HEVC proxy, casting, DVR, and Multi-View)
 - `yt-dlp` in PATH (optional — used as HLS fallback and for YouTube/Twitch URL resolution in Multi-View tiles)
 - Python packages: `flask`, `aiohttp`, `requests`, `yt-dlp`
 - `cast_addon.py` in the same directory (optional — enables casting to TV/speakers)
 - `multiview_addon.py` in the same directory (optional — enables Multi-View grid player)
+- `dvr_addon.py` in the same directory (optional — enables DVR scheduled recording tab)
 
 ---
 
@@ -49,13 +50,13 @@ It is a local player interface — a front-end that connects to IPTV portals and
 
 | File | Required | Purpose |
 |---|---|---|
-| `FlaskyIPTV_Suite_byGG.py` | ✓ | Main app |
-| `install_requirements_FlaskyIPTV_Suite.py` | — | Run once to install dependencies |
+| `FlaskyIPTV_Player_byGG.py` | ✓ | Main app |
+| `install_requirements_FlaskyIPTV_Player.py` | — | Run once to install dependencies |
 | `cast_addon.py` | optional | Casting to Chromecast / DLNA / AirPlay |
 | `multiview_addon.py` | optional | Multi-View grid player |
 | `multiview_layouts.json` | auto-created | Saved Multi-View layouts (created on first save) |
-| `dvr_addon.py` | optional | DVR |
-| `dvr_jobs.json` | auto-created | Saved DVR jobs (created on first save) |
+| `dvr_addon.py` | optional | DVR — scheduled and manual recordings |
+| `dvr_jobs.json` | auto-created | Saved DVR job list (created on first scheduled recording) |
 
 ---
 
@@ -64,7 +65,7 @@ It is a local player interface — a front-end that connects to IPTV portals and
 Before starting the app for the first time, run the bundled installer:
 
 ```bash
-python install_requirements_FlaskyIPTV_Suite.py
+python install_requirements_FlaskyIPTV_Player.py
 ```
 
 The installer will:
@@ -75,7 +76,7 @@ The installer will:
 - Check if `ffmpeg` and `ffprobe` are available in PATH
 - **Detect `cast_addon.py`** and interactively offer to install each cast protocol package
 - **Detect `multiview_addon.py`** and verify its dependencies (ffmpeg + yt-dlp)
-- **Detect `dvr_addon.py`** and verify its dependencies
+- **Detect `dvr_addon.py`** and verify its dependencies (ffmpeg required)
 - On **Android/Termux** — automatically installs `ffmpeg` via `pkg install ffmpeg` if missing
 - On **Windows/macOS/Linux** — prints install instructions for your platform if ffmpeg is missing
 - Check that port 5000 is free
@@ -98,7 +99,7 @@ Once the installer finishes with no errors, proceed to running the app.
 ## Running the App
 
 ```bash
-python FlaskyIPTV_Suite_byGG.py
+python FlaskyIPTV_Player_byGG.py
 ```
 
 Then open **http://localhost:5000** in your browser or WebView.
@@ -174,6 +175,57 @@ When playing IPTV channels, each tile's header shows:
 - Requires a browser with **MSE (Media Source Extensions)** support: Chrome, Edge, Firefox, Brave
 - On Android: Firefox for Android has full MSE support; some WebView-based browsers may not
 - ffmpeg must be installed — each tile runs one ffmpeg process to transcode the stream to MPEG-TS for the browser
+
+### DVR — Scheduled Recording (`dvr_addon.py`)
+
+A full DVR tab for scheduling, managing, and playing back recordings of live channels.
+
+**Requires:** `dvr_addon.py` in the same directory + `ffmpeg` installed.
+
+#### Scheduling Recordings
+- **From EPG** — open the EPG panel for any live channel, find a programme, and click **⏺ Record** to schedule it. Start and end times are filled in automatically from the EPG data.
+- **Manual** — use the **+ Manual** button in the DVR tab to schedule any channel for a custom time range. Pick the channel from your connected portal's live list, set start and end time, and confirm.
+- **Record Now** — start an immediate recording of the currently playing channel from the Player tab using the **⏺ Record** button. Duration is set manually.
+
+#### Job States
+Each recording job passes through the following states:
+
+| State | Meaning |
+|---|---|
+| `scheduled` | Waiting for the start time — ffmpeg has not started yet |
+| `recording` | ffmpeg is actively writing the `.ts` file |
+| `completed` | Recording finished successfully |
+| `error` | ffmpeg exited with an error (error message shown in the job card) |
+| `cancelled` | Job was cancelled before it started |
+
+The scheduler wakes every 5 seconds to fire any jobs that are due. Missed recordings (start time passed while the app was not running) are marked as missed on next startup.
+
+#### Editing & Cancelling Jobs
+- Scheduled jobs can have their start and end times edited before recording begins
+- Any scheduled job can be cancelled; in-progress recordings can be stopped early
+- Completed jobs and their history entries can be deleted individually or all at once
+
+#### Timeshift — Watch While Recording
+While a recording is in progress you can watch it from the beginning (or any point already recorded) without making a second connection to the portal:
+
+- Click **▶ Watch** on an active recording job
+- Playback starts from the beginning of the recording file as ffmpeg writes it in real time
+- Full seeking within the already-recorded portion is supported
+- HEVC and AC3 audio are transcoded on the fly to H.264/AAC so any browser can play it
+
+#### Completed Recordings Library
+- All completed `.ts` files are listed in the **Recordings** section of the DVR tab
+- Each entry shows filename, file size, and recording duration
+- **▶ Play** — plays the recording in the built-in player (HEVC is transcoded automatically)
+- **🗑 Delete** — removes the recording file from disk
+- **📂 Show in folder** — opens the containing folder in Windows Explorer / macOS Finder (desktop only)
+
+#### Storage
+- A storage usage bar shows how much disk space the DVR folder is using and what is available
+- The DVR output folder can be changed from within the DVR tab:
+  - **Desktop:** opens a native OS folder picker dialog
+  - **Android/Termux:** opens an inline folder browser to navigate the device filesystem
+- Recordings are saved as `.ts` files — compatible with VLC, MPV, and most media players
 
 ### Cast to TV / Speakers (`cast_addon.py`)
 - Cast any live channel, VOD, or series stream to a device on your local network
@@ -265,30 +317,32 @@ All settings are saved in browser localStorage and persist across sessions.
 
 | Setting | Where | Description |
 |---|---|---|
-| MKV save folder | ⚙ Settings | Default output path for recordings and downloads |
+| MKV save folder | ⚙ Settings | Default output path for MKV recordings and downloads |
 | M3U save path | ⚙ Settings | Default output path for exported M3U files |
 | External player (desktop) | ⚙ Settings | Full path to player executable |
 | External player (mobile) | ⚙ Settings | Choose VLC / MX Player / MX Pro / Just Player / Ask |
 | OpenSubtitles API key | ⚙ Settings | Free key from opensubtitles.com/en/consumers |
 | External EPG URL | Connect panel | XMLTV URL used for EPG and What's On Now |
+| DVR output folder | DVR tab | Folder where `.ts` recording files are saved |
 
 ---
 
 ## Android / Termux Notes
 
 - Run the script inside Termux — it starts a Flask server accessible from the phone's own browser or any WebView app
-- File browser for local subtitle loading works via `os.listdir()` on the device filesystem
+- File browser for local subtitle and DVR folder selection works via `os.listdir()` on the device filesystem
 - The `_isMobile` detection uses both User-Agent and touch API checks, so it works correctly inside WebView apps that report a desktop UA
 - HEVC streams pass directly to external players without transcoding (external players handle it natively)
 - `pyatv` (AirPlay) may not build on Termux — skip it during install if it fails; Chromecast and DLNA will still work
 - **Multi-View on Android:** Firefox for Android has full MSE support and works well. Most Chromium-based WebViews also support MSE. Use Firefox or Brave (F-Droid) for the best experience.
+- **DVR on Android:** recordings are saved as `.ts` files to the configured folder (defaults to `~/Downloads/DVR`). Timeshift playback works on Android — the HEVC transcode runs server-side in ffmpeg so the browser receives H.264/AAC regardless of the source codec.
 
 ---
 
 ## Architecture Notes
 
 - Single-file app — everything (Python backend + full HTML/CSS/JS frontend) is in one `.py` file
-- `cast_addon.py` and `multiview_addon.py` are fully self-contained drop-in modules; no other files are required for either feature
+- `cast_addon.py`, `multiview_addon.py`, and `dvr_addon.py` are fully self-contained drop-in modules; the main app degrades gracefully if any of them are absent
 - The HTML is a Jinja2 template rendered by Flask's `render_template_string`
 - HLS playback uses **HLS.js** loaded from CDN
 - Multi-View playback uses **mpegts.js** loaded from CDN — each tile decodes an MPEG-TS stream via MSE
@@ -299,6 +353,7 @@ All settings are saved in browser localStorage and persist across sessions.
 - EPG data is cached in memory; large XMLTV files (30k+ channels) may use up to ~2 GB RAM
 - Cast stream proxy runs on a separate port and serves plain LAN URLs; cast devices never see auth headers directly
 - Multi-View stream proxy (`/api/multiview/stream`) runs one ffmpeg process per unique stream URL, shared across all tiles showing the same channel. A background janitor thread cleans up idle streams after 30 seconds.
+- DVR scheduler runs as a background daemon thread, waking every 5 seconds to fire any due jobs. Job state persists to `dvr_jobs.json`. On startup, any job stuck in `recording` state (ffmpeg died while the app was stopped) is recovered — completed if the file exists and has size, otherwise marked as error.
 
 ---
 
@@ -311,3 +366,6 @@ All settings are saved in browser localStorage and persist across sessions.
 - Multi-View requires MSE support in the browser — older or restricted WebViews may not support it
 - Each Multi-View tile runs one ffmpeg process; 9 simultaneous tiles = 9 ffmpeg processes. On low-end hardware (e.g. older Android phones) this may be demanding. Use fewer tiles or lower-bitrate channels if you experience performance issues.
 - YouTube/Twitch URL playback in Multi-View tiles requires yt-dlp installed and working. yt-dlp resolves a direct stream URL; the stream is then proxied through ffmpeg the same way as IPTV channels. Live streams work; age-restricted or DRM-protected content will not.
+- DVR recordings are saved as raw `.ts` files — they are not remuxed to MKV or MP4. Most players (VLC, MPV, Kodi) handle `.ts` natively; Windows Media Player may not.
+- DVR timeshift (watch while recording) transcodes on the fly via ffmpeg — on low-end hardware this may be slow to start or choppy. Timeshift works best on the same machine running the Flask server.
+- If the app is stopped while a recording is in progress, ffmpeg is killed and the partial `.ts` file is kept. On next startup the job is recovered as completed (if the file has content) or error (if the file is empty/missing).
