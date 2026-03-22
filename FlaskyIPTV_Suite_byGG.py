@@ -5717,12 +5717,45 @@ _TRANSPARENT_PNG = (
 # Hosts that are known to use cookie/session-based hotlink protection.
 # Browser UA + Referer alone will never work for these — we serve the transparent
 # PNG immediately without even attempting a network fetch, saving a round-trip.
-_HOTLINK_BLOCKED_HOSTS = frozenset({
-    "www.lyngsat.com",
-    "lyngsat.com",
-    "lyngsat-logo.com",
-    "www.lyngsat-logo.com",
-})
+# Hosts that block hotlinking with 403 — populated dynamically.
+# A host is only marked as blocked after _HOTLINK_403_THRESHOLD consecutive 403s,
+# to avoid false-positives from one-off errors or transient blocks.
+_HOTLINK_BLOCKED_HOSTS: set = set()
+_HOTLINK_BLOCKED_HOSTS_LOCK = threading.Lock()
+_HOTLINK_403_COUNTS: dict = {}   # host → 403 count
+_HOTLINK_403_THRESHOLD = 10
+
+def _record_host_403(host: str):
+    """Increment 403 counter for host; mark blocked once threshold is reached."""
+    with _HOTLINK_BLOCKED_HOSTS_LOCK:
+        _HOTLINK_403_COUNTS[host] = _HOTLINK_403_COUNTS.get(host, 0) + 1
+        if _HOTLINK_403_COUNTS[host] >= _HOTLINK_403_THRESHOLD:
+            if host not in _HOTLINK_BLOCKED_HOSTS:
+                _HOTLINK_BLOCKED_HOSTS.add(host)
+                return True  # just crossed threshold — caller should log
+    return False
+
+# Hosts that rate-limit (429) when hit with many concurrent requests.
+# Populated dynamically — any host that returns 429 gets added here and
+# subsequent requests to it are throttled with a semaphore + retry backoff.
+_RATE_LIMITED_HOSTS: set = set()
+_RATE_LIMITED_HOSTS_LOCK = threading.Lock()
+# Semaphore per rate-limited host — at most N concurrent outbound requests
+_RATE_LIMIT_SEMAPHORES: dict = {}
+_RATE_LIMIT_SEMAPHORES_LOCK = threading.Lock()
+_RATE_LIMIT_CONCURRENCY = 2   # max simultaneous requests to any rate-limited host
+
+def _get_host_semaphore(host: str):
+    with _RATE_LIMIT_SEMAPHORES_LOCK:
+        if host not in _RATE_LIMIT_SEMAPHORES:
+            _RATE_LIMIT_SEMAPHORES[host] = threading.Semaphore(_RATE_LIMIT_CONCURRENCY)
+        return _RATE_LIMIT_SEMAPHORES[host]
+
+def _mark_host_rate_limited(host: str):
+    with _RATE_LIMITED_HOSTS_LOCK:
+        _RATE_LIMITED_HOSTS.add(host)
+    # Pre-create semaphore so future requests are throttled immediately
+    _get_host_semaphore(host)
 
 
 @flask_app.route("/api/proxy")
@@ -5751,16 +5784,19 @@ def api_proxy():
     cors = _CORS_HEADERS  # module-level constant — no allocation per request
 
     # ── Known hotlink-blocked hosts: return transparent PNG immediately ───
-    if is_img_url:
-        try:
-            _host = urlparse(url).netloc.lower()
-        except Exception:
-            _host = ""
-        if _host in _HOTLINK_BLOCKED_HOSTS:
-            hdrs = dict(cors)
-            hdrs["Content-Type"] = "image/png"
-            hdrs["Cache-Control"] = "public, max-age=86400"
-            return Response(_TRANSPARENT_PNG, status=200, headers=hdrs)
+    # Check host regardless of is_img_url — some Wikimedia thumbnail URLs have
+    # dimension suffixes that confuse the extension regex.
+    try:
+        _host = urlparse(url).netloc.lower()
+    except Exception:
+        _host = ""
+    with _HOTLINK_BLOCKED_HOSTS_LOCK:
+        _is_blocked = _host in _HOTLINK_BLOCKED_HOSTS
+    if _is_blocked:
+        hdrs = dict(cors)
+        hdrs["Content-Type"] = "image/png"
+        hdrs["Cache-Control"] = "public, max-age=86400"
+        return Response(_TRANSPARENT_PNG, status=200, headers=hdrs)
 
     # ── Cache read ────────────────────────────────────────────────────────
     if is_img_url and "Range" not in request.headers:
@@ -5803,9 +5839,31 @@ def api_proxy():
         if "Range" in request.headers:
             headers["Range"] = request.headers["Range"]
         # proxies={} bypasses Windows system proxy (fixes ERR_UNEXPECTED_PROXY_AUTH)
-        resp = _requests_lib.get(url, headers=headers, stream=True, timeout=20,
-                                 allow_redirects=True, verify=False,
-                                 proxies={"http": None, "https": None})
+        # If this host has previously returned 429, throttle with a semaphore.
+        # On any 429 response, mark the host and retry with exponential backoff.
+        with _RATE_LIMITED_HOSTS_LOCK:
+            _is_rate_limited_host = _host in _RATE_LIMITED_HOSTS
+        _sem = _get_host_semaphore(_host) if _is_rate_limited_host else None
+        if _sem:
+            _sem.acquire()
+        try:
+            resp = None
+            _backoff = 1.0
+            for _attempt in range(3):
+                resp = _requests_lib.get(url, headers=headers, stream=True, timeout=20,
+                                         allow_redirects=True, verify=False,
+                                         proxies={"http": None, "https": None})
+                if resp.status_code != 429:
+                    break
+                # First time this host 429s — mark it for all future requests
+                _mark_host_rate_limited(_host)
+                resp.close()
+                if _attempt < 2:
+                    time.sleep(_backoff)
+                    _backoff *= 2
+        finally:
+            if _sem:
+                _sem.release()
         ct = resp.headers.get("Content-Type", "application/octet-stream")
         is_img_ct = ct.split(";")[0].strip().startswith("image/")
         # Treat as image if either the URL extension or the response CT says so
@@ -5840,7 +5898,15 @@ def api_proxy():
                 hdrs["X-Cache"] = "MISS"
                 return Response(data, status=200, headers=hdrs)
             elif resp.status_code == 403:
-                # Hotlink-blocked — serve transparent PNG so the browser's
+                # Count 403s per host — only mark as hotlink-blocked after threshold
+                if _record_host_403(_host):
+                    state.log(f"[Proxy] {_HOTLINK_403_THRESHOLD}x 403 from {_host} — future image requests will skip fetch")
+                hdrs = dict(cors)
+                hdrs["Content-Type"] = "image/png"
+                hdrs["Cache-Control"] = "public, max-age=3600"
+                return Response(_TRANSPARENT_PNG, status=200, headers=hdrs)
+            elif resp.status_code == 429:
+                # Hotlink-blocked or rate-limited — serve transparent PNG so the browser's
                 # onerror handler hides the <img> cleanly with no log spam.
                 hdrs = dict(cors)
                 hdrs["Content-Type"] = "image/png"
@@ -6666,7 +6732,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   #pctrl-panel.expanded #pctrl-body{max-height:300px!important}
 }
 @media(min-width:900px){
-  #main{display:grid!important;grid-template-columns:350px 32px 1fr;height:100%;transition:grid-template-columns .3s ease}
+  #main{display:grid!important;grid-template-columns:350px 28px 1fr;height:100%;transition:grid-template-columns .3s ease}
   #main.items-open{grid-template-columns:350px 350px 1fr}
   #main.items-open #p-items > *{opacity:1;transition:opacity .2s ease .15s}
   #main:not(.items-open) #p-items > *{opacity:0;pointer-events:none;transition:opacity .1s ease}
