@@ -4794,7 +4794,7 @@ def api_find_channel():
     epg_cwords    = _fch_core_words(epg_channel_name)
     _, epg_cc_raw = _fch_strip_prefix(epg_channel_name)
     if not epg_cc_raw:
-        m = re.search(rf'\.({_CC_PATTERN})$', epg_channel_name, re.I)
+        m = re.search(rf'\.({_FCH_CC_PAT})$', epg_channel_name, re.I)
         if m:
             epg_cc_raw = m.group(1)
     epg_cc = _fch_norm_code(epg_cc_raw)   # canonical country code or ""
