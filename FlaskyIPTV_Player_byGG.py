@@ -6505,14 +6505,35 @@ def api_hls_proxy():
 
     # Capture stderr for debugging
     stderr_lines = []
+    # Known-benign ffmpeg messages that fire during normal live stream startup
+    # (mid-GOP join before first keyframe) — suppress to avoid log spam.
+    # These are non-fatal and resolve automatically once ffmpeg syncs to an IDR frame.
+    _FFMPEG_BENIGN_NOISE = (
+        "decode_slice_header error",
+        "no frame!",
+        "concealing",
+        "cabac_init_idc",
+        "out of range poc",
+        "left block unavailable",
+        "error while decoding mb",
+    )
+    _benign_counts: dict = {}   # noise phrase → count, for one-time "suppressing X" log
+
     def _log_stderr():
         try:
             for raw in proc.stderr:
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 if line:
                     stderr_lines.append(line)
-                    # Log errors and important info
                     low = line.lower()
+                    # Suppress known-benign startup noise — log only on first occurrence
+                    matched_noise = next((p for p in _FFMPEG_BENIGN_NOISE if p in low), None)
+                    if matched_noise:
+                        _benign_counts[matched_noise] = _benign_counts.get(matched_noise, 0) + 1
+                        if _benign_counts[matched_noise] == 1:
+                            state.log(f"[ffmpeg/{mode_str}] (suppressing repeated startup noise: '{matched_noise}')")
+                        continue
+                    # Log errors and important info
                     if any(k in low for k in ("error", "invalid", "failed", "unable", "fatal", "unknown")):
                         state.log(f"[ffmpeg/{mode_str}] ERR: {line[:120]}")
                     elif "stream #" in low and "video" in low:
@@ -10674,6 +10695,7 @@ function doPlay(url, name, opts={}){
   if(window._mpegRetries) window._mpegRetries = {}; // reset general retry counter
   window._remuxFired = false;                        // reset remux fallback flag
   window._hlsRemuxFired = false;                     // reset HLS remux fallback flag
+  window._hlsManifestRetried = false;                // reset manifest retry flag
   if(window._hlsRetries) window._hlsRetries = {};    // reset HLS retry counter
   setNP('▶ '+pName);
   document.getElementById('pu').textContent=url;
@@ -10751,7 +10773,7 @@ function doPlay(url, name, opts={}){
     hlsObj.loadSource(px);
     hlsObj.attachMedia(vid);
     hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>vid.play().catch(()=>{}));
-    hlsObj.on(Hls.Events.ERROR,(_,data)=>{
+    const hlsErrorHandler = (_,data)=>{
       const _det=(data.details||'').toLowerCase();
       const _isManifest=_det.includes('manifest');
       // Log all fatal errors and manifest errors
@@ -10765,11 +10787,49 @@ function doPlay(url, name, opts={}){
         if(hlsObj){hlsObj.destroy();hlsObj=null;}
         return;
       }
-      // manifestParsingError: retrying same manifest is pointless, go straight to remux
+      // manifestParsingError: portal likely returned an error page or dropped the stream
+      // transiently. Retry HLS.js first (portal may recover); only fall back to ffmpeg
+      // remux if the retry also fails — remux cannot help when the portal itself is down.
       if(_isManifest && !_playerStopped && !url.includes('hls_proxy') && !window._hlsRemuxFired){
+        if(!window._hlsManifestRetried){
+          // First manifest error — destroy and retry HLS.js after 3s
+          window._hlsManifestRetried = true;
+          alog('[HLS] Manifest error — portal may have hiccuped, retrying HLS in 3s…','w');
+          if(hlsObj){hlsObj.destroy();hlsObj=null;}
+          vid.pause(); vid.removeAttribute('src'); vid.load();
+          setNP('⟳ Stream hiccup — retrying: '+name+'…');
+          setTimeout(()=>{
+            if(_playerStopped) return;
+            alog('[HLS] Retrying HLS after manifest error…','w');
+            hlsObj=new Hls({
+              enableWorker:false, lowLatencyMode:false,
+              maxBufferLength:60, maxMaxBufferLength:180,
+              fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
+              levelLoadingTimeOut:20000,
+              xhrSetup(xhr){xhr.withCredentials=false;},
+              subtitleStreamController: class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  onAudioTrackSwitching(){}  onSubtitleFragProcessed(){}  onBufferFlushing(){}  on(){}  off(){} },
+              subtitleTrackController:  class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  on(){}  off(){} },
+            });
+            hlsObj.loadSource(px);
+            hlsObj.attachMedia(vid);
+            hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>{
+              alog('[HLS] Retry succeeded','k');
+              setNP('▶ '+name);
+              vid.play().catch(()=>{});
+            });
+            // Re-attach the same error handler — if it fires again _hlsManifestRetried
+            // is already true so it will fall through to the remux path below.
+            hlsObj.on(Hls.Events.ERROR, hlsErrorHandler);
+          }, 3000);
+          return;
+        }
+        // Second manifest error after retry — now try ffmpeg remux
         window._hlsRemuxFired=true;
-        alog('[HLS] Manifest unparseable — trying ffmpeg remux…','w');
+        alog('[HLS] Manifest error persists after retry — trying ffmpeg remux…','w');
         if(hlsObj){hlsObj.destroy();hlsObj=null;}
+        // Release the <video> element connection too — portals with connections=1/1
+        // will 403 ffmpeg if the browser still holds the slot when ffmpeg connects.
+        vid.pause(); vid.removeAttribute('src'); vid.load();
         const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
         setTimeout(()=>{
           if(_playerStopped) return;
@@ -10815,7 +10875,7 @@ function doPlay(url, name, opts={}){
               }
             });
           } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
-        },0);
+        },3000);  // 3s grace period — lets portal release the connection slot before ffmpeg connects
         return;
       }
       if(!data.fatal) return;
@@ -10831,6 +10891,7 @@ function doPlay(url, name, opts={}){
           alog('[HLS] Retries exhausted — trying ffmpeg remux…','w');
           const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
           if(hlsObj){hlsObj.destroy();hlsObj=null;}
+          vid.pause(); vid.removeAttribute('src'); vid.load();
           setTimeout(()=>{
             if(_playerStopped) return;
             setNP('▶ '+name+' [remux]');
@@ -10875,7 +10936,7 @@ function doPlay(url, name, opts={}){
                 }
               });
             } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
-          },0);
+          },2000);  // 2s grace period — lets portal release the connection slot before ffmpeg connects
         } else if(!_playerStopped){
           alog('[HLS] Stream failed — channel may be offline','e');
           setNP('✗ Stream unavailable: '+name);
@@ -10885,7 +10946,8 @@ function doPlay(url, name, opts={}){
       } else if(data.type===Hls.ErrorTypes.MEDIA_ERROR){
         hlsObj.recoverMediaError();
       }
-    });
+    };
+    hlsObj.on(Hls.Events.ERROR, hlsErrorHandler);
   } else if(isHls && vid.canPlayType('application/vnd.apple.mpegurl')){
     // ── Native HLS (Safari / iOS WebView) ─────────────────────
     vid.src=url; vid.play().catch(()=>{});
