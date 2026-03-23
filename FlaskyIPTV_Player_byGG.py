@@ -3574,71 +3574,68 @@ def api_resolve():
             transcode_reason = None
             is_vod = mode in ('vod', 'series')  # VOD needs different handling than live
             
-            # Check both path and query string for container extensions.
-            # Many portals serve files via get.php?stream=movie.mkv&mac=xxx —
-            # splitting on '?' loses the extension, skipping the codec probe entirely.
+            # Normalise URL for quick extension checks.
             url_lower_full = url.lower()
             url_lower      = url_lower_full.split('?')[0]
 
-            # ==== SMART CONTAINER DETECTION ====
-            needs_codec_check = (
-                url_lower.endswith('.mp4') or
-                url_lower.endswith('.mkv') or
-                url_lower.endswith(".m3u8") or                
-                re.search(r'\.mp4[?&]', url_lower_full) is not None or
-                re.search(r'\.mkv[?&]', url_lower_full) is not None or
-                re.search(r'\.mp4$',    url_lower_full) is not None or
-                re.search(r'\.mkv$',    url_lower_full) is not None or
-                any(ext in url_lower for ext in ['.hevc', '.265', '.h265'])
-            )
-            
-            # Quick extension-based HEVC hint
+            # ==== UNIVERSAL CODEC PROBE ====
+            # We probe every URL regardless of extension — HEVC and AC3/DTS/EAC3
+            # audio appear in plain live streams, Xtream URLs, stalker-portal links,
+            # and anything else with no recognisable container hint in the path.
+            # Skipping the probe for "unknown" URLs was the source of missed transcodes.
+            #
+            # Fast path: URL contains an explicit HEVC extension — skip ffprobe entirely.
+            codecs = None   # populated below when ffprobe runs
             if any(ext in url_lower for ext in ['.hevc', '.265', '.h265']):
                 needs_transcode = True
                 transcode_reason = "hevc by extension"
                 state.log(f"[RESOLVE] HEVC suspected by extension: {url_lower[-20:]}")
-            
-            # For MP4/MKV containers, check BOTH video AND audio codecs
-            elif needs_codec_check:
-                codecs = probe_stream_codecs(url, timeout=6)
-                
+
+            else:
+                # Always run ffprobe — timeout kept short (8 s) so channel-switch
+                # latency stays acceptable even for slow live streams.
+                codecs = probe_stream_codecs(url, timeout=8)
+
                 if codecs:
-                    # Check video codec
+                    # ── Video codec check ────────────────────────────────────
                     if codecs.get("video"):
-                        vcodec = codecs["video"][0].lower() if codecs["video"] else ""
+                        vcodec = codecs["video"][0].lower()
                         detected_codec = vcodec
-                        
                         hevc_codecs = ("hevc", "h265", "h.265", "hev1", "hvc1", "x265")
                         if vcodec in hevc_codecs or any(h in vcodec for h in hevc_codecs):
                             needs_transcode = True
                             transcode_reason = f"hevc video ({vcodec})"
                             state.log(f"[RESOLVE] HEVC video detected: {vcodec}")
-                    
-                    # Check audio codec - browsers only support AAC, MP3, Opus, Vorbis
+
+                    # ── Audio codec check ────────────────────────────────────
+                    # Browsers support: AAC, MP3/MP2, Opus, Vorbis, FLAC.
+                    # Everything else (AC3, EAC3, DTS, TrueHD, PCM…) needs transcode.
                     if not needs_transcode and codecs.get("audio"):
-                        acodec = codecs["audio"][0].lower() if codecs["audio"] else ""
-                        
-                        # Browser-supported audio codecs
+                        acodec = codecs["audio"][0].lower()
                         safe_audio = ("aac", "mp3", "mp2", "opus", "vorbis", "flac")
-                        
-                        # Common problematic codecs in MKV
-                        bad_audio = ("ac3", "eac3", "dts", "dca", "truehd", "mlp", "pcm")
-                        
-                        if acodec not in safe_audio and (acodec in bad_audio or 
-                            any(b in acodec for b in bad_audio)):
+                        bad_audio  = ("ac3", "eac3", "dts", "dca", "truehd", "mlp", "pcm")
+                        if acodec not in safe_audio and (
+                                acodec in bad_audio or any(b in acodec for b in bad_audio)):
                             needs_transcode = True
                             transcode_reason = f"incompatible audio ({acodec})"
                             state.log(f"[RESOLVE] Audio codec needs transcode: {acodec}")
                         else:
                             state.log(f"[RESOLVE] Audio codec OK: {acodec}")
-                    
+
                     if not needs_transcode:
-                        state.log(f"[RESOLVE] All codecs playable: v={detected_codec}, a={codecs.get('audio', ['?'])[0] if codecs.get('audio') else 'none'}")
+                        a_str = codecs.get('audio', ['?'])[0] if codecs.get('audio') else 'none'
+                        state.log(f"[RESOLVE] All codecs playable: v={detected_codec}, a={a_str}")
+
                 else:
+                    # ffprobe timed-out or couldn't open the stream.
+                    # Fall through to direct play — the JS error-handler will
+                    # escalate to hls_proxy/ffmpeg if the browser also fails.
                     state.log(f"[RESOLVE] ffprobe failed, attempting direct play")
-            
-            # Legacy MPEG-TS probe for live streams
-            if not needs_transcode and 'play_token=' in url:
+
+            # Legacy MPEG-TS byte-scan fallback: only useful when ffprobe couldn't
+            # connect (codecs is None) and this is a token-based live stream.
+            # Now that we probe everything, this is a rare last-resort path.
+            if not needs_transcode and codecs is None and 'play_token=' in url:
                 try:
                     if _probe_hevc(url):
                         needs_transcode = True
