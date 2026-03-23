@@ -9548,8 +9548,21 @@ function toggleFav(i){
   }
   saveFavs(arr,mode);
   // If filter is active, re-apply it so removed items disappear immediately
-  if(_favsFilterActive) _applyFavsFilter();
-  else renderItems(filtItems);
+  if(_favsFilterActive){
+    _applyFavsFilter();
+  } else {
+    // Update only the star button in-place to preserve scroll position
+    const rows = document.getElementById('ilist').querySelectorAll('.irow');
+    if(rows[i]){
+      const starBtn = rows[i].querySelector('button[title="Favourite"]');
+      if(starBtn) starBtn.style.color = isFav(it) ? '#f5c518' : 'rgba(255,255,255,0.25)';
+    }
+    // Update the favourites badge count
+    const b = document.getElementById('badge');
+    const total = loadFavs(mode).length;
+    b.textContent = total>99?'99+':total;
+    b.classList.toggle('vis', total>0);
+  }
 }
 
 // ── HEADER ─────────────────────────────────────────────────
@@ -9757,10 +9770,8 @@ function toggleFavsFilter(){
 
 function _applyFavsFilter(){
   const favs=loadFavs(mode);
-  const names=new Set(favs.map(f=>f.name||f.o_name||f.fname||''));
-  filtItems=allItems.filter(it=>names.has(it.name||it.o_name||it.fname||''));
-  // If allItems is empty (no category browsed yet), show all saved favs for this mode
-  if(!allItems.length) filtItems=[...favs];
+  // Always show ALL saved favourites for this mode/portal — never restrict to current category
+  filtItems=[...favs];
   document.getElementById('isrch').value='';
   const mLabel={live:'Live',vod:'VOD',series:'Series'}[mode]||mode;
   mkBcrum('⭐ '+mLabel+' Favourites');
