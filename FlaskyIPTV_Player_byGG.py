@@ -38,7 +38,7 @@ Added progress bar with real kbs speed for downloading MKV, and items/total item
 Fixed EPG out of memory happening in large EPG lists (although now large external EPG lists can use 2000 MB of ram, like 30k channel lists)
 Fixed laggy desktop input in the search field for Whats on Now tab and dekstop version of saved logins tab.
 Added button that opens external player of your choice (on desktop select exe, on mobile you can pick VLC, MX, MX PRO, Just Player)
-Added option to add subtitles from opensubtitles.com via inscript serach (get free apikey from https://www.opensubtitles.com/en/consumers)
+Added option to add subtitles from opensubtitles.com via inscript serach (get free API key from https://www.opensubtitles.com/en/consumers)
 Added option to add local subtitles file for subtitles (.srt/.vtt/.ass/.ssa) via Local File tab in the subtitle modal.
 Subtitle delay +/- works the same for local files as for OpenSubtitles.
 Desktop view optimizations, bigger player, now activity log is hidden by default, can expand, player controls can be hidden to expand player, theater mode button to fully expand player and hiding all tabs.
@@ -54,12 +54,14 @@ Added cast to Chromecast, DLNA, Airplay feature.
 Added Multi-View feature that also supports external URLs like YouTube/Twitch (does not work on age-gated content)
 Fixed external EPG decompression blocking threads, added EPG caching per attempted channel while we wait external EPG download to finish.
 Improved button highlights and added a glossy style to all buttons.
-Fixed some vods and series with mp4/mkv with hevc video or unsuported audio formats not playing in browser.
-Varius UI fixes, adjustments and overall script optimizations.
+Fixed some vods and series with mp4/mkv with hevc video or unsupported audio formats not playing in the browser.
+Various UI fixes, adjustments, and overall script ui optimizations.
 Added logo caching for MAC portal (PortalClient): live channels use get_all_channels fallback (one request, cached); VOD/series use a zero-cost in-memory dict built from already-fetched items.
 Extended StalkerPortalClient logo caching to VOD and series modes (was live-only); same zero-cost in-memory dict strategy.
 Fixed Xtream double round-trip: handshake() and account_info() previously both issued GET /player_api.php — account_info() now reads from the cached user_info set by handshake(), saving one network call on every connect.
 Added Xtream logo cache: stream_id → logo URL dict populated during fetch_items_page, fills missing logos without extra requests.
+Added DVR support via dvr_addon.
+More fixes for videos and audio that need transcoding.
 """
 
 import base64
