@@ -10936,7 +10936,7 @@ function doPlay(url, name, opts={}){
                 }
               });
             } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
-          },2000);  // 2s grace period — lets portal release the connection slot before ffmpeg connects
+          },3000);  // 3s grace period — lets portal release the connection slot before ffmpeg connects
         } else if(!_playerStopped){
           alog('[HLS] Stream failed — channel may be offline','e');
           setNP('✗ Stream unavailable: '+name);
@@ -11038,7 +11038,7 @@ function doPlay(url, name, opts={}){
                       mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{enableWorker:false});
                       mpegtsObj.attachMediaElement(vid); mpegtsObj.load(); vid.play().catch(()=>{});
                     } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
-                  },0);
+                  },3000);  // 3s grace period before ffmpeg connects
                 }
               });
             } else {
@@ -11112,7 +11112,65 @@ function doPlay(url, name, opts={}){
         const _mk = String(pIdx)+'|'+url.slice(-20);
         window._mpegRetries[_mk] = (window._mpegRetries[_mk]||0)+1;
         if(window._mpegRetries[_mk] <= 3 && !_playerStopped){
+          // Reconnect attempts — unload/load on same instance
           setTimeout(()=>{ if(mpegtsObj && !_playerStopped){ mpegtsObj.unload(); mpegtsObj.load(); vid.play().catch(()=>{}); }},2000);
+        } else if(window._mpegRetries[_mk] === 4 && !_playerStopped && !window._remuxFired){
+          // 3 reconnects failed — do one full fresh-instance restart (same as HLS hiccup retry)
+          // before giving up and going to ffmpeg remux. Portal may have dropped the session;
+          // a brand-new mpegtsObj gets a clean TCP connection with no stale state.
+          alog('[MPEGTS] Reconnects failed — doing fresh restart before remux…','w');
+          setNP('⟳ Stream hiccup — retrying: '+name+'…');
+          if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
+          vid.pause(); vid.removeAttribute('src'); vid.load();
+          setTimeout(()=>{
+            if(_playerStopped) return;
+            alog('[MPEGTS] Fresh restart attempt…','w');
+            _playerStopped = false;
+            mpegtsObj=mpegts.createPlayer({
+              type:'mse', isLive:true, url:px, cors:true,
+            },{
+              enableWorker:false,
+              liveBufferLatencyChasing:true,
+              liveBufferLatencyMaxLatency:8,
+              liveBufferLatencyMinRemain:2,
+            });
+            mpegtsObj.attachMediaElement(vid);
+            mpegtsObj.load();
+            vid.play().catch(()=>{});
+            // If this also errors, _mpegRetries[_mk] will be 5 → falls to remux below
+            mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2,ei2)=>{
+              if(!_playerStopped){
+                alog('[MPEGTS] Fresh restart failed — escalating to remux…','w');
+                window._mpegRetries[_mk] = 99; // force past retry threshold on next tick
+                // Trigger the same handler logic by synthesising a network error event
+                if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
+                vid.pause(); vid.removeAttribute('src'); vid.load();
+                if(!window._remuxFired){
+                  window._remuxFired = true;
+                  const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
+                  setTimeout(()=>{
+                    if(_playerStopped) return;
+                    _playerStopped=false;
+                    setNP('▶ '+name+' [remux]');
+                    mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{
+                      enableWorker:false,liveBufferLatencyChasing:true,
+                      liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3,
+                    });
+                    mpegtsObj.attachMediaElement(vid);
+                    mpegtsObj.load();
+                    vid.play().catch(()=>{});
+                    mpegtsObj.on(mpegts.Events.ERROR,(et3,ed3)=>{
+                      if(!_playerStopped){
+                        alog('[MPEGTS/remux] '+(ed3?.msg||JSON.stringify(ed3)),'e');
+                        setNP('✗ Stream unavailable: '+name);
+                        document.getElementById('ppbtn').textContent='▶';
+                      }
+                    });
+                  }, 3000);  // 3s grace period before ffmpeg connects
+                }
+              }
+            });
+          }, 3000);  // 3s for portal to recover before fresh reconnect
         } else if(!_playerStopped && !url.includes('hls_proxy') && !window._remuxFired){
           // All normal retries exhausted — try ffmpeg -c copy remux as last resort.
           // Handles container/mux issues that mpegts.js can't parse but ffmpeg can.
@@ -11140,7 +11198,7 @@ function doPlay(url, name, opts={}){
                 document.getElementById('ppbtn').textContent='\u25b6';
               }
             });
-          },0);
+          },3000);  // 3s grace period — lets portal release the connection slot before ffmpeg connects
         } else if(!_playerStopped){
           alog('[MPEGTS] Stream failed after retries \u2014 channel may be offline','e');
           setNP('\u2717 Stream unavailable: '+name);
