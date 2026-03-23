@@ -3584,6 +3584,7 @@ def api_resolve():
             needs_codec_check = (
                 url_lower.endswith('.mp4') or
                 url_lower.endswith('.mkv') or
+                url_lower.endswith(".m3u8") or                
                 re.search(r'\.mp4[?&]', url_lower_full) is not None or
                 re.search(r'\.mkv[?&]', url_lower_full) is not None or
                 re.search(r'\.mp4$',    url_lower_full) is not None or
@@ -9634,7 +9635,11 @@ async function doConnect(){
       const _rawUrl = payload.m3u_url || payload.url || '';
       const _portalHost = _rawUrl ? (()=>{try{return new URL(_rawUrl).hostname;}catch(e){return _rawUrl.replace(/https?:\/\//,'').split('/')[0].split(':')[0];}})() : '';
       document.getElementById('portal-name-label').textContent = _portalHost || '—';
-      _favsPortalKey = (_portalHost || '—').trim();
+      // Include the credential (username for Xtream/M3U, MAC for MAC/Stalker) so
+      // two different logins on the same portal host get completely separate fav stores.
+      const _credSlug = (payload.username || payload.mac || '').trim().toLowerCase()
+                          .replace(/[^a-z0-9]/g,'').slice(0,24);
+      _favsPortalKey = ((_portalHost || '—').trim()) + (_credSlug ? '_'+_credSlug : '');
       // Populate multiview portal max-connection registry
       // so the badge can show e.g. "myportal.tv  ·  2/4 connections"
       if(d.max_connections && d.max_connections > 0 && (d.portal_url || _rawUrl)){
