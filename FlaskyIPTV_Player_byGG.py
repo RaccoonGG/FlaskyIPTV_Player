@@ -2755,7 +2755,7 @@ class M3UClient:
         if self._xtream_client:
             try:
                 result = await self._xtream_client.account_info()
-                # XtreamClient.account_info() returns (ident, exp, max_conn) — pass through
+                # XtreamClient.account_info() returns (ident, exp, max_conn, password) — pass through
                 return result
             except Exception:
                 pass
@@ -3147,7 +3147,7 @@ async def _connect_async():
                 xt = XtreamClient(detected["base"], detected["username"], detected["password"], state.log)
                 async with xt:
                     await xt.handshake()
-                    ident, exp, max_conn = await xt.account_info()
+                    ident, exp, max_conn, _pw = await xt.account_info()
                     state.m3u_xtream_override = detected
                     state.log(f"[CONNECT] ✓ Xtream API connected: {ident} | {exp}")
                     for m in ("live", "vod", "series"):
