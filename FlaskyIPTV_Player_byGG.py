@@ -10757,6 +10757,7 @@ let _playerStopped = false;  // set true when user stops — blocks any pending 
 
 function _destroyPlayers(){
   // Note: does NOT set _playerStopped — caller (doPlay/playerStop) manages that
+  if(window._stallWatchdog){ clearInterval(window._stallWatchdog); window._stallWatchdog=null; }
   if(hlsObj){hlsObj.destroy();hlsObj=null;}
   if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
   vid.pause(); vid.removeAttribute('src'); vid.load();
@@ -10773,6 +10774,45 @@ function doPlay(url, name, opts={}){
   window._hlsRemuxFired = false;                     // reset HLS remux fallback flag
   window._hlsManifestRetried = false;                // reset manifest retry flag
   if(window._hlsRetries) window._hlsRetries = {};    // reset HLS retry counter
+  window._vodRemuxFired = false;                     // reset VOD remux guard
+  // ── Stall watchdog ────────────────────────────────────────────────────────
+  // Neither HLS.js nor mpegts.js fires an error when the stream silently
+  // freezes mid-playback (currentTime stops advancing but no fatal event).
+  // This is the most common symptom on slow portals. The watchdog polls every
+  // 6 s: if currentTime hasn't moved and the video isn't intentionally paused,
+  // it attempts an unload/load recovery cycle. After 3 failed cycles it gives
+  // up so it doesn't loop endlessly on a genuinely offline channel.
+  if(window._stallWatchdog) clearInterval(window._stallWatchdog);
+  window._stallWatchdog = null;
+  window._stallLastTime = -1;
+  window._stallHits = 0;
+  window._stallWatchdog = setInterval(()=>{
+    if(_playerStopped){ clearInterval(window._stallWatchdog); window._stallWatchdog=null; return; }
+    if(vid.paused || vid.ended || vid.readyState < 2) return; // intentionally paused or not loaded yet
+    const ct = vid.currentTime;
+    if(ct === window._stallLastTime && ct > 0){
+      window._stallHits++;
+      alog('[Watchdog] Stall detected ('+window._stallHits+'/3) — currentTime frozen at '+ct.toFixed(2)+'s','w');
+      if(window._stallHits >= 3){
+        // Three consecutive 6 s checks frozen — give up, don't loop endlessly
+        clearInterval(window._stallWatchdog); window._stallWatchdog=null;
+        alog('[Watchdog] Stream appears offline after 3 stall cycles — stopping','e');
+        setNP('✗ Stream stalled — channel may be offline');
+        document.getElementById('ppbtn').textContent='▶';
+        return;
+      }
+      // Attempt a silent recovery: unload then reload without destroying the player.
+      // This re-opens the HTTP connection to the portal without a full page-reload.
+      setNP('⟳ Buffering… '+pName);
+      if(mpegtsObj){ try{ mpegtsObj.unload(); mpegtsObj.load(); vid.play().catch(()=>{}); }catch(e){} }
+      else if(hlsObj){ try{ hlsObj.stopLoad(); hlsObj.startLoad(); }catch(e){} }
+    } else {
+      // Time is advancing — reset hit counter
+      window._stallHits = 0;
+    }
+    window._stallLastTime = ct;
+  }, 6000);
+  // ─────────────────────────────────────────────────────────────────────────
   setNP('▶ '+pName);
   document.getElementById('pu').textContent=url;
   document.getElementById('ppbtn').textContent='⏸';
@@ -10837,9 +10877,18 @@ function doPlay(url, name, opts={}){
     // ── HLS via HLS.js ────────────────────────────────────────
     hlsObj=new Hls({
       enableWorker:false, lowLatencyMode:false,
-      maxBufferLength:60, maxMaxBufferLength:180,
+      // Buffer: 30 s target (was 60) — less aggressive on slow portals,
+      // avoids burst-requesting fragments that overwhelm a struggling server.
+      maxBufferLength:30, maxMaxBufferLength:60,
+      // Timeouts: generous for slow portals
       fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
       levelLoadingTimeOut:20000,
+      // Silent fragment/level retries before escalating to a fatal error.
+      // On a slow portal a single failed fetch is normal — retry 6× with
+      // 1.5 s back-off before giving up and firing the error handler.
+      fragLoadingMaxRetry:6, fragLoadingRetryDelay:1500,
+      levelLoadingMaxRetry:4, levelLoadingRetryDelay:1500,
+      manifestLoadingMaxRetry:3, manifestLoadingRetryDelay:1500,
       xhrSetup(xhr){xhr.withCredentials=false;},
       // Disable HLS.js subtitle track management with full no-op stubs
       // so our own addTextTrack() cues are never touched by HLS internals
@@ -10879,9 +10928,12 @@ function doPlay(url, name, opts={}){
             alog('[HLS] Retrying HLS after manifest error…','w');
             hlsObj=new Hls({
               enableWorker:false, lowLatencyMode:false,
-              maxBufferLength:60, maxMaxBufferLength:180,
+              maxBufferLength:30, maxMaxBufferLength:60,
               fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
               levelLoadingTimeOut:20000,
+              fragLoadingMaxRetry:6, fragLoadingRetryDelay:1500,
+              levelLoadingMaxRetry:4, levelLoadingRetryDelay:1500,
+              manifestLoadingMaxRetry:3, manifestLoadingRetryDelay:1500,
               xhrSetup(xhr){xhr.withCredentials=false;},
               subtitleStreamController: class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  onAudioTrackSwitching(){}  onSubtitleFragProcessed(){}  onBufferFlushing(){}  on(){}  off(){} },
               subtitleTrackController:  class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  on(){}  off(){} },
@@ -11041,8 +11093,10 @@ function doPlay(url, name, opts={}){
     },{
       enableWorker:false,
       liveBufferLatencyChasing: isLiveStream,
-      liveBufferLatencyMaxLatency: isLiveStream ? 8 : undefined,
-      liveBufferLatencyMinRemain: isLiveStream ? 2 : undefined,
+      // 12 s window matches all remux/fallback paths — avoids the latency-chaser
+      // speeding up playback too aggressively when a slow portal delivers bursts.
+      liveBufferLatencyMaxLatency: isLiveStream ? 12 : undefined,
+      liveBufferLatencyMinRemain: isLiveStream ? 3 : undefined,
       autoCleanupSourceBuffer: !isLiveStream,
     });
     mpegtsObj.attachMediaElement(vid);
@@ -11091,9 +11145,12 @@ function doPlay(url, name, opts={}){
               setNP('▶ '+name+' [HLS fallback]');
               hlsObj = new Hls({
                 enableWorker:false, lowLatencyMode:false,
-                maxBufferLength:60, maxMaxBufferLength:180,
+                maxBufferLength:30, maxMaxBufferLength:60,
                 fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
                 levelLoadingTimeOut:20000,
+                fragLoadingMaxRetry:6, fragLoadingRetryDelay:1500,
+                levelLoadingMaxRetry:4, levelLoadingRetryDelay:1500,
+                manifestLoadingMaxRetry:3, manifestLoadingRetryDelay:1500,
                 xhrSetup(xhr){xhr.withCredentials=false;},
                 subtitleStreamController: class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  onAudioTrackSwitching(){}  onSubtitleFragProcessed(){}  onBufferFlushing(){}  on(){}  off(){} },
                 subtitleTrackController:  class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  on(){}  off(){} },
@@ -11207,8 +11264,8 @@ function doPlay(url, name, opts={}){
             },{
               enableWorker:false,
               liveBufferLatencyChasing:true,
-              liveBufferLatencyMaxLatency:8,
-              liveBufferLatencyMinRemain:2,
+              liveBufferLatencyMaxLatency:12,
+              liveBufferLatencyMinRemain:3,
             });
             mpegtsObj.attachMediaElement(vid);
             mpegtsObj.load();
