@@ -2344,7 +2344,7 @@ class XtreamClient:
         status = info.get("status", "?")
         password = str(info.get("password", "") or "")
         self.log(f"[XTREAM] Account: user={self.username}  status={status}  expiry={exp}  connections={active}/{max_conn_raw}")
-        return (self.username, exp, max_conn_int, password)
+        return (self.username, exp, max_conn_int, password, str(active))
 
     async def fetch_categories(self, mode: str):
         action_map = {"live": "get_live_categories", "vod": "get_vod_categories", "series": "get_series_categories"}
@@ -2755,7 +2755,7 @@ class M3UClient:
         if self._xtream_client:
             try:
                 result = await self._xtream_client.account_info()
-                # XtreamClient.account_info() returns (ident, exp, max_conn, password) — pass through
+                # XtreamClient.account_info() returns (ident, exp, max_conn, password, active_cons) — pass through
                 return result
             except Exception:
                 pass
@@ -3147,7 +3147,7 @@ async def _connect_async():
                 xt = XtreamClient(detected["base"], detected["username"], detected["password"], state.log)
                 async with xt:
                     await xt.handshake()
-                    ident, exp, max_conn, _pw = await xt.account_info()
+                    ident, exp, max_conn, _pw, active_cons = await xt.account_info()
                     state.m3u_xtream_override = detected
                     state.log(f"[CONNECT] ✓ Xtream API connected: {ident} | {exp}")
                     for m in ("live", "vod", "series"):
@@ -3160,7 +3160,7 @@ async def _connect_async():
                             state.cats_cache[m] = []
                     state.connected = True
                     state.set_status(f"Connected (Xtream via M3U): {ident} | {exp}")
-                    state.profile_data = {'type':'xtream','user':ident,'exp':exp,'max_conn':str(max_conn) if max_conn else ''}
+                    state.profile_data = {'type':'xtream','user':ident,'exp':exp,'max_conn':str(max_conn) if max_conn else '','active_cons':active_cons}
                     return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
                             "max_connections": max_conn, "portal_url": detected["base"],
                             "is_stalker": False}
@@ -3249,8 +3249,9 @@ async def _connect_async():
                 'mac': client.mac if hasattr(client, 'mac') else '',
                 'exp': exp,
                 'max_conn': str(max_conn) if max_conn else '',
-                # Xtream returns 4-tuple: (user, exp, max_conn, password)
+                # Xtream returns 5-tuple: (user, exp, max_conn, password, active_cons)
                 # PortalClient returns 5-tuple: (ident, phone, max_conn, settings_pwd, adult_pwd)
+                'active_cons':       _ai4[4] if _is_xtream and len(_ai4) > 4 else '',
                 'password':          _ai4[3] if _is_xtream and len(_ai4) > 3 else '',
                 'settings_password': _ai4[3] if not _is_xtream and len(_ai4) > 3 else '',
                 'adult_password':    _ai4[4] if not _is_xtream and len(_ai4) > 4 else '',
@@ -12760,7 +12761,7 @@ async function openProfileModal(){
       html+=row('MAC',d.mac);
       if(!isMacAddr(d.user)) html+=row('Username',d.user);
       html+=row('Expiry',d.exp);
-      html+=row('Max connections',d.max_conn);
+      html+=row('Connections', d.active_cons!==undefined&&d.active_cons!==''&&d.max_conn ? d.active_cons+' / '+d.max_conn : d.max_conn||d.active_cons);
       if(d.type==='xtream'){
         // password intentionally omitted from portal info display
       } else {
