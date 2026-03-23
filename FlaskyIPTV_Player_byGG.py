@@ -5843,6 +5843,32 @@ def _record_host_403(host: str):
                 return True  # just crossed threshold — caller should log
     return False
 
+# Hosts that fail DNS resolution — after _DNS_FAIL_THRESHOLD consecutive failures
+# the host is silenced and we return a transparent PNG without logging.
+_DNS_FAIL_BLOCKED_HOSTS: set = set()
+_DNS_FAIL_BLOCKED_HOSTS_LOCK = threading.Lock()
+_DNS_FAIL_COUNTS: dict = {}   # host → DNS failure count
+_DNS_FAIL_THRESHOLD = 3        # silence after 3 failures (DNS failures are persistent)
+
+def _record_host_dns_fail(host: str) -> bool:
+    """Increment DNS-failure counter; silence host once threshold is reached.
+    Returns True the first time the threshold is crossed (caller should log once)."""
+    with _DNS_FAIL_BLOCKED_HOSTS_LOCK:
+        _DNS_FAIL_COUNTS[host] = _DNS_FAIL_COUNTS.get(host, 0) + 1
+        if _DNS_FAIL_COUNTS[host] >= _DNS_FAIL_THRESHOLD:
+            if host not in _DNS_FAIL_BLOCKED_HOSTS:
+                _DNS_FAIL_BLOCKED_HOSTS.add(host)
+                return True  # just crossed threshold
+    return False
+
+def _is_dns_fail(exc: Exception) -> bool:
+    """Return True if the exception looks like a DNS resolution failure."""
+    msg = str(exc).lower()
+    return any(k in msg for k in (
+        "nameresolutionerror", "getaddrinfo failed", "name or service not known",
+        "nodename nor servname", "failed to resolve", "errno 11001", "errno 11002",
+    ))
+
 # Hosts that rate-limit (429) when hit with many concurrent requests.
 # Populated dynamically — any host that returns 429 gets added here and
 # subsequent requests to it are throttled with a semaphore + retry backoff.
@@ -5900,6 +5926,8 @@ def api_proxy():
         _host = ""
     with _HOTLINK_BLOCKED_HOSTS_LOCK:
         _is_blocked = _host in _HOTLINK_BLOCKED_HOSTS
+    with _DNS_FAIL_BLOCKED_HOSTS_LOCK:
+        _is_blocked = _is_blocked or (_host in _DNS_FAIL_BLOCKED_HOSTS)
     if _is_blocked:
         hdrs = dict(cors)
         hdrs["Content-Type"] = "image/png"
@@ -6044,7 +6072,15 @@ def api_proxy():
             state.log(f"[Proxy] HTTP {resp.status_code} ← {url[:80]}")
         return Response(stream_with_context(_gen()), status=resp.status_code, headers=h)
     except Exception as e:
-        state.log(f"[Proxy] Error: {e} ← {url[:80]}")
+        if _is_dns_fail(e):
+            crossed = _record_host_dns_fail(_host)
+            if crossed:
+                state.log(f"[Proxy] DNS failure {_DNS_FAIL_THRESHOLD}x for {_host} — silencing future logo requests")
+            elif _DNS_FAIL_COUNTS.get(_host, 0) < _DNS_FAIL_THRESHOLD:
+                state.log(f"[Proxy] Error: {e} ← {url[:80]}")
+            # else: already silenced — return transparent PNG quietly
+        else:
+            state.log(f"[Proxy] Error: {e} ← {url[:80]}")
         return Response(f"Proxy error: {e}", status=502)
 
 
@@ -6446,11 +6482,10 @@ def api_hls_proxy():
         ]
         mode_str = "audio-transcode"
     else:
-        # Remux only (copy all streams)
-        cmd = [
-            ffmpeg, "-hide_banner", "-nostdin",
-            "-user_agent", "VLC/3.0.0 LibVLC/3.0.0",
-            "-i", url,
+        # Remux only (copy all streams) — use base_input so -referer and
+        # reconnect flags are included (same as transcode/audio_only paths).
+        # Missing -referer was the cause of 403 Forbidden from Xtream portals.
+        cmd = base_input + [
             "-c", "copy",
             "-f", "mpegts", "-",
         ]
