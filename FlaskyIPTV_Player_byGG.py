@@ -3502,9 +3502,31 @@ def api_episodes():
         return jsonify({"error": str(e), "episodes": []})
 
 
-def _probe_hevc(url: str) -> bool:
-    """Read first ~1880 bytes of a MPEG-TS stream and return True if video is HEVC (stream_type 0x24).
-    Times out quickly — failure is non-fatal, we just skip the transcode."""
+def _probe_ts_streams(url: str) -> dict:
+    """Read the first ~1880 bytes of a MPEG-TS stream and parse the PMT to identify
+    video and audio stream types — without invoking ffprobe.
+
+    Returns a dict:
+        {
+          "hevc":        bool,  # True if video stream type is 0x24 (HEVC/H.265)
+          "bad_audio":   bool,  # True if audio codec is unsupported by browsers
+          "audio_codec": str,   # human-readable codec name, e.g. "ac3"
+        }
+
+    Audio stream types that browsers cannot decode natively:
+        0x81        AC3  (Dolby Digital) — common on North American cable
+        0x82        DTS
+        0x83        TrueHD / DTS-HD (used by some Dolby streams)
+        0x06 + 0x7a EAC3 (Dolby Digital Plus) — identified via descriptor tag in PMT
+
+    Times out quickly — failure is non-fatal, caller should catch exceptions.
+    """
+    _BAD_AUDIO_TYPES = {
+        0x81: "ac3",
+        0x82: "dts",
+        0x83: "truehd",
+    }
+    result = {"hevc": False, "bad_audio": False, "audio_codec": ""}
     try:
         hdrs = {"User-Agent": "VLC/3.0", "Accept": "*/*"}
         r = _requests_lib.get(url, headers=hdrs, stream=True, timeout=5, verify=False,
@@ -3527,6 +3549,7 @@ def _probe_hevc(url: str) -> bool:
             if has_adapt: off = 5 + pkt[4]
             if off >= 188: continue
             if pkt[1] & 0x40: off += 1  # pointer field
+            # ── PAT: find first non-NIT program PID ──────────────────────────
             if pid == 0 and pmt_pid is None:
                 pos = off + 8
                 while pos + 3 < 188:
@@ -3534,20 +3557,45 @@ def _probe_hevc(url: str) -> bool:
                     pp = ((pkt[pos+2] & 0x1f) << 8) | pkt[pos+3]
                     pos += 4
                     if pn != 0: pmt_pid = pp; break
+            # ── PMT: walk stream entries ─────────────────────────────────────
             elif pmt_pid and pid == pmt_pid:
                 sec = pkt[off:]
                 if len(sec) < 12: continue
                 pi_len = ((sec[10] & 0x0f) << 8) | sec[11]
                 pos = 12 + pi_len
                 while pos + 4 < len(sec) - 4:
-                    st = sec[pos]
-                    ei = ((sec[pos+3] & 0x0f) << 8) | sec[pos+4]
-                    if st == 0x24: return True   # HEVC
+                    st  = sec[pos]                                  # stream_type byte
+                    ei  = ((sec[pos+3] & 0x0f) << 8) | sec[pos+4] # ES info length
+                    # Video: HEVC
+                    if st == 0x24:
+                        result["hevc"] = True
+                    # Audio: hard-coded bad types
+                    elif st in _BAD_AUDIO_TYPES:
+                        result["bad_audio"]  = True
+                        result["audio_codec"] = _BAD_AUDIO_TYPES[st]
+                    # Audio: stream_type 0x06 (private PES) — scan descriptors for
+                    # EAC3 (tag 0x7a).  Many European and IPTV portals use this.
+                    elif st == 0x06 and ei > 0:
+                        desc_end = pos + 5 + ei
+                        dp = pos + 5
+                        while dp + 1 < desc_end and dp + 1 < len(sec):
+                            tag  = sec[dp]
+                            dlen = sec[dp+1]
+                            if tag == 0x7a:  # EAC3 descriptor
+                                result["bad_audio"]  = True
+                                result["audio_codec"] = "eac3"
+                            dp += 2 + dlen
                     pos += 5 + ei
-                return False
-        return False
+                return result   # PMT found and parsed — done
+        return result
     except Exception:
-        return False
+        return result
+
+
+def _probe_hevc(url: str) -> bool:
+    """Legacy shim — returns True if the MPEG-TS stream contains HEVC video.
+    New code should call _probe_ts_streams() directly for full codec info."""
+    return _probe_ts_streams(url)["hevc"]
 
 
 @flask_app.route("/api/resolve", methods=["POST"])
@@ -3628,21 +3676,35 @@ def api_resolve():
 
                 else:
                     # ffprobe timed-out or couldn't open the stream.
-                    # Fall through to direct play — the JS error-handler will
-                    # escalate to hls_proxy/ffmpeg if the browser also fails.
-                    state.log(f"[RESOLVE] ffprobe failed, attempting direct play")
+                    # Fall through to TS byte-scan below, then direct play as last resort.
+                    state.log(f"[RESOLVE] ffprobe failed, attempting TS probe then direct play")
 
-            # Legacy MPEG-TS byte-scan fallback: only useful when ffprobe couldn't
-            # connect (codecs is None) and this is a token-based live stream.
-            # Now that we probe everything, this is a rare last-resort path.
-            if not needs_transcode and codecs is None and 'play_token=' in url:
+            # ── TS byte-scan fallback ────────────────────────────────────────────
+            # When ffprobe failed (codecs is None) we fall back to reading the
+            # raw MPEG-TS packet headers directly.  Previously this only ran for
+            # play_token= URLs, leaving every other URL type uncovered when
+            # ffprobe timed out.  Now it runs for ALL URLs — if the stream is not
+            # MPEG-TS the parser just returns all-False within 1880 bytes and we
+            # fall through to direct play as before.
+            if not needs_transcode and codecs is None:
                 try:
-                    if _probe_hevc(url):
+                    ts_info = _probe_ts_streams(url)
+                    if ts_info["hevc"]:
                         needs_transcode = True
                         transcode_reason = "hevc (ts probe)"
-                        is_vod = False  # play_token indicates live
+                        if 'play_token=' in url:
+                            is_vod = False
+                        state.log(f"[RESOLVE] TS probe: HEVC video detected")
+                    elif ts_info["bad_audio"]:
+                        needs_transcode = True
+                        transcode_reason = f"incompatible audio ({ts_info['audio_codec']}) (ts probe)"
+                        if 'play_token=' in url:
+                            is_vod = False
+                        state.log(f"[RESOLVE] TS probe: bad audio detected: {ts_info['audio_codec']}")
+                    else:
+                        state.log(f"[RESOLVE] TS probe: no transcode needed (or not MPEG-TS)")
                 except Exception as pe:
-                    state.log(f"[RESOLVE] HEVC TS probe failed: {pe}")
+                    state.log(f"[RESOLVE] TS probe failed: {pe}")
             
             # Apply transcode if needed
             if needs_transcode:
@@ -11219,15 +11281,50 @@ function doPlay(url, name, opts={}){
           document.getElementById('ppbtn').textContent='\u25b6';
           window._mpegRetries[_mk]=0;
         }
-      } else if(!isLiveStream && et===mpegts.ErrorTypes.NETWORK_ERROR){
-        alog('[MPEGTS] VOD stream unavailable'+_codeTag+' — '+msg,'e');
-        setNP('✗ Stream unavailable'+_codeTag+': '+name);
-        document.getElementById('ppbtn').textContent='▶';
       } else if(!isLiveStream && fallbackUrl && et===mpegts.ErrorTypes.NETWORK_ERROR){
-        // Catchup path-based .ts failed → try query-string format via HLS.js
+        // Catchup path-based .ts failed → try query-string format via HLS.js.
+        // NOTE: this branch MUST come before the plain !isLiveStream branch below,
+        // otherwise the broader condition swallows it and fallbackUrl is never tried.
         alog('[MPEGTS] Catchup .ts failed — retrying with fallback URL via HLS.js','w');
         _destroyPlayers();
         doPlay(fallbackUrl, name, {isLive:false});
+      } else if(!isLiveStream && et===mpegts.ErrorTypes.NETWORK_ERROR){
+        // VOD network error — try a single ffmpeg remux pass before giving up.
+        // This handles container/mux issues that mpegts.js can't recover from but
+        // ffmpeg -c copy can (e.g. partial PES, missing keyframe at start).
+        if(!url.includes('hls_proxy') && !window._vodRemuxFired){
+          window._vodRemuxFired = true;
+          alog('[MPEGTS] VOD network error — trying ffmpeg remux…','w');
+          const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
+          setTimeout(()=>{
+            if(_playerStopped) return;
+            if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
+            vid.pause(); vid.removeAttribute('src'); vid.load();
+            _playerStopped=false;
+            setNP('▶ '+name+' [remux]');
+            if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
+              mpegtsObj=mpegts.createPlayer({type:'mse',isLive:false,url:remuxUrl,cors:true},{
+                enableWorker:false,autoCleanupSourceBuffer:true,
+              });
+              mpegtsObj.attachMediaElement(vid);
+              mpegtsObj.load();
+              vid.play().catch(()=>{});
+              mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
+                if(!_playerStopped){
+                  alog('[MPEGTS/VOD remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
+                  setNP('✗ Stream unavailable: '+name);
+                  document.getElementById('ppbtn').textContent='▶';
+                }
+              });
+            } else {
+              vid.src=remuxUrl; vid.play().catch(()=>{});
+            }
+          }, 1000);
+        } else {
+          alog('[MPEGTS] VOD stream unavailable'+_codeTag+' — '+msg,'e');
+          setNP('✗ Stream unavailable'+_codeTag+': '+name);
+          document.getElementById('ppbtn').textContent='▶';
+        }
       }
     });
     if(isLiveStream) vid.play().catch(()=>{});
