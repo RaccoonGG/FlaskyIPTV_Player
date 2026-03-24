@@ -38,11 +38,11 @@ Added progress bar with real kbs speed for downloading MKV, and items/total item
 Fixed EPG out of memory happening in large EPG lists (although now large external EPG lists can use 2000 MB of ram, like 30k channel lists)
 Fixed laggy desktop input in the search field for Whats on Now tab and dekstop version of saved logins tab.
 Added button that opens external player of your choice (on desktop select exe, on mobile you can pick VLC, MX, MX PRO, Just Player)
-Added option to add subtitles from opensubtitles.com via inscript serach (get free API key from https://www.opensubtitles.com/en/consumers)
+Added option to add subtitles from opensubtitles.com via inscript search (get free API key from https://www.opensubtitles.com/en/consumers)
 Added option to add local subtitles file for subtitles (.srt/.vtt/.ass/.ssa) via Local File tab in the subtitle modal.
 Subtitle delay +/- works the same for local files as for OpenSubtitles.
 Desktop view optimizations, bigger player, now activity log is hidden by default, can expand, player controls can be hidden to expand player, theater mode button to fully expand player and hiding all tabs.
-Added external play button inside Whats on Now tab after search and matching channel, and added also inside catchup tab.
+Added external play button inside Whats on Now tab after search and matching channel, and added it also inside catchup tab.
 Fixed a major bug with yt-dlp fallback not respecting the stop button.
 Fixed ffmpeg mkv download not working on specific HLS VODs/series, by adding mpeg-ts format as a fallback to mkv.
 Added logos to channels/vods/series.
@@ -52,16 +52,14 @@ Added local M3U file parsing in M3U connect options.
 Added EPG layout to items tab.
 Added cast to Chromecast, DLNA, Airplay feature.
 Added Multi-View feature that also supports external URLs like YouTube/Twitch (does not work on age-gated content)
-Fixed external EPG decompression blocking threads, added EPG caching per attempted channel while we wait external EPG download to finish.
+Fixed external EPG decompression blocking threads and added EPG caching per attempted channel while we wait for the external EPG download to finish.
 Improved button highlights and added a glossy style to all buttons.
 Fixed some vods and series with mp4/mkv with hevc video or unsupported audio formats not playing in the browser.
-Various UI fixes, adjustments, and overall script ui optimizations.
+Various UI fixes, adjustments, and overall script optimizations.
 Added logo caching for MAC portal (PortalClient): live channels use get_all_channels fallback (one request, cached); VOD/series use a zero-cost in-memory dict built from already-fetched items.
 Extended StalkerPortalClient logo caching to VOD and series modes (was live-only); same zero-cost in-memory dict strategy.
 Fixed Xtream double round-trip: handshake() and account_info() previously both issued GET /player_api.php — account_info() now reads from the cached user_info set by handshake(), saving one network call on every connect.
 Added Xtream logo cache: stream_id → logo URL dict populated during fetch_items_page, fills missing logos without extra requests.
-Added DVR support via dvr_addon.
-More fixes for videos and audio that need transcoding.
 """
 
 import base64
@@ -3644,7 +3642,14 @@ def api_resolve():
             else:
                 # Always run ffprobe — timeout kept short (8 s) so channel-switch
                 # latency stays acceptable even for slow live streams.
-                codecs = probe_stream_codecs(url, timeout=8)
+                # Pass User-Agent and protocol_whitelist — many MAC/Xtream portals
+                # reject ffprobe's default Lavf user-agent and ffprobe needs the
+                # whitelist to open http/https/tcp streams without a config file.
+                _probe_pre_args = [
+                    "-user_agent", "VLC/3.0.0 LibVLC/3.0.0",
+                    "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+                ]
+                codecs = probe_stream_codecs(url, pre_input_args=_probe_pre_args, timeout=8)
 
                 if codecs:
                     # ── Video codec check ────────────────────────────────────
@@ -10777,6 +10782,9 @@ function doPlay(url, name, opts={}){
   window._hlsManifestRetried = false;                // reset manifest retry flag
   if(window._hlsRetries) window._hlsRetries = {};    // reset HLS retry counter
   window._vodRemuxFired = false;                     // reset VOD remux guard
+  window._hlsMediaRecoveries = 0;                    // reset HLS media recovery counter
+  window._hlsFreshRestarted = false;                  // reset HLS fresh-restart guard
+  window._hlsRecoverySuccessHandler = null;           // reset FRAG_BUFFERED success handler
   // ── Stall watchdog ────────────────────────────────────────────────────────
   // Neither HLS.js nor mpegts.js fires an error when the stream silently
   // freezes mid-playback (currentTime stops advancing but no fatal event).
@@ -11008,14 +11016,174 @@ function doPlay(url, name, opts={}){
         },3000);  // 3s grace period — lets portal release the connection slot before ffmpeg connects
         return;
       }
-      if(!data.fatal) return;
+      if(!data.fatal){
+        // ── Non-fatal MEDIA_ERROR handling ──────────────────────────────────
+        // HLS.js fires non-fatal MEDIA_ERROR for buffer stalls, nudge-on-stall,
+        // and MSE append hiccups before promoting them to fatal.
+        //
+        // Strategy:
+        //   • Wait 1 s before acting — browser often self-recovers on hiccups
+        //   • Save currentTime before recovery (some browsers reset it to 0)
+        //   • Call recoverMediaError() then vid.play() — without play() the user
+        //     has to manually press play to resume, which was the reported bug
+        //   • Restore position if browser reset it back to 0 after recovery
+        //   • Listen for a successful FRAG_BUFFERED after recovery to reset the
+        //     counter — only count consecutive unrecovered errors
+        //   • After 5 failed consecutive recoveries escalate to remux
+        //   • bufferAddCodecError = codec truly unsupported → skip recovery, go
+        //     straight to transcode
+        if(data.type === Hls.ErrorTypes.MEDIA_ERROR){
+          const _det2 = (data.details||'').toLowerCase();
+          // Only treat as a codec error when HLS.js fires the actual codec-specific
+          // error details. includes('codec') is too broad — it would match benign
+          // strings like "audio codec drift" that are recoverable via recoverMediaError().
+          const _isCodecError = _det2.includes('addcodec') || _det2.includes('incompatiblecodec');
+          if(_isCodecError && !_playerStopped && !window._hlsRemuxFired){
+            // Codec unsupported — recoverMediaError() won't help, go to transcode now
+            window._hlsRemuxFired = true;
+            alog('[HLS] Codec error (non-fatal escalation) — trying ffmpeg transcode…','w');
+            if(hlsObj){hlsObj.destroy();hlsObj=null;}
+            vid.pause(); vid.removeAttribute('src'); vid.load();
+            const remuxUrl='/api/hls_proxy?transcode=1&url='+encodeURIComponent(url);
+            setTimeout(()=>{
+              if(_playerStopped) return;
+              _playerStopped=false;
+              setNP('▶ '+name+' [transcoding]');
+              if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
+                mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{
+                  enableWorker:false,liveBufferLatencyChasing:true,
+                  liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3,
+                });
+                mpegtsObj.attachMediaElement(vid); mpegtsObj.load(); vid.play().catch(()=>{});
+                mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
+                  if(!_playerStopped){ alog('[HLS/codec-transcode] '+(ed2?.msg||String(ed2)),'e'); setNP('✗ Transcode failed: '+name); document.getElementById('ppbtn').textContent='▶'; }
+                });
+              } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
+            }, 3000);
+          } else if(!_isCodecError && hlsObj && !_playerStopped){
+            if(!window._hlsMediaRecoveries) window._hlsMediaRecoveries = 0;
+            // Increment INSIDE the delay — HLS.js can fire bufferStalledError +
+            // bufferNudgeOnStall back-to-back within milliseconds. Incrementing
+            // here would count 2 errors before the first recovery even runs,
+            // causing premature escalation to remux.
+            const _hlsIsLive = (opts.isLive !== false);
+            alog('[HLS] Non-fatal media error — will recover in 2 s…','w');
+            if(window._hlsMediaRecoveries < 5){
+              // Delay 2 s: give the browser a chance to self-recover from a transient stall.
+              // Do NOT pause/clear src — that kills the picture. Just wait, then nudge.
+              setTimeout(()=>{
+                if(_playerStopped || !hlsObj) return;
+                window._hlsMediaRecoveries++;
+                const _savedTime = vid.currentTime;
+                if(_hlsIsLive){
+                  // Live stream: recoverMediaError() tears down the MSE source buffer and
+                  // forces a manifest re-request. On portals with rolling segment numbers
+                  // (e.g. 302779.m3u8) the new manifest references segments that were valid
+                  // when the error fired but are already expired by the time recovery runs —
+                  // causing manifestParsingError cascade → remux → 403 on stale segment URL.
+                  // stopLoad()+startLoad(-1) just resumes the fragment loader from the live
+                  // edge without touching the source buffer — much less disruptive.
+                  alog('[HLS] Live non-fatal ('+window._hlsMediaRecoveries+'/5) — nudging loader from live edge…','w');
+                  try{ hlsObj.stopLoad(); hlsObj.startLoad(-1); }catch(e){}
+                  vid.play().catch(()=>{});
+                } else {
+                  // VOD: recoverMediaError() is safe — segment URLs don't expire
+                  alog('[HLS] VOD non-fatal ('+window._hlsMediaRecoveries+'/5) — attempting recoverMediaError…','w');
+                  try{ hlsObj.recoverMediaError(); }catch(e){}
+                  setTimeout(()=>{
+                    if(_playerStopped) return;
+                    // Some browsers reset currentTime to 0 when MSE is reattached — restore it.
+                    if(_savedTime > 2 && vid.currentTime < _savedTime - 2){
+                      alog('[HLS] Restoring VOD position to '+_savedTime.toFixed(1)+'s after recovery','w');
+                      try{ vid.currentTime = _savedTime; }catch(e){}
+                    }
+                    vid.play().catch(()=>{});
+                  }, 200);
+                }
+                // Register a one-shot FRAG_BUFFERED listener to reset the recovery counter
+                // if a fragment plays successfully — only count consecutive failures.
+                if(hlsObj && !window._hlsRecoverySuccessHandler){
+                  window._hlsRecoverySuccessHandler = ()=>{
+                    if(window._hlsMediaRecoveries > 0){
+                      alog('[HLS] Recovery succeeded — resetting error counter','k');
+                      window._hlsMediaRecoveries = 0;
+                    }
+                    // Save reference before nulling — off(null) is a no-op
+                    const _h = window._hlsRecoverySuccessHandler;
+                    window._hlsRecoverySuccessHandler = null;
+                    if(hlsObj) hlsObj.off(Hls.Events.FRAG_BUFFERED, _h);
+                  };
+                  hlsObj.once(Hls.Events.FRAG_BUFFERED, window._hlsRecoverySuccessHandler);
+                }
+              }, 2000);
+            } else if(!window._hlsRemuxFired){
+              // 5 consecutive failed recoveries — escalate to remux
+              window._hlsRemuxFired = true;
+              alog('[HLS] Media recovery exhausted (5/5) — trying ffmpeg remux…','w');
+              if(hlsObj){hlsObj.destroy();hlsObj=null;}
+              vid.pause(); vid.removeAttribute('src'); vid.load();
+              const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
+              setTimeout(()=>{
+                if(_playerStopped) return;
+                _playerStopped=false;
+                setNP('▶ '+name+' [remux]');
+                if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
+                  mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{
+                    enableWorker:false,liveBufferLatencyChasing:true,
+                    liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3,
+                  });
+                  mpegtsObj.attachMediaElement(vid); mpegtsObj.load(); vid.play().catch(()=>{});
+                  mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
+                    if(!_playerStopped){ alog('[HLS/remux] '+(ed2?.msg||String(ed2)),'e'); setNP('✗ Stream unavailable: '+name); document.getElementById('ppbtn').textContent='▶'; }
+                  });
+                } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
+              }, 3000);
+            }
+          }
+        }
+        return;
+      }
       // Fatal non-manifest errors
       if(data.type===Hls.ErrorTypes.NETWORK_ERROR){
         if(!window._hlsRetries) window._hlsRetries={};
         const _hk=String(pIdx)+'|'+url.slice(-20);
         window._hlsRetries[_hk]=(window._hlsRetries[_hk]||0)+1;
-        if(window._hlsRetries[_hk]<=3&&!_playerStopped){
+        if(window._hlsRetries[_hk]<=4&&!_playerStopped){
+          // Up to 4 startLoad() retries with back-off before escalating further
           setTimeout(()=>{if(hlsObj&&!_playerStopped)hlsObj.startLoad();},2500);
+        } else if(window._hlsRetries[_hk]===5 && !_playerStopped && !window._hlsRemuxFired && !window._hlsFreshRestarted){
+          // After 4 failed retries, do one full HLS destroy+recreate before remux.
+          // A brand-new HLS instance gets a clean TCP connection — same as mpegts fresh restart.
+          window._hlsFreshRestarted = true;
+          alog('[HLS] Retries exhausted — doing fresh HLS restart before remux…','w');
+          setNP('⟳ Stream hiccup — retrying: '+name+'…');
+          if(hlsObj){hlsObj.destroy();hlsObj=null;}
+          vid.pause(); vid.removeAttribute('src'); vid.load();
+          setTimeout(()=>{
+            if(_playerStopped) return;
+            _playerStopped = false;
+            hlsObj=new Hls({
+              enableWorker:false, lowLatencyMode:false,
+              maxBufferLength:30, maxMaxBufferLength:60,
+              fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
+              levelLoadingTimeOut:20000,
+              fragLoadingMaxRetry:6, fragLoadingRetryDelay:1500,
+              levelLoadingMaxRetry:4, levelLoadingRetryDelay:1500,
+              manifestLoadingMaxRetry:3, manifestLoadingRetryDelay:1500,
+              xhrSetup(xhr){xhr.withCredentials=false;},
+              subtitleStreamController: class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  onAudioTrackSwitching(){}  onSubtitleFragProcessed(){}  onBufferFlushing(){}  on(){}  off(){} },
+              subtitleTrackController:  class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  on(){}  off(){} },
+            });
+            hlsObj.loadSource(px);
+            hlsObj.attachMedia(vid);
+            hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>{
+              alog('[HLS] Fresh restart succeeded','k');
+              setNP('▶ '+name);
+              vid.play().catch(()=>{});
+            });
+            // _hlsRetries[_hk] is now 5 — next fatal network error falls to remux
+            hlsObj.on(Hls.Events.ERROR, hlsErrorHandler);
+          }, 3000);
         } else if(!_playerStopped&&!url.includes('hls_proxy')&&!window._hlsRemuxFired){
           window._hlsRemuxFired=true;
           alog('[HLS] Retries exhausted — trying ffmpeg remux…','w');
@@ -11037,7 +11205,6 @@ function doPlay(url, name, opts={}){
               mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
                 if(!_playerStopped){
                   alog('[HLS/remux] '+(ed2?.msg||String(ed2)),'e');
-                // MSE/codec error (e.g. HEVC) — escalate to ffmpeg transcode
                 const _isMSE2 = (String(et2||'').includes('Media') || String(et2||'')==='MediaError')
                              && (String(ed2||'').includes('MSE')||String(ed2?.msg||'').includes('MSE')
                                    ||String(ed2||'').includes('Unsupported')||String(ed2?.msg||'').includes('Unsupported'));
@@ -11074,7 +11241,43 @@ function doPlay(url, name, opts={}){
           if(hlsObj){hlsObj.destroy();hlsObj=null;}
         }
       } else if(data.type===Hls.ErrorTypes.MEDIA_ERROR){
-        hlsObj.recoverMediaError();
+        // Fatal MEDIA_ERROR — try recoverMediaError() up to 5 times, auto-resume
+        // after each attempt, restore position if browser reset it to 0.
+        if(!window._hlsMediaRecoveries) window._hlsMediaRecoveries = 0;
+        window._hlsMediaRecoveries++;
+        if(window._hlsMediaRecoveries <= 5 && hlsObj){
+          alog('[HLS] Fatal media error ('+window._hlsMediaRecoveries+'/5) — attempting recoverMediaError…','w');
+          const _savedTime = vid.currentTime;
+          try{ hlsObj.recoverMediaError(); }catch(e){}
+          setTimeout(()=>{
+            if(_playerStopped) return;
+            if(_savedTime > 2 && vid.currentTime < _savedTime - 2){
+              try{ vid.currentTime = _savedTime; }catch(e){}
+            }
+            vid.play().catch(()=>{});
+          }, 200);
+        } else if(!_playerStopped && !window._hlsRemuxFired){
+          window._hlsRemuxFired = true;
+          alog('[HLS] Fatal media error unrecoverable — escalating to ffmpeg remux…','w');
+          if(hlsObj){hlsObj.destroy();hlsObj=null;}
+          vid.pause(); vid.removeAttribute('src'); vid.load();
+          const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
+          setTimeout(()=>{
+            if(_playerStopped) return;
+            _playerStopped=false;
+            setNP('▶ '+name+' [remux]');
+            if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
+              mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{
+                enableWorker:false,liveBufferLatencyChasing:true,
+                liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3,
+              });
+              mpegtsObj.attachMediaElement(vid); mpegtsObj.load(); vid.play().catch(()=>{});
+              mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
+                if(!_playerStopped){ alog('[HLS/media-remux] '+(ed2?.msg||String(ed2)),'e'); setNP('✗ Stream unavailable: '+name); document.getElementById('ppbtn').textContent='▶'; }
+              });
+            } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
+          }, 3000);
+        }
       }
     };
     hlsObj.on(Hls.Events.ERROR, hlsErrorHandler);
