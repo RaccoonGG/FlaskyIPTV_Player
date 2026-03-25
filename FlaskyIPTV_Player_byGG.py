@@ -10820,7 +10820,18 @@ function doPlay(url, name, opts={}){
       // This re-opens the HTTP connection to the portal without a full page-reload.
       setNP('⟳ Buffering… '+pName);
       if(mpegtsObj){ try{ mpegtsObj.unload(); mpegtsObj.load(); vid.play().catch(()=>{}); }catch(e){} }
-      else if(hlsObj){ try{ hlsObj.stopLoad(); hlsObj.startLoad(); }catch(e){} }
+      else if(hlsObj){
+        try{
+          hlsObj.stopLoad();
+          // startLoad(-1) jumps to the live edge rather than resuming from the stale position
+          hlsObj.startLoad(-1);
+          const _lp = hlsObj.liveSyncPosition;
+          if(typeof _lp === 'number' && Number.isFinite(_lp) && vid.currentTime < _lp - 2){
+            try{ vid.currentTime = Math.max(0, _lp - 1); }catch(e){}
+          }
+        }catch(e){}
+        vid.play().catch(()=>{});
+      }
     } else {
       // Time is advancing — reset hit counter
       window._stallHits = 0;
@@ -10890,26 +10901,29 @@ function doPlay(url, name, opts={}){
 
   } else if(isHls && typeof Hls !== 'undefined' && Hls.isSupported()){
     // ── HLS via HLS.js ────────────────────────────────────────
-    hlsObj=new Hls({
-      enableWorker:false, lowLatencyMode:false,
-      // Buffer: 30 s target (was 60) — less aggressive on slow portals,
-      // avoids burst-requesting fragments that overwhelm a struggling server.
-      maxBufferLength:45, maxMaxBufferLength:90,
-      // Timeouts: generous for slow portals
-      fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
-      levelLoadingTimeOut:20000,
-      // Silent fragment/level retries before escalating to a fatal error.
-      // On a slow portal a single failed fetch is normal — retry 6× with
-      // 1.5 s back-off before giving up and firing the error handler.
-      fragLoadingMaxRetry:6, fragLoadingRetryDelay:1500,
-      levelLoadingMaxRetry:4, levelLoadingRetryDelay:1500,
-      manifestLoadingMaxRetry:5, manifestLoadingRetryDelay:2500,
+    // Shared HLS config — used in every new Hls() call below.
+    // enableWorker:true  → parsing/remux runs off the main thread (less UI jank)
+    // maxBufferLength:18 → keeps live stream ≤18s behind edge; 45 caused visible lag/drift
+    // backBufferLength:10 → evict old segments quickly; frees memory, reduces MSE pressure
+    // liveSyncDurationCount:3 / liveMaxLatencyDurationCount:5 → stay 3-5 segments from edge
+    // Shorter retry delays: 6×1500ms = 9s of stalls before escalation; now 4×800ms = 3.2s
+    const _HLS_CFG = {
+      enableWorker:true, lowLatencyMode:false,
+      maxBufferLength:18, maxMaxBufferLength:30,
+      backBufferLength:10,
+      liveSyncDurationCount:3, liveMaxLatencyDurationCount:5,
+      fragLoadingTimeOut:20000, manifestLoadingTimeOut:15000,
+      levelLoadingTimeOut:15000,
+      fragLoadingMaxRetry:4, fragLoadingRetryDelay:800,
+      levelLoadingMaxRetry:3, levelLoadingRetryDelay:800,
+      manifestLoadingMaxRetry:3, manifestLoadingRetryDelay:1500,
       xhrSetup(xhr){xhr.withCredentials=false;},
       // Disable HLS.js subtitle track management with full no-op stubs
       // so our own addTextTrack() cues are never touched by HLS internals
       subtitleStreamController: class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  onAudioTrackSwitching(){}  onSubtitleFragProcessed(){}  onBufferFlushing(){}  on(){}  off(){} },
       subtitleTrackController:  class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  on(){}  off(){} },
-    });
+    };
+    hlsObj=new Hls(_HLS_CFG);
     hlsObj.loadSource(px);
     hlsObj.attachMedia(vid);
     hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>vid.play().catch(()=>{}));
@@ -10932,27 +10946,34 @@ function doPlay(url, name, opts={}){
       // remux if the retry also fails — remux cannot help when the portal itself is down.
       if(_isManifest && !_playerStopped && !url.includes('hls_proxy') && !window._hlsRemuxFired){
         if(!window._hlsManifestRetried){
-          // First manifest error — destroy and retry HLS.js after 3s
           window._hlsManifestRetried = true;
-          alog('[HLS] Manifest error — portal may have hiccuped, retrying HLS in 3s…','w');
+          // First manifest error — distinguish transient network blip from a real parse failure.
+          // manifestParsingError = HLS.js got bytes but couldn't parse them (portal sent error page).
+          // Other manifest errors (load timeout, 5xx) = transient; soft reload is enough.
+          const _isParseError = _det.includes('manifestparsingerror') || _det.includes('parsing');
+          if(!_isParseError){
+            // Soft re-sync: just reload the manifest from the live edge — no destroy needed.
+            alog('[HLS] Manifest load hiccup — re-syncing live edge (soft retry)…','w');
+            try {
+              hlsObj.stopLoad();
+              hlsObj.startLoad(-1);
+              const _lp = hlsObj.liveSyncPosition;
+              if(typeof _lp === 'number' && Number.isFinite(_lp) && vid.currentTime < _lp - 2){
+                try{ vid.currentTime = Math.max(0, _lp - 1); }catch(e){}
+              }
+            } catch(e){}
+            vid.play().catch(()=>{});
+            return;
+          }
+          // True parse error (portal sent an HTML error page etc.) — destroy and hard retry.
+          alog('[HLS] Manifest parse error — destroying and retrying HLS in 3s…','w');
           if(hlsObj){hlsObj.destroy();hlsObj=null;}
           vid.pause(); vid.removeAttribute('src'); vid.load();
           setNP('⟳ Stream hiccup — retrying: '+name+'…');
           setTimeout(()=>{
             if(_playerStopped) return;
-            alog('[HLS] Retrying HLS after manifest error…','w');
-            hlsObj=new Hls({
-              enableWorker:false, lowLatencyMode:false,
-              maxBufferLength:45, maxMaxBufferLength:90,
-              fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
-              levelLoadingTimeOut:20000,
-              fragLoadingMaxRetry:6, fragLoadingRetryDelay:1500,
-              levelLoadingMaxRetry:4, levelLoadingRetryDelay:1500,
-              manifestLoadingMaxRetry:5, manifestLoadingRetryDelay:2500,
-              xhrSetup(xhr){xhr.withCredentials=false;},
-              subtitleStreamController: class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  onAudioTrackSwitching(){}  onSubtitleFragProcessed(){}  onBufferFlushing(){}  on(){}  off(){} },
-              subtitleTrackController:  class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  on(){}  off(){} },
-            });
+            alog('[HLS] Retrying HLS after manifest parse error…','w');
+            hlsObj=new Hls(_HLS_CFG);
             hlsObj.loadSource(px);
             hlsObj.attachMedia(vid);
             hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>{
@@ -11074,22 +11095,26 @@ function doPlay(url, name, opts={}){
             const _hlsIsLive = (opts.isLive !== false);
             alog('[HLS] Non-fatal media error — will recover in 2 s…','w');
             if(window._hlsMediaRecoveries < 5){
-              // Delay 2 s: give the browser a chance to self-recover from a transient stall.
-              // Do NOT pause/clear src — that kills the picture. Just wait, then nudge.
+              // Delay 1 s (was 2 s): give the browser a brief chance to self-recover.
+              // Live streams don't benefit from a long wait — the edge is moving away.
               setTimeout(()=>{
                 if(_playerStopped || !hlsObj) return;
                 window._hlsMediaRecoveries++;
                 const _savedTime = vid.currentTime;
                 if(_hlsIsLive){
-                  // Live stream: recoverMediaError() tears down the MSE source buffer and
-                  // forces a manifest re-request. On portals with rolling segment numbers
-                  // (e.g. 302779.m3u8) the new manifest references segments that were valid
-                  // when the error fired but are already expired by the time recovery runs —
-                  // causing manifestParsingError cascade → remux → 403 on stale segment URL.
-                  // stopLoad()+startLoad(-1) just resumes the fragment loader from the live
-                  // edge without touching the source buffer — much less disruptive.
-                  alog('[HLS] Live non-fatal ('+window._hlsMediaRecoveries+'/5) — nudging loader from live edge…','w');
-                  try{ hlsObj.stopLoad(); hlsObj.startLoad(-1); }catch(e){}
+                  // Live stream: stopLoad+startLoad(-1) resumes fragment loader from the live
+                  // edge without touching the source buffer — much less disruptive than
+                  // recoverMediaError() which triggers a full MSE teardown.
+                  // Also nudge currentTime to live edge if we've drifted more than 2s behind.
+                  alog('[HLS] Live non-fatal ('+window._hlsMediaRecoveries+'/5) — re-syncing live edge…','w');
+                  try {
+                    hlsObj.stopLoad();
+                    hlsObj.startLoad(-1);
+                    const _lp = hlsObj.liveSyncPosition;
+                    if(typeof _lp === 'number' && Number.isFinite(_lp) && vid.currentTime < _lp - 2){
+                      try{ vid.currentTime = Math.max(0, _lp - 1); }catch(e){}
+                    }
+                  } catch(e){}
                   vid.play().catch(()=>{});
                 } else {
                   // VOD: recoverMediaError() is safe — segment URLs don't expire
@@ -11167,18 +11192,7 @@ function doPlay(url, name, opts={}){
           setTimeout(()=>{
             if(_playerStopped) return;
             _playerStopped = false;
-            hlsObj=new Hls({
-              enableWorker:false, lowLatencyMode:false,
-              maxBufferLength:45, maxMaxBufferLength:90,
-              fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
-              levelLoadingTimeOut:20000,
-              fragLoadingMaxRetry:6, fragLoadingRetryDelay:1500,
-              levelLoadingMaxRetry:4, levelLoadingRetryDelay:1500,
-              manifestLoadingMaxRetry:5, manifestLoadingRetryDelay:2500,
-              xhrSetup(xhr){xhr.withCredentials=false;},
-              subtitleStreamController: class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  onAudioTrackSwitching(){}  onSubtitleFragProcessed(){}  onBufferFlushing(){}  on(){}  off(){} },
-              subtitleTrackController:  class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  on(){}  off(){} },
-            });
+            hlsObj=new Hls(_HLS_CFG);
             hlsObj.loadSource(px);
             hlsObj.attachMedia(vid);
             hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>{
@@ -11353,18 +11367,21 @@ function doPlay(url, name, opts={}){
             const pxUrl = rawUrl.startsWith('/api/') ? rawUrl : '/api/proxy?url='+encodeURIComponent(rawUrl);
             if(typeof Hls !== 'undefined' && Hls.isSupported()){
               setNP('▶ '+name+' [HLS fallback]');
-              hlsObj = new Hls({
-                enableWorker:false, lowLatencyMode:false,
-                maxBufferLength:45, maxMaxBufferLength:90,
-                fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
-                levelLoadingTimeOut:20000,
-                fragLoadingMaxRetry:6, fragLoadingRetryDelay:1500,
-                levelLoadingMaxRetry:4, levelLoadingRetryDelay:1500,
-                manifestLoadingMaxRetry:5, manifestLoadingRetryDelay:2500,
+              // Reuse the shared _HLS_CFG from the outer doPlay scope if available,
+              // otherwise define equivalent settings inline for this fallback path.
+              const _fbCfg = (typeof _HLS_CFG !== 'undefined') ? _HLS_CFG : {
+                enableWorker:true, lowLatencyMode:false,
+                maxBufferLength:18, maxMaxBufferLength:30, backBufferLength:10,
+                liveSyncDurationCount:3, liveMaxLatencyDurationCount:5,
+                fragLoadingTimeOut:20000, manifestLoadingTimeOut:15000, levelLoadingTimeOut:15000,
+                fragLoadingMaxRetry:4, fragLoadingRetryDelay:800,
+                levelLoadingMaxRetry:3, levelLoadingRetryDelay:800,
+                manifestLoadingMaxRetry:3, manifestLoadingRetryDelay:1500,
                 xhrSetup(xhr){xhr.withCredentials=false;},
                 subtitleStreamController: class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  onAudioTrackSwitching(){}  onSubtitleFragProcessed(){}  onBufferFlushing(){}  on(){}  off(){} },
                 subtitleTrackController:  class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  on(){}  off(){} },
-              });
+              };
+              hlsObj = new Hls(_fbCfg);
               hlsObj.loadSource(pxUrl);
               hlsObj.attachMedia(vid);
               hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>vid.play().catch(()=>{}));
@@ -14630,7 +14647,8 @@ async function _mvPlayChannel(wid, channel, cEl){
 
     if(typeof Hls !== 'undefined' && (resolvedUrl.includes('.m3u8') || resolvedUrl.includes('m3u8'))){
       // HLS manifest (YouTube live at specific quality)
-      const hlsInst = new Hls({ enableWorker:false, maxBufferLength:60 });
+      const hlsInst = new Hls({ enableWorker:true, maxBufferLength:30, maxMaxBufferLength:40, backBufferLength:10,
+        liveSyncDurationCount:3, liveMaxLatencyDurationCount:5 });
       hlsInst.loadSource(proxyVideoUrl);
       hlsInst.attachMedia(videoEl);
       hlsInst.on(Hls.Events.MANIFEST_PARSED, ()=>{ videoEl.play().catch(()=>{}); });
