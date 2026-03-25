@@ -6587,9 +6587,13 @@ def api_hls_proxy():
     )
     _benign_counts: dict = {}   # noise phrase → count, for one-time "suppressing X" log
 
+    _proc_killed = [False]   # shared flag — set True when we kill the process
+
     def _log_stderr():
         try:
             for raw in proc.stderr:
+                if _proc_killed[0]:
+                    break   # process killed by us — discard buffered stderr noise                
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 if line:
                     stderr_lines.append(line)
@@ -6634,6 +6638,7 @@ def api_hls_proxy():
         except Exception as e:
             state.log(f"[ffmpeg/{mode_str}] Generator error: {e}")
         finally:
+            _proc_killed[0] = True   # tell stderr thread to stop logging            
             proc.kill()
             proc.wait()
             rc = proc.returncode
@@ -11611,7 +11616,14 @@ function doPlay(url, name, opts={}){
     // ── Fallback: direct proxy (MP4, VOD, etc.) ────────────────
     vid.src=px; vid.play().catch(()=>{});
   }
-  renderItems(filtItems);
+  // Update the "now playing" highlight without re-rendering the full list.
+  // renderItems() replaces innerHTML entirely and resets scrollTop — the user
+  // loses their scroll position every time they play a channel.
+  // Instead just toggle the .now class in-place on the existing rows.
+  (()=>{
+    const rows = document.getElementById('ilist').querySelectorAll('.irow');
+    rows.forEach((r, i) => r.classList.toggle('now', i === pIdx));
+  })();
 }
 
 vid.addEventListener('play',()=>document.getElementById('ppbtn').textContent='⏸');
