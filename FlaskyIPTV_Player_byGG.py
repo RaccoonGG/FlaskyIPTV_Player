@@ -10889,7 +10889,7 @@ function doPlay(url, name, opts={}){
       enableWorker:false, lowLatencyMode:false,
       // Buffer: 30 s target (was 60) — less aggressive on slow portals,
       // avoids burst-requesting fragments that overwhelm a struggling server.
-      maxBufferLength:30, maxMaxBufferLength:60,
+      maxBufferLength:45, maxMaxBufferLength:90,
       // Timeouts: generous for slow portals
       fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
       levelLoadingTimeOut:20000,
@@ -10898,7 +10898,7 @@ function doPlay(url, name, opts={}){
       // 1.5 s back-off before giving up and firing the error handler.
       fragLoadingMaxRetry:6, fragLoadingRetryDelay:1500,
       levelLoadingMaxRetry:4, levelLoadingRetryDelay:1500,
-      manifestLoadingMaxRetry:3, manifestLoadingRetryDelay:1500,
+      manifestLoadingMaxRetry:5, manifestLoadingRetryDelay:2500,
       xhrSetup(xhr){xhr.withCredentials=false;},
       // Disable HLS.js subtitle track management with full no-op stubs
       // so our own addTextTrack() cues are never touched by HLS internals
@@ -10938,12 +10938,12 @@ function doPlay(url, name, opts={}){
             alog('[HLS] Retrying HLS after manifest error…','w');
             hlsObj=new Hls({
               enableWorker:false, lowLatencyMode:false,
-              maxBufferLength:30, maxMaxBufferLength:60,
+              maxBufferLength:45, maxMaxBufferLength:90,
               fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
               levelLoadingTimeOut:20000,
               fragLoadingMaxRetry:6, fragLoadingRetryDelay:1500,
               levelLoadingMaxRetry:4, levelLoadingRetryDelay:1500,
-              manifestLoadingMaxRetry:3, manifestLoadingRetryDelay:1500,
+              manifestLoadingMaxRetry:5, manifestLoadingRetryDelay:2500,
               xhrSetup(xhr){xhr.withCredentials=false;},
               subtitleStreamController: class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  onAudioTrackSwitching(){}  onSubtitleFragProcessed(){}  onBufferFlushing(){}  on(){}  off(){} },
               subtitleTrackController:  class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  on(){}  off(){} },
@@ -10968,9 +10968,9 @@ function doPlay(url, name, opts={}){
         // Release the <video> element connection too — portals with connections=1/1
         // will 403 ffmpeg if the browser still holds the slot when ffmpeg connects.
         vid.pause(); vid.removeAttribute('src'); vid.load();
-        const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
         setTimeout(()=>{
           if(_playerStopped) return;
+          const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
           setNP('▶ '+name+' [remux]');
           if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
             _playerStopped=false;
@@ -11013,7 +11013,7 @@ function doPlay(url, name, opts={}){
               }
             });
           } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
-        },3000);  // 3s grace period — lets portal release the connection slot before ffmpeg connects
+        }, 3000);  // 3s grace — gives 1/1 connection portals time to release the slot
         return;
       }
       if(!data.fatal){
@@ -11044,9 +11044,9 @@ function doPlay(url, name, opts={}){
             alog('[HLS] Codec error (non-fatal escalation) — trying ffmpeg transcode…','w');
             if(hlsObj){hlsObj.destroy();hlsObj=null;}
             vid.pause(); vid.removeAttribute('src'); vid.load();
-            const remuxUrl='/api/hls_proxy?transcode=1&url='+encodeURIComponent(url);
             setTimeout(()=>{
               if(_playerStopped) return;
+              const remuxUrl='/api/hls_proxy?transcode=1&url='+encodeURIComponent(url);
               _playerStopped=false;
               setNP('▶ '+name+' [transcoding]');
               if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
@@ -11122,9 +11122,9 @@ function doPlay(url, name, opts={}){
               alog('[HLS] Media recovery exhausted (5/5) — trying ffmpeg remux…','w');
               if(hlsObj){hlsObj.destroy();hlsObj=null;}
               vid.pause(); vid.removeAttribute('src'); vid.load();
-              const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
               setTimeout(()=>{
                 if(_playerStopped) return;
+                const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
                 _playerStopped=false;
                 setNP('▶ '+name+' [remux]');
                 if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
@@ -11164,12 +11164,12 @@ function doPlay(url, name, opts={}){
             _playerStopped = false;
             hlsObj=new Hls({
               enableWorker:false, lowLatencyMode:false,
-              maxBufferLength:30, maxMaxBufferLength:60,
+              maxBufferLength:45, maxMaxBufferLength:90,
               fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
               levelLoadingTimeOut:20000,
               fragLoadingMaxRetry:6, fragLoadingRetryDelay:1500,
               levelLoadingMaxRetry:4, levelLoadingRetryDelay:1500,
-              manifestLoadingMaxRetry:3, manifestLoadingRetryDelay:1500,
+              manifestLoadingMaxRetry:5, manifestLoadingRetryDelay:2500,
               xhrSetup(xhr){xhr.withCredentials=false;},
               subtitleStreamController: class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  onAudioTrackSwitching(){}  onSubtitleFragProcessed(){}  onBufferFlushing(){}  on(){}  off(){} },
               subtitleTrackController:  class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  on(){}  off(){} },
@@ -11187,11 +11187,11 @@ function doPlay(url, name, opts={}){
         } else if(!_playerStopped&&!url.includes('hls_proxy')&&!window._hlsRemuxFired){
           window._hlsRemuxFired=true;
           alog('[HLS] Retries exhausted — trying ffmpeg remux…','w');
-          const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
           if(hlsObj){hlsObj.destroy();hlsObj=null;}
           vid.pause(); vid.removeAttribute('src'); vid.load();
           setTimeout(()=>{
             if(_playerStopped) return;
+            const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
             setNP('▶ '+name+' [remux]');
             _playerStopped=false;
             if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
@@ -11233,7 +11233,7 @@ function doPlay(url, name, opts={}){
                 }
               });
             } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
-          },3000);  // 3s grace period — lets portal release the connection slot before ffmpeg connects
+          }, 3000);  // 3s grace — gives 1/1 connection portals time to release the slot
         } else if(!_playerStopped){
           alog('[HLS] Stream failed — channel may be offline','e');
           setNP('✗ Stream unavailable: '+name);
@@ -11261,9 +11261,9 @@ function doPlay(url, name, opts={}){
           alog('[HLS] Fatal media error unrecoverable — escalating to ffmpeg remux…','w');
           if(hlsObj){hlsObj.destroy();hlsObj=null;}
           vid.pause(); vid.removeAttribute('src'); vid.load();
-          const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
           setTimeout(()=>{
             if(_playerStopped) return;
+            const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
             _playerStopped=false;
             setNP('▶ '+name+' [remux]');
             if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
@@ -11350,12 +11350,12 @@ function doPlay(url, name, opts={}){
               setNP('▶ '+name+' [HLS fallback]');
               hlsObj = new Hls({
                 enableWorker:false, lowLatencyMode:false,
-                maxBufferLength:30, maxMaxBufferLength:60,
+                maxBufferLength:45, maxMaxBufferLength:90,
                 fragLoadingTimeOut:25000, manifestLoadingTimeOut:20000,
                 levelLoadingTimeOut:20000,
                 fragLoadingMaxRetry:6, fragLoadingRetryDelay:1500,
                 levelLoadingMaxRetry:4, levelLoadingRetryDelay:1500,
-                manifestLoadingMaxRetry:3, manifestLoadingRetryDelay:1500,
+                manifestLoadingMaxRetry:5, manifestLoadingRetryDelay:2500,
                 xhrSetup(xhr){xhr.withCredentials=false;},
                 subtitleStreamController: class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  onAudioTrackSwitching(){}  onSubtitleFragProcessed(){}  onBufferFlushing(){}  on(){}  off(){} },
                 subtitleTrackController:  class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  on(){}  off(){} },
