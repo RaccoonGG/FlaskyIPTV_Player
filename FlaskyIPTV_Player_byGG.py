@@ -3683,8 +3683,47 @@ def api_resolve():
 
                 else:
                     # ffprobe timed-out or couldn't open the stream.
-                    # Fall through to TS byte-scan below, then direct play as last resort.
-                    state.log(f"[RESOLVE] ffprobe failed, attempting TS probe then direct play")
+                    # For HLS (m3u8) URLs the TS byte-scan cannot read HLS playlists —
+                    # it always returns all-False, which is misleading.  Instead, retry
+                    # ffprobe once with HLS-specific protocol whitelist args.
+                    _is_hls_url = '.m3u8' in url_lower or '.m3u8' in url_lower_full
+                    if _is_hls_url:
+                        state.log(f"[RESOLVE] ffprobe failed on HLS URL — retrying with HLS protocol args")
+                        _hls_probe_args = [
+                            "-user_agent", "VLC/3.0.0 LibVLC/3.0.0",
+                            "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls,applehttp",
+                            "-allowed_extensions", "ALL",
+                        ]
+                        codecs = probe_stream_codecs(url, pre_input_args=_hls_probe_args, timeout=12)
+                        if codecs:
+                            state.log(f"[RESOLVE] ffprobe HLS retry succeeded")
+                            if codecs.get("video"):
+                                vcodec = codecs["video"][0].lower()
+                                detected_codec = vcodec
+                                hevc_codecs = ("hevc", "h265", "h.265", "hev1", "hvc1", "x265")
+                                if vcodec in hevc_codecs or any(h in vcodec for h in hevc_codecs):
+                                    needs_transcode = True
+                                    transcode_reason = f"hevc video ({vcodec})"
+                                    state.log(f"[RESOLVE] HEVC video detected: {vcodec}")
+                            if not needs_transcode and codecs.get("audio"):
+                                acodec = codecs["audio"][0].lower()
+                                safe_audio = ("aac", "mp3", "mp2", "opus", "vorbis", "flac")
+                                bad_audio  = ("ac3", "eac3", "dts", "dca", "truehd", "mlp", "pcm")
+                                if acodec not in safe_audio and (
+                                        acodec in bad_audio or any(b in acodec for b in bad_audio)):
+                                    needs_transcode = True
+                                    transcode_reason = f"incompatible audio ({acodec})"
+                                    state.log(f"[RESOLVE] Audio codec needs transcode: {acodec}")
+                                else:
+                                    state.log(f"[RESOLVE] Audio codec OK: {acodec}")
+                            if not needs_transcode:
+                                a_str = codecs.get('audio', ['?'])[0] if codecs.get('audio') else 'none'
+                                state.log(f"[RESOLVE] HLS retry: all codecs playable: v={detected_codec}, a={a_str}")
+                        else:
+                            state.log(f"[RESOLVE] ffprobe HLS retry also failed — playing direct")
+                    else:
+                        # Non-HLS URL: fall through to TS byte-scan below
+                        state.log(f"[RESOLVE] ffprobe failed, attempting TS probe then direct play")
 
             # ── TS byte-scan fallback ────────────────────────────────────────────
             # When ffprobe failed (codecs is None) we fall back to reading the
@@ -3693,7 +3732,11 @@ def api_resolve():
             # ffprobe timed out.  Now it runs for ALL URLs — if the stream is not
             # MPEG-TS the parser just returns all-False within 1880 bytes and we
             # fall through to direct play as before.
-            if not needs_transcode and codecs is None:
+            # Guard: skip for HLS (m3u8) URLs — the TS parser cannot read HLS
+            # manifests and always returns all-False.  ffprobe retry above is the
+            # correct fallback for HLS; if that also failed, play direct.
+            _is_hls_url = '.m3u8' in url_lower or '.m3u8' in url_lower_full
+            if not needs_transcode and codecs is None and not _is_hls_url:
                 try:
                     ts_info = _probe_ts_streams(url)
                     if ts_info["hevc"]:
@@ -10927,18 +10970,61 @@ function doPlay(url, name, opts={}){
     hlsObj.loadSource(px);
     hlsObj.attachMedia(vid);
     hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>vid.play().catch(()=>{}));
+    let _hlsRetryFired = false;
     const hlsErrorHandler = (_,data)=>{
       const _det=(data.details||'').toLowerCase();
       const _isManifest=_det.includes('manifest');
       // Log all fatal errors and manifest errors
       if(data.fatal || _isManifest) alog('[HLS] '+data.type+': '+data.details+(data.fatal?' (fatal)':' (non-fatal)'),'e');
-      // 503/403/404 — hard stop immediately
+      // Non-fatal errors (e.g. manifestParsingError, network hiccups) — HLS.js
+      // handles these internally; do NOT destroy or retry from here.
+      if(!data.fatal) return;
+      // 503/403/404 — hard stop immediately, no retry
       const hc=data?.response?.code||0;
       if(hc===503||hc===403||hc===404){
         alog('[HLS] Channel unavailable ('+hc+') — stopping','e');
         setNP('✗ Channel unavailable ('+hc+')');
         document.getElementById('ppbtn').textContent='▶';
         if(hlsObj){hlsObj.destroy();hlsObj=null;}
+        return;
+      }
+      // Fatal error — first try: recreate HLS instance (portal may have hiccuped)
+      if(!_hlsRetryFired && !_playerStopped){
+        _hlsRetryFired = true;
+        alog('[HLS] Fatal error — retrying with fresh HLS instance…','w');
+        setNP('⟳ Stream hiccup — retrying: '+name+'…');
+        if(hlsObj){hlsObj.destroy();hlsObj=null;}
+        vid.pause(); vid.removeAttribute('src'); vid.load();
+        setTimeout(()=>{
+          if(_playerStopped) return;
+          _playerStopped = false;
+          const _retryHls = new Hls(_HLS_CFG);
+          hlsObj = _retryHls;
+          _retryHls.loadSource(px);
+          _retryHls.attachMedia(vid);
+          _retryHls.on(Hls.Events.MANIFEST_PARSED,()=>vid.play().catch(()=>{}));
+          _retryHls.on(Hls.Events.ERROR,(_,d2)=>{
+            if(!d2.fatal) return;
+            if(!_playerStopped && !window._remuxFired){
+              window._remuxFired = true;
+              alog('[HLS] Retry also failed — falling back to ffmpeg remux…','w');
+              if(hlsObj){hlsObj.destroy();hlsObj=null;}
+              const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
+              setTimeout(()=>{
+                if(_playerStopped) return;
+                _playerStopped = false;
+                setNP('▶ '+name+' [remux]');
+                if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
+                  mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{
+                    enableWorker:false,liveBufferLatencyChasing:true,
+                    liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3,
+                  });
+                  mpegtsObj.attachMediaElement(vid); mpegtsObj.load(); vid.play().catch(()=>{});
+                } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
+              },3000);
+            }
+          });
+        },2000);
         return;
       }
     };
