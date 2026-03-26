@@ -11185,7 +11185,7 @@ function doPlay(url, name, opts={}){
       // play_token URLs: re-resolve for fresh token, but cap at 2 retries
       if(isLiveStream && et===mpegts.ErrorTypes.NETWORK_ERROR && hasPlayToken){
         if(!window._ptRetries) window._ptRetries = {};
-        const _rk = pIdx+'|'+url.slice(-20);
+        const _rk = String(pIdx);
         window._ptRetries[_rk] = (window._ptRetries[_rk]||0)+1;
         if(window._ptRetries[_rk] <= 2 && !_playerStopped){
           alog('[MPEGTS] play_token failed (attempt '+window._ptRetries[_rk]+'/2) — re-resolving…','w');
