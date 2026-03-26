@@ -10903,13 +10903,13 @@ function doPlay(url, name, opts={}){
     // ── HLS via HLS.js ────────────────────────────────────────
     // Shared HLS config — used in every new Hls() call below.
     // enableWorker:true  → parsing/remux runs off the main thread (less UI jank)
-    // maxBufferLength:18 → keeps live stream ≤18s behind edge; 45 caused visible lag/drift
+    // maxBufferLength:20 → keeps live stream ≤20s behind edge; 45 caused visible lag/drift
     // backBufferLength:10 → evict old segments quickly; frees memory, reduces MSE pressure
     // liveSyncDurationCount:3 / liveMaxLatencyDurationCount:5 → stay 3-5 segments from edge
     // Shorter retry delays: 6×1500ms = 9s of stalls before escalation; now 4×800ms = 3.2s
     const _HLS_CFG = {
       enableWorker:true, lowLatencyMode:false,
-      maxBufferLength:18, maxMaxBufferLength:30,
+      maxBufferLength:20, maxMaxBufferLength:30,
       backBufferLength:10,
       liveSyncDurationCount:3, liveMaxLatencyDurationCount:5,
       fragLoadingTimeOut:20000, manifestLoadingTimeOut:15000,
@@ -10939,107 +10939,6 @@ function doPlay(url, name, opts={}){
         setNP('✗ Channel unavailable ('+hc+')');
         document.getElementById('ppbtn').textContent='▶';
         if(hlsObj){hlsObj.destroy();hlsObj=null;}
-        return;
-      }
-      // manifestParsingError: portal likely returned an error page or dropped the stream
-      // transiently. Retry HLS.js first (portal may recover); only fall back to ffmpeg
-      // remux if the retry also fails — remux cannot help when the portal itself is down.
-      if(_isManifest && !_playerStopped && !url.includes('hls_proxy') && !window._hlsRemuxFired){
-        if(!window._hlsManifestRetried){
-          window._hlsManifestRetried = true;
-          // First manifest error — distinguish transient network blip from a real parse failure.
-          // manifestParsingError = HLS.js got bytes but couldn't parse them (portal sent error page).
-          // Other manifest errors (load timeout, 5xx) = transient; soft reload is enough.
-          const _isParseError = _det.includes('manifestparsingerror') || _det.includes('parsing');
-          if(!_isParseError){
-            // Soft re-sync: just reload the manifest from the live edge — no destroy needed.
-            alog('[HLS] Manifest load hiccup — re-syncing live edge (soft retry)…','w');
-            try {
-              hlsObj.stopLoad();
-              hlsObj.startLoad(-1);
-              const _lp = hlsObj.liveSyncPosition;
-              if(typeof _lp === 'number' && Number.isFinite(_lp) && vid.currentTime < _lp - 2){
-                try{ vid.currentTime = Math.max(0, _lp - 1); }catch(e){}
-              }
-            } catch(e){}
-            vid.play().catch(()=>{});
-            return;
-          }
-          // True parse error (portal sent an HTML error page etc.) — destroy and hard retry.
-          alog('[HLS] Manifest parse error — destroying and retrying HLS in 3s…','w');
-          if(hlsObj){hlsObj.destroy();hlsObj=null;}
-          vid.pause(); vid.removeAttribute('src'); vid.load();
-          setNP('⟳ Stream hiccup — retrying: '+name+'…');
-          setTimeout(()=>{
-            if(_playerStopped) return;
-            alog('[HLS] Retrying HLS after manifest parse error…','w');
-            hlsObj=new Hls(_HLS_CFG);
-            hlsObj.loadSource(px);
-            hlsObj.attachMedia(vid);
-            hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>{
-              alog('[HLS] Retry succeeded','k');
-              setNP('▶ '+name);
-              vid.play().catch(()=>{});
-            });
-            // Re-attach the same error handler — if it fires again _hlsManifestRetried
-            // is already true so it will fall through to the remux path below.
-            hlsObj.on(Hls.Events.ERROR, hlsErrorHandler);
-          }, 3000);
-          return;
-        }
-        // Second manifest error after retry — now try ffmpeg remux
-        window._hlsRemuxFired=true;
-        alog('[HLS] Manifest error persists after retry — trying ffmpeg remux…','w');
-        if(hlsObj){hlsObj.destroy();hlsObj=null;}
-        // Release the <video> element connection too — portals with connections=1/1
-        // will 403 ffmpeg if the browser still holds the slot when ffmpeg connects.
-        vid.pause(); vid.removeAttribute('src'); vid.load();
-        setTimeout(()=>{
-          if(_playerStopped) return;
-          const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
-          setNP('▶ '+name+' [remux]');
-          if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
-            _playerStopped=false;
-            mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{
-              enableWorker:false,liveBufferLatencyChasing:true,
-              liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3,
-            });
-            mpegtsObj.attachMediaElement(vid);
-            mpegtsObj.load();
-            vid.play().catch(()=>{});
-            mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
-              if(!_playerStopped){
-                alog('[HLS/remux] '+(ed2?.msg||String(ed2)),'e');
-              // MSE/codec error (e.g. HEVC) — escalate to ffmpeg transcode
-              const _isMSE2 = (String(et2||'').includes('Media') || String(et2||'')==='MediaError')
-                           && (String(ed2||'').includes('MSE')||String(ed2?.msg||'').includes('MSE')
-                               ||String(ed2||'').includes('Unsupported')||String(ed2?.msg||'').includes('Unsupported'));
-              if(_isMSE2 && !_playerStopped && !window._mseTranscodeFired){
-                window._mseTranscodeFired=true;
-                alog('[HLS/remux] HEVC codec — escalating to ffmpeg transcode…','w');
-                setTimeout(()=>{
-                  if(_playerStopped) return;
-                  if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
-                  vid.pause(); vid.removeAttribute('src'); vid.load();
-                  _playerStopped=false;
-                  const transcodeUrl='/api/hls_proxy?transcode=1&url='+encodeURIComponent(url);
-                  setNP('▶ '+name+' [transcoding HEVC→H.264]');
-                  if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
-                    mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:transcodeUrl,cors:true},{enableWorker:false,liveBufferLatencyChasing:true,liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3});
-                    mpegtsObj.attachMediaElement(vid); mpegtsObj.load(); vid.play().catch(()=>{});
-                    mpegtsObj.on(mpegts.Events.ERROR,(et3,ed3)=>{
-                      if(!_playerStopped){ alog('[HLS/transcode] '+(ed3?.msg||String(ed3)),'e'); setNP('✗ Transcode failed: '+name); document.getElementById('ppbtn').textContent='▶'; }
-                    });
-                  } else { vid.src=transcodeUrl; vid.play().catch(()=>{}); }
-                },0);
-                return;
-              }
-                setNP('✗ Stream unavailable: '+name);
-                document.getElementById('ppbtn').textContent='▶';
-              }
-            });
-          } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
-        }, 3000);  // 3s grace — gives 1/1 connection portals time to release the slot
         return;
       }
     };
@@ -11115,7 +11014,7 @@ function doPlay(url, name, opts={}){
               // otherwise define equivalent settings inline for this fallback path.
               const _fbCfg = (typeof _HLS_CFG !== 'undefined') ? _HLS_CFG : {
                 enableWorker:true, lowLatencyMode:false,
-                maxBufferLength:18, maxMaxBufferLength:30, backBufferLength:10,
+                maxBufferLength:20, maxMaxBufferLength:30, backBufferLength:10,
                 liveSyncDurationCount:3, liveMaxLatencyDurationCount:5,
                 fragLoadingTimeOut:20000, manifestLoadingTimeOut:15000, levelLoadingTimeOut:15000,
                 fragLoadingMaxRetry:4, fragLoadingRetryDelay:800,
