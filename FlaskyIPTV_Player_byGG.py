@@ -10981,6 +10981,20 @@ function doPlay(url, name, opts={}){
       if(!data.fatal) return;
       // 503/403/404 — hard stop immediately, no retry
       const hc=data?.response?.code||0;
+      if(hc===456){
+        alog('[HLS] Wrong location — use a VPN (456)','w');
+        setNP('✗ Wrong location — use a VPN');
+        document.getElementById('ppbtn').textContent='▶';
+        if(hlsObj){hlsObj.destroy();hlsObj=null;}
+        return;
+      }
+      if(hc===458){
+        alog('[HLS] Max connections already in use (458)','w');
+        setNP('✗ Max connections in use');
+        document.getElementById('ppbtn').textContent='▶';
+        if(hlsObj){hlsObj.destroy();hlsObj=null;}
+        return;
+      }
       if(hc===503||hc===403||hc===404){
         alog('[HLS] Channel unavailable ('+hc+') — stopping','e');
         setNP('✗ Channel unavailable ('+hc+')');
@@ -11176,6 +11190,18 @@ function doPlay(url, name, opts={}){
         return;
       }
       // 503/403/404 = channel offline — stop immediately, never retry
+      if(httpCode===456){
+        alog('[MPEGTS] Wrong location — use a VPN (456)','w');
+        setNP('✗ Wrong location — use a VPN');
+        document.getElementById('ppbtn').textContent='▶';
+        return;
+      }
+      if(httpCode===458){
+        alog('[MPEGTS] Max connections already in use (458)','w');
+        setNP('✗ Max connections in use');
+        document.getElementById('ppbtn').textContent='▶';
+        return;
+      }
       if(httpCode===503 || httpCode===403 || httpCode===404){
         alog('[MPEGTS] Channel unavailable ('+httpCode+') — stopping','e');
         setNP('✗ Channel unavailable ('+httpCode+')');
