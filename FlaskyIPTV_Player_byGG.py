@@ -424,11 +424,21 @@ class PortalClient:
         assert self.session is not None
         url = f"{self.base}/portal.php?action=handshake&type=stb&token=&JsHttpRequest=1-xml"
         self.log(f"[MAC] Handshake → {self.base}")
-        async with self.session.get(url) as r:
-            self.log(f"[MAC] Handshake HTTP {r.status}")
-            payload = await safe_json(r)
+        payload = None
+        _status = 0
+        for _attempt in range(4):  # up to 3 retries on 429
+            async with self.session.get(url) as r:
+                _status = r.status
+                self.log(f"[MAC] Handshake HTTP {r.status}")
+                if r.status == 429:
+                    _wait = 2 ** _attempt  # 1s, 2s, 4s
+                    self.log(f"[MAC] Handshake 429 — backing off {_wait}s (attempt {_attempt+1}/4)")
+                    await asyncio.sleep(_wait)
+                    continue
+                payload = await safe_json(r)
+                break
         if not isinstance(payload, dict):
-            raise RuntimeError(f"Handshake failed: empty/non-JSON response (HTTP {r.status})")
+            raise RuntimeError(f"Handshake failed: empty/non-JSON response (HTTP {_status})")
         js = payload.get("js")
         if isinstance(js, list) and js:
             js = js[0]
@@ -777,7 +787,7 @@ class PortalClient:
             if not cmd_value:
                 return ""
             cmd_value = cmd_value.strip().replace("\\/", "/")
-            for prefix in ("ffmpeg ", "auto "):
+            for prefix in ("ffmpeg ", "auto ", "ffrt "):
                 if cmd_value.lower().startswith(prefix):
                     cmd_value = cmd_value[len(prefix):].strip()
             # Fix hostless URLs: http://:/... or http:///...
@@ -810,10 +820,10 @@ class PortalClient:
         if not cmd:
             return cmd
         cmd = cmd.replace("\\/", "/").strip()
-        if cmd.startswith("ffmpeg "):
-            cmd = cmd.split(" ", 1)[1].strip()
-        if cmd.lower().startswith("auto "):
-            cmd = cmd.split(" ", 1)[1].strip()
+        for _pfx in ("ffmpeg ", "auto ", "ffrt "):
+            if cmd.lower().startswith(_pfx):
+                cmd = cmd.split(" ", 1)[1].strip()
+                break
         return cmd
 
     async def resolve_localhost_url(self, stub_url: str) -> str:
@@ -846,11 +856,10 @@ class PortalClient:
                     if isinstance(data, dict):
                         resolved = data.get("cmd") or data.get("url")
                 if resolved and isinstance(resolved, str):
-                    # Strip "ffmpeg " or "auto " prefix
-                    if resolved.startswith("ffmpeg "):
-                        resolved = resolved.split(" ", 1)[1]
-                    if resolved.lower().startswith("auto "):
-                        resolved = resolved.split(" ", 1)[1]
+                    for _pfx in ("ffmpeg ", "auto ", "ffrt "):
+                        if resolved.lower().startswith(_pfx):
+                            resolved = resolved.split(" ", 1)[1]
+                            break
                     resolved = resolved.replace("\\/", "/").strip()
                     if resolved.startswith(("http://", "https://", "rtsp://")):
                         self.log(f"[LOCALHOST FIX] Resolved ch={cid} → {resolved[:120]}")
@@ -1554,20 +1563,28 @@ class StalkerPortalClient:
         url = self._load_url(type="stb", action="handshake", token="", JsHttpRequest="1-xml")
         headers = self._headers(include_auth=False, include_token=False)
         self.log(f"[STALKER] Handshake → {self.base}{self.LOAD_PHP}")
-        async with self.session.get(url, headers=headers) as r:
-            self.log(f"[STALKER] Handshake HTTP {r.status}")
-            if r.status == 404:
-                # Stalker-specific: generate token+prehash and retry
-                self.log("[STALKER] 404 on handshake — retrying with token+prehash")
-                tok = self._generate_token()
-                prehash = self._generate_prehash(tok)
-                url2 = self._load_url(type="stb", action="handshake",
-                                      token=tok, prehash=prehash, JsHttpRequest="1-xml")
-                async with self.session.get(url2, headers=headers) as r2:
-                    self.log(f"[STALKER] Retry handshake HTTP {r2.status}")
-                    payload = await safe_json(r2)
-            else:
-                payload = await safe_json(r)
+        payload = None
+        for _attempt in range(4):  # up to 3 retries on 429
+            async with self.session.get(url, headers=headers) as r:
+                self.log(f"[STALKER] Handshake HTTP {r.status}")
+                if r.status == 429:
+                    _wait = 2 ** _attempt  # 1s, 2s, 4s
+                    self.log(f"[STALKER] Handshake 429 — backing off {_wait}s (attempt {_attempt+1}/4)")
+                    await asyncio.sleep(_wait)
+                    continue
+                if r.status == 404:
+                    # Stalker-specific: generate token+prehash and retry
+                    self.log("[STALKER] 404 on handshake — retrying with token+prehash")
+                    tok = self._generate_token()
+                    prehash = self._generate_prehash(tok)
+                    url2 = self._load_url(type="stb", action="handshake",
+                                          token=tok, prehash=prehash, JsHttpRequest="1-xml")
+                    async with self.session.get(url2, headers=headers) as r2:
+                        self.log(f"[STALKER] Retry handshake HTTP {r2.status}")
+                        payload = await safe_json(r2)
+                else:
+                    payload = await safe_json(r)
+                break
 
         if not isinstance(payload, dict) or "js" not in payload:
             raise RuntimeError(f"[STALKER] Handshake failed — no valid JSON response")
@@ -1914,10 +1931,10 @@ class StalkerPortalClient:
         if not resolved:
             return stub
         resolved = resolved.strip()
-        if resolved.lower().startswith("ffmpeg "):
-            resolved = resolved.split(" ", 1)[1].strip()
-        if resolved.lower().startswith("auto "):
-            resolved = resolved.split(" ", 1)[1].strip()
+        for _pfx in ("ffmpeg ", "auto ", "ffrt "):
+            if resolved.lower().startswith(_pfx):
+                resolved = resolved.split(" ", 1)[1].strip()
+                break
         resolved = resolved.replace("\\/", "/")
         if resolved.startswith(("http://", "https://", "rtsp://")):
             self.log(f"[STALKER] Resolved ch={cid} → {resolved[:120]}")
@@ -1980,10 +1997,10 @@ class StalkerPortalClient:
         if not cmd_value:
             return ""
         cmd_value = cmd_value.strip()
-        if cmd_value.lower().startswith("ffmpeg "):
-            cmd_value = cmd_value.split(" ", 1)[1].strip()
-        if cmd_value.lower().startswith("auto "):
-            cmd_value = cmd_value.split(" ", 1)[1].strip()
+        for _pfx in ("ffmpeg ", "auto ", "ffrt "):
+            if cmd_value.lower().startswith(_pfx):
+                cmd_value = cmd_value.split(" ", 1)[1].strip()
+                break
         cmd_value = cmd_value.replace("\\/", "/")
         # Fix hostless URLs the portal sometimes returns:
         #   http://:/stalker_portal/...  or  http:///stalker_portal/...
@@ -2039,10 +2056,10 @@ class StalkerPortalClient:
             return ""
         # Strip 'ffmpeg '/'auto ' prefix
         cmd_value = cmd_value.strip()
-        if cmd_value.lower().startswith("ffmpeg "):
-            cmd_value = cmd_value.split(" ", 1)[1].strip()
-        if cmd_value.lower().startswith("auto "):
-            cmd_value = cmd_value.split(" ", 1)[1].strip()
+        for _pfx in ("ffmpeg ", "auto ", "ffrt "):
+            if cmd_value.lower().startswith(_pfx):
+                cmd_value = cmd_value.split(" ", 1)[1].strip()
+                break
         cmd_value = cmd_value.replace("\\/", "/")
         # Detect stub: empty host (http:///ch/...) or localhost/ch/...
         is_stub = (
@@ -2128,10 +2145,10 @@ class StalkerPortalClient:
         if not cmd:
             return ""
         cmd = cmd.strip()
-        if cmd.lower().startswith("ffmpeg "):
-            cmd = cmd.split(" ", 1)[1].strip()
-        if cmd.lower().startswith("auto "):
-            cmd = cmd.split(" ", 1)[1].strip()
+        for _pfx in ("ffmpeg ", "auto ", "ffrt "):
+            if cmd.lower().startswith(_pfx):
+                cmd = cmd.split(" ", 1)[1].strip()
+                break
         cmd = cmd.replace("\\/", "/")
         if cmd.startswith(("http://", "https://", "rtsp://")):
             is_stub = (re.search(r'https?:///ch/', cmd) or re.search(r'https?://localhost/ch/', cmd))
@@ -2976,10 +2993,13 @@ class AppState:
         self._xmltv_dl_events: dict = {}     # url → threading.Event()
         self._xmltv_downloading: set = set() # urls currently in-flight
         self._xmltv_needs: set = set()       # cache_keys confirmed to need XMLTV (no portal data)
-        # Persistent StalkerPortalClient — reused across requests to avoid
-        # repeated handshake/profile calls that cause portal rate-limiting
-        self._stalker_client: object = None
-        self._stalker_client_lock = threading.Lock()
+        # Cached MAC/Stalker EPG token — acquired once, reused for all EPG
+        # requests so we don't do a full handshake per channel (causes 429s).
+        self._mac_epg_token: str = ""
+        self._mac_epg_headers: dict = {}
+        # _mac_epg_token_lock: guards the check+handshake as one atomic unit.
+        # Only the thread that acquires it handshakes; others block until done.
+        self._mac_epg_token_lock = threading.Lock()
         self.profile_data: dict = {}   # raw profile/account info for display
         # ── Persistent logo caches ─────────────────────────────────────────
         # These survive across _make_client() calls (client instances are
@@ -3367,6 +3387,8 @@ def api_connect():
         state._xmltv_dl_events = {}
         state._xmltv_downloading = set()
         state._xmltv_needs = set()
+        state._mac_epg_token = ""
+        state._mac_epg_headers = {}
         state._short_epg_broken = set()
         state._xmltv_no_data = set()
         state._won_ch_cache = (0.0, [])
@@ -4392,9 +4414,19 @@ def api_epg():
     # Cache key: portal type + channel identifier
     cache_key = f"{state.conn_type}:{stream_id or tvg_id}"
     cached = state._epg_cache.get(cache_key)
+    ext_url = state.ext_epg_url
     if cached:
         ts, result = cached
         if time.time() - ts < state._epg_cache_ttl:
+            _is_empty = not result.get("current") and not result.get("next") and not result.get("schedule")
+            if _is_empty and ext_url and ext_url in state._xmltv_downloading:
+                # Portal already failed for this channel; XMLTV now downloading.
+                # Do NOT re-run the portal chain — just return loading immediately.
+                state._xmltv_needs.add(cache_key)
+                del state._epg_cache[cache_key]
+                _loading = {"current": None, "next": None,
+                            "error": "EPG loading… please try again in a moment"}
+                return jsonify(_loading)
             state.log(f"[EPG] Cache hit for {cache_key}")
             return jsonify(result)
         else:
@@ -4402,7 +4434,6 @@ def api_epg():
 
     # Short-circuit: if this channel is confirmed to need XMLTV (no portal data)
     # and XMLTV is still downloading, skip the entire portal chain immediately.
-    ext_url = state.ext_epg_url
     if cache_key in state._xmltv_needs and ext_url and ext_url in state._xmltv_downloading:
         _loading = {"current": None, "next": None,
                     "error": "EPG loading… please try again in a moment"}
@@ -4503,50 +4534,111 @@ def api_epg():
         if conn == "mac":
             ch_id = str(item.get("ch_id") or item.get("id") or stream_id or "").strip()
             php = "/stalker_portal/server/load.php" if state.is_stalker_portal else "/portal.php"
-            client = StalkerPortalClient(state.url, state.mac, state.log) if state.is_stalker_portal \
-                     else PortalClient(state.url, state.mac, state.log)
-            async with client:
-                await client.handshake()
-                headers = client._headers(include_auth=True) if state.is_stalker_portal \
-                          else client.headers
-                base_url = normalize_base_url(state.url)
-                if not ch_id:
-                    # No portal ch_id — skip straight to external EPG if available
-                    pass
-                else:
-                    epg_url = (f"{base_url}{php}?type=itv&action=get_short_epg"
-                               f"&ch_id={ch_id}&count=10&JsHttpRequest=1-xml")
-                    state.log(f"[EPG] Trying: {epg_url}")
-                    async with client.session.get(epg_url, headers=headers,
-                                                  timeout=aiohttp.ClientTimeout(total=10)) as r:
+            base_url = normalize_base_url(state.url)
+
+            async def _mac_epg_request(ch_id, php):
+                """Fetch EPG for one channel, reusing cached token. Re-handshakes once on 401."""
+                _timeout = aiohttp.ClientTimeout(total=30, connect=10)
+
+                async def _ensure_token():
+                    """Return cached headers, acquiring token if needed.
+                    For stalker portals: tokens are short-lived and invalidated
+                    under concurrent load — skip the cache entirely and always
+                    do a fresh handshake per request to avoid Authorization failures.
+                    For plain MAC portals: token is stable, so cache and reuse.
+                    """
+                    loop = asyncio.get_event_loop()
+                    def _sync_ensure():
+                        if state.is_stalker_portal:
+                            # Always fresh handshake for stalker — no caching
+                            _cl = StalkerPortalClient(state.url, state.mac, state.log)
+                            _loop2 = asyncio.new_event_loop()
+                            try:
+                                async def _do_hs():
+                                    async with _cl:
+                                        await _cl.handshake()
+                                        return _cl._headers(include_auth=True)
+                                return _loop2.run_until_complete(_do_hs())
+                            finally:
+                                _loop2.close()
+                        else:
+                            with state._mac_epg_token_lock:
+                                if state._mac_epg_token:
+                                    return dict(state._mac_epg_headers)
+                                _cl = PortalClient(state.url, state.mac, state.log)
+                                _loop2 = asyncio.new_event_loop()
+                                try:
+                                    async def _do_hs():
+                                        async with _cl:
+                                            await _cl.handshake()
+                                            return _cl.token, dict(_cl.headers)
+                                    _tok, _hdrs = _loop2.run_until_complete(_do_hs())
+                                finally:
+                                    _loop2.close()
+                                state._mac_epg_token = _tok
+                                state._mac_epg_headers = _hdrs
+                                state.log("[EPG] MAC token acquired and cached for reuse")
+                                return dict(_hdrs)
+                    return await loop.run_in_executor(None, _sync_ensure)
+
+                headers = await _ensure_token()
+                epg_url = (f"{base_url}{php}?type=itv&action=get_short_epg"
+                           f"&ch_id={ch_id}&count=10&JsHttpRequest=1-xml")
+                state.log(f"[EPG] Trying: {epg_url}")
+                async with aiohttp.ClientSession(timeout=_timeout) as sess:
+                    async with sess.get(epg_url, headers=headers) as r:
                         state.log(f"[EPG] HTTP {r.status}")
                         payload = await safe_json(r)
-                    state.log(f"[EPG] Raw: {str(payload)[:300]}")
-                    result = _parse_stalker_epg(payload, ch_id)
-                    if result.get("current") or result.get("next") or result.get("schedule"):
-                        return result
-                    state.log(f"[EPG] Portal returned no EPG data for this channel")
-                    # Fallback: try alternate path (portal.php ↔ load.php)
-                    if state.is_stalker_portal:
-                        alt_php = "/stalker_portal/portal.php"
-                    else:
-                        alt_php = "/stalker_portal/server/load.php"
-                    if alt_php != php:
-                        alt_epg_url = (f"{base_url}{alt_php}?type=itv&action=get_short_epg"
-                                       f"&ch_id={ch_id}&count=10&JsHttpRequest=1-xml")
-                        state.log(f"[EPG] Retrying via alt path: {alt_epg_url}")
-                        try:
-                            async with client.session.get(alt_epg_url, headers=headers,
-                                                          timeout=aiohttp.ClientTimeout(total=10)) as r2:
-                                state.log(f"[EPG] Alt HTTP {r2.status}")
-                                payload2 = await safe_json(r2)
-                            state.log(f"[EPG] Alt raw: {str(payload2)[:300]}")
-                            result2 = _parse_stalker_epg(payload2, ch_id)
-                            if result2.get("current") or result2.get("next") or result2.get("schedule"):
-                                return result2
-                            state.log(f"[EPG] Alt path also returned no EPG data")
-                        except Exception as _e2:
-                            state.log(f"[EPG] Alt path error: {_e2}")
+                        # Detect auth failure by status OR by "Authorization failed"
+                        # in the response body (stalker portals return HTTP 200 with
+                        # this text when the token has expired/been invalidated).
+                        _auth_failed = (
+                            r.status == 401
+                            or ("authorization failed" in
+                                str(payload.get("text", "") if isinstance(payload, dict) else "").lower())
+                        )
+                        if _auth_failed:
+                            state.log("[EPG] MAC token rejected (auth failed) — re-handshaking")
+                            with state._mac_epg_token_lock:
+                                state._mac_epg_token = ""
+                                state._mac_epg_headers = {}
+                            headers = await _ensure_token()
+                        else:
+                            return r.status, payload
+                    # Retry with fresh token
+                    async with sess.get(epg_url, headers=headers) as r2:
+                        state.log(f"[EPG] HTTP {r2.status} (retry)")
+                        return r2.status, await safe_json(r2)
+
+            if not ch_id:
+                pass  # No portal ch_id — skip straight to external EPG
+            else:
+                _status, payload = await _mac_epg_request(ch_id, php)
+                state.log(f"[EPG] Raw: {str(payload)[:300]}")
+                result = _parse_stalker_epg(payload, ch_id)
+                if result.get("current") or result.get("next") or result.get("schedule"):
+                    return result
+                state.log(f"[EPG] Portal returned no EPG data for this channel")
+                # Stalker portals alternate between their two endpoints.
+                # Plain MAC portals use portal.php as primary; also try
+                # /server/load.php (without the stalker_portal prefix) as fallback.
+                if state.is_stalker_portal:
+                    alt_php = "/stalker_portal/portal.php" \
+                              if php == "/stalker_portal/server/load.php" \
+                              else "/stalker_portal/server/load.php"
+                else:
+                    alt_php = "/server/load.php"
+                state.log(f"[EPG] Retrying via alt path ({alt_php})")
+                try:
+                    _status2, payload2 = await _mac_epg_request(ch_id, alt_php)
+                    state.log(f"[EPG] Alt HTTP {_status2}")
+                    state.log(f"[EPG] Alt raw: {str(payload2)[:300]}")
+                    result2 = _parse_stalker_epg(payload2, ch_id)
+                    if result2.get("current") or result2.get("next") or result2.get("schedule"):
+                        return result2
+                    state.log(f"[EPG] Alt path also returned no EPG data")
+                except Exception as _e2:
+                    state.log(f"[EPG] Alt path error: {_e2}")
 
             # External EPG fallback for MAC/Stalker
             if state.ext_epg_url:
@@ -4626,9 +4718,51 @@ def api_epg():
         return jsonify({k: v for k, v in result.items() if k != "_xmltv_checked"})
     except Exception as e:
         state.log(f"[EPG] Error: {type(e).__name__}: {e}")
+        # If ext EPG is configured, this portal failure (429, 502, handshake error)
+        # is recoverable — the channel may well be in the XMLTV feed.
+        # Trigger XMLTV download if not already running/cached, mark channel as
+        # needing XMLTV, and return "loading" so the client retries via the poller.
+        # Never cache the portal exception as a permanent "No EPG data" result.
+        _ext = state.ext_epg_url
+        if _ext and _ext not in state._xmltv_cache and _ext not in state._xmltv_no_data:
+            state._xmltv_needs.add(cache_key)
+            if _ext not in state._xmltv_downloading:
+                state._xmltv_downloading.add(_ext)
+                state.log(f"[EPG] Portal error — launching XMLTV download for {_ext}")
+                def _exc_bg(_url=_ext):
+                    try:
+                        _loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(_loop)
+                        _ed, _cn = _loop.run_until_complete(_build_xmltv_index(_url, state.log))
+                        _loop.close()
+                        state._xmltv_cache[_url] = (time.time(), _ed, _cn)
+                        if not _ed:
+                            state._xmltv_no_data.add(_url)
+                    except Exception as _e2:
+                        state.log(f"[EPG] Background XMLTV error: {_e2}")
+                    finally:
+                        state._xmltv_downloading.discard(_url)
+                        state._xmltv_needs.clear()
+                        stale = [k for k, v in list(state._epg_cache.items())
+                                 if not v[1].get("current") and not v[1].get("next")
+                                 and not v[1].get("schedule")]
+                        for k in stale:
+                            state._epg_cache.pop(k, None)
+                threading.Thread(target=_exc_bg, daemon=True, name="xmltv-exc-bg").start()
+            _loading_err = {"current": None, "next": None,
+                            "error": "EPG loading… please try again in a moment"}
+            state._epg_cache[cache_key] = (time.time() - (state._epg_cache_ttl - 4), _loading_err)
+            return jsonify(_loading_err)
+        if _ext and _ext in state._xmltv_downloading:
+            state._xmltv_needs.add(cache_key)
+            _loading_err = {"current": None, "next": None,
+                            "error": "EPG loading… please try again in a moment"}
+            state._epg_cache[cache_key] = (time.time() - (state._epg_cache_ttl - 4), _loading_err)
+            return jsonify(_loading_err)
+        # No ext EPG configured — cache error briefly (30s) so a dead channel
+        # does not hammer the portal on every open.
         err_result = {"current": None, "next": None, "error": str(e)}
-        # Cache errors too so a broken channel doesn't retry every single request
-        state._epg_cache[cache_key] = (time.time(), err_result)
+        state._epg_cache[cache_key] = (time.time() - (state._epg_cache_ttl - 30), err_result)
         return jsonify(err_result)
 
 
@@ -4675,7 +4809,8 @@ def api_whats_on():
                     state._xmltv_downloading.discard(ek)
                     state._xmltv_needs.clear()
                     stale = [k for k, v in list(state._epg_cache.items())
-                             if "loading" in (v[1].get("error") or "").lower()]
+                             if not v[1].get("current") and not v[1].get("next")
+                             and not v[1].get("schedule")]
                     for k in stale:
                         state._epg_cache.pop(k, None)
 
@@ -5831,10 +5966,12 @@ async def _fetch_xmltv_epg(xmltv_url: str, tvg_id: str, log_cb=None,
                 # Clear the "needs XMLTV" markers so all waiting channels get
                 # a fresh EPG lookup now that the data is available.
                 state._xmltv_needs.clear()
-                # Also clear the per-channel "loading" cache entries so they
-                # don't serve stale loading responses after the download finishes.
+                # Evict ALL no-data per-channel cache entries (both "loading" and
+                # "confirmed empty") so every channel gets a fresh lookup now that
+                # the XMLTV index is populated.
                 stale = [k for k, v in list(state._epg_cache.items())
-                         if "loading" in (v[1].get("error") or "").lower()]
+                         if not v[1].get("current") and not v[1].get("next")
+                         and not v[1].get("schedule")]
                 for k in stale:
                     state._epg_cache.pop(k, None)
 
