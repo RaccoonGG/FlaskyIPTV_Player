@@ -8589,6 +8589,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <div style="display:flex;flex-direction:column;gap:4px;align-self:flex-start;flex-shrink:0" class="pctrl-desktop-only">
             <button class="btn-red" id="rbtn" onclick="togRec()" style="height:28px;padding:0 10px;font-size:12px">⏺ Record</button>
             <button class="btn-ghost" id="dl-now-btn" onclick="dlNowMKV()" title="Download currently playing item as MKV" disabled style="flex-shrink:0;height:28px;padding:0 10px;font-size:12px">⬇ MKV</button>
+            <button class="btn-ghost" id="dvr-desktop-btn" onclick="dvrOpen()" title="Open DVR scheduler" style="height:28px;padding:0 10px;font-size:12px">📹 DVR</button>
           </div>
           <div class="btn-vol-group">
           <div class="ctrl-r ctr">
@@ -9265,11 +9266,13 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 const CFG = {{ config | safe }};
 const _DVR_OK = CFG.dvr_ok === true;
 
-// Hide DVR button in Actions drawer if addon is not installed
+// Hide DVR buttons if addon is not installed
 if(!_DVR_OK){
   document.addEventListener('DOMContentLoaded', ()=>{
     const btn = document.getElementById('adr-dvr-btn');
     if(btn) btn.style.display = 'none';
+    const dBtn = document.getElementById('dvr-desktop-btn');
+    if(dBtn) dBtn.style.display = 'none';
   });
 }
 
