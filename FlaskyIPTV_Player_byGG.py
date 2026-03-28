@@ -2993,12 +2993,14 @@ class AppState:
         self._xmltv_dl_events: dict = {}     # url → threading.Event()
         self._xmltv_downloading: set = set() # urls currently in-flight
         self._xmltv_needs: set = set()       # cache_keys confirmed to need XMLTV (no portal data)
-        # Cached MAC/Stalker EPG token — acquired once, reused for all EPG
-        # requests so we don't do a full handshake per channel (causes 429s).
+        # Plain MAC portal EPG token — cached after first handshake and reused
+        # for all subsequent EPG requests (avoids per-channel handshake → 429s).
+        # Stalker portals do NOT use this cache — their tokens are short-lived
+        # and invalidate under concurrent load, so they always do a fresh handshake.
         self._mac_epg_token: str = ""
         self._mac_epg_headers: dict = {}
-        # _mac_epg_token_lock: guards the check+handshake as one atomic unit.
-        # Only the thread that acquires it handshakes; others block until done.
+        # Guards the MAC token check+set as one atomic unit so only one thread
+        # ever handshakes; all others wait and return the cached result.
         self._mac_epg_token_lock = threading.Lock()
         self.profile_data: dict = {}   # raw profile/account info for display
         # ── Persistent logo caches ─────────────────────────────────────────
@@ -4537,7 +4539,10 @@ def api_epg():
             base_url = normalize_base_url(state.url)
 
             async def _mac_epg_request(ch_id, php):
-                """Fetch EPG for one channel, reusing cached token. Re-handshakes once on 401."""
+                """Fetch EPG for one channel.
+                Plain MAC: reuses cached token, re-handshakes on 401/auth-failure.
+                Stalker: always does a fresh handshake (tokens are too short-lived to cache).
+                """
                 _timeout = aiohttp.ClientTimeout(total=30, connect=10)
 
                 async def _ensure_token():
@@ -4598,10 +4603,14 @@ def api_epg():
                                 str(payload.get("text", "") if isinstance(payload, dict) else "").lower())
                         )
                         if _auth_failed:
-                            state.log("[EPG] MAC token rejected (auth failed) — re-handshaking")
-                            with state._mac_epg_token_lock:
-                                state._mac_epg_token = ""
-                                state._mac_epg_headers = {}
+                            state.log("[EPG] Portal token rejected (auth failed) — re-handshaking")
+                            # For plain MAC portals, clear the cached token so
+                            # _ensure_token() acquires a fresh one.
+                            # Stalker portals never cache a token, so this is a no-op for them.
+                            if not state.is_stalker_portal:
+                                with state._mac_epg_token_lock:
+                                    state._mac_epg_token = ""
+                                    state._mac_epg_headers = {}
                             headers = await _ensure_token()
                         else:
                             return r.status, payload
