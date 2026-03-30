@@ -5347,38 +5347,56 @@ def api_catchup():
             except Exception as e:
                 state.log(f"[CatchUp] Xtream EPG fetch error: {e}")
 
-            # ── Step 1.5: get_epg_info fallback ──────────────────────────────
+            # ── Step 1.5: get_simple_data_table fallback ─────────────────────
+            # Same endpoint used by playlist.py / MainWindow reference impl.
+            # Returns epg_listings with has_archive flag and base64-encoded titles.
             if not results:
-                epg_info_url = (f"{base_norm}/player_api.php"
-                                f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}"
-                                f"&action=get_epg_info&stream_id={sid}")
-                state.log(f"[CatchUp] Trying get_epg_info stream_id={sid}")
+                simple_url = (f"{base_norm}/player_api.php"
+                              f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}"
+                              f"&action=get_simple_data_table&stream_id={sid}")
+                state.log(f"[CatchUp] Trying get_simple_data_table stream_id={sid}")
                 try:
                     async with aiohttp.ClientSession() as sess:
-                        async with sess.get(epg_info_url,
+                        async with sess.get(simple_url,
                                             timeout=aiohttp.ClientTimeout(total=12)) as r2:
                             payload2 = await safe_json(r2)
                     if isinstance(payload2, dict):
-                        parsed2  = _parse_xtream_short_epg(payload2)
-                        entries2 = parsed2.get("schedule", [])
-                        state.log(f"[CatchUp] get_epg_info entries: {len(entries2)} total")
-                        for ep in entries2:
-                            ep_s = ep.get("start", 0)
-                            ep_e = ep.get("end",   0)
-                            if ep_s and ep_e and ep_s < now_ts:
-                                _ma2 = "1" if ep_s >= _arch_cutoff else "0"
-                                results.append({
-                                    "title": ep.get("title") or "Unknown",
-                                    "start": ep_s, "stop": ep_e,
-                                    "cmd": sid, "live_cmd": sid,
-                                    "mark_archive": _ma2,
-                                    "epg_id": "", "id": "", "ch_id": "",
-                                })
+                        listings2 = payload2.get("epg_listings") or []
+                        state.log(f"[CatchUp] get_simple_data_table entries: {len(listings2)} total")
+                        for ep in listings2:
+                            if not isinstance(ep, dict):
+                                continue
+                            ep_s = int(ep.get("start_timestamp") or 0)
+                            ep_e = int(ep.get("stop_timestamp")  or 0)
+                            if not ep_s or ep_s >= now_ts:
+                                continue
+                            # Title is base64-encoded (same as playlist.py reference)
+                            raw_title = ep.get("title") or ""
+                            try:
+                                import base64 as _b64
+                                ep_title = _b64.b64decode(raw_title.encode()).decode("utf-8")
+                            except Exception:
+                                ep_title = raw_title
+                            ep_title = ep_title.strip() or "Unknown"
+                            _ma2 = "1" if ep_s >= _arch_cutoff else "0"
+                            results.append({
+                                "title":        ep_title,
+                                "start":        ep_s,
+                                "stop":         ep_e,
+                                "cmd":          sid,
+                                "live_cmd":     sid,
+                                "mark_archive": _ma2,
+                                "epg_id":       "",
+                                "id":           "",
+                                "ch_id":        "",
+                            })
                         if results:
                             results.sort(key=lambda x: x.get("start", 0), reverse=True)
-                            state.log(f"[CatchUp] get_epg_info gave {len(results)} past entries")
+                            state.log(f"[CatchUp] get_simple_data_table gave {len(results)} past entries")
+                        else:
+                            state.log("[CatchUp] get_simple_data_table returned no past entries")
                 except Exception as e:
-                    state.log(f"[CatchUp] get_epg_info error: {e}")
+                    state.log(f"[CatchUp] get_simple_data_table error: {e}")
 
             # ── Step 2: XMLTV fallback — wide-window index ────────────────────
             # KEY FIX: the live EPG index only keeps ±4-20h of data.  For catchup
