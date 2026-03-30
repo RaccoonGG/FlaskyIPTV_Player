@@ -4507,7 +4507,7 @@ def api_epg():
             if stream_id and not short_epg_skip:
                 epg_api_url = (f"{base_norm}/player_api.php"
                                f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}"
-                               f"&action=get_short_epg&stream_id={stream_id}&limit=20")
+                               f"&action=get_short_epg&stream_id={stream_id}&limit=30")
                 state.log(f"[EPG] Xtream get_short_epg stream_id={stream_id}")
                 try:
                     async with aiohttp.ClientSession() as sess:
@@ -4532,33 +4532,6 @@ def api_epg():
                     state.log(f"[EPG] get_short_epg error: {e}")
             elif short_epg_skip:
                 state.log(f"[EPG] Skipping get_short_epg (portal flagged as broken)")
-
-            # ── Method 1.5: get_epg_info ──────────────────────────────────────
-            if stream_id and base_norm in state._short_epg_broken:
-                epg_info_url2 = (f"{base_norm}/player_api.php"
-                                 f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}"
-                                 f"&action=get_epg_info&stream_id={stream_id}&limit=5")
-                state.log(f"[EPG] Trying get_epg_info stream_id={stream_id}")
-                try:
-                    async with aiohttp.ClientSession() as sess:
-                        async with sess.get(epg_info_url2,
-                                            timeout=aiohttp.ClientTimeout(total=10)) as r_ei:
-                            payload_ei = await safe_json(r_ei)
-                    if isinstance(payload_ei, dict):
-                        lst_ei = (payload_ei.get("epg_listings") or
-                                  (payload_ei.get("js") or {}).get("data") or
-                                  (payload_ei.get("js") or {}).get("epg_listings") or [])
-                        if lst_ei and isinstance(lst_ei, list):
-                            result_ei = _parse_xtream_short_epg(payload_ei)
-                            if result_ei.get("current") or result_ei.get("next"):
-                                state.log(f"[EPG] get_epg_info OK — "
-                                          f"current={result_ei.get('current', {}).get('title', '?')!r}")
-                                return result_ei
-                            state.log("[EPG] get_epg_info: entries but no current/next")
-                        else:
-                            state.log("[EPG] get_epg_info: empty")
-                except Exception as e:
-                    state.log(f"[EPG] get_epg_info error: {e}")
 
             # ── Method 2: portal's own XMLTV ─────────────────────────────────
             epg_ch_id = str(item.get("epg_channel_id") or "").strip()
@@ -5328,7 +5301,10 @@ def api_catchup():
                 for ep in all_entries:
                     ep_end   = ep.get("end", 0)
                     ep_start = ep.get("start", 0)
-                    if ep_start and ep_end and ep_start < now_ts:
+                    # Don't gate on ep_end — entries missing stop time would be
+                    # silently dropped, falling through to slower fallbacks.
+                    # Include them with stop=0; frontend shows start-only.
+                    if ep_start and ep_start < now_ts:
                         _ma = "1" if ep_start >= _arch_cutoff else "0"
                         results.append({
                             "title":        ep.get("title") or "Unknown",
@@ -5368,6 +5344,14 @@ def api_catchup():
                                 continue
                             ep_s = int(ep.get("start_timestamp") or 0)
                             ep_e = int(ep.get("stop_timestamp")  or 0)
+                            # Some Xtream panels omit stop_timestamp; fall back to
+                            # start + duration (seconds) — same logic as playlist.py
+                            # which computes duration from (stop_ts - start_ts).
+                            if not ep_e and ep_s:
+                                try:
+                                    ep_e = ep_s + int(ep.get("duration") or 0)
+                                except Exception:
+                                    pass
                             if not ep_s or ep_s >= now_ts:
                                 continue
                             # Title is base64-encoded (same as playlist.py reference)
@@ -5839,6 +5823,13 @@ def _parse_xtream_short_epg(payload: dict) -> dict:
         # Prefer unix timestamp fields (start_timestamp, stop_timestamp) over formatted strings
         start = _to_ts(ep.get("start_timestamp") or ep.get("time") or ep.get("start"))
         end   = _to_ts(ep.get("stop_timestamp")  or ep.get("time_to") or ep.get("end") or ep.get("stop"))
+        # Many Xtream panels omit stop_timestamp and only send duration (seconds).
+        # Compute end from duration so the catchup end-time column is populated.
+        if not end and start:
+            try:
+                end = start + float(ep.get("duration") or ep.get("duration_secs") or 0)
+            except Exception:
+                pass
         if not title or not start:
             continue
         entries.append({"title": title, "start": start, "end": end, "desc": desc})
