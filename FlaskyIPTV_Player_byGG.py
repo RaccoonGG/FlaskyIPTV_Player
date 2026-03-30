@@ -2317,6 +2317,36 @@ class XtreamClient:
             raise RuntimeError(f"Xtream: authentication failed — wrong username/password")
         # Cache user_info so account_info() can read it without a second request.
         self._cached_user_info = info
+        # Compute server UTC offset using calendar.timegm (NOT datetime.timestamp).
+        # datetime.timestamp() on a naive datetime applies CLIENT local timezone —
+        # wrong on any non-UTC client. calendar.timegm always treats timetuple as UTC.
+        # Example: server=UTC-4, client=UTC+2
+        #   .timestamp() → -21600 (wrong: -6h)  calendar.timegm → -14400 (correct: -4h)
+        self._server_utc_offset: int = 0
+        try:
+            import calendar as _cal
+            from datetime import datetime as _dt2
+            srv = data.get("server_info", {})
+            if isinstance(srv, dict):
+                ts_now = srv.get("timestamp_now") or srv.get("time")
+                t_str  = srv.get("time_now") or srv.get("server_time") or ""
+                tz_nm  = str(srv.get("timezone") or "").strip()
+                if ts_now and t_str:
+                    _srv_naive = _dt2.strptime(str(t_str)[:19], "%Y-%m-%d %H:%M:%S")
+                    _offset    = _cal.timegm(_srv_naive.timetuple()) - int(float(ts_now))
+                    if -50400 <= _offset <= 50400:
+                        self._server_utc_offset = _offset
+                        self.log(f"[XTREAM] Server UTC offset: {_offset:+d}s ({tz_nm or 'derived'})")
+                elif tz_nm:
+                    try:
+                        import zoneinfo as _zi, datetime as _dm
+                        _z = _zi.ZoneInfo(tz_nm)
+                        self._server_utc_offset = int(_dm.datetime.now(_z).utcoffset().total_seconds())
+                        self.log(f"[XTREAM] Server UTC offset: {self._server_utc_offset:+d}s (from {tz_nm!r})")
+                    except Exception:
+                        self.log(f"[XTREAM] Timezone {tz_nm!r} — zoneinfo unavailable, using UTC")
+        except Exception as _tz_e:
+            self.log(f"[XTREAM] Timezone detection failed ({_tz_e}), using UTC")
         self.log(f"[XTREAM] Auth OK — status: {info.get('status','?')}  expiry: {info.get('exp_date','?')}")
         return info
 
@@ -3003,6 +3033,14 @@ class AppState:
         # ever handshakes; all others wait and return the cached result.
         self._mac_epg_token_lock = threading.Lock()
         self.profile_data: dict = {}   # raw profile/account info for display
+        # UTC offset in seconds of the Xtream portal server clock (0 = UTC).
+        # Populated by XtreamClient.handshake() via calendar.timegm arithmetic.
+        self._portal_utc_offset: int = 0
+        # Separate XMLTV cache for catchup — built with a wide past window
+        # (tv_archive_duration days back) so all archived programmes are available.
+        # Distinct from _xmltv_cache which only keeps ±4-20h for live EPG.
+        self._xmltv_catchup_cache: dict = {}   # base_norm → (ts, epg_dict, chan_names, win_back_h)
+        self._xmltv_catchup_downloading: set = set()
         # ── Persistent logo caches ─────────────────────────────────────────
         # These survive across _make_client() calls (client instances are
         # short-lived — created and destroyed per request — so any cache on
@@ -3183,6 +3221,8 @@ async def _connect_async():
                     state.connected = True
                     state.set_status(f"Connected (Xtream via M3U): {ident} | {exp}")
                     state.profile_data = {'type':'xtream','user':ident,'exp':exp,'max_conn':str(max_conn) if max_conn else '','active_cons':active_cons}
+                    if hasattr(xt, "_server_utc_offset"):
+                        state._portal_utc_offset = xt._server_utc_offset
                     return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
                             "max_connections": max_conn, "portal_url": detected["base"],
                             "is_stalker": False}
@@ -3289,6 +3329,8 @@ async def _connect_async():
                 state.cats_cache[m] = []
     state.connected = True
     state.set_status(f"Connected: {ident} | {exp}")
+    if state.conn_type == "xtream" and hasattr(client, "_server_utc_offset"):
+        state._portal_utc_offset = client._server_utc_offset
     return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
             "max_connections": max_conn, "portal_url": state.url or state.m3u_url,
             "is_stalker": state.is_stalker_portal}
@@ -3399,6 +3441,9 @@ def api_connect():
         # Reset logo caches so a new portal starts fresh
         state._logo_cache_live = None
         state._logo_cache_vod = {}
+        state._portal_utc_offset = 0
+        state._xmltv_catchup_cache = {}
+        state._xmltv_catchup_downloading = set()
         # Local M3U file: pre-parse content, set flag so _connect_async skips network
         m3u_content = data.get("m3u_content", "").strip()
         if m3u_content and state.conn_type == "m3u_url":
@@ -4488,6 +4533,33 @@ def api_epg():
             elif short_epg_skip:
                 state.log(f"[EPG] Skipping get_short_epg (portal flagged as broken)")
 
+            # ── Method 1.5: get_epg_info ──────────────────────────────────────
+            if stream_id and base_norm in state._short_epg_broken:
+                epg_info_url2 = (f"{base_norm}/player_api.php"
+                                 f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}"
+                                 f"&action=get_epg_info&stream_id={stream_id}&limit=5")
+                state.log(f"[EPG] Trying get_epg_info stream_id={stream_id}")
+                try:
+                    async with aiohttp.ClientSession() as sess:
+                        async with sess.get(epg_info_url2,
+                                            timeout=aiohttp.ClientTimeout(total=10)) as r_ei:
+                            payload_ei = await safe_json(r_ei)
+                    if isinstance(payload_ei, dict):
+                        lst_ei = (payload_ei.get("epg_listings") or
+                                  (payload_ei.get("js") or {}).get("data") or
+                                  (payload_ei.get("js") or {}).get("epg_listings") or [])
+                        if lst_ei and isinstance(lst_ei, list):
+                            result_ei = _parse_xtream_short_epg(payload_ei)
+                            if result_ei.get("current") or result_ei.get("next"):
+                                state.log(f"[EPG] get_epg_info OK — "
+                                          f"current={result_ei.get('current', {}).get('title', '?')!r}")
+                                return result_ei
+                            state.log("[EPG] get_epg_info: entries but no current/next")
+                        else:
+                            state.log("[EPG] get_epg_info: empty")
+                except Exception as e:
+                    state.log(f"[EPG] get_epg_info error: {e}")
+
             # ── Method 2: portal's own XMLTV ─────────────────────────────────
             epg_ch_id = str(item.get("epg_channel_id") or "").strip()
             portal_result = None
@@ -5212,17 +5284,25 @@ def api_catchup():
             base_norm = f"{_p.scheme}://{_p.netloc}"
             now_ts = datetime.now(timezone.utc).timestamp()
 
-            # ── Step 1: get_epg — full channel schedule including past entries ───
-            # get_epg returns the full EPG listing for the channel (past + future),
-            # sorted newest-first on most panels.  This is the correct endpoint for
-            # catchup because it includes historical programmes the user can rewind to.
-            # get_short_epg only returns a handful of current/next entries and never
-            # contains past programmes, so it is useless here.
+            # Archive window — how far back the portal retains recordings.
+            # tv_archive_duration comes from get_live_streams (days as int).
+            # We use this to: (a) compute mark_archive=0/1 per entry,
+            # (b) build a wide-window XMLTV index that covers the full window.
+            try:
+                _arch_days = max(1, int(item.get("tv_archive_duration") or 0))
+            except Exception:
+                _arch_days = 1
+            if _arch_days == 0:
+                _arch_days = 7  # safe default when not reported
+            _arch_cutoff = now_ts - _arch_days * 86400  # programmes older = greyed out
+
+            results = []
+
+            # ── Step 1: get_epg ──────────────────────────────────────────────
             epg_api_url = (f"{base_norm}/player_api.php"
                            f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}"
                            f"&action=get_epg&stream_id={sid}")
             state.log(f"[CatchUp] Xtream get_epg stream_id={sid}")
-
             results = []
             try:
                 async with aiohttp.ClientSession() as sess:
@@ -5234,97 +5314,182 @@ def api_catchup():
                 all_entries = parsed.get("schedule", [])
                 state.log(f"[CatchUp] Xtream EPG entries: {len(all_entries)} total")
 
-                # Include past entries (start < now) — these are the ones the user
-                # can rewind to via timeshift.
+                if len(all_entries) == 0 and isinstance(payload, dict):
+                    raw = (payload.get("epg_listings") or
+                           (payload.get("js") or {}).get("data") or
+                           (payload.get("js") or {}).get("epg_listings") or [])
+                    if isinstance(raw, list) and len(raw) > 0:
+                        s = raw[0]
+                        state.log(f"[CatchUp] get_epg raw={len(raw)} parsed to 0 "
+                                  f"— sample keys: {list(s.keys()) if isinstance(s, dict) else s}")
+                    else:
+                        state.log("[CatchUp] get_epg returned empty — portal may not support this endpoint")
+
                 for ep in all_entries:
                     ep_end   = ep.get("end", 0)
                     ep_start = ep.get("start", 0)
                     if ep_start and ep_end and ep_start < now_ts:
+                        _ma = "1" if ep_start >= _arch_cutoff else "0"
                         results.append({
                             "title":        ep.get("title") or "Unknown",
                             "start":        ep_start,
                             "stop":         ep_end,
-                            # Store stream_id in cmd/live_cmd so api_catchup/play
-                            # can build the timeshift URL without extra state.
                             "cmd":          sid,
                             "live_cmd":     sid,
-                            "mark_archive": "1",  # Xtream always supports timeshift
+                            "mark_archive": _ma,
                             "epg_id":       "",
                             "id":           "",
                             "ch_id":        "",
                         })
 
-                # Sort newest first (same as MAC catchup)
                 results.sort(key=lambda x: x.get("start", 0), reverse=True)
 
             except Exception as e:
                 state.log(f"[CatchUp] Xtream EPG fetch error: {e}")
 
-            # ── Step 2: fallback to portal XMLTV for past-3-days window ───────────
-            # _fetch_xmltv_epg is designed for current/next EPG (±1-3h window).
-            # For catchup we access the XMLTV index cache directly and apply a
-            # wider 3-day past window ourselves.  We also try channel name as
-            # lookup when no dedicated epg_channel_id is available.
+            # ── Step 1.5: get_epg_info fallback ──────────────────────────────
+            if not results:
+                epg_info_url = (f"{base_norm}/player_api.php"
+                                f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}"
+                                f"&action=get_epg_info&stream_id={sid}")
+                state.log(f"[CatchUp] Trying get_epg_info stream_id={sid}")
+                try:
+                    async with aiohttp.ClientSession() as sess:
+                        async with sess.get(epg_info_url,
+                                            timeout=aiohttp.ClientTimeout(total=12)) as r2:
+                            payload2 = await safe_json(r2)
+                    if isinstance(payload2, dict):
+                        parsed2  = _parse_xtream_short_epg(payload2)
+                        entries2 = parsed2.get("schedule", [])
+                        state.log(f"[CatchUp] get_epg_info entries: {len(entries2)} total")
+                        for ep in entries2:
+                            ep_s = ep.get("start", 0)
+                            ep_e = ep.get("end",   0)
+                            if ep_s and ep_e and ep_s < now_ts:
+                                _ma2 = "1" if ep_s >= _arch_cutoff else "0"
+                                results.append({
+                                    "title": ep.get("title") or "Unknown",
+                                    "start": ep_s, "stop": ep_e,
+                                    "cmd": sid, "live_cmd": sid,
+                                    "mark_archive": _ma2,
+                                    "epg_id": "", "id": "", "ch_id": "",
+                                })
+                        if results:
+                            results.sort(key=lambda x: x.get("start", 0), reverse=True)
+                            state.log(f"[CatchUp] get_epg_info gave {len(results)} past entries")
+                except Exception as e:
+                    state.log(f"[CatchUp] get_epg_info error: {e}")
+
+            # ── Step 2: XMLTV fallback — wide-window index ────────────────────
+            # KEY FIX: the live EPG index only keeps ±4-20h of data.  For catchup
+            # we need up to tv_archive_duration days of history.  We maintain a
+            # separate catchup XMLTV cache built with win_back_h = archive_days*24
+            # so all archived programmes are present and can be greyed/active.
             if not results:
                 epg_ch_id = str(item.get("epg_channel_id") or "").strip()
                 tvg_name  = str(item.get("name") or "").strip()
-                lookup_id = epg_ch_id or tvg_name  # fall back to channel name
+                lookup_id = epg_ch_id or tvg_name
                 if lookup_id and base_norm not in state._xmltv_no_data:
                     xmltv_url = (f"{base_norm}/xmltv.php"
                                  f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}")
-                    state.log(f"[CatchUp] Xtream XMLTV fallback (lookup={lookup_id!r})")
+                    state.log(f"[CatchUp] Xtream XMLTV fallback (lookup={lookup_id!r}, window={_arch_days}d)")
                     try:
-                        # Build / retrieve the per-portal XMLTV index (shared with EPG cache)
                         ck = base_norm
-                        cached_xmltv = state._xmltv_cache.get(ck)
-                        if cached_xmltv:
-                            _, epg_dict, chan_names = cached_xmltv
+                        # Use the wide catchup cache; rebuild if window is wider than cached
+                        cached_cu = state._xmltv_catchup_cache.get(ck)
+                        if cached_cu:
+                            _cu_ts, epg_dict, chan_names, _cu_win = cached_cu
+                            # Rebuild if cache expired (30 min) or window is too narrow
+                            if (time.time() - _cu_ts > state._xmltv_cache_ttl
+                                    or _cu_win < _arch_days):
+                                cached_cu = None
+                        epg_dict = chan_names = None
+                        if cached_cu:
+                            _, epg_dict, chan_names, _ = cached_cu
+                        elif ck in state._xmltv_catchup_downloading:
+                            state.log(f"[CatchUp] Wide XMLTV download already running for {ck} — waiting…")
+                            for _w in range(120):
+                                await asyncio.sleep(1)
+                                if ck not in state._xmltv_catchup_downloading:
+                                    break
+                            cached_cu = state._xmltv_catchup_cache.get(ck)
+                            if cached_cu:
+                                _, epg_dict, chan_names, _ = cached_cu
+                            else:
+                                state.log(f"[CatchUp] Wide XMLTV wait timed out for {ck}")
+                                epg_dict, chan_names = {}, {}
                         else:
-                            epg_dict, chan_names = await _build_xmltv_index(
-                                xmltv_url, state.log)
-                            state._xmltv_cache[ck] = (time.time(), epg_dict, chan_names)
-                            if not epg_dict:
-                                state._xmltv_no_data.add(ck)
-
+                            # Download with full archive window (e.g. 7d back, 1d forward)
+                            state._xmltv_catchup_downloading.add(ck)
+                            state.log(f"[CatchUp] Downloading wide XMLTV (win_back={_arch_days * 24}h)")
+                            try:
+                                epg_dict, chan_names = await _build_xmltv_index(
+                                    xmltv_url, state.log,
+                                    win_back_h=_arch_days * 24, win_fwd_h=2)
+                                state._xmltv_catchup_cache[ck] = (time.time(), epg_dict, chan_names, _arch_days)
+                                if not epg_dict:
+                                    state._xmltv_no_data.add(ck)
+                            finally:
+                                state._xmltv_catchup_downloading.discard(ck)
                         if epg_dict:
                             lookup_lower = lookup_id.strip().lower()
                             entries = epg_dict.get(lookup_lower)
-                            # Display-name fallback: match via <display-name> in XMLTV
+                            # Fallback 1: display-name match
                             if not entries:
                                 for cid, names in chan_names.items():
-                                    if (lookup_lower in names
-                                            or any(lookup_lower in n or n in lookup_lower
-                                                   for n in names)):
+                                    if (lookup_lower in names or
+                                            any(lookup_lower in n or n in lookup_lower for n in names)):
                                         entries = epg_dict.get(cid)
                                         if entries:
-                                            state.log(f"[CatchUp] XMLTV name match:"
-                                                      f" {lookup_id!r} → {cid!r}")
+                                            state.log(f"[CatchUp] XMLTV name match: {lookup_id!r} → {cid!r}")
                                             break
+                            # Fallback 2: noise-stripped matching (HD/SD/FHD/channel/tv…)
+                            if not entries:
+                                lookup_norm = _normalize_ch_name(lookup_id)
+                                if lookup_norm and lookup_norm != lookup_lower:
+                                    entries = epg_dict.get(lookup_norm)
+                                    if not entries:
+                                        for cid, names in chan_names.items():
+                                            cid_norm   = _normalize_ch_name(cid)
+                                            names_norm = [_normalize_ch_name(n) for n in names]
+                                            if (lookup_norm == cid_norm or lookup_norm in names_norm
+                                                    or any(lookup_norm in nn or nn in lookup_norm
+                                                           for nn in names_norm if nn)):
+                                                entries = epg_dict.get(cid)
+                                                if entries:
+                                                    state.log(f"[CatchUp] XMLTV normalized match: {lookup_id!r} → {cid!r}")
+                                                    break
 
                             if entries:
-                                cutoff = now_ts - 86400 * 3   # look back up to 3 days
+                                # cutoff = full archive window (not hardcoded 3 days)
+                                cutoff = _arch_cutoff
                                 for ep in entries:
-                                    # Support both tuple (title,start,end,desc) and legacy dict
                                     if isinstance(ep, tuple):
                                         ep_title, ep_start, ep_end = ep[0], ep[1], ep[2]
                                     else:
-                                        ep_title  = ep.get("title") or "Unknown"
-                                        ep_start  = ep.get("start", 0)
-                                        ep_end    = ep.get("end",   0)
-                                    if ep_start and ep_end and cutoff <= ep_start < now_ts:
+                                        ep_title = ep.get("title") or "Unknown"
+                                        ep_start = ep.get("start", 0)
+                                        ep_end   = ep.get("end",   0)
+                                    # Include all entries back to archive window,
+                                    # mark older ones greyed (mark_archive=0).
+                                    # Look back one extra day for partial entries near the edge.
+                                    if ep_start and ep_end and (cutoff - 86400) <= ep_start < now_ts:
+                                        _ma3 = "1" if ep_start >= _arch_cutoff else "0"
                                         results.append({
                                             "title":        ep_title or "Unknown",
                                             "start":        ep_start,
                                             "stop":         ep_end,
                                             "cmd":          sid,
                                             "live_cmd":     sid,
-                                            "mark_archive": "1",
+                                            "mark_archive": _ma3,
                                             "epg_id":       "",
                                             "id":           "",
                                             "ch_id":        "",
                                         })
                                 results.sort(key=lambda x: x.get("start", 0), reverse=True)
-                                state.log(f"[CatchUp] XMLTV gave {len(results)} past entries")
+                                state.log(f"[CatchUp] XMLTV gave {len(results)} past entries "
+                                          f"({sum(1 for r in results if r['mark_archive']=='1')} active, "
+                                          f"{sum(1 for r in results if r['mark_archive']=='0')} greyed)")
                     except Exception as e:
                         state.log(f"[CatchUp] Xtream XMLTV fallback error: {e}")
 
@@ -5492,9 +5657,14 @@ def api_catchup_play():
             pwd   = creds["password"] if creds else state.password
             _p = urlparse(base)
             dur = max(1, math.ceil((stop_ts - start_ts) / 60))
-            start_dt  = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-            # Format: YYYY-MM-DD:HH-MM  (date:time separator=colon, time uses dashes)
-            start_fmt = start_dt.strftime("%Y-%m-%d:%H-%M")
+            # Convert UTC epoch to server local time using the offset computed at
+            # connect time via calendar.timegm arithmetic (no client-tz contamination).
+            _offset_secs = getattr(state, "_portal_utc_offset", 0)
+            _srv_local_ts = start_ts + _offset_secs
+            start_fmt = datetime.utcfromtimestamp(_srv_local_ts).strftime("%Y-%m-%d:%H-%M")
+            state.log(f"[CatchUp/Play] Server offset={_offset_secs:+d}s  "
+                      f"start_utc={datetime.utcfromtimestamp(start_ts).strftime('%Y-%m-%d %H:%M')}  "
+                      f"start_server={start_fmt}")
 
             # Primary: path-based .ts format — routes through mpegts.js automatically.
             # Do NOT use quote() on credentials — raw values match what the server expects.
@@ -5741,6 +5911,21 @@ def _parse_stalker_epg(payload: dict, ch_id: str) -> dict:
         except Exception:
             continue
     return out
+
+
+# ── Channel-name normalizer for fuzzy XMLTV matching ─────────────────────────
+# Mirrors reference player normalize_channel_name() — strips punctuation and
+# noise words (HD/SD/FHD/UHD/4K/channel/tv/plus…) then collapses whitespace.
+_RE_NOISE = re.compile(r'\b(hd|sd|fhd|uhd|4k|hevc|h265|channel|tv|plus|entertainment)\b', re.I)
+_RE_NONWD = re.compile(r'[^\w\s]')
+_RE_MSPC  = re.compile(r'\s+')
+
+def _normalize_ch_name(name: str) -> str:
+    s = name.lower().strip()
+    s = _RE_NONWD.sub('', s)
+    s = _RE_NOISE.sub('', s)
+    s = _RE_MSPC.sub(' ', s).strip()
+    return s
 
 
 async def _build_xmltv_index(xmltv_url: str, log_cb=None,
@@ -5993,7 +6178,7 @@ async def _fetch_xmltv_epg(xmltv_url: str, tvg_id: str, log_cb=None,
     # ── Resolve channel ID → programme list ───────────────────────────────────
     entries = epg_dict.get(lookup)
 
-    # Fallback: match via display-name if exact ID miss
+    # Fallback 1: match via XMLTV <display-name>
     if not entries:
         for cid, names in chan_names.items():
             if lookup in names or any(lookup in n or n in lookup for n in names):
@@ -6001,6 +6186,23 @@ async def _fetch_xmltv_epg(xmltv_url: str, tvg_id: str, log_cb=None,
                 if entries:
                     _log(f"[EPG] XMLTV display-name fallback: {tvg_id!r} → {cid!r}")
                     break
+
+    # Fallback 2: noise-stripped name match — "BBC One HD" → "bbc one" matches "BBC One"
+    if not entries:
+        lookup_norm = _normalize_ch_name(tvg_id)
+        if lookup_norm and lookup_norm != lookup:
+            entries = epg_dict.get(lookup_norm)
+            if not entries:
+                for cid, names in chan_names.items():
+                    cid_norm   = _normalize_ch_name(cid)
+                    names_norm = [_normalize_ch_name(n) for n in names]
+                    if (lookup_norm == cid_norm or lookup_norm in names_norm
+                            or any(lookup_norm in nn or nn in lookup_norm
+                                   for nn in names_norm if nn)):
+                        entries = epg_dict.get(cid)
+                        if entries:
+                            _log(f"[EPG] XMLTV normalized-name match: {tvg_id!r} → {cid!r}")
+                            break
 
     if not entries:
         _log(f"[EPG] XMLTV: no programmes found for {tvg_id!r}")
@@ -6239,11 +6441,14 @@ def api_proxy():
         _sem = _get_host_semaphore(_host) if _is_rate_limited_host else None
         if _sem:
             _sem.acquire()
+        # Short timeout for logos so a dead CDN cannot hold a Flask thread for 20 s.
+        _req_timeout = 6 if is_img_url else 20
         try:
             resp = None
             _backoff = 1.0
             for _attempt in range(3):
-                resp = _requests_lib.get(url, headers=headers, stream=True, timeout=20,
+                resp = _requests_lib.get(url, headers=headers, stream=True,
+                                         timeout=_req_timeout,
                                          allow_redirects=True, verify=False,
                                          proxies={"http": None, "https": None})
                 if resp.status_code != 429:
@@ -6306,10 +6511,14 @@ def api_proxy():
                 hdrs["Cache-Control"] = "public, max-age=3600"
                 return Response(_TRANSPARENT_PNG, status=200, headers=hdrs)
             else:
-                state.log(f"[Proxy] HTTP {resp.status_code} ← {url[:80]}")
+                # Any other non-200 (404, 500, 503…) — serve transparent PNG silently.
+                if (_DNS_FAIL_COUNTS.get(_host, 0) < 2 and
+                        _HOTLINK_403_COUNTS.get(_host, 0) < 2):
+                    state.log(f"[Proxy] HTTP {resp.status_code} ← {url[:120]}")
                 hdrs = dict(cors)
-                hdrs["Content-Type"] = ct
-                return Response(data, status=resp.status_code, headers=hdrs)
+                hdrs["Content-Type"] = "image/png"
+                hdrs["Cache-Control"] = "public, max-age=3600"
+                return Response(_TRANSPARENT_PNG, status=200, headers=hdrs)
 
         # ── Non-image: stream as before ───────────────────────────────────
         def _gen():
@@ -6326,7 +6535,7 @@ def api_proxy():
         if "Content-Range" in resp.headers:
             h["Content-Range"] = resp.headers["Content-Range"]
         if resp.status_code not in (200, 206):
-            state.log(f"[Proxy] HTTP {resp.status_code} ← {url[:80]}")
+            state.log(f"[Proxy] HTTP {resp.status_code} ← {url[:120]}")
         return Response(stream_with_context(_gen()), status=resp.status_code, headers=h)
     except Exception as e:
         if _is_dns_fail(e):
@@ -6334,10 +6543,17 @@ def api_proxy():
             if crossed:
                 state.log(f"[Proxy] DNS failure {_DNS_FAIL_THRESHOLD}x for {_host} — silencing future logo requests")
             elif _DNS_FAIL_COUNTS.get(_host, 0) < _DNS_FAIL_THRESHOLD:
-                state.log(f"[Proxy] Error: {e} ← {url[:80]}")
-            # else: already silenced — return transparent PNG quietly
+                state.log(f"[Proxy] Error: {e} ← {url[:120]}")
+        elif is_img_url:
+            if _DNS_FAIL_COUNTS.get(_host, 0) < 1 and _HOTLINK_403_COUNTS.get(_host, 0) < 1:
+                state.log(f"[Proxy] Logo fetch error ({type(e).__name__}) ← {url[:120]}")
         else:
-            state.log(f"[Proxy] Error: {e} ← {url[:80]}")
+            state.log(f"[Proxy] Error: {e} ← {url[:120]}")
+        if is_img_url:
+            hdrs = dict(cors)
+            hdrs["Content-Type"] = "image/png"
+            hdrs["Cache-Control"] = "public, max-age=60"
+            return Response(_TRANSPARENT_PNG, status=200, headers=hdrs)
         return Response(f"Proxy error: {e}", status=502)
 
 
@@ -10489,7 +10705,11 @@ function openItemMenu(i, btn){
   // Show/hide buttons based on context
   document.getElementById('imenu-sep1').style.display     = isLive&&!grp?'block':'none';
   document.getElementById('imenu-epg').style.display      = isLive&&!grp?'flex':'none';
-  document.getElementById('imenu-catchup').style.display  = isLive&&!grp?'flex':'none';
+  const _imCuEl=document.getElementById('imenu-catchup');
+  _imCuEl.style.display=isLive&&!grp?'flex':'none';
+  const _imCuOk=_channelSupportsCatchup(it);
+  _imCuEl.style.opacity=_imCuOk?'':'0.4';
+  _imCuEl.style.pointerEvents=_imCuOk?'':'none';
   document.getElementById('imenu-sep2').style.display     = !grp?'block':'none';
   document.getElementById('imenu-ext').style.display      = !grp&&!show?'flex':'none';
   document.getElementById('imenu-imdb').style.display     = (!isLive&&!grp)?'flex':'none';
@@ -10533,6 +10753,7 @@ function iMenuCatchup(){
   closeItemMenu();
   const it = filtItems[_iMenuIdx];
   if(!it) return;
+  if(!_channelSupportsCatchup(it)){toast('This channel does not support Catch-up TV','wrn');return;}
   _epgItem = it;
   showCatchup();
 }
@@ -10941,7 +11162,10 @@ async function playItem(i){
   _epgItem = (itemMode==='live') ? it : null;
   document.getElementById('epg-now').textContent='';
   document.getElementById('epgbtn').style.opacity=(itemMode==='live')?'1':'0.35';
-  document.getElementById('catchupbtn').style.opacity=(itemMode==='live')?'1':'0.35';
+  const _cuSupported=(itemMode==='live')&&_channelSupportsCatchup(it);
+  const _cuBtn=document.getElementById('catchupbtn');
+  _cuBtn.style.opacity=_cuSupported?'1':'0.35';
+  _cuBtn.style.pointerEvents=_cuSupported?'':'none';
   const name=it.name||it.o_name||it.fname||'Unknown';
   const direct=it._direct_url||it._url;
   if(direct){doPlay(direct,name,{isLive:itemMode==='live'});return;}
@@ -11352,6 +11576,10 @@ function doPlay(url, name, opts={}){
         return;
       }
       if(httpCode===503 || httpCode===403 || httpCode===404){
+        if(!isLiveStream && fallbackUrl && httpCode===404){
+          alog('[MPEGTS] Catchup .ts → 404 — retrying via query-string fallback (HLS.js)','w');
+          _destroyPlayers(); doPlay(fallbackUrl, name, {isLive:false}); return;
+        }
         alog('[MPEGTS] Channel unavailable ('+httpCode+') — stopping','e');
         setNP('✗ Channel unavailable ('+httpCode+')');
         document.getElementById('ppbtn').textContent='▶';
@@ -11607,6 +11835,14 @@ async function togRec(){isRec?stopRec():startRec();}
 
 // ── EPG ────────────────────────────────────────────────────────────────────
 let _epgItem=null;
+
+// Xtream: tv_archive=1 → catchup supported, 0 → not supported.
+// MAC/Stalker/M3U: field absent → allow (API handles gracefully).
+function _channelSupportsCatchup(it){
+  if(!it) return false;
+  if('tv_archive' in it) return it.tv_archive===1 || it.tv_archive==='1';
+  return true;
+}
 function _fmtEpgTime(ts){
   if(!ts) return '';
   const d=new Date(ts*1000);
