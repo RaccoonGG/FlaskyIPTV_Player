@@ -5632,7 +5632,7 @@ def api_catchup():
                         page += 1
 
             if not results:
-                return {"error": "No EPG data found for this channel"}
+                return {"error": "No catchup data found — this channel likely does not support catch-up."}
             results.sort(key=lambda x: x["start"], reverse=True)
             return {"archive_listings": results, "label": item.get("name", "")}
 
@@ -7700,7 +7700,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 }
 @media(min-width:900px){
   #main{display:grid!important;grid-template-columns:350px 28px 1fr;height:100%;transition:grid-template-columns .3s ease}
-  #main.items-open{grid-template-columns:350px 350px 1fr}
+  #main.items-open{grid-template-columns:350px 380px 1fr}
   #main.items-open #p-items > *{opacity:1;transition:opacity .2s ease .15s}
   #main:not(.items-open) #p-items > *{opacity:0;pointer-events:none;transition:opacity .1s ease}
   #main:not(.items-open) #p-items::after{content:'›';position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:16px;color:var(--txt3);pointer-events:none}
@@ -9368,7 +9368,6 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   <div id="item-menu-hdr">Options</div>
   <div class="imenu-sep" id="imenu-sep1"></div>
   <button class="imenu-btn" id="imenu-epg"      onclick="iMenuEPG()">     <span class="imenu-ico">📅</span>EPG / Programme Info</button>
-  <button class="imenu-btn" id="imenu-catchup"  onclick="iMenuCatchup()"> <span class="imenu-ico">↺</span>Catch-up TV</button>
   <div class="imenu-sep" id="imenu-sep2"></div>
   <button class="imenu-btn" id="imenu-ext"      onclick="iMenuExternal()"><span class="imenu-ico">🎬</span>External Player</button>
   <button class="imenu-btn" id="imenu-imdb"     onclick="iMenuIMDB()">    <span class="imenu-ico">🔍</span>Open TMDB/IMDB</button>
@@ -10973,6 +10972,7 @@ function renderItems(items){
     const logo=it.logo||it.stream_icon||it.cover||it.screenshot_uri||it.pic||epLogo||'';
     const logoSrc = logo && (logo.startsWith('http://') || logo.startsWith('https://'))
       ? '/api/proxy?url='+encodeURIComponent(logo) : logo;
+    const hasCatchup = mode==='live' && playable && _channelSupportsCatchup(it);
     return '<div class="irow'+(playing?' now':'')+'" style="--d:'+(Math.min(i,20)*.016)+'s">'
       +'<input class="ichk" type="checkbox" data-i="'+i+'" onchange="onChk('+i+',this.checked)">'
       +(logoSrc?'<img class="ilogo" loading="lazy" src="'+esc(logoSrc)+'" onerror="this.style.display=\'none\'">'+'':'<span style="width:36px;height:24px;flex-shrink:0;display:inline-block"></span>')
@@ -10982,6 +10982,7 @@ function renderItems(items){
       +'<div class="ibtns">'
         +(grp?'<button class="btn-ghost" onclick="drillGrp('+i+')">'+epN+' eps</button>':'')
         +(show&&isSeries?'<button class="btn-ghost" onclick="drillShow('+i+')">Eps</button>':'')
+        +(hasCatchup?'<button class="btn-ghost" onclick="event.stopPropagation();openCatchupInRow('+i+')" title="Catch-up TV" style="padding:0 7px;font-size:14px">↺</button>':'')
         +(playable?'<button class="btn-blue" onclick="playItem('+i+')">▶</button>':'')
         +'<button class="btn-ghost imenu-trigger" onclick="event.stopPropagation();openItemMenu('+i+',this)" title="More options" style="padding:0 6px;font-size:18px;line-height:1;letter-spacing:0">⋮</button>'
       +'</div></div>';
@@ -11026,11 +11027,6 @@ function openItemMenu(i, btn){
   // Show/hide buttons based on context
   document.getElementById('imenu-sep1').style.display     = isLive&&!grp?'block':'none';
   document.getElementById('imenu-epg').style.display      = isLive&&!grp?'flex':'none';
-  const _imCuEl=document.getElementById('imenu-catchup');
-  _imCuEl.style.display=isLive&&!grp?'flex':'none';
-  const _imCuOk=_channelSupportsCatchup(it);
-  _imCuEl.style.opacity=_imCuOk?'':'0.4';
-  _imCuEl.style.pointerEvents=_imCuOk?'':'none';
   document.getElementById('imenu-sep2').style.display     = !grp?'block':'none';
   document.getElementById('imenu-ext').style.display      = !grp&&!show?'flex':'none';
   document.getElementById('imenu-imdb').style.display     = (!isLive&&!grp)?'flex':'none';
@@ -11075,6 +11071,15 @@ function iMenuCatchup(){
   const it = filtItems[_iMenuIdx];
   if(!it) return;
   if(!_channelSupportsCatchup(it)){toast('This channel does not support Catch-up TV','wrn');return;}
+  _epgItem = it;
+  showCatchup();
+}
+
+function openCatchupInRow(i){
+  const it = filtItems[i];
+  if(!it) return;
+  if(!_channelSupportsCatchup(it)){toast('This channel does not support Catch-up TV','wrn');return;}
+  _iMenuIdx = i;
   _epgItem = it;
   showCatchup();
 }
@@ -11628,7 +11633,29 @@ function doPlay(url, name, opts={}){
   if(isDirect){
     // ── Direct container (MKV/MP4/AVI) — browser native playback via proxy ──
     alog('[Direct] Playing natively ('+playerType+'): '+pName,'k');
-    vid.src=px; vid.play().catch(()=>{});
+    // Pre-check response status so we can surface 456/458 in the log the same
+    // way HLS and MPEGTS paths do — the video element cannot expose HTTP codes.
+    const _dAbrt = new AbortController();
+    fetch(px, {signal: _dAbrt.signal}).then(r=>{
+      _dAbrt.abort(); // stop body download — we only needed the status
+      if(r.status===456){
+        alog('[Direct] Wrong location — use a VPN (456)','w');
+        setNP('✗ Wrong location — use a VPN');
+        document.getElementById('ppbtn').textContent='▶';
+        return;
+      }
+      if(r.status===458){
+        alog('[Direct] Max connections already in use (458)','w');
+        setNP('✗ Max connections in use');
+        document.getElementById('ppbtn').textContent='▶';
+        return;
+      }
+      if(!_playerStopped){ vid.src=px; vid.play().catch(()=>{}); }
+    }).catch(()=>{
+      // AbortError (from _dAbrt.abort above) should not reach here since we're
+      // already inside .then(); any real network error → fall back to direct load.
+      if(!_playerStopped){ vid.src=px; vid.play().catch(()=>{}); }
+    });
 
   } else if(isStorageUrl){
     // ── Stalker storage/get.php — direct to video, no proxy ──────
@@ -12679,7 +12706,7 @@ function showCatchup(){
   _loadCatchupEPG();
 }
 
-function closeCatchup(){document.getElementById('catchup-overlay').style.display='none';}
+function closeCatchup(){document.getElementById('catchup-overlay').style.display='none';_mvCatchupCtx=null;}
 document.getElementById('catchup-overlay').addEventListener('click',function(e){if(e.target===this)closeCatchup();});
 
 function _cuFmtTime(ts){const d=new Date(ts*1000);return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
@@ -12764,14 +12791,27 @@ function doPlayArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, en
     body:JSON.stringify({cmd, live_cmd:liveCmd, epg_id:realId, start:startTs, stop:stopTs})})
   .then(r=>r.json()).then(d=>{
     if(d.url){
-      closeCatchup();
       const label=(_epgItem?_epgItem.name:'')+' — '+title+' [↺]';
-      // Pass raw URL — doPlay always wraps in /api/proxy itself
-      // Catchup is VOD — isLive:false prevents mpegts.js SourceBuffer crash
-      // d.fallback_url is the query-string format; used if path-based .ts fails
-      // d.duration_secs lets mpegts.js set a real duration so the seek bar works
-      doPlay(d.url, label, {isLive:false, fallbackUrl:d.fallback_url||null, durationSecs:d.duration_secs||0});
-      toast('↺ Playing catch-up: '+title,'ok');
+      // If catchup was opened from a multiview widget, route back to that slot
+      const _cuMvCtx = _mvCatchupCtx;
+      closeCatchup(); // also clears _mvCatchupCtx
+      if(_cuMvCtx && _cuMvCtx.wid && _cuMvCtx.cEl){
+        const synth = {
+          name:        label,
+          _direct_url: d.url,
+          id:          'catchup-'+Date.now(),
+          _is_live:    false,
+        };
+        _mvPlayChannel(_cuMvCtx.wid, synth, _cuMvCtx.cEl);
+        toast('↺ Playing catch-up in Multi-View: '+title,'ok');
+      } else {
+        // Pass raw URL — doPlay always wraps in /api/proxy itself
+        // Catchup is VOD — isLive:false prevents mpegts.js SourceBuffer crash
+        // d.fallback_url is the query-string format; used if path-based .ts fails
+        // d.duration_secs lets mpegts.js set a real duration so the seek bar works
+        doPlay(d.url, label, {isLive:false, fallbackUrl:d.fallback_url||null, durationSecs:d.duration_secs||0});
+        toast('↺ Playing catch-up: '+title,'ok');
+      }
     } else {
       if(status) status.textContent='❌ '+(d.error||'Not available');
     }
@@ -15602,7 +15642,11 @@ function _mvBuildItemRow(it, i, forEpisodes){
     btns += `<button class="btn-ghost" onclick="event.stopPropagation();_mvSelDrillShow(${i})" title="Browse episodes">Eps</button>`;
   }
   if(!isShow && !isGroup){
-    // Directly playable — play button
+    // Directly playable — catchup (live only, where supported) then play button
+    const _mvIsCatchup = _mvSelContentMode === 'live' && _channelSupportsCatchup(it);
+    if(_mvIsCatchup){
+      btns += `<button class="btn-ghost" style="height:24px;padding:0 6px;font-size:13px" onclick="event.stopPropagation();_mvOpenCatchupForItem(${i})" title="Catch-up TV">↺</button>`;
+    }
     btns += `<button class="btn-blue" style="height:24px;padding:0 8px;font-size:11px" onclick="event.stopPropagation();_mvSelPickItem(${i})" title="Play in Multi-View">▶</button>`;
   }
   // Submenu ⋮ — only for multiview widget context (not DVR channel picker)
@@ -15618,6 +15662,26 @@ function _mvBuildItemRow(it, i, forEpisodes){
     <div class="mv-item-btns">${btns}</div>
     ${drillArrow}
   </div>`;
+}
+
+// Open catchup overlay for an MV selector item (live channels only)
+// Stores the widget context so doPlayArchiveCmd can route back to MV instead of main player.
+let _mvCatchupCtx = null; // { wid, cEl } set when catchup opened from MV; null for main player
+function _mvOpenCatchupForItem(i){
+  let it;
+  if(_mvSelNavMode === 'episodes'){
+    it = (_mvSelEpisodesFiltered.length ? _mvSelEpisodesFiltered : _mvSelEpisodes)[i];
+  } else {
+    it = (_mvSelFilteredItems.length ? _mvSelFilteredItems : _mvSelItems)[i];
+  }
+  if(!it) return;
+  if(!_channelSupportsCatchup(it)){toast('This channel does not support Catch-up TV','wrn');return;}
+  _mvCloseCtxMenu();
+  document.getElementById('mv-sel-overlay').classList.remove('open');
+  // Save the widget context so the play resolution routes back to this MV slot
+  _mvCatchupCtx = _mvSelWidgetCtx ? { ..._mvSelWidgetCtx } : null;
+  _epgItem = it;
+  showCatchup();
 }
 
 // Pick item (play in multiview) — called from play button or clicking a playable row.
