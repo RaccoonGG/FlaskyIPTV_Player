@@ -60,6 +60,8 @@ Added logo caching for MAC portal (PortalClient): live channels use get_all_chan
 Extended StalkerPortalClient logo caching to VOD and series modes (was live-only); same zero-cost in-memory dict strategy.
 Fixed Xtream double round-trip: handshake() and account_info() previously both issued GET /player_api.php — account_info() now reads from the cached user_info set by handshake(), saving one network call on every connect.
 Added Xtream logo cache: stream_id → logo URL dict populated during fetch_items_page, fills missing logos without extra requests.
+Improved EPG matching channels when using external EPG.
+Added session-wide cache for category items.
 """
 
 import base64
