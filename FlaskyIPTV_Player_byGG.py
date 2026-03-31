@@ -2980,6 +2980,7 @@ class AppState:
         self.connected = False
         self.is_stalker_portal = False  # True when URL contains 'stalker_portal'
         self.cats_cache: dict = {}
+        self._items_cache: dict = {}  # (mode, cat_id) → list of items, session-wide
         self.m3u_cache = None
         self.m3u_is_local = False
         self.m3u_xtream_override = None
@@ -3424,6 +3425,7 @@ def api_connect():
             "stalker_portal" in state.url.lower()
         )
         state.cats_cache = {}
+        state._items_cache = {}
         state.m3u_cache = None
         state.m3u_is_local = False
         state.m3u_xtream_override = None
@@ -3490,6 +3492,7 @@ def api_clear_cache():
     state._logo_cache_live = None
     state._logo_cache_vod  = {}
     state.cats_cache        = {}
+    state._items_cache      = {}
     state._won_ch_cache     = {}
     state.log("[CACHE] Server-side caches cleared — ready for reconnect")
     return jsonify({"ok": True})
@@ -3506,6 +3509,15 @@ def api_items():
 
     if not state.connected:
         return jsonify({"error": "Not connected", "items": []})
+
+    # ── Session-wide items cache — keyed by (mode, cat_id) ───────────────────
+    # Cleared on disconnect/reconnect and on Clear Cache. Avoids re-paginating
+    # the same category every time the user returns to it.
+    _cache_key = (mode, cat_id)
+    if _cache_key in state._items_cache:
+        cached_items = state._items_cache[_cache_key]
+        state.log(f"[ITEMS] Cache hit: {mode} cat={cat_id} ({len(cached_items)} items)")
+        return jsonify({"items": cached_items, "count": len(cached_items), "has_more": False})
 
     try:
         async def fetch():
@@ -3532,6 +3544,8 @@ def api_items():
         result = run_async(fetch())
         items = result["items"] if isinstance(result, dict) else result
         has_more = result.get("has_more", False) if isinstance(result, dict) else False
+        if not has_more:
+            state._items_cache[_cache_key] = items
         return jsonify({"items": items, "count": len(items), "has_more": has_more})
     except Exception as e:
         state.log(f"[ITEMS] Error: {e}")
