@@ -3054,10 +3054,11 @@ class AppState:
         #   Built lazily from items that arrive with logos; zero extra requests.
         self._logo_cache_live: dict | None = None
         self._logo_cache_vod: dict = {}
-        # Cache for all-channels list used by What's on Now → Find Channel
-        # (timestamp, [{"name", "cmd"/"stream_id"/"url", "tvg_id", ...}])
-        self._won_ch_cache: tuple = (0.0, [])
-        self._won_ch_cache_ttl = 1200  # 20 minutes
+        # Cache for all-channels list used by What's on Now → Find Channel.
+        # Keyed by portal base URL so the walk only happens ONCE per connected portal
+        # for the entire session — not on a TTL. Cleared on disconnect/reconnect.
+        # {portal_key: [{"name", "cmd"/"stream_id"/"url", "tvg_id", ...}]}
+        self._won_ch_cache: dict = {}
         # Download/export progress tracking (polled via /api/status)
         self.task_type       = ""   # "m3u" | "mkv" | ""
         self.task_label      = ""   # current item name
@@ -3437,7 +3438,7 @@ def api_connect():
         state._mac_epg_headers = {}
         state._short_epg_broken = set()
         state._xmltv_no_data = set()
-        state._won_ch_cache = (0.0, [])
+        state._won_ch_cache = {}
         state.connected = False
         state.stop_flag.clear()
         # Reset logo caches so a new portal starts fresh
@@ -3489,6 +3490,7 @@ def api_clear_cache():
     state._logo_cache_live = None
     state._logo_cache_vod  = {}
     state.cats_cache        = {}
+    state._won_ch_cache     = {}
     state.log("[CACHE] Server-side caches cleared — ready for reconnect")
     return jsonify({"ok": True})
 
@@ -4986,10 +4988,11 @@ def api_find_channel():
     if not epg_channel_name and not epg_channel_id:
         return jsonify({"found": False, "error": "No channel name provided"})
 
-    # ── Return cached channel list if fresh ──────────────────────────────────
-    cache_ts, cached_channels = state._won_ch_cache
-    if cached_channels and (time.time() - cache_ts) < state._won_ch_cache_ttl:
-        channels = cached_channels
+    # ── Return cached channel list if available for this portal ─────────────
+    _portal_key = f"{state.conn_type}:{state.url}:{getattr(state, 'mac', '')}:{getattr(state, 'username', '')}"
+    if _portal_key in state._won_ch_cache:
+        channels = state._won_ch_cache[_portal_key]
+        state.log(f"[FIND_CH] Using session-cached {len(channels)} channels for {_portal_key[:60]}")
     else:
         # ── Fetch all live channels from portal ───────────────────────────────
         async def fetch_all_channels():
@@ -5020,6 +5023,14 @@ def api_find_channel():
                             state.log(f"[FIND_CH] Attempt 1.{_try}: {url[:80]}")
                             async with client.session.get(url, headers=hdrs) as r:
                                 payload = await safe_json(r)
+                            # Log the raw response structure to help debug portals that return 0
+                            if isinstance(payload, dict):
+                                js = payload.get("js", {})
+                                total = js.get("total_items", "?") if isinstance(js, dict) else "?"
+                                data_len = len(js.get("data", [])) if isinstance(js, dict) else "?"
+                                state.log(f"[FIND_CH] get_all_channels raw: total_items={total} data={data_len} keys={list(payload.keys())}")
+                            else:
+                                state.log(f"[FIND_CH] get_all_channels raw: {str(payload)[:120]}")
                             chans = normalize_js(payload)
                             state.log(f"[FIND_CH] Attempt 1.{_try} → {len(chans)} channels")
                             if chans:
@@ -5043,6 +5054,11 @@ def api_find_channel():
                             state.log(f"[FIND_CH] Attempt 2: {alt_url[:80]}")
                             async with client.session.get(alt_url, headers=alt_hdrs) as r2:
                                 payload2 = await safe_json(r2)
+                            if isinstance(payload2, dict):
+                                js2 = payload2.get("js", {})
+                                total2 = js2.get("total_items", "?") if isinstance(js2, dict) else "?"
+                                data_len2 = len(js2.get("data", [])) if isinstance(js2, dict) else "?"
+                                state.log(f"[FIND_CH] get_all_channels alt raw: total_items={total2} data={data_len2}")
                             chans = normalize_js(payload2)
                             state.log(f"[FIND_CH] Attempt 2 → {len(chans)} channels")
                         except Exception as e2:
@@ -5092,8 +5108,8 @@ def api_find_channel():
 
         try:
             channels = run_async(fetch_all_channels())
-            state._won_ch_cache = (time.time(), channels)
-            state.log(f"[FIND_CH] Fetched {len(channels)} live channels from portal")
+            state._won_ch_cache[_portal_key] = channels
+            state.log(f"[FIND_CH] Fetched {len(channels)} live channels — cached for session")
         except Exception as e:
             state.log(f"[FIND_CH] Fetch error: {e}")
             return jsonify({"found": False, "error": str(e)})
@@ -6094,7 +6110,7 @@ async def _build_xmltv_index(xmltv_url: str, log_cb=None,
 
     Returns: (epg_dict, chan_names)
       epg_dict   = {channel_id_lower: [(title, start, end, desc), ...]}
-      chan_names  = {channel_id_lower: [display_name_lower, ...]}
+      chan_names  = {channel_id_lower: [(display_name_lower, lang_lower), ...]}
     """
     _log = log_cb or (lambda x: None)
 
