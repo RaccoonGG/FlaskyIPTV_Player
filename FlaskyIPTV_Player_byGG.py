@@ -3023,6 +3023,7 @@ class AppState:
         self._xmltv_dl_events: dict = {}     # url → threading.Event()
         self._xmltv_downloading: set = set() # urls currently in-flight
         self._xmltv_needs: set = set()       # cache_keys confirmed to need XMLTV (no portal data)
+        self._xmltv_match_cache: dict = {}   # (lookup, feed_ck) → resolved cid | None
         # Plain MAC portal EPG token — cached after first handshake and reused
         # for all subsequent EPG requests (avoids per-channel handshake → 429s).
         # Stalker portals do NOT use this cache — their tokens are short-lived
@@ -3431,6 +3432,7 @@ def api_connect():
         state._xmltv_dl_events = {}
         state._xmltv_downloading = set()
         state._xmltv_needs = set()
+        state._xmltv_match_cache = {}
         state._mac_epg_token = ""
         state._mac_epg_headers = {}
         state._short_epg_broken = set()
@@ -4885,7 +4887,7 @@ def api_whats_on():
     for _ck, (ts, epg_dict, chan_names) in list(state._xmltv_cache.items()):
         for channel_id, programmes in epg_dict.items():
             names = chan_names.get(channel_id, [])
-            display_name = names[0].title() if names else channel_id
+            display_name = names[0][0].title() if names else channel_id
             for prog in programmes:
                 # Support both tuple (title,start,end,desc) and legacy dict entries
                 if isinstance(prog, tuple):
@@ -5436,11 +5438,12 @@ def api_catchup():
                         if epg_dict:
                             lookup_lower = lookup_id.strip().lower()
                             entries = epg_dict.get(lookup_lower)
-                            # Fallback 1: display-name match
+                            # Fallback 1: display-name match (names are (name, lang) tuples)
                             if not entries:
                                 for cid, names in chan_names.items():
-                                    if (lookup_lower in names or
-                                            any(lookup_lower in n or n in lookup_lower for n in names)):
+                                    name_strs = [n for n, _ in names]
+                                    if (lookup_lower in name_strs or
+                                            any(lookup_lower in n or n in lookup_lower for n in name_strs)):
                                         entries = epg_dict.get(cid)
                                         if entries:
                                             state.log(f"[CatchUp] XMLTV name match: {lookup_id!r} → {cid!r}")
@@ -5453,7 +5456,7 @@ def api_catchup():
                                     if not entries:
                                         for cid, names in chan_names.items():
                                             cid_norm   = _normalize_ch_name(cid)
-                                            names_norm = [_normalize_ch_name(n) for n in names]
+                                            names_norm = [_normalize_ch_name(n) for n, _ in names]
                                             if (lookup_norm == cid_norm or lookup_norm in names_norm
                                                     or any(lookup_norm in nn or nn in lookup_norm
                                                            for nn in names_norm if nn)):
@@ -5928,6 +5931,139 @@ _RE_NOISE = re.compile(r'\b(hd|sd|fhd|uhd|4k|hevc|h265|channel|tv|plus|entertain
 _RE_NONWD = re.compile(r'[^\w\s]')
 _RE_MSPC  = re.compile(r'\s+')
 
+# ── EPG channel-matching helpers (region/subregion clusters + scoring) ────────
+# Adapted from script (8) — provides country-aware, proximity-ranked XMLTV
+# channel matching used by _fetch_xmltv_epg.
+
+_EPG_ALIASES = {"gb": "uk", "sr": "rs"}
+
+# Sub-regions: tightly coupled by language/history/culture.
+# _epg_proximity uses SMALLEST matching group — so tighter clusters always win.
+_EPG_SUBREGIONS = [
+    {"uk","gb","ie"},                               # British Isles (3)
+    {"us","ca"},                                    # N.America EN (2)
+    {"au","nz"},                                    # Oceania EN (2)
+    {"gr","cy"},                                    # Greek (2)
+    {"ro","md"},                                    # Romanian (2)
+    {"jp","kr"},                                    # East Asia (2)
+    {"il","ps"},                                    # Levant (2)
+    {"pl","cz","sk"},                               # West Slavic (3)
+    {"de","at","ch","li"},                          # DACH (4)
+    {"nl","be","lu","aw"},                          # Dutch/Benelux (4)
+    {"it","sm","va","mt"},                          # Italian (4)
+    {"rs","sr","hr","ba","me"},                     # BCS core (5)
+    {"no","se","dk","fi","is"},                     # Nordic (5)
+    {"in","pk","bd"},                               # South Asia core (3)
+    {"al","mk","bg","rs","gr","me"},                # Balkan (6)
+    {"tr","az","tm","uz","kg","kz"},                # Turkic (6)
+    {"ru","ua","by","bg","rs","mk"},                # East/South Slavic (6)
+    {"fr","be","lu","mc","ch"},                     # Francophone Europe (5)
+    {"pt","br","ao","mz","cv","gw","st","tl"},      # Lusophone (8)
+    {"cn","hk","tw","sg","my"},                     # Chinese-speaking (5)
+    {"za","ng","ke","gh","et","tz"},                # Sub-Saharan Africa (6)
+    {"rs","sr","hr","ba","si","me","mk"},           # ex-YU (7)
+    {"hu","ro","bg","at","sk"},                     # Carpathian (5)
+    {"es","pt","mx","ar","co","cl","pe","uy","bo","ec","py","ve"},
+    {"ar","sa","ae","eg","iq","jo","kw","lb","ly","ma","sd","sy","tn","ye"},
+    {"de","at","pl","cz","sk","hu","ro","bg","rs","sr",
+     "hr","ba","si","me","mk","al","lv","lt","ee"},
+    {"uk","gb","ie","us","ca","au","nz","za"},
+    {"gr","cy","mt","it","es","pt","fr","al","tr"},
+    {"no","se","dk","fi","is","de","at","nl","be","lu"},
+    {"us","ca","mx","br","ar","co","cl","pe"},
+    {"cn","hk","tw","jp","kr","sg","my","id","th"},
+    {"sa","ae","eg","iq","ir","jo","kw","lb","qa","tr"},
+    {"za","ng","ke","gh","et","tz","ma","eg","tn","dz"},
+]
+
+_EPG_REGIONS = [
+    {"rs","sr","hr","ba","si","me","mk","al","bg","ro","hu","at","de","ch","li",
+     "cz","sk","pl","ua","by","ru","lv","lt","ee","fi","no","se","dk","is",
+     "uk","gb","ie","fr","be","lu","nl","es","pt","it","sm","va","mt","gr","cy",
+     "tr","md","am","ge","az","xk"},
+    {"us","ca","mx","gt","bz","hn","sv","ni","cr","pa","cu","jm","ht","do",
+     "tt","bb","lc","vc","gd","ag","dm","kn","bs","ky","vi","pr"},
+    {"br","ar","co","cl","pe","uy","bo","ec","py","ve","gy","gf"},
+    {"cn","hk","tw","jp","kr","mn","kp"},
+    {"in","pk","bd","lk","np","bt","mv"},
+    {"sg","my","id","ph","th","vn","kh","la","mm","bn","tl"},
+    {"au","nz","pg","fj","sb","vu","ws","to","ki","fm","mh","pw","nr","tv"},
+    {"sa","ae","eg","iq","ir","jo","kw","lb","om","qa","sy","ye","il","ps",
+     "tr","az","tm","uz","kg","kz","tj","af"},
+    {"za","ng","ke","gh","et","tz","ug","rw","mz","zm","zw","mw","ao","cd",
+     "cm","ci","sn","ml","bf","ne","td","sd","so","er","dj","ma","tn","ly",
+     "dz","mu","mg","re","sc"},
+]
+
+_EPG_NOISE_SUFFIXES = re.compile(
+    r'[\s_]*(\bfhd\b|\bhd\b|\b4k\b|\buhd\b|\bvip\b|\braw\b|\bplus\b|\bsd\b)$',
+    re.IGNORECASE
+)
+_EPG_COUNTRY_PREFIX = re.compile(r'^[a-z]{2,4}\s*[|:]\s*', re.IGNORECASE)
+
+
+def _epg_strip_noise(s: str) -> str:
+    """Remove IPTV country prefix and quality suffix from a channel name.
+    Also normalise + and & to spaces so 'crime + investigation' core-strips
+    to 'crime investigation' and can match XMLTV IDs like crimeinvestigation.rs.
+    """
+    s = _EPG_COUNTRY_PREFIX.sub('', s.lower())
+    s = _EPG_NOISE_SUFFIXES.sub('', s)
+    # Treat + and & as word separators (e.g. "crime + investigation" → "crime investigation")
+    s = re.sub(r'\s*[+&]\s*', ' ', s)
+    return s.strip()
+
+
+def _epg_cid_suffix(cid: str) -> str:
+    """Extract country suffix from a XMLTV channel ID (e.g. hbo.2.hd.hr → hr)."""
+    for p in reversed(cid.split(".")):
+        if 2 <= len(p) <= 3 and p.isalpha() and p not in ("hd","sd","4k","uhd","fhd"):
+            return p
+    return ""
+
+
+def _epg_proximity(cid: str, lookup_country: str) -> int:
+    """Geographic proximity rank (lower = closer).
+    0   = same country
+    2-N = same sub-region; smaller group = tighter linguistic fit
+    100 = same broad continent region
+    200 = different continent
+    """
+    sfx = _epg_cid_suffix(cid)
+    if not sfx or not lookup_country:
+        return 999
+    lc = _EPG_ALIASES.get(lookup_country, lookup_country)
+    sc = _EPG_ALIASES.get(sfx, sfx)
+    if lc == sc:
+        return 0
+    best_subregion = None
+    for grp in _EPG_SUBREGIONS:
+        if lc in grp and sc in grp:
+            if best_subregion is None or len(grp) < best_subregion:
+                best_subregion = len(grp)
+    if best_subregion is not None:
+        return best_subregion
+    for grp in _EPG_REGIONS:
+        if lc in grp and sc in grp:
+            return 100
+    return 200
+
+
+def _epg_levenshtein(a: str, b: str) -> int:
+    """Simple Levenshtein edit distance for short channel name strings."""
+    if a == b: return 0
+    if not a: return len(b)
+    if not b: return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            curr.append(min(prev[j + 1] + 1, curr[j] + 1,
+                            prev[j] + (0 if ca == cb else 1)))
+        prev = curr
+    return prev[-1]
+
+
 def _normalize_ch_name(name: str) -> str:
     s = name.lower().strip()
     s = _RE_NONWD.sub('', s)
@@ -6038,7 +6174,9 @@ async def _build_xmltv_index(xmltv_url: str, log_cb=None,
                 if tag == "channel":
                     cid = (elem.get("id") or "").strip().lower()
                     if cid:
-                        names = [dn.text.strip().lower()
+                        # Store as (name_lower, lang_lower) tuples so matching
+                        # can prefer the right language variant over same-named foreign channels.
+                        names = [(dn.text.strip().lower(), (dn.get("lang") or "").strip().lower())
                                  for dn in elem.findall("display-name") if dn.text]
                         chan_names_[cid] = names
                 elif tag == "programme":
@@ -6184,33 +6322,176 @@ async def _fetch_xmltv_epg(xmltv_url: str, tvg_id: str, log_cb=None,
         return out
 
     # ── Resolve channel ID → programme list ───────────────────────────────────
-    entries = epg_dict.get(lookup)
-
-    # Fallback 1: match via XMLTV <display-name>
+    entries = None  # always initialised — avoids UnboundLocalError
+    # ── 1. Match cache: if we already resolved this lookup → jump to the CID ──
+    _match_key = (lookup, ck)
+    _cached_match_cid = state._xmltv_match_cache.get(_match_key)
+    if _cached_match_cid is not None:
+        entries = epg_dict.get(_cached_match_cid) if _cached_match_cid else None
+        if entries:
+            _log(f"[EPG] XMLTV match-cache hit: {tvg_id!r} → {_cached_match_cid!r}")
+        else:
+            # CID was cached but no longer in index (feed refresh) — fall through
+            del state._xmltv_match_cache[_match_key]
     if not entries:
-        for cid, names in chan_names.items():
-            if lookup in names or any(lookup in n or n in lookup for n in names):
-                entries = epg_dict.get(cid)
-                if entries:
-                    _log(f"[EPG] XMLTV display-name fallback: {tvg_id!r} → {cid!r}")
+        # ── 2. tvg-id direct lookup ────────────────────────────────────────────
+        _tvg_as_id = tvg_id.strip()
+        for _try_id in (_tvg_as_id, _tvg_as_id.lower(), _tvg_as_id.upper()):
+            _candidate = epg_dict.get(_try_id)
+            if _candidate:
+                entries = _candidate
+                _log(f"[EPG] XMLTV tvg-id direct hit: {tvg_id!r} → {_try_id!r}")
+                state._xmltv_match_cache[_match_key] = _try_id
+                break
+
+    if not entries:
+        # ── 3. Exact channel-ID lookup (lookup = tvg_id lowercased) ───────────
+        entries = epg_dict.get(lookup)
+        if entries:
+            _log(f"[EPG] XMLTV exact-ID hit: {tvg_id!r} → {lookup!r} ({len(entries)} progs)")
+            state._xmltv_match_cache[_match_key] = lookup
+
+    # Fallback: scored display-name / proximity matching using region clusters.
+    # Extract country code and strip noise — use module-level helpers.
+    _cc_m = re.match(r'^' + r'([a-z]{2,4})' + r'\s*[|:]\s*', lookup)
+    lookup_country = _cc_m.group(1) if _cc_m else ""
+    lookup_core = _epg_strip_noise(lookup)
+
+    def _name_matches(names, lc, cid):
+        """Check if any (name, lang) pair in names matches lookup core lc.
+        Returns (matched, lang_matches_country) tuple.
+        Substring (n_core in lc) only accepted when channel has a country signal.
+        """
+        has_country_signal = bool(
+            lookup_country and (
+                cid.endswith("." + lookup_country) or
+                any(lang and (lang == lookup_country or lang.startswith(lookup_country))
+                    for _, lang in names)
+            )
+        )
+        for n, lang in names:
+            n_core = _epg_strip_noise(n)
+            if not n_core:
+                continue
+            lang_hit = lang == lookup_country or lang.startswith(lookup_country)
+            if lc == n_core:
+                return True, lang_hit
+            if len(n_core) >= 3 and n_core in lc:
+                if not lookup_country or has_country_signal:
+                    return True, lang_hit
+        return False, False
+
+    if not entries and lookup_core:
+        _log(f"[EPG] XMLTV fallback: lookup={lookup!r} core={lookup_core!r} country={lookup_country!r}")
+        # ── Tier 0: construct XMLTV channel ID directly ───────────────────────
+        if lookup_country:
+            _core_nodots = lookup_core.replace(" ", "")
+            _core_dots   = lookup_core.replace(" ", ".")
+            for _cid_guess in [
+                _core_nodots + "." + lookup_country,
+                _core_nodots + "-" + lookup_country,
+                _core_nodots + lookup_country,
+                _core_dots   + "." + lookup_country,
+            ]:
+                _log(f"[EPG] XMLTV trying constructed-ID: {_cid_guess!r}")
+                _candidate = epg_dict.get(_cid_guess)
+                if _candidate:
+                    _log(f"[EPG] XMLTV constructed-ID match: {tvg_id!r} → {_cid_guess!r}")
+                    entries = _candidate
+                    state._xmltv_match_cache[_match_key] = _cid_guess
                     break
 
-    # Fallback 2: noise-stripped name match — "BBC One HD" → "bbc one" matches "BBC One"
-    if not entries:
-        lookup_norm = _normalize_ch_name(tvg_id)
-        if lookup_norm and lookup_norm != lookup:
-            entries = epg_dict.get(lookup_norm)
-            if not entries:
-                for cid, names in chan_names.items():
-                    cid_norm   = _normalize_ch_name(cid)
-                    names_norm = [_normalize_ch_name(n) for n in names]
-                    if (lookup_norm == cid_norm or lookup_norm in names_norm
-                            or any(lookup_norm in nn or nn in lookup_norm
-                                   for nn in names_norm if nn)):
-                        entries = epg_dict.get(cid)
-                        if entries:
-                            _log(f"[EPG] XMLTV normalized-name match: {tvg_id!r} → {cid!r}")
-                            break
+        # ── Tier 1: scored display-name matching ─────────────────────────────
+        # Score 2 = name matches AND channel has country signal
+        # Score 1 = name matches, no country signal (international)
+        if not entries:
+            best_cid = None
+            best_score = -1
+            score1_candidates = []
+            for cid, names in chan_names.items():
+                cid_country_match = lookup_country and cid.endswith("." + lookup_country)
+                name_hit, lang_hit = _name_matches(names, lookup_core, cid)
+                if not name_hit:
+                    continue
+                score = 2 if (lang_hit or cid_country_match) else 1
+                if score == 2:
+                    candidate = epg_dict.get(cid)
+                    if candidate:
+                        best_score = 2
+                        best_cid = cid
+                        entries = candidate
+                        break
+                else:
+                    candidate = epg_dict.get(cid)
+                    if candidate:
+                        score1_candidates.append((cid, candidate))
+
+            if best_score < 2 and score1_candidates:
+                if not lookup_country:
+                    best_cid, entries = score1_candidates[0]
+                    best_score = 1
+                elif len(score1_candidates) == 1:
+                    best_cid, entries = score1_candidates[0]
+                    best_score = 1
+                    _log(f"[EPG] XMLTV: sole match {best_cid!r} for {tvg_id!r} (international)")
+                else:
+                    # Multiple candidates — rank by geographic proximity
+                    score1_candidates.sort(key=lambda x: _epg_proximity(x[0], lookup_country))
+                    all_ranked = [(c, _epg_proximity(c, lookup_country)) for c, _ in score1_candidates]
+                    _log(f"[EPG] XMLTV: {len(score1_candidates)} candidates for {tvg_id!r} (top 5):")
+                    for _c, _r in all_ranked[:5]:
+                        _log(f"[EPG]   rank={_r:3d}  {_c}")
+                    best_cid, entries = score1_candidates[0]
+                    best_score = 1
+                    # If the closest geographic match is rank >= 6, it's a language
+                    # the user probably can't read (e.g. Greek, Bulgarian for a Serbian
+                    # channel). Prefer an English-language version (.us/.uk/.gb/.au)
+                    # if one exists among the candidates — English is more universally
+                    # readable than a geographically "close" but foreign-language match.
+                    _best_rank = all_ranked[0][1] if all_ranked else 0
+                    if _best_rank >= 6:
+                        _EN_SUFFIXES = {"us", "uk", "gb", "au", "nz", "ca", "ie"}
+                        for _cid, _cand in score1_candidates:
+                            if _epg_cid_suffix(_cid) in _EN_SUFFIXES and _cand:
+                                _log(f"[EPG] XMLTV: best rank={_best_rank} ≥ 6 — preferring English: {_cid!r}")
+                                best_cid, entries = _cid, _cand
+                                break
+
+            if best_score >= 0 and best_cid:
+                _log(f"[EPG] XMLTV best candidate: score={best_score} cid={best_cid!r} for {tvg_id!r}")
+            if entries:
+                _log(f"[EPG] XMLTV display-name fallback (score={best_score}): {tvg_id!r} → {best_cid!r}")
+                state._xmltv_match_cache[_match_key] = best_cid
+
+    # ── Tier 2: fuzzy name match (Levenshtein) ────────────────────────────────
+    # Only for names >= 8 chars. Threshold scales with name length.
+    _fuzz_best_cid = None
+    _fuzz_best_dist = 3
+    _fuzz_min_len = 8
+    _fuzz_threshold = max(1, len(lookup_core) // 8)
+    if not entries and lookup_core and len(lookup_core) >= _fuzz_min_len:
+        _fuzz_best_rank = 999
+        for cid, names in chan_names.items():
+            for n, lang in names:
+                n_core = _epg_strip_noise(n)
+                if not n_core or len(n_core) < _fuzz_min_len:
+                    continue
+                if abs(len(n_core) - len(lookup_core)) > _fuzz_threshold + 1:
+                    continue
+                dist = _epg_levenshtein(lookup_core, n_core)
+                if dist > _fuzz_threshold:
+                    continue
+                prox = _epg_proximity(cid, lookup_country)
+                if dist < _fuzz_best_dist or (dist == _fuzz_best_dist and prox < _fuzz_best_rank):
+                    candidate = epg_dict.get(cid)
+                    if candidate:
+                        _fuzz_best_dist = dist
+                        _fuzz_best_rank = prox
+                        _fuzz_best_cid = cid
+                        entries = candidate
+        if entries:
+            _log(f"[EPG] XMLTV fuzzy match (dist={_fuzz_best_dist}): {tvg_id!r} → {_fuzz_best_cid!r}")
+            state._xmltv_match_cache[_match_key] = _fuzz_best_cid
 
     if not entries:
         _log(f"[EPG] XMLTV: no programmes found for {tvg_id!r}")
