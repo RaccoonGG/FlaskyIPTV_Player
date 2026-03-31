@@ -5673,15 +5673,14 @@ def api_catchup_play():
             cu_url = (f"{_p.scheme}://{_p.netloc}"
                       f"/timeshift/{user}/{pwd}/{dur}/{start_fmt}/{sid}.ts")
 
-            # Fallback: query-string format for servers that don't support path-based format.
-            # timeshift.php returns m3u8 so it routes through HLS.js.
+            # Fallback: query-string format (timeshift.php) — HLS.js handles this.
             cu_url_fallback = (f"{_p.scheme}://{_p.netloc}/streaming/timeshift.php"
                                f"?username={user}&password={pwd}"
                                f"&stream={sid}&start={start_fmt}&duration={dur}")
 
             state.log(f"[CatchUp/Play] Xtream timeshift (path/primary)   -> {cu_url}")
             state.log(f"[CatchUp/Play] Xtream timeshift (query/fallback)  -> {cu_url_fallback}")
-            return {"url": cu_url, "fallback_url": cu_url_fallback}
+            return {"url": cu_url, "fallback_url": cu_url_fallback, "duration_secs": int(stop_ts - start_ts)}
 
         # ── MAC / Stalker portal ──────────────────────────────────────────────
         start_dt_utc = datetime.fromtimestamp(start_ts, tz=timezone.utc)
@@ -11403,8 +11402,19 @@ function doPlay(url, name, opts={}){
             if(!d2.fatal) return;
             if(!_playerStopped && !window._remuxFired){
               window._remuxFired = true;
-              alog('[HLS] Retry also failed — falling back to ffmpeg remux…','w');
               if(hlsObj){hlsObj.destroy();hlsObj=null;}
+              // Catchup/VOD: HLS failed (portal doesn't support timeshift.php) —
+              // fall back to the .ts path which plays without a seek bar rather
+              // than handing off to ffmpeg remux (which would play as live/no-seek anyway).
+              if(!isLiveStream && fallbackUrl){
+                alog('[HLS] Retry also failed — falling back to .ts (catchup fallback)…','w');
+                setTimeout(()=>{
+                  if(_playerStopped) return;
+                  doPlay(fallbackUrl, name, {isLive:false, durationSecs:opts.durationSecs||0});
+                },1000);
+                return;
+              }
+              alog('[HLS] Retry also failed — falling back to ffmpeg remux…','w');
               const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
               setTimeout(()=>{
                 if(_playerStopped) return;
@@ -11437,8 +11447,13 @@ function doPlay(url, name, opts={}){
   } else if(mpegtsOk){
     // ── Raw MPEG-TS via mpegts.js ──────────────────────────────
     const isLiveStream = (opts.isLive !== false);
+    // For catchup streams we know the exact duration from start/stop timestamps.
+    // Passing it in the mediaDataSource lets mpegts.js set vid.duration via
+    // MediaSource so the seek bar shows a real progress range instead of Infinity.
+    const _knownDur = (!isLiveStream && opts.durationSecs > 0) ? opts.durationSecs : undefined;
     mpegtsObj=mpegts.createPlayer({
       type:'mse', isLive: isLiveStream, url:px, cors:true,
+      duration: _knownDur,
     },{
       enableWorker:false,
       liveBufferLatencyChasing: isLiveStream,
@@ -12441,7 +12456,8 @@ function doPlayArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, en
       // Pass raw URL — doPlay always wraps in /api/proxy itself
       // Catchup is VOD — isLive:false prevents mpegts.js SourceBuffer crash
       // d.fallback_url is the query-string format; used if path-based .ts fails
-      doPlay(d.url, label, {isLive:false, fallbackUrl:d.fallback_url||null});
+      // d.duration_secs lets mpegts.js set a real duration so the seek bar works
+      doPlay(d.url, label, {isLive:false, fallbackUrl:d.fallback_url||null, durationSecs:d.duration_secs||0});
       toast('↺ Playing catch-up: '+title,'ok');
     } else {
       if(status) status.textContent='❌ '+(d.error||'Not available');
