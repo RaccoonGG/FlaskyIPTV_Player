@@ -10152,8 +10152,8 @@ function subLoadLocalFile(input){
 function _subInitLangGrid(){
   const grid = document.getElementById('sub-lang-grid');
   if(!grid || grid.children.length) return;
-  // Default checked: English + Serbian
-  const defaults = new Set(['en','sr']);
+  // Default checked: English
+  const defaults = new Set(['en']);
   grid.innerHTML = SUB_LANGS.map(l => `
     <label class="sub-lang-chip">
       <input type="checkbox" value="${l.code}" ${defaults.has(l.code)?'checked':''}>
