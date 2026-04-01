@@ -6652,6 +6652,36 @@ def _is_dns_fail(exc: Exception) -> bool:
         "nodename nor servname", "failed to resolve", "errno 11001", "errno 11002",
     ))
 
+# Hosts that repeatedly time-out on connection — after _TIMEOUT_THRESHOLD
+# consecutive ConnectTimeout errors the host is silenced and we return a
+# transparent PNG without logging, same strategy as DNS-fail blocking.
+_TIMEOUT_BLOCKED_HOSTS: set = set()
+_TIMEOUT_BLOCKED_HOSTS_LOCK = threading.Lock()
+_TIMEOUT_COUNTS: dict = {}   # host → timeout count
+_TIMEOUT_THRESHOLD = 3       # silence after 3 timeouts (likely unreachable host)
+
+def _record_host_timeout(host: str) -> bool:
+    """Increment connect-timeout counter; silence host once threshold is reached.
+    Returns True the first time the threshold is crossed (caller should log once)."""
+    with _TIMEOUT_BLOCKED_HOSTS_LOCK:
+        _TIMEOUT_COUNTS[host] = _TIMEOUT_COUNTS.get(host, 0) + 1
+        if _TIMEOUT_COUNTS[host] >= _TIMEOUT_THRESHOLD:
+            if host not in _TIMEOUT_BLOCKED_HOSTS:
+                _TIMEOUT_BLOCKED_HOSTS.add(host)
+                return True  # just crossed threshold
+    return False
+
+def _is_connect_timeout(exc: Exception) -> bool:
+    """Return True if the exception is a connection-timeout (not a read timeout)."""
+    t = type(exc).__name__
+    if t in ("ConnectTimeout", "ConnectionError"):
+        return True
+    msg = str(exc).lower()
+    return any(k in msg for k in (
+        "connecttimeout", "connect timeout", "connection timed out",
+        "timed out", "etimedout",
+    ))
+
 # Hosts that rate-limit (429) when hit with many concurrent requests.
 # Populated dynamically — any host that returns 429 gets added here and
 # subsequent requests to it are throttled with a semaphore + retry backoff.
@@ -6711,6 +6741,8 @@ def api_proxy():
         _is_blocked = _host in _HOTLINK_BLOCKED_HOSTS
     with _DNS_FAIL_BLOCKED_HOSTS_LOCK:
         _is_blocked = _is_blocked or (_host in _DNS_FAIL_BLOCKED_HOSTS)
+    with _TIMEOUT_BLOCKED_HOSTS_LOCK:
+        _is_blocked = _is_blocked or (_host in _TIMEOUT_BLOCKED_HOSTS)
     if _is_blocked:
         hdrs = dict(cors)
         hdrs["Content-Type"] = "image/png"
@@ -6868,6 +6900,12 @@ def api_proxy():
                 state.log(f"[Proxy] DNS failure {_DNS_FAIL_THRESHOLD}x for {_host} — silencing future logo requests")
             elif _DNS_FAIL_COUNTS.get(_host, 0) < _DNS_FAIL_THRESHOLD:
                 state.log(f"[Proxy] Error: {e} ← {url[:120]}")
+        elif _is_connect_timeout(e):
+            crossed = _record_host_timeout(_host)
+            if crossed:
+                state.log(f"[Proxy] ConnectTimeout {_TIMEOUT_THRESHOLD}x for {_host} — silencing future logo requests")
+            elif _TIMEOUT_COUNTS.get(_host, 0) < _TIMEOUT_THRESHOLD:
+                state.log(f"[Proxy] Logo fetch error ({type(e).__name__}) ← {url[:120]}")
         elif is_img_url:
             if _DNS_FAIL_COUNTS.get(_host, 0) < 1 and _HOTLINK_403_COUNTS.get(_host, 0) < 1:
                 state.log(f"[Proxy] Logo fetch error ({type(e).__name__}) ← {url[:120]}")
