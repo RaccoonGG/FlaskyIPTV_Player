@@ -3225,7 +3225,7 @@ async def _connect_async():
                             state.cats_cache[m] = []
                     state.connected = True
                     state.set_status(f"Connected (Xtream via M3U): {ident} | {exp}")
-                    state.profile_data = {'type':'xtream','user':ident,'exp':exp,'max_conn':str(max_conn) if max_conn else '','active_cons':active_cons}
+                    state.profile_data = {'type':'xtream','user':ident,'exp':exp,'max_conn':str(max_conn) if max_conn else '','active_cons':active_cons,'portal_url':detected["base"]}
                     if hasattr(xt, "_server_utc_offset"):
                         state._portal_utc_offset = xt._server_utc_offset
                     return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
@@ -3253,7 +3253,7 @@ async def _connect_async():
                     state.log(f"[CONNECT] {m.upper()}: {len(state.cats_cache[m])} categories")
         state.connected = True
         state.set_status(f"Connected: {ident} | {exp}")
-        state.profile_data = {'type': 'm3u', 'user': ident, 'exp': exp, 'max_conn': str(max_conn) if max_conn else ''}
+        state.profile_data = {'type': 'm3u', 'user': ident, 'exp': exp, 'max_conn': str(max_conn) if max_conn else '', 'portal_url': state.m3u_url}
         return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
                 "max_connections": max_conn, "portal_url": state.m3u_url,
                 "is_stalker": state.is_stalker_portal}
@@ -3302,11 +3302,13 @@ async def _connect_async():
                     'active_cons': str(prof.get('active_cons') or prof.get('online_streams') or ''),
                     'settings_password': str(prof.get('settings_password', '') or ''),
                     'adult_password': str(prof.get('parent_password', '') or prof.get('adult_password', '') or ''),
+                    'portal_url': state.url or state.m3u_url,
                 }
             except Exception as e:
                 state.log(f"[CONNECT] Could not fetch Stalker profile details: {e}")
                 state.profile_data = {'type': 'stalker', 'mac': client.mac, 'exp': exp,
-                                      'max_conn': str(max_conn) if max_conn else ''}
+                                      'max_conn': str(max_conn) if max_conn else '',
+                                      'portal_url': state.url or state.m3u_url}
         elif not state.is_stalker_portal:
             _is_xtream = (state.conn_type == 'xtream' or
                           (state.conn_type == 'm3u_url' and state.m3u_xtream_override))
@@ -3322,6 +3324,7 @@ async def _connect_async():
                 'password':          _ai4[3] if _is_xtream and len(_ai4) > 3 else '',
                 'settings_password': _ai4[3] if not _is_xtream and len(_ai4) > 3 else '',
                 'adult_password':    _ai4[4] if not _is_xtream and len(_ai4) > 4 else '',
+                'portal_url': state.url or state.m3u_url,
             }
         state.log(f"[CONNECT] ✓ Connected: {ident} | {exp}")
         for m in ("live", "vod", "series"):
@@ -13668,6 +13671,7 @@ async function openProfileModal(){
     const isMacAddr=v=>v&&/^([0-9a-f]{2}[:\-]){5}[0-9a-f]{2}$/i.test(v.trim());
     const pwdStyle=' style="font-family:monospace;letter-spacing:2px;color:var(--acc)"';
     let html=`<div style="margin-bottom:10px"><span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:4px;${badgeStyle}">${typeLabel[tk]||tk.toUpperCase()}</span></div>`;
+    html+=row('Portal',d.portal_url);
     if(d.type==='stalker'){
       html+=row('MAC',d.mac);
       html+=row('Login',d.login);
