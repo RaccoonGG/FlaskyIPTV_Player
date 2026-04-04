@@ -62,6 +62,8 @@ Fixed Xtream double round-trip: handshake() and account_info() previously both i
 Added Xtream logo cache: stream_id → logo URL dict populated during fetch_items_page, fills missing logos without extra requests.
 Improved EPG matching channels when using external EPG.
 Added session-wide cache for category items.
+Added ability to hide categories and channels, you can undo these via hidden items manager via action button menu.
+Added ability to sort categories and channels via drag and drop.
 """
 
 import base64
@@ -7871,6 +7873,18 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .c-name{flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;z-index:1}
 .c-arr{font-size:10px;color:var(--txt3);flex-shrink:0;z-index:1;transition:var(--tr)}
 .citem:hover .c-arr{color:var(--acc);transform:translateX(3px)}
+/* ─── drag-to-reorder ────────────────────────────────────────── */
+.drag-src{opacity:.45!important;outline:2px dashed var(--acc);outline-offset:-2px;
+  cursor:grabbing!important;z-index:10;transition:none!important}
+.drag-src::before,.drag-src::after{display:none}
+.drag-src:active{transform:none!important}
+.citem.drag-src{animation:none}
+.irow.drag-src{animation:none}
+.drag-dropline{height:2px;background:var(--acc);border-radius:2px;
+  margin:1px 4px;pointer-events:none;flex-shrink:0;box-shadow:0 0 6px var(--acc)}
+.drag-ind{position:absolute;right:38px;top:50%;transform:translateY(-50%);
+  font-size:15px;color:var(--acc);font-weight:900;pointer-events:none;
+  text-shadow:0 0 8px rgba(0,0,0,.9);letter-spacing:0;line-height:1;z-index:20}
 
 /* ─── skeleton ───────────────────────────────────────────────── */
 /* ::before = icon placeholder, ::after = text placeholder — both STATIC.
@@ -8254,24 +8268,8 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   box-shadow:0 0 10px var(--orange),0 0 20px rgba(245,158,11,.35);pointer-events:none}
 #t-act.act-open .nt-ico{transform:scale(1.2);filter:drop-shadow(0 0 8px var(--orange))}
 
-/* Desktop Actions button — shown in panel header on desktop, hidden on mobile */
-.ph-act-btn{display:none;align-items:center;gap:5px;padding:5px 12px;
-  font-size:12px;font-weight:700;border-radius:20px;position:relative;
-  background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
-  border:none;cursor:pointer;flex-shrink:0;overflow:hidden;
-  box-shadow:0 2px 10px var(--glow2),inset 0 1px 0 rgba(255,255,255,.15);transition:var(--tr)}
-.ph-act-btn::before{content:'';position:absolute;top:0;left:0;width:100%;height:100%;
-  background:linear-gradient(90deg,transparent,rgba(255,255,255,.18),transparent);
-  transform:translateX(-100%);transition:transform .5s ease;pointer-events:none}
-.ph-act-btn:hover::before{transform:translateX(100%)}
-.ph-act-btn:hover{filter:brightness(1.12);transform:scale(1.03);box-shadow:var(--glow-acc)}
-.ph-act-btn:active{transform:scale(.96)}
-.ph-act-badge{background:var(--green);color:#fff;font-size:9px;font-weight:800;
-  border-radius:10px;padding:1px 5px;min-width:16px;text-align:center;display:none;
-  margin-left:3px;border:1.5px solid var(--bg)}
-.ph-act-badge.vis{display:inline-block}
+/* Desktop: hide panel header h3 (no space for text when tabs visible) and adjust .ph padding */
 @media(min-width:900px){
-  .ph-act-btn{display:flex;padding:4px 8px;font-size:11px;gap:3px}
   .ph h3{display:none}
   .ph{padding:8px 10px;gap:5px;justify-content:space-between}
 }
@@ -8487,7 +8485,9 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 @media(max-width:899px){
   #p-mv{ bottom:56px; }
 }
-/* Desktop multiview button — only shown on desktop (handled by JS) */
+/* Desktop multiview button — hidden on mobile, visible on desktop */
+#mv-desktop-btn{ display:none }
+@media(min-width:900px){ #mv-desktop-btn{ display:inline-flex } }
 #mv-desktop-btn.mv-btn-active{
   background:var(--acc) !important;
   color:#fff !important;
@@ -9054,7 +9054,6 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <button class="mt" data-m="vod" onclick="setMode('vod')"><span class="mt-ico">🎬</span><span class="mt-txt">VOD</span></button>
         <button class="mt" data-m="series" onclick="setMode('series')"><span class="mt-ico">📂</span><span class="mt-txt">Series</span></button>
       </div>
-      <!-- Category-level actions accessible via FAB on mobile only -->
     </div>
     <div style="padding:8px 10px 0;flex-shrink:0;display:flex;flex-direction:column;gap:6px">
       <div class="tag-bar" id="tag-bar" style="display:none"></div>
@@ -9083,9 +9082,6 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
         <div class="bcrum" id="bcrum" style="flex:1;min-width:0"><span class="bc-s">Categories</span></div>
         <button class="epg-layout-btn" id="epg-grid-btn" onclick="toggleEpgGrid()" title="EPG Grid view" style="display:none">📅 EPG</button>
-        <button class="ph-act-btn" onclick="openDrawer('items')" title="Download / Actions" id="ph-items-act-btn">
-          ⚡ Actions<span class="ph-act-badge" id="ph-item-badge"></span>
-        </button>
       </div>
       <div class="sbar" id="items-sbar"><span class="sico">🔍</span>
         <input id="isrch" type="search" placeholder="Search items…" oninput="filterItems()">
@@ -9132,6 +9128,27 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <!-- RIGHT BUTTON GROUP -->
           <div style="display:flex;align-items:center;gap:6px">
 
+            <button id="pctrl-act-btn"
+              onclick="event.stopPropagation();openActTab()"
+              title="Actions"
+              style="height:26px;padding:0 10px;font-size:12px;font-weight:700;
+              border-radius:var(--rss);background:var(--s4);color:var(--txt2);
+              border:1px solid var(--bdr2);letter-spacing:.5px;position:relative;overflow:hidden">
+              ⚡ Actions<span id="pctrl-act-badge" style="display:none;position:absolute;
+                top:-4px;right:-4px;background:var(--green);color:#fff;font-size:9px;
+                font-weight:800;min-width:14px;height:14px;border-radius:20px;
+                text-align:center;line-height:14px;padding:0 3px;pointer-events:none"></span>
+            </button>
+
+            <button id="mv-desktop-btn"
+              onclick="event.stopPropagation();mvToggle()"
+              title="Multi-View"
+              style="height:26px;padding:0 10px;font-size:12px;font-weight:700;
+              border-radius:var(--rss);background:var(--s4);color:var(--txt2);
+              border:1px solid var(--bdr2);letter-spacing:.5px;display:none">
+              ⊞ Multi-View
+            </button>
+
             <button class="btn-ghost pnav" id="theaterbtn"
               onclick="toggleTheater()"
               title="Theater mode"
@@ -9144,15 +9161,6 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
                 <polyline points="4,14 2,14 2,12"/>
                 <polyline points="12,14 14,14 14,12"/>
               </svg>
-            </button>
-
-            <button id="mv-desktop-btn"
-              onclick="event.stopPropagation();mvToggle()"
-              title="Multi-View"
-              style="height:26px;padding:0 10px;font-size:12px;font-weight:700;
-              border-radius:var(--rss);background:var(--s4);color:var(--txt2);
-              border:1px solid var(--bdr2);letter-spacing:.5px;display:none">
-              ⊞ Multi-View
             </button>
 
           </div>
@@ -9414,6 +9422,8 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   <button class="imenu-btn" id="imenu-imdb"     onclick="iMenuIMDB()">    <span class="imenu-ico">🔍</span>Open TMDB/IMDB</button>
   <button class="imenu-btn" id="imenu-rec"      onclick="iMenuRec()">     <span class="imenu-ico">⏺</span>Record</button>
   <button class="imenu-btn" id="imenu-mkv"      onclick="iMenuMKV()">     <span class="imenu-ico">⬇</span>Download MKV</button>
+  <div class="imenu-sep" id="imenu-sep3"></div>
+  <button class="imenu-btn" id="imenu-hide"     onclick="iMenuHide()">    <span class="imenu-ico">🚫</span>Hide this item</button>
 </div>
 <div id="item-menu-bg" onclick="closeItemMenu()" style="display:none;position:fixed;inset:0;z-index:799"></div>
 
@@ -9635,6 +9645,19 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <span class="adr-sub" id="adr-cat-all-sub"></span>
         </button>
       </div>
+      <div class="adr-section">
+        <div class="adr-section-title">Visibility</div>
+        <button class="adr-btn btn-ghost" id="adr-hide-sel" onclick="hideSelectedAll()" disabled>
+          <span class="adr-ico">🚫</span>
+          <span class="adr-lbl">Hide selected</span>
+          <span class="adr-sub" id="adr-hide-sub"></span>
+        </button>
+        <button class="adr-btn btn-ghost" onclick="closeDrawer();openHiddenManager()" style="margin-top:6px">
+          <span class="adr-ico">👁</span>
+          <span class="adr-lbl">Manage hidden</span>
+          <span class="adr-sub" id="adr-hidden-count"></span>
+        </button>
+      </div>
       <div class="adr-progress" id="adr-progress-items">
         <div class="adr-prog-hdr">
           <div class="adr-prog-title" id="adr-prog-items-title">Downloading...</div>
@@ -9655,6 +9678,41 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 </div>
 
 <div id="toasts"></div>
+
+<!-- HIDDEN ITEMS MANAGER -->
+<div id="hidden-overlay" onclick="if(event.target===this)closeHiddenManager()"
+  style="display:none;position:fixed;inset:0;z-index:950;background:rgba(0,0,0,.65);
+         align-items:center;justify-content:center">
+  <div style="background:var(--s2);border:1px solid var(--bdr);border-radius:var(--r);
+              width:min(440px,93vw);max-height:80vh;display:flex;flex-direction:column;overflow:hidden">
+    <div style="display:flex;align-items:center;padding:13px 16px;border-bottom:1px solid var(--bdr);flex-shrink:0">
+      <span style="flex:1;font-size:14px;font-weight:800;color:var(--txt)">🚫 Hidden</span>
+      <button class="btn-ghost" onclick="closeHiddenManager()" style="height:28px;padding:0 10px;font-size:12px">✕</button>
+    </div>
+    <div style="display:flex;gap:5px;padding:9px 12px 8px;border-bottom:1px solid var(--bdr);flex-shrink:0">
+      <button id="hm-tab-live"   onclick="hmSetMode('live')"   style="flex:1;height:28px;font-size:11px;font-weight:500;cursor:pointer;background:transparent;border:1px solid var(--bdr);border-radius:var(--rsm);color:var(--txt);transition:all .15s">Live</button>
+      <button id="hm-tab-vod"    onclick="hmSetMode('vod')"    style="flex:1;height:28px;font-size:11px;font-weight:500;cursor:pointer;background:transparent;border:1px solid var(--bdr);border-radius:var(--rsm);color:var(--txt);transition:all .15s">VOD</button>
+      <button id="hm-tab-series" onclick="hmSetMode('series')" style="flex:1;height:28px;font-size:11px;font-weight:500;cursor:pointer;background:transparent;border:1px solid var(--bdr);border-radius:var(--rsm);color:var(--txt);transition:all .15s">Series</button>
+    </div>
+    <div style="display:flex;gap:0;padding:7px 12px;border-bottom:1px solid var(--bdr);flex-shrink:0">
+      <button id="hm-sub-items" onclick="hmSetSubView('items')"
+        style="flex:1;height:26px;font-size:11px;cursor:pointer;
+               border:1px solid var(--bdr);border-radius:var(--rsm) 0 0 var(--rsm);
+               background:transparent;color:var(--txt);transition:all .15s">📋 Items</button>
+      <button id="hm-sub-cats" onclick="hmSetSubView('cats')"
+        style="flex:1;height:26px;font-size:11px;cursor:pointer;
+               border:1px solid var(--bdr);border-left:none;border-radius:0 var(--rsm) var(--rsm) 0;
+               background:transparent;color:var(--txt);transition:all .15s">📁 Categories</button>
+    </div>
+    <div id="hm-list" style="flex:1;overflow-y:auto;min-height:60px"></div>
+    <div style="display:flex;align-items:center;gap:8px;padding:9px 14px;border-top:1px solid var(--bdr);flex-shrink:0">
+      <span id="hm-count" style="flex:1;font-size:11px;color:var(--txt3)"></span>
+      <button id="hm-clear-btn" onclick="hmClearAll()"
+        style="height:28px;padding:0 12px;font-size:11px;cursor:pointer;background:rgba(248,113,113,.1);
+               border:1px solid rgba(248,113,113,.3);border-radius:var(--rsm);color:#f87171">Clear All</button>
+    </div>
+  </div>
+</div>
 
 <!-- WHAT'S ON NOW MODAL -->
 <div id="won-overlay" onclick="if(event.target===this)closeWhatsOn()">
@@ -10373,6 +10431,198 @@ function _favsKey(m){
 }
 function loadFavs(m){ try{return JSON.parse(localStorage.getItem(_favsKey(m))||'[]');}catch(e){return[];} }
 function saveFavs(arr,m){ try{localStorage.setItem(_favsKey(m),JSON.stringify(arr));}catch(e){} }
+
+// ── HIDDEN ITEMS ─────────────────────────────────────────────────────────────
+// Stored per portal + mode: localStorage['hidden_live_host_user'] = ['Channel A', 'Channel B', …]
+function _hiddenKey(m){ return 'hidden_'+(m||mode)+'_'+_favsPortalKey; }
+function loadHidden(m){ try{return new Set(JSON.parse(localStorage.getItem(_hiddenKey(m))||'[]'));}catch(e){return new Set();} }
+function saveHidden(s,m){ try{localStorage.setItem(_hiddenKey(m),JSON.stringify([...s]));}catch(e){} }
+function _hideItems(items, m){
+  const s=loadHidden(m||mode);
+  items.forEach(it=>{ const n=it.name||it.o_name||it.fname||it.title||''; if(n) s.add(n); });
+  saveHidden(s,m||mode);
+}
+function _unhideItem(name, m){ const s=loadHidden(m||mode); s.delete(name); saveHidden(s,m||mode); }
+
+// ── HIDDEN CATEGORIES ─────────────────────────────────────────────────────────
+// Stored per portal + mode: localStorage['hidden_cats_live_portalkey'] = [[key, title], …]
+function _hiddenCatKey(m){ return 'hidden_cats_'+(m||mode)+'_'+_favsPortalKey; }
+function loadHiddenCats(m){
+  try{ return new Map(JSON.parse(localStorage.getItem(_hiddenCatKey(m))||'[]')); }
+  catch(e){ return new Map(); }
+}
+function saveHiddenCats(map,m){ try{localStorage.setItem(_hiddenCatKey(m),JSON.stringify([...map]));}catch(e){} }
+function _hideCat(cat, m){
+  const map=loadHiddenCats(m||mode);
+  map.set(String(cat.id||cat.title), cat.title||String(cat.id)||'?');
+  saveHiddenCats(map,m||mode);
+}
+function _unhideCatKey(key, m){ const map=loadHiddenCats(m||mode); map.delete(key); saveHiddenCats(map,m||mode); }
+
+// ── DRAG-TO-REORDER ───────────────────────────────────────────────────────────
+// Per-portal per-mode order, same key namespace as hidden/favs.
+
+function _catOrderKey(m){ return 'cat_order_'+(m||mode)+'_'+_favsPortalKey; }
+function loadCatOrder(m){ try{return JSON.parse(localStorage.getItem(_catOrderKey(m))||'null');}catch(e){return null;} }
+function saveCatOrder(arr,m){ try{localStorage.setItem(_catOrderKey(m),JSON.stringify(arr));}catch(e){} }
+
+function _itemOrderKey(m,catKey){ return 'item_order_'+(m||mode)+'_'+_favsPortalKey+'_'+(catKey||''); }
+function loadItemOrder(m,catKey){ try{return JSON.parse(localStorage.getItem(_itemOrderKey(m,catKey))||'null');}catch(e){return null;} }
+function saveItemOrder(arr,m,catKey){ try{localStorage.setItem(_itemOrderKey(m,catKey),JSON.stringify(arr));}catch(e){} }
+function _curCatKey(){ return String(curCat?.id||curCat?.title||''); }
+
+// Sort arr by position of keyFn(item) in savedKeys. Unknown items go to end preserving relative order.
+function _applyOrder(arr, savedKeys, keyFn){
+  if(!savedKeys||!savedKeys.length) return arr;
+  const pos=new Map(savedKeys.map((k,i)=>[k,i]));
+  const n=savedKeys.length;
+  return [...arr].sort((a,b)=>{
+    const ai=pos.has(keyFn(a))?pos.get(keyFn(a)):n;
+    const bi=pos.has(keyFn(b))?pos.get(keyFn(b)):n;
+    return ai-bi;
+  });
+}
+
+// Re-sort arr to match DOM order of rows (matched by data-key attribute).
+function _reorderByDom(arr, rows, keyFn){
+  const pos=new Map(rows.map((r,i)=>[r.dataset.key,i]));
+  return [...arr].sort((a,b)=>{
+    const ak=keyFn(a), bk=keyFn(b);
+    const ai=pos.has(ak)?pos.get(ak):arr.length;
+    const bi=pos.has(bk)?pos.get(bk):arr.length;
+    return ai-bi;
+  });
+}
+
+// Attach drag-sort to a list container.
+// rowSel: CSS selector for draggable rows.
+// searchEl: if non-null and has text, drag is suppressed (confusing to reorder filtered results).
+// onCommit(rows): called with final ordered NodeList of rows after drop.
+function _initDragSort(container, rowSel, searchEl, onCommit){
+  if(container._ds){ container._ds.destroy(); }
+
+  let holdTimer=null, srcRow=null, dropLine=null, lastBefore=undefined, edgeScrollRaf=null;
+  let dragActive=false;
+  const HOLD_MS=400;
+  const EDGE_ZONE=60;
+  const EDGE_SPEED=8;
+
+  function liveRows(){ return [...container.querySelectorAll(rowSel)]; }
+  function stopEdgeScroll(){ if(edgeScrollRaf){ cancelAnimationFrame(edgeScrollRaf); edgeScrollRaf=null; } }
+
+  // Attached to document at POINTERDOWN time (before browser claims scroll).
+  // Only blocks scroll and moves rows once dragActive=true.
+  function onTouchMove(e){
+    if(!dragActive) return;
+    e.preventDefault(); // blocks browser scroll — works because listener was added before gesture started
+    const t = e.touches[0];
+    if(!t) return;
+    moveToY(t.clientY);
+  }
+
+  function onPointerMove(e){
+    if(!dragActive) return;
+    moveToY(e.clientY);
+  }
+
+  function moveToY(y){
+    stopEdgeScroll();
+    const rect = container.getBoundingClientRect();
+    const distTop = y - rect.top, distBot = rect.bottom - y;
+    if(distTop < EDGE_ZONE || distBot < EDGE_ZONE){
+      const dir = distTop < EDGE_ZONE ? -1 : 1;
+      const speed = (EDGE_ZONE - (dir===-1 ? distTop : distBot)) / EDGE_ZONE * EDGE_SPEED;
+      (function doScroll(){
+        container.scrollTop += dir * speed;
+        edgeScrollRaf = requestAnimationFrame(doScroll);
+      })();
+    }
+
+    const candidates = liveRows().filter(r => r !== srcRow && r !== dropLine);
+    let before = null;
+    for(const r of candidates){
+      const rr = r.getBoundingClientRect();
+      if(y < rr.top + rr.height * 0.5){ before = r; break; }
+    }
+    if(before === lastBefore) return;
+    lastBefore = before;
+    if(before){
+      container.insertBefore(dropLine, before);
+      container.insertBefore(srcRow, dropLine);
+    } else {
+      container.appendChild(dropLine);
+      container.appendChild(srcRow);
+    }
+  }
+
+  function removeDragListeners(){
+    document.removeEventListener('touchmove',    onTouchMove);
+    document.removeEventListener('touchend',     onEnd);
+    document.removeEventListener('touchcancel',  onEnd);
+    document.removeEventListener('pointermove',  onPointerMove);
+    document.removeEventListener('pointerup',    onEnd);
+    document.removeEventListener('pointercancel',onEnd);
+  }
+
+  function onEnd(){
+    clearTimeout(holdTimer); holdTimer = null;
+    stopEdgeScroll();
+    removeDragListeners();
+    dragActive = false;
+    container.style.userSelect = '';
+    if(!srcRow) return;
+    srcRow.querySelector('.drag-ind')?.remove();
+    srcRow.classList.remove('drag-src');
+    if(dropLine?.parentNode) dropLine.parentNode.removeChild(dropLine);
+    dropLine = null; lastBefore = undefined;
+    onCommit(liveRows());
+    srcRow = null;
+  }
+
+  function onDown(e){
+    if(e.button && e.button !== 0) return;
+    if(e.target.closest('button,input,a,label,select')) return;
+    if(searchEl && searchEl.value.trim()) return;
+    const row = e.target.closest(rowSel);
+    if(!row || !row.dataset.key) return;
+
+    // Attach listeners to document NOW — before browser decides this is a scroll.
+    // touchmove is {passive:false} so we can call preventDefault once drag is confirmed.
+    document.addEventListener('touchmove',    onTouchMove,  {passive:false});
+    document.addEventListener('touchend',     onEnd,        {passive:true});
+    document.addEventListener('touchcancel',  onEnd,        {passive:true});
+    document.addEventListener('pointermove',  onPointerMove,{passive:true});
+    document.addEventListener('pointerup',    onEnd,        {passive:true});
+    document.addEventListener('pointercancel',onEnd,        {passive:true});
+
+    holdTimer = setTimeout(()=>{
+      holdTimer = null;
+      srcRow = row;
+      dragActive = true;
+      row.classList.add('drag-src');
+      if(!row.querySelector('.drag-ind')){
+        const ind = document.createElement('span');
+        ind.className = 'drag-ind'; ind.textContent = '↕';
+        row.appendChild(ind);
+      }
+      dropLine = document.createElement('div');
+      dropLine.className = 'drag-dropline';
+      container.style.userSelect = 'none';
+    }, HOLD_MS);
+  }
+
+  container.addEventListener('pointerdown', onDown);
+
+  container._ds={
+    destroy(){
+      clearTimeout(holdTimer); stopEdgeScroll(); removeDragListeners();
+      container.removeEventListener('pointerdown', onDown);
+      container.style.userSelect = '';
+      container._ds = null;
+    }
+  };
+}
+
 function isFav(item){
   const name=item.name||item.o_name||item.fname||'';
   return loadFavs(mode).some(f=>(f.name||f.o_name||f.fname||'')===name);
@@ -10643,9 +10893,15 @@ function switchMode(m, cats){
 function filterCats(){
   const q=document.getElementById('csrch').value.toLowerCase();
   const tag=_activeTag;
-  let cats=allCats;
+  const _hiddenCats=loadHiddenCats(mode);
+  let cats=allCats.filter(c=>!_hiddenCats.has(String(c.id||c.title)));
   if(tag) cats=cats.filter(c=>_catTag(c.title)===tag);
   if(q)   cats=cats.filter(c=>c.title.toLowerCase().includes(q));
+  // Apply custom order only when not actively searching/tag-filtering
+  if(!q&&!tag){
+    const order=loadCatOrder(mode);
+    if(order) cats=_applyOrder(cats, order, c=>String(c.id||c.title));
+  }
   renderCats(cats);
 }
 
@@ -10819,8 +11075,8 @@ function renderCats(cats){
   _renderedCats=cats;
   el.innerHTML=cats.map((c,i)=>{
     const sel=selCats.has(c.id||c.title);
-    // Use data-idx to avoid any JSON/quote issues inside HTML attributes
-    return '<div class="citem" style="--d:'+(Math.min(i,40)*.022)+'s" data-idx="'+i+'">'
+    const key=esc(String(c.id||c.title));
+    return '<div class="citem" style="--d:'+(Math.min(i,40)*.022)+'s" data-idx="'+i+'" data-key="'+key+'">'
       +'<input class="cat-chk" type="checkbox"'+(sel?' checked':'')
         +' data-idx="'+i+'" onchange="onCatChkIdx('+i+',this.checked)"'
         +' onclick="event.stopPropagation()">'
@@ -10830,6 +11086,15 @@ function renderCats(cats){
       +'<span class="c-arr" style="cursor:pointer" onclick="browseIdx('+i+')">›</span>'
       +'</div>';
   }).join('');
+
+  // Init drag-sort — disabled while search is active
+  _initDragSort(el, '.citem', document.getElementById('csrch'), (orderedRows)=>{
+    const newKeys=orderedRows.map(r=>r.dataset.key);
+    allCats=_reorderByDom(allCats, orderedRows, c=>String(c.id||c.title));
+    saveCatOrder(newKeys, mode);
+    // Re-render so data-idx values match new _renderedCats order
+    renderCats(allCats.filter(c=>!loadHiddenCats(mode).has(String(c.id||c.title))));
+  });
 }
 function browseIdx(i){
   const c=_renderedCats[i]; if(!c) return;
@@ -10848,6 +11113,24 @@ function selAllCats(v){
   if(v) allCats.forEach(c=>selCats.set(c.id||c.title,c));
   filterCats(); refreshCatBtns();
 }
+function hideSelectedAll(){
+  const nItems=selSet.size, nCats=selCats.size;
+  if(!nItems && !nCats) return;
+  if(nCats) selCats.forEach(cat=>_hideCat(cat, mode));
+  if(nItems) _hideItems([...selSet], mode);
+  selCats.clear();
+  selSet.clear();
+  document.querySelectorAll('.cat-chk').forEach(c=>c.checked=false);
+  document.querySelectorAll('.ichk').forEach(c=>c.checked=false);
+  filterCats();
+  _doFilterItems();
+  refreshBtns();
+  const parts=[];
+  if(nCats) parts.push(nCats+' categor'+(nCats===1?'y':'ies'));
+  if(nItems) parts.push(nItems+' item'+(nItems===1?'':'s'));
+  toast('🚫 Hidden '+parts.join(' + '),'info');
+}
+
 function refreshCatBtns(){
   const n=selCats.size, ff=CFG.ffmpeg_ok;
   // Drawer buttons
@@ -10862,11 +11145,16 @@ function refreshCatBtns(){
   if(mkvSub) mkvSub.textContent=sub;
   const cnt=document.getElementById('adr-cat-count');
   if(cnt) cnt.textContent=n+' selected';
-  // FAB badge (mobile) + desktop header badge
+  // Hide selected button (shared with items)
+  _refreshHideBtn();
+  // FAB badge (mobile) + pctrl badge (desktop)
+  const total=n+selSet.size;
   const b=document.getElementById('act-tab-badge');
-  if(b){b.textContent=n>99?'99+':n; b.classList.toggle('vis',n>0);}
-  const pb=document.getElementById('ph-cat-badge');
-  if(pb){pb.textContent=n>99?'99+':n; pb.classList.toggle('vis',n>0);}
+  if(b){b.textContent=total>99?'99+':total; b.classList.toggle('vis',total>0);}
+  // pctrl badge
+  const pcb=document.getElementById('pctrl-act-badge');
+  if(pcb){pcb.textContent=total>99?'99+':total; pcb.style.display=total>0?'':'none';}
+  _updateHiddenCount();
 }
 async function dlSelCats(type){
   const cats=[...selCats.values()];
@@ -10963,12 +11251,14 @@ function _setLoadingHeader(text){
 
 function showItems(label, items){
   document.getElementById('main').classList.add('items-open');
-  allItems=items; filtItems=[...items]; selSet.clear();
+  allItems=items; selSet.clear();
   document.getElementById('ilist').scrollTop=0;
   document.getElementById('isrch').value='';
   document.getElementById('backbtn').disabled=false; // always can go back to categories
 
-  mkBcrum(label); renderItems(filtItems); refreshBtns();
+  mkBcrum(label);
+  _doFilterItems(); // applies hidden filter + search in one place
+  refreshBtns();
   const n=loadFavs(mode).length;
   const b=document.getElementById('badge');
   b.textContent=n>99?'99+':n; b.classList.toggle('vis',n>0);
@@ -11014,7 +11304,7 @@ function renderItems(items){
     const logoSrc = logo && (logo.startsWith('http://') || logo.startsWith('https://'))
       ? '/api/proxy?url='+encodeURIComponent(logo) : logo;
     const hasCatchup = mode==='live' && playable && _channelSupportsCatchup(it);
-    return '<div class="irow'+(playing?' now':'')+'" style="--d:'+(Math.min(i,20)*.016)+'s">'
+    return '<div class="irow'+(playing?' now':'')+'" style="--d:'+(Math.min(i,20)*.016)+'s" data-key="'+esc(name)+'">'
       +'<input class="ichk" type="checkbox" data-i="'+i+'" onchange="onChk('+i+',this.checked)">'
       +(logoSrc?'<img class="ilogo" loading="lazy" src="'+esc(logoSrc)+'" onerror="this.style.display=\'none\'">'+'':'<span style="width:36px;height:24px;flex-shrink:0;display:inline-block"></span>')
       +'<button onclick="toggleFav('+i+')" title="Favourite"'
@@ -11032,6 +11322,18 @@ function renderItems(items){
   el.innerHTML = items.slice(0, _ITEMS_BATCH).map(buildRow).join('');
   refreshBtns();
   _updateEpgGridBtn();
+
+  // Init drag-sort on the container (event-delegated, handles lazy-appended rows too)
+  _initDragSort(el, '.irow', document.getElementById('isrch'), (orderedRows)=>{
+    const catKey=_curCatKey();
+    const newKeys=orderedRows.map(r=>r.dataset.key);
+    const keyFn=it=>it.name||it.o_name||it.fname||'';
+    filtItems=_reorderByDom(filtItems, orderedRows, keyFn);
+    allItems =_reorderByDom(allItems,  orderedRows, keyFn);
+    saveItemOrder(newKeys, mode, catKey);
+    // Re-render so all onclick indices match new filtItems order
+    renderItems(filtItems);
+  });
 
   if(items.length <= _ITEMS_BATCH) return;
 
@@ -11073,6 +11375,8 @@ function openItemMenu(i, btn){
   document.getElementById('imenu-imdb').style.display     = (!isLive&&!grp)?'flex':'none';
   document.getElementById('imenu-rec').style.display      = isLive&&!grp&&!show?'flex':'none';   // live only
   document.getElementById('imenu-mkv').style.display      = !isLive&&!grp&&!show?'flex':'none';   // vod/series playable items only
+  document.getElementById('imenu-sep3').style.display     = 'block';
+  document.getElementById('imenu-hide').style.display     = 'flex';
 
   // Position menu near button
   const menu = document.getElementById('item-menu');
@@ -11207,6 +11511,18 @@ function iMenuMKV(){
   document.querySelectorAll('.ichk').forEach((c,ci)=>{ c.checked = (ci===_iMenuIdx); });
   refreshBtns();
   dlMKV();
+}
+
+function iMenuHide(){
+  closeItemMenu();
+  const it = filtItems[_iMenuIdx];
+  if(!it) return;
+  const name = it.name||it.o_name||it.fname||'';
+  _hideItems([it], mode);
+  _doFilterItems();
+  refreshBtns();
+  _updateHiddenCount();
+  toast('🚫 Hidden: '+name,'info');
 }
 
 function iMenuIMDB(){
@@ -11419,10 +11735,17 @@ function filterItems(){
 }
 function _doFilterItems(){
   const q=document.getElementById('isrch').value.toLowerCase();
+  const _hidden=loadHidden(mode);
   const base=_favsFilterActive
     ? loadFavs(mode).filter(f=>!allItems.length||allItems.some(it=>(it.name||it.o_name||it.fname||'')===(f.name||f.o_name||f.fname||'')))
     : allItems;
-  filtItems=q?base.filter(it=>(it.name||it.o_name||it.fname||'').toLowerCase().includes(q)):[...base];
+  const visible=base.filter(it=>!_hidden.has(it.name||it.o_name||it.fname||''));
+  filtItems=q?visible.filter(it=>(it.name||it.o_name||it.fname||'').toLowerCase().includes(q)):[...visible];
+  // Apply custom order only when not searching
+  if(!q){
+    const order=loadItemOrder(mode, _curCatKey());
+    if(order) filtItems=_applyOrder(filtItems, order, it=>it.name||it.o_name||it.fname||'');
+  }
   renderItems(filtItems);
 }
 
@@ -11438,6 +11761,7 @@ function selAll(v){
 
 function refreshBtns(){
   const n=selSet.size, ff=CFG.ffmpeg_ok;
+  const nc=selCats.size;
   // Drawer buttons
   const m3uBtn=document.getElementById('adr-dlm3u');
   const mkvBtn=document.getElementById('adr-dlmkv');
@@ -11453,13 +11777,165 @@ function refreshBtns(){
   // Show current category name on whole-cat button
   const catSub=document.getElementById('adr-cat-all-sub');
   if(catSub) catSub.textContent=curCat?curCat.title:'';
-  // FAB badge (mobile) + desktop header badge
+  // Unified hide button — enabled if anything selected (cats or items)
+  _refreshHideBtn();
+  // FAB badge (mobile) + pctrl badge (desktop)
+  const total=n+nc;
   const b=document.getElementById('act-tab-badge');
-  if(b){b.textContent=n>99?'99+':n; b.classList.toggle('vis',n>0);}
-
-  const pb=document.getElementById('ph-item-badge');
-  if(pb){pb.textContent=n>99?'99+':n; pb.classList.toggle('vis',n>0);}
+  if(b){b.textContent=total>99?'99+':total; b.classList.toggle('vis',total>0);}
+  const pcb=document.getElementById('pctrl-act-badge');
+  if(pcb){pcb.textContent=total>99?'99+':total; pcb.style.display=total>0?'':'none';}
+  _updateHiddenCount();
 }
+
+function _refreshHideBtn(){
+  const n=selSet.size, nc=selCats.size, total=n+nc;
+  const hideBtn=document.getElementById('adr-hide-sel');
+  if(hideBtn) hideBtn.disabled=total===0;
+  const hideSub=document.getElementById('adr-hide-sub');
+  if(!hideSub) return;
+  const parts=[];
+  if(nc) parts.push(nc+' cat'+(nc===1?'':'s'));
+  if(n)  parts.push(n+' item'+(n===1?'':'s'));
+  hideSub.textContent=parts.join(' + ');
+}
+
+// ── HIDE SELECTED (unified) ────────────────────────────────────────────────────
+
+function _updateHiddenCount(){
+  const iCnt=loadHidden(mode).size;
+  const cCnt=loadHiddenCats(mode).size;
+  const total=iCnt+cCnt;
+  const txt=total?(iCnt?' '+iCnt+' item'+(iCnt===1?'':'s'):'')+(cCnt?' '+cCnt+' cat'+(cCnt===1?'':'s'):''):'' ;
+  const el=document.getElementById('adr-hidden-count');
+  if(el) el.textContent=total?txt.trim()+' hidden':'';
+}
+
+// ── HIDDEN ITEMS MANAGER ──────────────────────────────────────────────────────
+let _hmMode='live';       // which mode tab: 'live' | 'vod' | 'series'
+let _hmSubView='items';   // which sub-toggle: 'items' | 'cats'
+
+function openHiddenManager(){
+  _hmMode = mode; // always default to current mode
+  // Default sub-view: 'cats' when on categories panel, 'items' when browsing items
+  _hmSubView = document.getElementById('main').classList.contains('items-open') ? 'items' : 'cats';
+  _hmRender();
+  document.getElementById('hidden-overlay').style.display='flex';
+}
+function closeHiddenManager(){
+  document.getElementById('hidden-overlay').style.display='none';
+}
+function hmSetMode(m){ _hmMode=m; _hmRender(); }
+function hmSetSubView(v){ _hmSubView=v; _hmRender(); }
+
+function _hmRender(){
+  // ── Mode tab highlights ──────────────────────────────────────────────────
+  ['live','vod','series'].forEach(t=>{
+    const btn=document.getElementById('hm-tab-'+t);
+    if(!btn) return;
+    const on=t===_hmMode;
+    btn.style.fontWeight  = on?'800':'500';
+    btn.style.background  = on?'rgba(255,255,255,.08)':'transparent';
+    btn.style.borderColor = on?'var(--acc)':'';
+    btn.style.color       = on?'var(--txt)':'var(--txt2)';
+  });
+
+  // ── Sub-view toggle highlights ───────────────────────────────────────────
+  ['items','cats'].forEach(v=>{
+    const btn=document.getElementById('hm-sub-'+v);
+    if(!btn) return;
+    const on=v===_hmSubView;
+    btn.style.fontWeight  = on?'700':'400';
+    btn.style.background  = on?'rgba(255,255,255,.08)':'transparent';
+    btn.style.borderColor = on?'var(--acc)':'var(--bdr)';
+    btn.style.color       = on?'var(--txt)':'var(--txt2)';
+  });
+
+  const list=document.getElementById('hm-list');
+  const cntEl=document.getElementById('hm-count');
+  const clearBtn=document.getElementById('hm-clear-btn');
+
+  // ── Categories sub-view ──────────────────────────────────────────────────
+  if(_hmSubView==='cats'){
+    const map=loadHiddenCats(_hmMode);
+    const entries=[...map.entries()].sort((a,b)=>a[1].localeCompare(b[1]));
+    if(cntEl) cntEl.textContent=entries.length
+      ?entries.length+' categor'+(entries.length===1?'y':'ies')+' hidden'
+      :'No hidden categories';
+    if(clearBtn) clearBtn.style.display=entries.length?'':'none';
+    if(!entries.length){
+      list.innerHTML='<div style="text-align:center;padding:28px 16px;color:var(--txt3);font-size:12px">No hidden categories for this mode</div>';
+      list._hmData=[];
+      return;
+    }
+    list._hmData=entries;
+    list.innerHTML=entries.map(([key,title],i)=>
+      `<div style="display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid rgba(255,255,255,.04)">
+        <span style="font-size:13px;flex-shrink:0">📁</span>
+        <span style="flex:1;font-size:12px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(title)}">${esc(title)}</span>
+        <button class="btn-ghost" style="flex-shrink:0;height:26px;padding:0 10px;font-size:11px" onclick="hmUnhideCat(${i})">Unhide</button>
+      </div>`
+    ).join('');
+    return;
+  }
+
+  // ── Items sub-view ───────────────────────────────────────────────────────
+  const s=loadHidden(_hmMode);
+  const names=[...s].sort((a,b)=>a.localeCompare(b));
+  if(cntEl) cntEl.textContent=names.length
+    ?names.length+' item'+(names.length===1?'':'s')+' hidden'
+    :'No hidden items';
+  if(clearBtn) clearBtn.style.display=names.length?'':'none';
+  if(!names.length){
+    list.innerHTML='<div style="text-align:center;padding:28px 16px;color:var(--txt3);font-size:12px">No hidden items for this mode</div>';
+    list._hmData=[];
+    return;
+  }
+  list._hmData=names;
+  list.innerHTML=names.map((n,i)=>
+    `<div style="display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid rgba(255,255,255,.04)">
+      <span style="flex:1;font-size:12px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(n)}">${esc(n)}</span>
+      <button class="btn-ghost" style="flex-shrink:0;height:26px;padding:0 10px;font-size:11px" onclick="hmUnhide(${i})">Unhide</button>
+    </div>`
+  ).join('');
+}
+
+function hmUnhide(i){
+  const list=document.getElementById('hm-list');
+  const names=list._hmData||[];
+  if(!names[i]) return;
+  const name=names[i];
+  _unhideItem(name,_hmMode);
+  _hmRender();
+  _updateHiddenCount();
+  if(_hmMode===mode){ _doFilterItems(); refreshBtns(); }
+  toast('✓ Unhidden: '+name,'ok');
+}
+function hmUnhideCat(i){
+  const list=document.getElementById('hm-list');
+  const entries=list._hmData||[];
+  if(!entries[i]) return;
+  const [key,title]=entries[i];
+  _unhideCatKey(key,_hmMode);
+  _hmRender();
+  _updateHiddenCount();
+  if(_hmMode===mode) filterCats();
+  toast('✓ Unhidden category: '+title,'ok');
+}
+function hmClearAll(){
+  if(_hmSubView==='cats'){
+    saveHiddenCats(new Map(),_hmMode);
+    if(_hmMode===mode) filterCats();
+    toast('✓ All hidden categories cleared','ok');
+  } else {
+    saveHidden(new Set(),_hmMode);
+    if(_hmMode===mode){ _doFilterItems(); refreshBtns(); }
+    toast('✓ All hidden items cleared','ok');
+  }
+  _hmRender();
+  _updateHiddenCount();
+}
+
 
 // ── SERIES DRILL ───────────────────────────────────────────
 function drillGrp(i){
@@ -13658,18 +14134,17 @@ function esc(s){
 // ── ACTION DRAWER ──────────────────────────────────────────
 let drawerCtx = 'cats';
 function openActTab(){
-  // Detect context from active panel
-  const active = document.querySelector('.panel.active');
-  const pid = active ? active.id : 'p-cats';
-  const ctx = pid==='p-items'||pid==='p-player' ? 'items' : 'cats';
-  openDrawer(ctx);
+  openDrawer('both');
 }
 function openDrawer(ctx){
   drawerCtx = ctx||'cats';
-  document.getElementById('adr-cats-content').classList.toggle('hidden', drawerCtx!=='cats');
-  document.getElementById('adr-items-content').classList.toggle('hidden', drawerCtx!=='items');
-  document.getElementById('adr-title').textContent = drawerCtx==='cats'
-    ? '⚡ Category Actions' : '⚡ Item Actions';
+  const showCats = drawerCtx==='cats' || drawerCtx==='both';
+  const showItems = drawerCtx==='items' || drawerCtx==='both';
+  document.getElementById('adr-cats-content').classList.toggle('hidden', !showCats);
+  document.getElementById('adr-items-content').classList.toggle('hidden', !showItems);
+  document.getElementById('adr-title').textContent = drawerCtx==='both'
+    ? '⚡ Actions'
+    : drawerCtx==='cats' ? '⚡ Category Actions' : '⚡ Item Actions';
   document.getElementById('act-overlay').classList.add('open');
   document.getElementById('act-drawer').classList.add('open');
   const tact = document.getElementById('t-act');
@@ -15788,15 +16263,34 @@ function _mvSelOpenItemMenu(i, btn){
       fn:`_mvSelIMDb(${i});_mvCloseCtxMenu()`});
   }
 
-  if(!actions.length){
-    // Fallback so the menu isn't empty
-    actions.push({icon:'ℹ', label:'No actions available', fn:`_mvCloseCtxMenu()`});
-  }
+  // Hide — always available
+  actions.push({icon:'🚫', label:'Hide this item', fn:`_mvCloseCtxMenu();_mvSelHideItem(${i})`});
 
   _mvOpenCtxMenu(btn, actions);
 }
 
 // ── MV submenu action helpers ──────────────────────────────────────────────
+
+function _mvSelHideItem(i){
+  let it;
+  if(_mvSelNavMode==='episodes'){
+    it=(_mvSelEpisodesFiltered.length?_mvSelEpisodesFiltered:_mvSelEpisodes)[i];
+  } else {
+    it=(_mvSelFilteredItems.length?_mvSelFilteredItems:_mvSelItems)[i];
+  }
+  if(!it) return;
+  const name=it.name||it.o_name||it.title||'';
+  _hideItems([it],_mvSelContentMode);
+  // Remove from in-memory list so re-render is instant without a network trip
+  if(_mvSelNavMode==='episodes'){
+    _mvSelEpisodes=_mvSelEpisodes.filter(e=>(e.name||e.title||'')!==name);
+  } else {
+    _mvSelItems=_mvSelItems.filter(e=>(e.name||e.o_name||e.title||'')!==name);
+  }
+  _mvRenderSel();
+  _updateHiddenCount();
+  toast('🚫 Hidden: '+name,'info');
+}
 
 async function _mvSelExternalPlay(i){
   let it;
@@ -15975,7 +16469,9 @@ function _mvRenderSel(){
     const _pRow = document.getElementById('mv-sel-play-url-row');
     if(_pRow) _pRow.style.display = 'none';
 
-    const eps = q ? _mvSelEpisodes.filter(ep=>(ep.name||ep.title||'').toLowerCase().includes(q)) : _mvSelEpisodes;
+    const _mvHiddenEps = loadHidden(_mvSelContentMode);
+    const eps = (q ? _mvSelEpisodes.filter(ep=>(ep.name||ep.title||'').toLowerCase().includes(q)) : _mvSelEpisodes)
+      .filter(ep=>!_mvHiddenEps.has(ep.name||ep.title||''));
     _mvSelEpisodesFiltered = eps;
 
     if(!eps.length){
@@ -16002,7 +16498,9 @@ function _mvRenderSel(){
     backBtn.style.display = '';
     document.getElementById('mv-sel-search').placeholder = 'Search…';
 
-    const filtered = q ? _mvSelItems.filter(it=>(it.name||it.o_name||it.title||'').toLowerCase().includes(q)) : _mvSelItems;
+    const _mvHidden = loadHidden(_mvSelContentMode);
+    const _mvVisible = _mvSelItems.filter(it=>!_mvHidden.has(it.name||it.o_name||it.title||''));
+    const filtered = q ? _mvVisible.filter(it=>(it.name||it.o_name||it.title||'').toLowerCase().includes(q)) : _mvVisible;
     _mvSelFilteredItems = filtered;
 
     if(!filtered.length){
