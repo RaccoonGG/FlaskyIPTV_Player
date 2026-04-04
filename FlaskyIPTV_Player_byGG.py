@@ -9576,62 +9576,40 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <button class="btn-ghost adr-rec-open" onclick="openDrawer();closeDrawer();" style="width:100%;height:34px;font-size:12px;font-weight:600;margin-top:4px" id="adr-rec-open">📂 Open player controls</button>
       </div>
     </div>
-    <div id="adr-cats-content" class="hidden">
+    <!-- UNIFIED ACTIONS — categories + items together -->
+    <div id="adr-unified-content" class="hidden">
       <div class="adr-section">
-        <div class="adr-section-title">Select Categories</div>
-        <div class="adr-sel-row">
-          <button class="btn-ghost" onclick="selAllCats(true)">☑ All</button>
-          <button class="btn-ghost" onclick="selAllCats(false)">☐ None</button>
-        </div>
-        <div class="adr-count" id="adr-cat-count">0 selected</div>
-      </div>
-      <div class="adr-section">
-        <div class="adr-section-title">Download Selected</div>
-        <button class="adr-btn btn-blue" id="adr-cat-m3u" onclick="dlSelCats('m3u')" disabled>
-          <span class="adr-ico">💾</span>
-          <span class="adr-lbl">Export as M3U</span>
-          <span class="adr-sub" id="adr-cat-m3u-sub"></span>
-        </button>
-        <button class="adr-btn btn-acc" id="adr-cat-mkv" onclick="dlSelCats('mkv')" disabled>
-          <span class="adr-ico">🎬</span>
-          <span class="adr-lbl">Download as MKV</span>
-          <span class="adr-sub" id="adr-cat-mkv-sub"></span>
-        </button>
-      </div>
-      <div class="adr-progress" id="adr-progress-cats">
-        <div class="adr-prog-hdr">
-          <div class="adr-prog-title" id="adr-prog-cats-title">Downloading...</div>
-          <div style="display:flex;gap:5px;align-items:center">
-            <button class="adr-prog-stop" id="adr-prog-cats-stop" onclick="doStop()" title="Stop download">⏹</button>
-            <button class="adr-prog-dismiss" id="adr-prog-cats-dismiss" onclick="dismissProgress('cats')" title="Dismiss" style="display:none">✕</button>
+        <div style="display:flex;gap:6px">
+          <!-- Categories column -->
+          <div style="flex:1">
+            <div class="adr-section-title">Categories</div>
+            <div class="adr-sel-row" style="margin-bottom:4px">
+              <button class="btn-ghost" onclick="selAllCats(true)">☑ All</button>
+              <button class="btn-ghost" onclick="selAllCats(false)">☐ None</button>
+            </div>
+            <div class="adr-count" id="adr-cat-count" style="margin-bottom:0">0 selected</div>
+          </div>
+          <!-- Divider -->
+          <div style="width:1px;background:var(--bdr);flex-shrink:0;margin:0 2px"></div>
+          <!-- Items column -->
+          <div style="flex:1">
+            <div class="adr-section-title">Items</div>
+            <div class="adr-sel-row" style="margin-bottom:4px">
+              <button class="btn-ghost" onclick="selAll(true)">☑ All</button>
+              <button class="btn-ghost" onclick="selAll(false)">☐ None</button>
+            </div>
+            <div class="adr-count" id="adr-item-count" style="margin-bottom:0">0 selected</div>
           </div>
         </div>
-        <div class="adr-prog-label" id="adr-prog-cats-label"></div>
-        <div class="adr-prog-bar-wrap"><div class="adr-prog-bar" id="adr-prog-cats-bar"></div></div>
-        <div class="adr-prog-footer">
-          <div class="adr-prog-count" id="adr-prog-cats-count"></div>
-          <div class="adr-prog-speed" id="adr-prog-cats-speed"></div>
-        </div>
-      </div>
-    </div>
-    <!-- ITEMS mode -->
-    <div id="adr-items-content" class="hidden">
-      <div class="adr-section">
-        <div class="adr-section-title">Select Items</div>
-        <div class="adr-sel-row">
-          <button class="btn-ghost" onclick="selAll(true)">☑ All</button>
-          <button class="btn-ghost" onclick="selAll(false)">☐ None</button>
-        </div>
-        <div class="adr-count" id="adr-item-count">0 selected</div>
       </div>
       <div class="adr-section">
-        <div class="adr-section-title">Selected Items</div>
-        <button class="adr-btn btn-blue" id="adr-dlm3u" onclick="dlM3U()" disabled>
+        <div class="adr-section-title">Export Selected</div>
+        <button class="adr-btn btn-blue" id="adr-dlm3u" onclick="dlSelectedAll('m3u')" disabled>
           <span class="adr-ico">💾</span>
           <span class="adr-lbl">Export selected → M3U</span>
           <span class="adr-sub" id="adr-m3u-sub"></span>
         </button>
-        <button class="adr-btn btn-acc" id="adr-dlmkv" onclick="dlMKV()" disabled>
+        <button class="adr-btn btn-acc" id="adr-dlmkv" onclick="dlSelectedAll('mkv')" disabled>
           <span class="adr-ico">🎬</span>
           <span class="adr-lbl">Download selected → MKV</span>
           <span class="adr-sub" id="adr-mkv-sub"></span>
@@ -11132,29 +11110,31 @@ function hideSelectedAll(){
 }
 
 function refreshCatBtns(){
-  const n=selCats.size, ff=CFG.ffmpeg_ok;
-  // Drawer buttons
-  const m3uBtn=document.getElementById('adr-cat-m3u');
-  const mkvBtn=document.getElementById('adr-cat-mkv');
-  if(m3uBtn) m3uBtn.disabled=n===0;
-  if(mkvBtn) mkvBtn.disabled=n===0||!ff;
-  const sub=n?n+' categor'+(n===1?'y':'ies'):'';
-  const m3uSub=document.getElementById('adr-cat-m3u-sub');
-  const mkvSub=document.getElementById('adr-cat-mkv-sub');
-  if(m3uSub) m3uSub.textContent=sub;
-  if(mkvSub) mkvSub.textContent=sub;
+  const n=selCats.size;
   const cnt=document.getElementById('adr-cat-count');
   if(cnt) cnt.textContent=n+' selected';
-  // Hide selected button (shared with items)
+  _refreshExportBtn();
+  // Hide selected button (shared with items)  
   _refreshHideBtn();
   // FAB badge (mobile) + pctrl badge (desktop)
   const total=n+selSet.size;
   const b=document.getElementById('act-tab-badge');
   if(b){b.textContent=total>99?'99+':total; b.classList.toggle('vis',total>0);}
-  // pctrl badge
+  // pctrl badge  
   const pcb=document.getElementById('pctrl-act-badge');
   if(pcb){pcb.textContent=total>99?'99+':total; pcb.style.display=total>0?'':'none';}
   _updateHiddenCount();
+}
+
+// Unified export dispatch — routes to items, categories, or both depending on what's selected
+async function dlSelectedAll(type){
+  const nCats=selCats.size, nItems=selSet.size;
+  if(!nCats && !nItems){toast('Select categories or items first','wrn');return;}
+  if(nCats) await dlSelCats(type);
+  if(nItems){
+    if(type==='m3u') await dlM3U();
+    else await dlMKV();
+  }
 }
 async function dlSelCats(type){
   const cats=[...selCats.values()];
@@ -11165,13 +11145,24 @@ async function dlSelCats(type){
   if(type==='mkv'&&!od){toast('Set output folder in ⚙ settings','wrn');return;}
   setBusy(true);
   let done=0;
+  const _hidden=loadHidden(mode);
   for(const cat of cats){
     setStatus('Downloading cat '+(++done)+'/'+cats.length+': '+cat.title+'…');
+    const catKey=_categoryKey(mode, cat);
+    const cached=(categoryItemsCache[mode]||{})[catKey];
+    let items=null;
+    if(cached && cached.length){
+      // Apply custom order then strip hidden items
+      const order=loadItemOrder(mode, String(cat.id||cat.title));
+      let ordered=cached;
+      if(order) ordered=_applyOrder(cached, order, it=>it.name||it.o_name||it.fname||'');
+      items=ordered.filter(it=>!_hidden.has(it.name||it.o_name||it.fname||''));
+    }
+    // items===null → server fetches from portal (no cache available for this cat)
+    const outPath=type==='m3u'?op:(od.replace(/\/?$/,'/')+mode+'_'+cat.title.replace(/[^a-z0-9]/gi,'_')+'.m3u');
     const r=await fetch('/api/download/m3u',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({items:null,category:cat,mode,
-        out_path:type==='m3u'?op:(od.replace(/\/?$/,'/')+mode+'_'+cat.title.replace(/[^a-z0-9]/gi,'_')+'.m3u')
-      })});
+      body:JSON.stringify({items,category:cat,mode,out_path:outPath,total_hint:items?items.length:0})});
     const d=await r.json();
     if(!d.ok) toast('Error on '+cat.title+': '+(d.error||'?'),'err');
   }
@@ -11760,32 +11751,38 @@ function selAll(v){
 }
 
 function refreshBtns(){
-  const n=selSet.size, ff=CFG.ffmpeg_ok;
-  const nc=selCats.size;
-  // Drawer buttons
-  const m3uBtn=document.getElementById('adr-dlm3u');
-  const mkvBtn=document.getElementById('adr-dlmkv');
-  if(m3uBtn) m3uBtn.disabled=n===0;
-  if(mkvBtn){mkvBtn.disabled=n===0||!ff; if(!ff) mkvBtn.title='ffmpeg not found';}
-  const sub=n?n+' item'+(n===1?'':'s'):'';
-  const m3uSub=document.getElementById('adr-m3u-sub');
-  const mkvSub=document.getElementById('adr-mkv-sub');
-  if(m3uSub) m3uSub.textContent=sub;
-  if(mkvSub) mkvSub.textContent=sub;
+  const n=selSet.size, nc=selCats.size;
   const cnt=document.getElementById('adr-item-count');
   if(cnt) cnt.textContent=n+' selected';
   // Show current category name on whole-cat button
   const catSub=document.getElementById('adr-cat-all-sub');
   if(catSub) catSub.textContent=curCat?curCat.title:'';
-  // Unified hide button — enabled if anything selected (cats or items)
+  _refreshExportBtn();
+  // Unified hide button — enabled if anything selected (cats or items)  
   _refreshHideBtn();
-  // FAB badge (mobile) + pctrl badge (desktop)
+  // FAB badge (mobile) + pctrl badge (desktop)  
   const total=n+nc;
   const b=document.getElementById('act-tab-badge');
   if(b){b.textContent=total>99?'99+':total; b.classList.toggle('vis',total>0);}
   const pcb=document.getElementById('pctrl-act-badge');
   if(pcb){pcb.textContent=total>99?'99+':total; pcb.style.display=total>0?'':'none';}
   _updateHiddenCount();
+}
+
+function _refreshExportBtn(){
+  const n=selSet.size, nc=selCats.size, total=n+nc, ff=CFG.ffmpeg_ok;
+  const m3uBtn=document.getElementById('adr-dlm3u');
+  const mkvBtn=document.getElementById('adr-dlmkv');
+  if(m3uBtn) m3uBtn.disabled=total===0;
+  if(mkvBtn){mkvBtn.disabled=total===0||!ff; if(!ff) mkvBtn.title='ffmpeg not found';}
+  const sub=document.getElementById('adr-m3u-sub');
+  const mkvSub=document.getElementById('adr-mkv-sub');
+  const parts=[];
+  if(nc) parts.push(nc+' cat'+(nc===1?'':'s'));
+  if(n)  parts.push(n+' item'+(n===1?'':'s'));
+  const label=parts.join(' + ');
+  if(sub) sub.textContent=label;
+  if(mkvSub) mkvSub.textContent=label;
 }
 
 function _refreshHideBtn(){
@@ -13527,11 +13524,13 @@ async function dlM3U(){
   const op=document.getElementById('o-m3u').value.trim();
   if(!op){toast('Set M3U output path first','wrn');return;}
   if(!selSet.size){toast('Select items first','wrn');return;}
+  // Send in filtItems order (respects drag-reorder), not insertion order of selSet
+  const ordered=[...filtItems].filter(it=>selSet.has(it));
   setBusy(true);
-  _showProgressNow('items','💾 Saving M3U…', curCat?curCat.title:'', selSet.size);
+  _showProgressNow('items','💾 Saving M3U…', curCat?curCat.title:'', ordered.length);
   const r=await fetch('/api/download/m3u',{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({items:[...selSet],category:curCat,mode,out_path:op,total_hint:selSet.size})});
+    body:JSON.stringify({items:ordered,category:curCat,mode,out_path:op,total_hint:ordered.length})});
   const d=await r.json();
   d.ok?(toast(d.message,'ok'),pollBusy()):(toast(d.error,'err'),setBusy(false),dismissProgress('items'));
 }
@@ -13562,11 +13561,13 @@ async function dlMKV(){
   const od=document.getElementById('o-dir').value.trim();
   if(!od){toast('Set output folder first','wrn');return;}
   if(!selSet.size){toast('Select items first','wrn');return;}
+  // Send in filtItems order (respects drag-reorder)
+  const ordered=[...filtItems].filter(it=>selSet.has(it));
   setBusy(true);
-  _showProgressNow('items','⬇ Downloading MKV…', curCat?curCat.title:'', selSet.size);
+  _showProgressNow('items','⬇ Downloading MKV…', curCat?curCat.title:'', ordered.length);
   const r=await fetch('/api/download/mkv',{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({items:[...selSet],category:curCat,mode,out_dir:od,
+    body:JSON.stringify({items:ordered,category:curCat,mode,out_dir:od,
       use_fallback:true})});
   const d=await r.json();
   d.ok?(toast(d.message,'ok'),pollBusy()):(toast(d.error,'err'),setBusy(false),dismissProgress('items'));
@@ -13576,11 +13577,13 @@ async function dlCat(){
   const op=document.getElementById('o-m3u').value.trim();
   if(!op){toast('Set M3U output path first','wrn');return;}
   if(!curCat){toast('Select a category first','wrn');return;}
+  // Use filtItems: already has hidden items removed and custom order applied
+  const items=filtItems.length?filtItems:null;
   setBusy(true);
-  _showProgressNow('items','💾 Saving M3U…', curCat.title, allItems.length);
+  _showProgressNow('items','💾 Saving M3U…', curCat.title, filtItems.length||allItems.length);
   const r=await fetch('/api/download/m3u',{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({items:null,category:curCat,mode,out_path:op,total_hint:allItems.length})});
+    body:JSON.stringify({items,category:curCat,mode,out_path:op,total_hint:filtItems.length||allItems.length})});
   const d=await r.json();
   d.ok?(toast(d.message,'ok'),pollBusy()):(toast(d.error,'err'),setBusy(false),dismissProgress('items'));
 }
@@ -14137,14 +14140,9 @@ function openActTab(){
   openDrawer('both');
 }
 function openDrawer(ctx){
-  drawerCtx = ctx||'cats';
-  const showCats = drawerCtx==='cats' || drawerCtx==='both';
-  const showItems = drawerCtx==='items' || drawerCtx==='both';
-  document.getElementById('adr-cats-content').classList.toggle('hidden', !showCats);
-  document.getElementById('adr-items-content').classList.toggle('hidden', !showItems);
-  document.getElementById('adr-title').textContent = drawerCtx==='both'
-    ? '⚡ Actions'
-    : drawerCtx==='cats' ? '⚡ Category Actions' : '⚡ Item Actions';
+  drawerCtx = ctx||'both';
+  document.getElementById('adr-unified-content').classList.remove('hidden');
+  document.getElementById('adr-title').textContent = '⚡ Actions';
   document.getElementById('act-overlay').classList.add('open');
   document.getElementById('act-drawer').classList.add('open');
   const tact = document.getElementById('t-act');
