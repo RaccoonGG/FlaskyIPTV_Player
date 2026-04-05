@@ -11109,22 +11109,30 @@ function hideSelectedAll(){
   toast('🚫 Hidden '+parts.join(' + '),'info');
 }
 
-function refreshCatBtns(){
-  const n=selCats.size;
-  const cnt=document.getElementById('adr-cat-count');
-  if(cnt) cnt.textContent=n+' selected';
+function refreshBtns(){
+  const n=selSet.size, nc=selCats.size;
+  // Item count
+  const icnt=document.getElementById('adr-item-count');
+  if(icnt) icnt.textContent=n+' selected';
+  // Cat count
+  const ccnt=document.getElementById('adr-cat-count');
+  if(ccnt) ccnt.textContent=nc+' selected';
+  // Whole-cat sub-label
+  const catSub=document.getElementById('adr-cat-all-sub');
+  if(catSub) catSub.textContent=curCat?curCat.title:'';
   _refreshExportBtn();
-  // Hide selected button (shared with items)  
+  // Hide selected button (shared with items)    
   _refreshHideBtn();
-  // FAB badge (mobile) + pctrl badge (desktop)
-  const total=n+selSet.size;
+  // FAB badge (mobile) + pctrl badge (desktop)  
+  const total=n+nc;
   const b=document.getElementById('act-tab-badge');
   if(b){b.textContent=total>99?'99+':total; b.classList.toggle('vis',total>0);}
-  // pctrl badge  
+  // pctrl badge    
   const pcb=document.getElementById('pctrl-act-badge');
   if(pcb){pcb.textContent=total>99?'99+':total; pcb.style.display=total>0?'':'none';}
   _updateHiddenCount();
 }
+const refreshCatBtns = refreshBtns;
 
 // Unified export dispatch — routes to items, categories, or both depending on what's selected
 async function dlSelectedAll(type){
@@ -11748,25 +11756,6 @@ function onChk(i,v){
 function selAll(v){
   document.querySelectorAll('.ichk').forEach(c=>c.checked=v);
   selSet.clear(); if(v) filtItems.forEach(it=>selSet.add(it)); refreshBtns();
-}
-
-function refreshBtns(){
-  const n=selSet.size, nc=selCats.size;
-  const cnt=document.getElementById('adr-item-count');
-  if(cnt) cnt.textContent=n+' selected';
-  // Show current category name on whole-cat button
-  const catSub=document.getElementById('adr-cat-all-sub');
-  if(catSub) catSub.textContent=curCat?curCat.title:'';
-  _refreshExportBtn();
-  // Unified hide button — enabled if anything selected (cats or items)  
-  _refreshHideBtn();
-  // FAB badge (mobile) + pctrl badge (desktop)  
-  const total=n+nc;
-  const b=document.getElementById('act-tab-badge');
-  if(b){b.textContent=total>99?'99+':total; b.classList.toggle('vis',total>0);}
-  const pcb=document.getElementById('pctrl-act-badge');
-  if(pcb){pcb.textContent=total>99?'99+':total; pcb.style.display=total>0?'':'none';}
-  _updateHiddenCount();
 }
 
 function _refreshExportBtn(){
