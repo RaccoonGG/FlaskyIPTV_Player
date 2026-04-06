@@ -7295,6 +7295,7 @@ def api_hls_proxy():
         "-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "10",
+        "-thread_queue_size", "512",
         "-fflags", "+genpts+igndts+discardcorrupt",
         "-i", url,
     ]
@@ -8189,14 +8190,15 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .adr-section-title{font-size:10px;font-weight:800;text-transform:uppercase;
   letter-spacing:1.2px;color:var(--txt3);margin-bottom:8px;padding-bottom:5px;
   border-bottom:1px solid var(--bdr)}
-.adr-btn{width:100%;height:46px;font-size:13px;font-weight:600;
-  display:flex;align-items:center;gap:10px;padding:0 16px;
-  margin-bottom:7px;border-radius:var(--rsm);text-align:left;justify-content:flex-start}
-.adr-btn span.adr-ico{font-size:18px;flex-shrink:0;width:26px;text-align:center}
-.adr-btn span.adr-lbl{flex:1}
-.adr-btn span.adr-sub{font-size:11px;color:rgba(255,255,255,.5);font-weight:400}
-.adr-sel-row{display:flex;gap:7px;margin-bottom:10px}
-.adr-sel-row button{flex:1;height:38px;font-size:12px}
+.adr-btn{width:100%;min-height:46px;font-size:13px;font-weight:600;
+  display:flex;align-items:center;gap:10px;padding:8px 16px;
+  margin-bottom:7px;border-radius:var(--rsm);text-align:left;justify-content:flex-start;
+  box-sizing:border-box}
+.adr-btn span.adr-ico{font-size:18px;flex-shrink:0;width:26px;text-align:center;align-self:flex-start;padding-top:1px}
+.adr-btn span.adr-lbl{flex:1;min-width:0;white-space:normal;word-break:break-word;line-height:1.3}
+.adr-btn span.adr-sub{font-size:11px;color:rgba(255,255,255,.5);font-weight:400;flex-shrink:0;white-space:nowrap;align-self:flex-start;padding-top:2px}
+.adr-sel-row{display:flex;gap:4px;margin-bottom:10px}
+.adr-sel-row button{flex:1;height:30px;font-size:11px;padding:0 4px}
 .adr-count{font-size:12px;color:var(--acc);font-weight:700;
   text-align:center;padding:6px 0 2px}
 /* Progress panel inside action drawer */
