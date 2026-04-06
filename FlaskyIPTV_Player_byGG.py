@@ -9617,14 +9617,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <span class="adr-sub" id="adr-mkv-sub"></span>
         </button>
       </div>
-      <div class="adr-section">
-        <div class="adr-section-title">Whole Category</div>
-        <button class="adr-btn btn-ghost" onclick="dlCat()">
-          <span class="adr-ico">📂</span>
-          <span class="adr-lbl">Export entire category → M3U</span>
-          <span class="adr-sub" id="adr-cat-all-sub"></span>
-        </button>
-      </div>
+
       <div class="adr-section">
         <div class="adr-section-title">Visibility</div>
         <button class="adr-btn btn-ghost" id="adr-hide-sel" onclick="hideSelectedAll()" disabled>
@@ -11119,9 +11112,6 @@ function refreshBtns(){
   // Cat count
   const ccnt=document.getElementById('adr-cat-count');
   if(ccnt) ccnt.textContent=nc+' selected';
-  // Whole-cat sub-label
-  const catSub=document.getElementById('adr-cat-all-sub');
-  if(catSub) catSub.textContent=curCat?curCat.title:'';
   _refreshExportBtn();
   // Hide selected button (shared with items)    
   _refreshHideBtn();
@@ -13564,20 +13554,6 @@ async function dlMKV(){
   d.ok?(toast(d.message,'ok'),pollBusy()):(toast(d.error,'err'),setBusy(false),dismissProgress('items'));
 }
 
-async function dlCat(){
-  const op=document.getElementById('o-m3u').value.trim();
-  if(!op){toast('Set M3U output path first','wrn');return;}
-  if(!curCat){toast('Select a category first','wrn');return;}
-  // Use filtItems: already has hidden items removed and custom order applied
-  const items=filtItems.length?filtItems:null;
-  setBusy(true);
-  _showProgressNow('items','💾 Saving M3U…', curCat.title, filtItems.length||allItems.length);
-  const r=await fetch('/api/download/m3u',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({items,category:curCat,mode,out_path:op,total_hint:filtItems.length||allItems.length})});
-  const d=await r.json();
-  d.ok?(toast(d.message,'ok'),pollBusy()):(toast(d.error,'err'),setBusy(false),dismissProgress('items'));
-}
 
 // ── STOP ───────────────────────────────────────────────────
 async function doStop(){
