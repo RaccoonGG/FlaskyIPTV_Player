@@ -1733,7 +1733,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
 
 
     async def _build_xmltv_index(xmltv_url: str, log_cb=None,
-                                 win_back_h: int = 4, win_fwd_h: int = 20) -> dict:
+                                 win_back_h: int = 2, win_fwd_h: int = 14) -> dict:
         """Download XMLTV and build a time-windowed channel→programmes index.
 
         Memory optimisations vs the naive approach:
