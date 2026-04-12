@@ -85,8 +85,8 @@ from flask import request, jsonify, Response
 
 from portal_clients import (
     PortalClient, StalkerPortalClient, XtreamClient,
-    normalize_base_url, safe_json,
-)
+    normalize_base_url, safe_json, normalize_js,
+ )
 
 
 # ===================== REGISTRATION =====================
