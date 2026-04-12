@@ -86,7 +86,7 @@ from flask import request, jsonify, Response
 from portal_clients import (
     PortalClient, StalkerPortalClient, XtreamClient,
     normalize_base_url, safe_json, normalize_js,
- )
+)
 
 
 # ===================== REGISTRATION =====================
@@ -492,7 +492,12 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
         if ek and ek not in state._xmltv_cache and ek not in state._xmltv_no_data:
             if ek not in state._xmltv_downloading:
                 state._xmltv_downloading.add(ek)
-                state.log(f"[WHATS_ON] Launching background EPG download from {ek}")
+                _ek_urls = [u.strip() for u in ek.splitlines() if u.strip()]
+                if len(_ek_urls) > 1:
+                    for _i, _u in enumerate(_ek_urls, 1):
+                        state.log(f"[WHATS_ON] Launching background EPG download [{_i}/{len(_ek_urls)}]: {_u}")
+                else:
+                    state.log(f"[WHATS_ON] Launching background EPG download from {ek}")
 
                 def _bg():
                     try:
@@ -1757,6 +1762,28 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
           chan_names  = {channel_id_lower: [(display_name_lower, lang_lower), ...]}
         """
         _log = log_cb or (lambda x: None)
+
+        # Multi-URL support: if xmltv_url contains newlines, split and fetch concurrently.
+        # Maximum 4 URLs accepted; extras are silently ignored.
+        # Each URL is fetched in parallel; results are merged into one index.
+        # Single-URL path is unchanged.
+        _urls = [u.strip() for u in xmltv_url.splitlines() if u.strip()][:4]
+        if len(_urls) > 1:
+            merged_epg: dict = {}
+            merged_names: dict = {}
+            async def _fetch_one(_url):
+                try:
+                    _log(f"[EPG] Multi-URL: fetching {_url}")
+                    return await _build_xmltv_index(_url, log_cb, win_back_h, win_fwd_h)
+                except Exception as _e:
+                    _log(f"[EPG] Multi-URL: failed for {_url}: {_e}")
+                    return {}, {}
+            _results = await asyncio.gather(*[_fetch_one(u) for u in _urls])
+            for _ed, _cn in _results:
+                for _ch, _progs in _ed.items():
+                    merged_epg.setdefault(_ch, []).extend(_progs)
+                merged_names.update(_cn)
+            return merged_epg, merged_names
 
         def _ts(s: str) -> float:
             s = s.strip()
