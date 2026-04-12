@@ -2091,7 +2091,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <label>MAC</label><span style="position:relative;display:inline-flex;align-items:center;max-width:200px;width:200px"><input id="i-mac" type="password" placeholder="00:1A:79:XX:XX:XX" style="width:100%;padding-right:28px" autocomplete="new-password" autocorrect="off" spellcheck="false"><button type="button" onclick="(function(b){var i=document.getElementById('i-mac');var shown=i.getAttribute('data-shown')==='1';if(shown){i.setAttribute('type','password');i.setAttribute('data-shown','0');b.textContent='👁';}else{i.setAttribute('type','text');i.setAttribute('data-shown','1');b.textContent='🙈';};})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button></span>
         </div>
         <div style="display:flex;gap:6px;align-items:center">
-          <label title="Optional: external XMLTV EPG URL. Leave blank to use portal's own EPG.">EPG</label><input id="i-mac-epg" type="text" inputmode="url" placeholder="https://… xmltv URL (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false">
+          <label title="Optional: external XMLTV EPG URL(s). One URL per line. Leave blank to use portal's own EPG.">EPG</label><textarea id="i-mac-epg" rows="2" placeholder="https://… xmltv URL (optional, one per line)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;width:100%"></textarea>
         </div>
       </div>
       <div id="cr-xtream" class="cr hidden" style="flex-direction:column;align-items:stretch">
@@ -2100,7 +2100,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <label>User</label><input id="i-us" placeholder="username" style="max-width:150px" autocomplete="new-password" autocorrect="off" spellcheck="false">
         </div>
         <div style="display:flex;gap:6px;align-items:center">
-          <label title="Optional: external XMLTV EPG URL (e.g. epg.best). Leave blank to use provider's own EPG.">EPG</label><input id="i-epg" type="text" inputmode="url" placeholder="https://epg.best/xmltv.php?… (optional)" style="flex:1" autocomplete="new-password" autocorrect="off" spellcheck="false">
+          <label title="Optional: external XMLTV EPG URL(s). One URL per line. Leave blank to use provider's own EPG.">EPG</label><textarea id="i-epg" rows="2" placeholder="https://epg.best/xmltv.php?… (optional, one per line)" style="flex:1;resize:vertical" autocomplete="new-password" autocorrect="off" spellcheck="false"></textarea>
           <label>Pass</label><span style="position:relative;display:inline-flex;align-items:center;max-width:150px;width:150px"><input id="i-pw" type="password" placeholder="password" style="width:100%;padding-right:28px" autocomplete="new-password"><button type="button" onclick="(function(b){var i=document.getElementById('i-pw');i.type=i.type==='password'?'text':'password';b.textContent=i.type==='password'?'👁':'🙈'})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button></span>
         </div>
       </div>
@@ -2113,7 +2113,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <!-- EPG row -->
         <div style="display:flex;gap:6px;align-items:center">
           <label title="Optional: external XMLTV EPG URL. Leave blank to use tvg-url from M3U.">EPG</label>
-          <input id="i-m3u-epg" type="text" inputmode="url" placeholder="https://epg.best/xmltv.php?… (optional)" style="max-width:300px" autocomplete="new-password" autocorrect="off" spellcheck="false">
+          <textarea id="i-m3u-epg" rows="2" placeholder="https://epg.best/xmltv.php?… (optional, one per line)" style="max-width:300px;resize:vertical" autocomplete="new-password" autocorrect="off" spellcheck="false"></textarea>
         </div>
         <!-- File row — always visible -->
         <div style="display:flex;gap:6px;align-items:center">
@@ -2513,17 +2513,17 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <div id="plf-mac">
           <div class="pl-row"><label>URL</label><input id="pl-url" type="text" inputmode="url" placeholder="http://portal.host:8080" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
           <div class="pl-row"><label>MAC</label><span style="position:relative;display:inline-flex;align-items:center;flex:1"><input id="pl-mac" type="password" placeholder="00:1A:79:XX:XX:XX" autocomplete="new-password" autocorrect="off" spellcheck="false" style="flex:1;padding-right:28px"><button type="button" onclick="(function(b){var i=document.getElementById('pl-mac');var shown=i.getAttribute('data-shown')==='1';if(shown){i.setAttribute('type','password');i.setAttribute('data-shown','0');b.textContent='👁';}else{i.setAttribute('type','text');i.setAttribute('data-shown','1');b.textContent='🙈';};})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button></span></div>
-          <div class="pl-row"><label>EPG</label><input id="pl-mac-epg" type="text" inputmode="url" placeholder="External EPG URL (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
+          <div class="pl-row"><label>EPG</label><textarea id="pl-mac-epg" rows="2" placeholder="External EPG URL(s), one per line (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;width:100%"></textarea></div>
         </div>
         <div id="plf-xtream" class="hidden">
           <div class="pl-row"><label>URL</label><input id="pl-xu" type="text" inputmode="url" placeholder="http://server.host:8080" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
           <div class="pl-row"><label>User</label><input id="pl-us" placeholder="username" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
           <div class="pl-row"><label>Pass</label><span style="position:relative;display:inline-flex;align-items:center;flex:1"><input id="pl-pw" type="password" placeholder="password" autocomplete="new-password" style="flex:1;padding-right:28px"><button type="button" onclick="(function(b){var i=document.getElementById('pl-pw');i.type=i.type==='password'?'text':'password';b.textContent=i.type==='password'?'👁':'🙈'})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button></span></div>
-          <div class="pl-row"><label>EPG</label><input id="pl-epg" type="text" inputmode="url" placeholder="External EPG URL (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
+          <div class="pl-row"><label>EPG</label><textarea id="pl-epg" rows="2" placeholder="External EPG URL(s), one per line (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;width:100%"></textarea></div>
         </div>
         <div id="plf-m3u" class="hidden">
           <div class="pl-row"><label>URL</label><input id="pl-m3u" type="text" inputmode="url" placeholder="http://example.com/list.m3u" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
-          <div class="pl-row"><label>EPG</label><input id="pl-m3u-epg" type="text" inputmode="url" placeholder="External EPG URL (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
+          <div class="pl-row"><label>EPG</label><textarea id="pl-m3u-epg" rows="2" placeholder="External EPG URL(s), one per line (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;width:100%"></textarea></div>
         </div>
         <div class="pl-row" style="justify-content:flex-end;gap:7px">
           <button class="btn-ghost" onclick="plClearForm()" style="height:34px;padding:0 12px;font-size:12px">Clear</button>
