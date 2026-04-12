@@ -40,9 +40,7 @@ It is a local player interface — a front-end that connects to IPTV portals and
 - `ffmpeg` and `ffprobe` in PATH (required for recording, downloading, HEVC proxy, casting, DVR, and Multi-View)
 - `yt-dlp` in PATH (optional — used as HLS fallback and for YouTube/Twitch URL resolution in Multi-View tiles)
 - Python packages: `flask`, `aiohttp`, `requests`, `yt-dlp`
-- `cast_addon.py` in the same directory (optional — enables casting to TV/speakers)
-- `multiview_addon.py` in the same directory (optional — enables Multi-View grid player)
-- `dvr_addon.py` in the same directory (optional — enables DVR scheduled recording tab)
+- All files listed as **required** in the Files table below must be placed in the same directory as the main script
 
 ---
 
@@ -51,11 +49,16 @@ It is a local player interface — a front-end that connects to IPTV portals and
 | File | Required | Purpose |
 |---|---|---|
 | `FlaskyIPTV_Player_byGG.py` | ✓ | Main app |
+| `portal_clients.py` | ✓ | Portal client classes — MAC/Stalker, Xtream, M3U |
+| `proxy_addon.py` | ✓ | Image proxy, HLS proxy, video proxy, ffmpeg stream transcode |
+| `download_addon.py` | ✓ | MKV/M3U download, quick record, ffmpeg/yt-dlp helpers |
+| `epg_addon.py` | ✓ | EPG, Catch-up TV, What's On Now, XMLTV support |
+| `subtitles_addon.py` | ✓ | Subtitle UI, OpenSubtitles search/download, local subtitle file loading |
 | `install_requirements_FlaskyIPTV_Player.py` | — | Run once to install dependencies |
 | `cast_addon.py` | optional | Casting to Chromecast / DLNA / AirPlay |
 | `multiview_addon.py` | optional | Multi-View grid player |
-| `multiview_layouts.json` | auto-created | Saved Multi-View layouts (created on first save) |
 | `dvr_addon.py` | optional | DVR — scheduled and manual recordings |
+| `multiview_layouts.json` | auto-created | Saved Multi-View layouts (created on first save) |
 | `dvr_jobs.json` | auto-created | Saved DVR job list (created on first scheduled recording) |
 
 ---
@@ -74,6 +77,7 @@ The installer will:
 - Install all required pip packages (`flask`, `aiohttp`, `requests`)
 - Install `yt-dlp` as an optional package
 - Check if `ffmpeg` and `ffprobe` are available in PATH
+- **Verify required addon files** (`portal_clients.py`, `proxy_addon.py`, `download_addon.py`, `epg_addon.py`, `subtitles_addon.py`) are present
 - **Detect `cast_addon.py`** and interactively offer to install each cast protocol package
 - **Detect `multiview_addon.py`** and verify its dependencies (ffmpeg + yt-dlp)
 - **Detect `dvr_addon.py`** and verify its dependencies (ffmpeg required)
@@ -250,7 +254,7 @@ pip install async-upnp-client     # DLNA / UPnP
 pip install pyatv                 # AirPlay
 ```
 
-### EPG (TV Guide)
+### EPG (TV Guide) (`epg_addon.py`)
 - Shows current and upcoming programme info per channel
 - Supports portal-native EPG (Stalker and Xtream)
 - Supports external XMLTV EPG URLs as a fallback or override
@@ -261,12 +265,12 @@ pip install pyatv                 # AirPlay
 - Xtream Codes catch-up (where supported by the portal)
 - Browse archived listings by date and time
 
-### Downloading
+### Downloading (`download_addon.py`)
 - **Save M3U** — export selected categories or all channels as a .m3u playlist file
 - **Record MKV** — record a live stream to MKV using ffmpeg with real-time progress (KB/s speed, file size)
 - **Download MKV** — download VOD/series items to MKV
 
-### Subtitles
+### Subtitles (`subtitles_addon.py`)
 - Search and download subtitles from OpenSubtitles.com (free API key required from opensubtitles.com/en/consumers)
 - Load local subtitle files directly from device storage (.srt / .vtt / .ass / .ssa)
 - Subtitle delay adjustment (+ / −) works for both OpenSubtitles and local files
@@ -341,8 +345,9 @@ All settings are saved in browser localStorage and persist across sessions.
 
 ## Architecture Notes
 
-- Single-file app — everything (Python backend + full HTML/CSS/JS frontend) is in one `.py` file
-- `cast_addon.py`, `multiview_addon.py`, and `dvr_addon.py` are fully self-contained drop-in modules; the main app degrades gracefully if any of them are absent
+- The app is split across multiple files — the main `.py` entry point plus required and optional addon modules, all in the same directory
+- `cast_addon.py`, `multiview_addon.py`, `dvr_addon.py`, and `subtitles_addon.py` are fully self-contained drop-in modules; the main app degrades gracefully if any of them are absent
+- `portal_clients.py`, `proxy_addon.py`, `download_addon.py`, `epg_addon.py`, and `subtitles_addon.py` are required — the app will not function correctly without them
 - The HTML is a Jinja2 template rendered by Flask's `render_template_string`
 - HLS playback uses **HLS.js** loaded from CDN
 - Multi-View playback uses **mpegts.js** loaded from CDN — each tile decodes an MPEG-TS stream via MSE
