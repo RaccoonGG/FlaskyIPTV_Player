@@ -3384,6 +3384,26 @@ function hmClearAll(){
   _hmRender(); _updateHiddenCount();
 }
 
+// ── Tag groups ────────────────────────────────────────────────────────────────
+// When a country tag is selected, also show categories tagged with regional blocs
+// that the country belongs to. Keys are every alias for that country — value is a
+// Set of all tags whose categories should appear when that key is active.
+const _EXYU_EXTRA  = new Set(['EXYU','EX-YU','EXUSSR','BALK','BALKAN']);
+const _TAG_GROUPS  = (function(){
+  const g = {};
+  // Ex-Yugoslavia countries: RS SR SRB / HR CRO / BA BOS / SI SLO / ME MNE / MK MKD
+  for(const t of ['RS','SR','SRB']) g[t] = new Set([...['RS','SR','SRB'], ..._EXYU_EXTRA]);
+  for(const t of ['HR','CRO'])      g[t] = new Set([...['HR','CRO'],      ..._EXYU_EXTRA]);
+  for(const t of ['BA','BOS'])      g[t] = new Set([...['BA','BOS'],      ..._EXYU_EXTRA]);
+  for(const t of ['SI','SLO'])      g[t] = new Set([...['SI','SLO'],      ..._EXYU_EXTRA]);
+  for(const t of ['ME','MNE'])      g[t] = new Set([...['ME','MNE'],      ..._EXYU_EXTRA]);
+  for(const t of ['MK','MKD'])      g[t] = new Set([...['MK','MKD'],      ..._EXYU_EXTRA]);
+  // UK aliases all match each other
+  for(const t of ['GB','UK','GBR','ENG','SCO','WAL','IRL'])
+    g[t] = new Set(['GB','UK','GBR','ENG','SCO','WAL','IRL']);
+  return g;
+})();
+
 function filterCats(){
   const q=document.getElementById('csrch').value.toLowerCase();
   const tag=_activeTag;
@@ -3392,7 +3412,11 @@ function filterCats(){
   // Pull out the All Channels entry — it will always be pinned first
   const allEntry = cats.find(c=>c.id==='__all__');
   let rest = cats.filter(c=>c.id!=='__all__');
-  if(tag) rest=rest.filter(c=>_catTag(c.title)===tag);
+  if(tag){
+    // Expand tag to its group — e.g. RS/SR/SRB also shows EXYU/BALK categories
+    const matchTags = _TAG_GROUPS[tag] || new Set([tag]);
+    rest=rest.filter(c=>matchTags.has(_catTag(c.title)));
+  }
   if(q)   rest=rest.filter(c=>c.title.toLowerCase().includes(q));
   // Apply custom order only when not actively searching/tag-filtering
   if(!q&&!tag){
@@ -3438,11 +3462,11 @@ const _KNOWN_TAG_PREFIXES = new Set([
   'YE',
   'ZM','ZW',
   // ── Regional blocs & groupings ───────────────────────────────────────────
-  'EU','XK',                                   // Kosovo, European Union
+  'EU',                                        // European Union
   'EXYU','EXUSSR',                             // Former Yugoslavia / Soviet bloc
   'ASIA',                                      // Asia regional
   'AFR',                                       // Africa regional
-  'ARAB','MENA',                               // Arab world / Middle East & North Africa
+  'ARB','ARAB','MENA',                         // Arab world / Middle East & North Africa
   'LATAM','LAT',                               // Latin America
   'SCAN','SCA',                                // Scandinavia
   'BALK',                                      // Balkans regional
@@ -3454,7 +3478,7 @@ const _KNOWN_TAG_PREFIXES = new Set([
   'NED','BEL','SUI','AUS','MEX','BRA','ARG','POL','CZE','SVK',
   'HUN','SWE','NOR','DEN','FIN','GRE','PER','COL','CHI','URU',
   'IND','PAK','BAN','SRI','NEP','AFG','KAZ','UZB','AZE','GEO',
-  'ARM','ALB','KOS','BOS','MNE','SRB','MKD','CRO','SLO','BUL',
+  'ARM','ALB','BOS','MNE','SRB','MKD','CRO','SLO','BUL',
   'ROM','MOL','UKR','BLR','BAL','SCO','IRL','WAL','ENG',
   'JAP','KOR','CHN','VIE','THA','MYS','IDN','PHI','HKG','TWN','MAC',
   'THAI','VIET','INDO','SING','MALAY','PAKI','IRAN','IRAQ',
@@ -3479,9 +3503,10 @@ function _catTag(title){
     .replace(/^EX[-_\s]?YU\b/i, 'EXYU')
     .replace(/^EX[-_\s]?USSR\b/i, 'EXUSSR');
 
-  // With hard separator (|  -  :) — e.g. "US | News", "SPORTS - HD", "EXYU: Movies"
-  // This is reliable because the portal explicitly structured the name this way.
-  let m = normalised.match(/^([A-Z0-9]{2,12})\s*[\|\:]\s*\S/i);
+  // Pipe/colon separator — catches all variants:
+  // |US| FREE TO AIR, US| Sports, US | News, US: Movies
+  // Optional leading | handles the |TAG| style; \s* allows zero or more spaces before separator.
+  let m = normalised.match(/^[|]?([A-Z0-9/]{2,12})\s*[|:]\s*\S/i);
   if(m) return m[1].toUpperCase();
 
   // Without separator — ONLY recognise the prefix if it is a known country/region tag.
@@ -3507,10 +3532,11 @@ const _LOCALE_TAG_CANDIDATES = (function(){
 
   // Step 2: derive from IANA timezone  ("Europe/Belgrade" → "RS")
   const TZ_MAP = {
+    // ── Europe ───────────────────────────────────────────────────────────────
     'europe/belgrade':'RS','europe/sarajevo':'BA','europe/zagreb':'HR',
     'europe/ljubljana':'SI','europe/skopje':'MK','europe/podgorica':'ME',
-    'europe/tirane':'AL','europe/pristina':'XK',
-    'europe/london':'GB','europe/dublin':'IE',
+    'europe/tirane':'AL',
+    'europe/london':'GB','europe/dublin':'IE','europe/isle_of_man':'GB','europe/jersey':'GB','europe/guernsey':'GB',
     'europe/paris':'FR','europe/berlin':'DE','europe/rome':'IT',
     'europe/madrid':'ES','europe/lisbon':'PT',
     'europe/amsterdam':'NL','europe/brussels':'BE',
@@ -3520,41 +3546,114 @@ const _LOCALE_TAG_CANDIDATES = (function(){
     'europe/vienna':'AT','europe/zurich':'CH',
     'europe/stockholm':'SE','europe/oslo':'NO','europe/copenhagen':'DK',
     'europe/helsinki':'FI','atlantic/reykjavik':'IS',
-    'europe/moscow':'RU','europe/kiev':'UA','europe/minsk':'BY',
+    'europe/moscow':'RU','europe/kyiv':'UA','europe/kiev':'UA','europe/minsk':'BY',
+    'europe/chisinau':'MD','europe/tiraspol':'MD',
     'europe/riga':'LV','europe/tallinn':'EE','europe/vilnius':'LT',
-    'europe/istanbul':'TR',
-    'asia/dubai':'AE','asia/riyadh':'SA','asia/kuwait':'KW',
-    'asia/qatar':'QA','asia/bahrain':'BH','asia/muscat':'OM',
+    'europe/istanbul':'TR','europe/ankara':'TR',
+    'europe/kaliningrad':'RU','europe/samara':'RU','europe/volgograd':'RU',
+    'europe/saratov':'RU','europe/ulyanovsk':'RU','europe/astrakhan':'RU',
+    'europe/luxembourg':'LU','europe/monaco':'MC','europe/andorra':'AD',
+    'europe/valletta':'MT','europe/san_marino':'IT','europe/vatican':'IT',
+    'europe/tallinn':'EE','europe/mariehamn':'FI',
+    'atlantic/azores':'PT','atlantic/madeira':'PT','atlantic/canary':'ES',
+    'atlantic/faroe':'DK',
+    // ── Asia ─────────────────────────────────────────────────────────────────
+    'asia/dubai':'AE','asia/abu_dhabi':'AE',
+    'asia/riyadh':'SA','asia/jeddah':'SA',
+    'asia/kuwait':'KW','asia/qatar':'QA','asia/bahrain':'BH','asia/muscat':'OM',
     'asia/baghdad':'IQ','asia/tehran':'IR',
-    'asia/jerusalem':'IL','asia/beirut':'LB','asia/damascus':'SY',
+    'asia/jerusalem':'IL','asia/tel_aviv':'IL',
+    'asia/beirut':'LB','asia/damascus':'SY',
     'asia/amman':'JO','asia/nicosia':'CY',
-    'asia/karachi':'PK','asia/kolkata':'IN','asia/dhaka':'BD',
-    'asia/colombo':'LK','asia/kathmandu':'NP',
-    'asia/kabul':'AF','asia/tashkent':'UZ','asia/almaty':'KZ',
+    'asia/karachi':'PK','asia/lahore':'PK',
+    'asia/kolkata':'IN','asia/calcutta':'IN','asia/mumbai':'IN',
+    'asia/dhaka':'BD','asia/colombo':'LK','asia/kathmandu':'NP',
+    'asia/kabul':'AF',
+    'asia/tashkent':'UZ','asia/samarkand':'UZ',
+    'asia/almaty':'KZ','asia/qyzylorda':'KZ','asia/aqtau':'KZ','asia/aqtobe':'KZ','asia/oral':'KZ',
+    'asia/ashgabat':'TM','asia/dushanbe':'TJ','asia/bishkek':'KG',
     'asia/tbilisi':'GE','asia/yerevan':'AM','asia/baku':'AZ',
-    'asia/tokyo':'JP','asia/seoul':'KR','asia/shanghai':'CN',
+    'asia/tokyo':'JP','asia/seoul':'KR','asia/pyongyang':'KP',
+    'asia/shanghai':'CN','asia/chongqing':'CN','asia/harbin':'CN','asia/urumqi':'CN',
     'asia/hong_kong':'HK','asia/taipei':'TW','asia/singapore':'SG',
-    'asia/kuala_lumpur':'MY','asia/jakarta':'ID','asia/manila':'PH',
-    'asia/bangkok':'TH','asia/ho_chi_minh':'VN','asia/yangon':'MM',
-    'pacific/auckland':'NZ','australia/sydney':'AU','australia/melbourne':'AU',
+    'asia/kuala_lumpur':'MY','asia/kuching':'MY',
+    'asia/jakarta':'ID','asia/makassar':'ID','asia/jayapura':'ID',
+    'asia/manila':'PH','asia/bangkok':'TH','asia/vientiane':'LA',
+    'asia/ho_chi_minh':'VN','asia/hanoi':'VN',
+    'asia/yangon':'MM','asia/phnom_penh':'KH','asia/ulaanbaatar':'MN',
+    'asia/brunei':'BN','asia/dili':'TL',
+    'indian/maldives':'MV','indian/mauritius':'MU',
+    // ── Pacific / Oceania ─────────────────────────────────────────────────────
+    'pacific/auckland':'NZ','pacific/chatham':'NZ',
+    'australia/sydney':'AU','australia/melbourne':'AU','australia/brisbane':'AU',
+    'australia/adelaide':'AU','australia/darwin':'AU','australia/perth':'AU',
+    'australia/hobart':'AU','australia/lord_howe':'AU',
+    'pacific/honolulu':'US','pacific/johnston':'US',
+    'pacific/guam':'US','pacific/saipan':'US',
+    'pacific/port_moresby':'PG','pacific/fiji':'FJ',
+    // ── Americas ─────────────────────────────────────────────────────────────
     'america/new_york':'US','america/los_angeles':'US','america/chicago':'US',
     'america/denver':'US','america/phoenix':'US','america/anchorage':'US',
+    'america/adak':'US','america/juneau':'US','america/sitka':'US','america/nome':'US',
+    'america/boise':'US','america/detroit':'US','america/kentucky/louisville':'US',
+    'america/kentucky/monticello':'US','america/indiana/indianapolis':'US',
+    'america/indiana/vincennes':'US','america/indiana/winamac':'US',
+    'america/indiana/marengo':'US','america/indiana/tell_city':'US',
+    'america/indiana/vevay':'US','america/north_dakota/center':'US',
+    'america/north_dakota/new_salem':'US','america/north_dakota/beulah':'US',
+    'america/puerto_rico':'US','america/virgin':'US',
     'america/toronto':'CA','america/vancouver':'CA','america/montreal':'CA',
-    'america/mexico_city':'MX','america/bogota':'CO','america/lima':'PE',
-    'america/santiago':'CL','america/buenos_aires':'AR','america/sao_paulo':'BR',
+    'america/winnipeg':'CA','america/edmonton':'CA','america/halifax':'CA',
+    'america/st_johns':'CA','america/regina':'CA','america/whitehorse':'CA',
+    'america/yellowknife':'CA','america/dawson':'CA','america/iqaluit':'CA',
+    'america/mexico_city':'MX','america/tijuana':'MX','america/monterrey':'MX',
+    'america/merida':'MX','america/chihuahua':'MX','america/hermosillo':'MX',
+    'america/mazatlan':'MX','america/cancun':'MX','america/ojinaga':'MX',
+    'america/bogota':'CO','america/lima':'PE',
+    'america/santiago':'CL','america/buenos_aires':'AR','america/argentina/buenos_aires':'AR',
+    'america/argentina/cordoba':'AR','america/argentina/salta':'AR',
+    'america/sao_paulo':'BR','america/manaus':'BR','america/belem':'BR',
+    'america/fortaleza':'BR','america/recife':'BR','america/noronha':'BR',
+    'america/cuiaba':'BR','america/porto_velho':'BR','america/boa_vista':'BR',
     'america/caracas':'VE','america/havana':'CU',
+    'america/lima':'PE','america/la_paz':'BO','america/asuncion':'PY',
+    'america/montevideo':'UY','america/guayaquil':'EC','america/guyana':'GY',
+    'america/paramaribo':'SR','america/cayenne':'GF',
+    'america/panama':'PA','america/costa_rica':'CR','america/managua':'NI',
+    'america/tegucigalpa':'HN','america/el_salvador':'SV','america/guatemala':'GT',
+    'america/belize':'BZ','america/nassau':'BS','america/kingston':'JM',
+    'america/port-au-prince':'HT','america/santo_domingo':'DO',
+    'america/port_of_spain':'TT','america/barbados':'BB','america/curacao':'CW',
+    // ── Africa ─────────────────────────────────────────────────────────────
     'africa/cairo':'EG','africa/johannesburg':'ZA','africa/lagos':'NG',
     'africa/nairobi':'KE','africa/casablanca':'MA','africa/tunis':'TN',
     'africa/algiers':'DZ','africa/accra':'GH','africa/addis_ababa':'ET',
+    'africa/dakar':'SN','africa/abidjan':'CI','africa/douala':'CM',
+    'africa/kinshasa':'CD','africa/brazzaville':'CG','africa/luanda':'AO',
+    'africa/maputo':'MZ','africa/harare':'ZW','africa/lusaka':'ZM',
+    'africa/dar_es_salaam':'TZ','africa/kampala':'UG','africa/kigali':'RW',
+    'africa/bujumbura':'BI','africa/lilongwe':'MW','africa/windhoek':'NA',
+    'africa/gaborone':'BW','africa/mbabane':'SZ','africa/maseru':'LS',
+    'africa/tripoli':'LY','africa/khartoum':'SD','africa/juba':'SS',
+    'africa/ndjamena':'TD','africa/niamey':'NE','africa/bamako':'ML',
+    'africa/ouagadougou':'BF','africa/conakry':'GN','africa/freetown':'SL',
+    'africa/monrovia':'LR','africa/bissau':'GW','africa/banjul':'GM',
+    'africa/nouakchott':'MR','africa/el_aaiun':'EH','africa/lome':'TG',
+    'africa/porto-novo':'BJ','africa/libreville':'GA','africa/malabo':'GQ',
+    'africa/sao_tome':'ST','africa/djibouti':'DJ','africa/asmara':'ER',
+    'africa/mogadishu':'SO','africa/antananarivo':'MG',
+    'indian/reunion':'RE','indian/comoro':'KM',
   };
   const tz = (Intl.DateTimeFormat().resolvedOptions().timeZone || '').toLowerCase();
   const fromTZ = TZ_MAP[tz] || '';
 
   // Step 3: build candidate list — ISO code + common IPTV aliases
+  // Ex-YU countries include EXYU so their local tag detection also tries EXYU
   const ALIASES = {
-    'RS':['RS','SR','SRB'],'BA':['BA','BOS'],'HR':['HR','CRO'],
-    'SI':['SI','SLO'],'MK':['MK','MKD'],'ME':['ME','MNE'],
-    'AL':['AL','ALB'],'XK':['XK','KOS'],
+    'RS':['RS','SR','SRB','EXYU','BALK'],'BA':['BA','BOS','EXYU','BALK'],
+    'HR':['HR','CRO','EXYU','BALK'],'SI':['SI','SLO','EXYU','BALK'],
+    'ME':['ME','MNE','EXYU','BALK'],'MK':['MK','MKD','EXYU','BALK'],
+    'AL':['AL','ALB','BALK'],
     'GB':['GB','UK','GBR','ENG','SCO','WAL','IRL'],
     'DE':['DE','GER'],'FR':['FR','FRA'],'IT':['IT','ITA'],
     'ES':['ES','ESP'],'PT':['PT','POR'],'NL':['NL','NED'],
@@ -3562,18 +3661,34 @@ const _LOCALE_TAG_CANDIDATES = (function(){
     'SK':['SK','SVK'],'HU':['HU','HUN'],'RO':['RO','ROM'],
     'BG':['BG','BUL'],'GR':['GR','GRE'],'TR':['TR','TUR'],
     'RU':['RU','RUS'],'UA':['UA','UKR'],'BY':['BY','BLR'],
+    'MD':['MD','MOL'],'LV':['LV','LAT'],'LT':['LT','LIT'],'EE':['EE','EST'],
     'SE':['SE','SWE'],'NO':['NO','NOR'],'DK':['DK','DEN'],
     'FI':['FI','FIN'],'IS':['IS','ICE'],
+    'AT':['AT','AUT'],'CH':['CH','SUI'],
     'US':['US','USA'],'CA':['CA','CAN'],'AU':['AU','AUS'],
+    'NZ':['NZ'],'IE':['IE','IRL'],
     'BR':['BR','BRA'],'AR':['AR','ARG'],'MX':['MX','MEX'],
-    'IN':['IN','IND'],'PK':['PK','PAK'],'JP':['JP','JAP'],
-    'KR':['KR','KOR'],'CN':['CN','CHN'],'TH':['TH','THAI'],
-    'VN':['VN','VIET'],'ID':['ID','INDO'],'MY':['MY','MALAY'],
-    'PH':['PH','PHI'],'SG':['SG','SING'],'HK':['HK','HKG'],
-    'TW':['TW','TWN'],'IR':['IR','IRN','IRAN'],
+    'CO':['CO','COL'],'PE':['PE','PER'],'CL':['CL','CHI'],
+    'UY':['UY','URU'],'VE':['VE'],'BO':['BO'],'PY':['PY'],
+    'IN':['IN','IND'],'PK':['PK','PAK'],'BD':['BD','BAN'],
+    'LK':['LK','SRI'],'NP':['NP','NEP'],'AF':['AF','AFG'],
+    'JP':['JP','JAP'],'KR':['KR','KOR'],'CN':['CN','CHN'],
+    'TH':['TH','THAI'],'VN':['VN','VIET'],'ID':['ID','INDO'],
+    'MY':['MY','MALAY'],'PH':['PH','PHI'],'SG':['SG','SING'],
+    'HK':['HK','HKG'],'TW':['TW','TWN'],'MN':['MN'],
+    'KZ':['KZ','KAZ'],'UZ':['UZ','UZB'],'GE':['GE','GEO'],
+    'AM':['AM','ARM'],'AZ':['AZ','AZE'],
+    'IR':['IR','IRN','IRAN'],'IQ':['IQ','IRAQ'],
     'SA':['SA','SAU'],'AE':['AE','UAE'],'EG':['EG','EGY'],
-    'MA':['MA','MAR'],'DZ':['DZ','ALG'],'NG':['NG','NIG'],
-    'ZA':['ZA','ZAF'],
+    'KW':['KW','KUW'],'QA':['QA','QAT'],'BH':['BH','BAH'],
+    'OM':['OM','OMN'],'YE':['YE','YEM'],
+    'JO':['JO','JOR'],'LB':['LB','LEB'],'SY':['SY','SYR'],
+    'IL':['IL'],'PS':['PS','PAL'],
+    'MA':['MA','MAR'],'DZ':['DZ','ALG'],'TN':['TN','TUN'],
+    'LY':['LY','LIB'],'SD':['SD'],'ET':['ET','ETH'],
+    'NG':['NG','NIG'],'GH':['GH'],'KE':['KE','KEN'],
+    'ZA':['ZA','ZAF'],'TZ':['TZ'],'SN':['SN','SEN'],
+    'CM':['CM','CMR'],'CI':['CI','CIV'],
   };
 
   const iso = fromTZ || fromLang;
@@ -3583,9 +3698,23 @@ const _LOCALE_TAG_CANDIDATES = (function(){
 function _buildTagBar(cats){
   const bar=document.getElementById('tag-bar');
   if(!bar) return;
+  // Raw counts per exact tag
+  const rawCounts={};
+  cats.forEach(c=>{ const t=_catTag(c.title); if(t) rawCounts[t]=(rawCounts[t]||0)+1; });
+  const tags=Object.keys(rawCounts).sort();
+  if(!tags.length){ bar.style.display='none'; _activeTag=''; return; }
+
+  // Group-aware counts: for each tag, sum counts of all tags in its group
+  // so SR pill shows "SR 15 + EXYU 8 = 23" rather than just "SR 15"
   const counts={};
-  cats.forEach(c=>{ const t=_catTag(c.title); if(t) counts[t]=(counts[t]||0)+1; });
-  const tags=Object.keys(counts).sort();
+  for(const t of tags){
+    const grp = _TAG_GROUPS[t];
+    if(grp){
+      counts[t] = tags.filter(x=>grp.has(x)).reduce((s,x)=>s+(rawCounts[x]||0), 0);
+    } else {
+      counts[t] = rawCounts[t];
+    }
+  }
   if(!tags.length){ bar.style.display='none'; _activeTag=''; return; }
 
   const NOT_COUNTRY = new Set(['4K','8K','UHD','FHD','HD','SD','HQ','4G','VIP','FOR','NEW','TOP','HOT','ALL']);
@@ -3775,7 +3904,6 @@ async function dlSelCats(type){
   pollBusy();
 }
 
-// ── BROWSE ─────────────────────────────────────────────────
 // ── BROWSE ─────────────────────────────────────────────────
 function _categoryKey(m, cat){
   // normalize category identity: prefer id, then category_id, then title
