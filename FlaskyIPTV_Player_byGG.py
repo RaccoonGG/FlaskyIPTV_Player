@@ -3495,6 +3495,91 @@ function _catTag(title){
   return '';
 }
 
+// ── Locale → country tag mapping ─────────────────────────────────────────────
+// Derives the user's local country tag from browser locale + timezone.
+// Returns a list of candidate tag codes in order of specificity (most specific first).
+// We return multiple candidates because IPTV portals may use ISO-2 (RS), local abbrev
+// (SR, SRB), or regional bloc (EXYU, BALK) for the same country.
+const _LOCALE_TAG_CANDIDATES = (function(){
+  // Step 1: get ISO-2 from navigator.language  ("sr-RS" → "RS", "en-US" → "US")
+  const lang = (navigator.language || '').toUpperCase();
+  const fromLang = lang.includes('-') ? lang.split('-').pop() : '';
+
+  // Step 2: derive from IANA timezone  ("Europe/Belgrade" → "RS")
+  const TZ_MAP = {
+    'europe/belgrade':'RS','europe/sarajevo':'BA','europe/zagreb':'HR',
+    'europe/ljubljana':'SI','europe/skopje':'MK','europe/podgorica':'ME',
+    'europe/tirane':'AL','europe/pristina':'XK',
+    'europe/london':'GB','europe/dublin':'IE',
+    'europe/paris':'FR','europe/berlin':'DE','europe/rome':'IT',
+    'europe/madrid':'ES','europe/lisbon':'PT',
+    'europe/amsterdam':'NL','europe/brussels':'BE',
+    'europe/warsaw':'PL','europe/prague':'CZ','europe/bratislava':'SK',
+    'europe/budapest':'HU','europe/bucharest':'RO','europe/sofia':'BG',
+    'europe/athens':'GR','europe/nicosia':'CY',
+    'europe/vienna':'AT','europe/zurich':'CH',
+    'europe/stockholm':'SE','europe/oslo':'NO','europe/copenhagen':'DK',
+    'europe/helsinki':'FI','atlantic/reykjavik':'IS',
+    'europe/moscow':'RU','europe/kiev':'UA','europe/minsk':'BY',
+    'europe/riga':'LV','europe/tallinn':'EE','europe/vilnius':'LT',
+    'europe/istanbul':'TR',
+    'asia/dubai':'AE','asia/riyadh':'SA','asia/kuwait':'KW',
+    'asia/qatar':'QA','asia/bahrain':'BH','asia/muscat':'OM',
+    'asia/baghdad':'IQ','asia/tehran':'IR',
+    'asia/jerusalem':'IL','asia/beirut':'LB','asia/damascus':'SY',
+    'asia/amman':'JO','asia/nicosia':'CY',
+    'asia/karachi':'PK','asia/kolkata':'IN','asia/dhaka':'BD',
+    'asia/colombo':'LK','asia/kathmandu':'NP',
+    'asia/kabul':'AF','asia/tashkent':'UZ','asia/almaty':'KZ',
+    'asia/tbilisi':'GE','asia/yerevan':'AM','asia/baku':'AZ',
+    'asia/tokyo':'JP','asia/seoul':'KR','asia/shanghai':'CN',
+    'asia/hong_kong':'HK','asia/taipei':'TW','asia/singapore':'SG',
+    'asia/kuala_lumpur':'MY','asia/jakarta':'ID','asia/manila':'PH',
+    'asia/bangkok':'TH','asia/ho_chi_minh':'VN','asia/yangon':'MM',
+    'pacific/auckland':'NZ','australia/sydney':'AU','australia/melbourne':'AU',
+    'america/new_york':'US','america/los_angeles':'US','america/chicago':'US',
+    'america/denver':'US','america/phoenix':'US','america/anchorage':'US',
+    'america/toronto':'CA','america/vancouver':'CA','america/montreal':'CA',
+    'america/mexico_city':'MX','america/bogota':'CO','america/lima':'PE',
+    'america/santiago':'CL','america/buenos_aires':'AR','america/sao_paulo':'BR',
+    'america/caracas':'VE','america/havana':'CU',
+    'africa/cairo':'EG','africa/johannesburg':'ZA','africa/lagos':'NG',
+    'africa/nairobi':'KE','africa/casablanca':'MA','africa/tunis':'TN',
+    'africa/algiers':'DZ','africa/accra':'GH','africa/addis_ababa':'ET',
+  };
+  const tz = (Intl.DateTimeFormat().resolvedOptions().timeZone || '').toLowerCase();
+  const fromTZ = TZ_MAP[tz] || '';
+
+  // Step 3: build candidate list — ISO code + common IPTV aliases
+  const ALIASES = {
+    'RS':['RS','SR','SRB'],'BA':['BA','BOS'],'HR':['HR','CRO'],
+    'SI':['SI','SLO'],'MK':['MK','MKD'],'ME':['ME','MNE'],
+    'AL':['AL','ALB'],'XK':['XK','KOS'],
+    'GB':['GB','UK','GBR','ENG','SCO','WAL','IRL'],
+    'DE':['DE','GER'],'FR':['FR','FRA'],'IT':['IT','ITA'],
+    'ES':['ES','ESP'],'PT':['PT','POR'],'NL':['NL','NED'],
+    'BE':['BE','BEL'],'PL':['PL','POL'],'CZ':['CZ','CZE'],
+    'SK':['SK','SVK'],'HU':['HU','HUN'],'RO':['RO','ROM'],
+    'BG':['BG','BUL'],'GR':['GR','GRE'],'TR':['TR','TUR'],
+    'RU':['RU','RUS'],'UA':['UA','UKR'],'BY':['BY','BLR'],
+    'SE':['SE','SWE'],'NO':['NO','NOR'],'DK':['DK','DEN'],
+    'FI':['FI','FIN'],'IS':['IS','ICE'],
+    'US':['US','USA'],'CA':['CA','CAN'],'AU':['AU','AUS'],
+    'BR':['BR','BRA'],'AR':['AR','ARG'],'MX':['MX','MEX'],
+    'IN':['IN','IND'],'PK':['PK','PAK'],'JP':['JP','JAP'],
+    'KR':['KR','KOR'],'CN':['CN','CHN'],'TH':['TH','THAI'],
+    'VN':['VN','VIET'],'ID':['ID','INDO'],'MY':['MY','MALAY'],
+    'PH':['PH','PHI'],'SG':['SG','SING'],'HK':['HK','HKG'],
+    'TW':['TW','TWN'],'IR':['IR','IRN','IRAN'],
+    'SA':['SA','SAU'],'AE':['AE','UAE'],'EG':['EG','EGY'],
+    'MA':['MA','MAR'],'DZ':['DZ','ALG'],'NG':['NG','NIG'],
+    'ZA':['ZA','ZAF'],
+  };
+
+  const iso = fromTZ || fromLang;
+  return iso ? (ALIASES[iso] || [iso]) : [];
+})();
+
 function _buildTagBar(cats){
   const bar=document.getElementById('tag-bar');
   if(!bar) return;
@@ -3503,16 +3588,37 @@ function _buildTagBar(cats){
   const tags=Object.keys(counts).sort();
   if(!tags.length){ bar.style.display='none'; _activeTag=''; return; }
 
-  // Country classifier: reuse the module-level _KNOWN_TAG_PREFIXES set as the
-  // single source of truth. Quality/format tags override it via NOT_COUNTRY.
   const NOT_COUNTRY = new Set(['4K','8K','UHD','FHD','HD','SD','HQ','4G','VIP','FOR','NEW','TOP','HOT','ALL']);
-
   function isCountryTag(t){
     if(NOT_COUNTRY.has(t)) return false;
     return _KNOWN_TAG_PREFIXES.has(t);
   }
 
-  const countryTags = tags.filter(t => isCountryTag(t));
+  // ── Priority ordering for country tags ───────────────────────────────────
+  // 1. Local tag (first candidate from locale detection that appears in this portal)
+  // 2. US, CA, UK/GB (in that order), skipping any already used as local
+  // 3. Rest alphabetical
+  const PRIORITY_AFTER_LOCAL = ['US','USA','CA','CAN','UK','GB','GBR'];
+
+  const localTag = _LOCALE_TAG_CANDIDATES.find(c => tags.includes(c)) || '';
+
+  function sortedCountryTags(tagList){
+    const used = new Set();
+    const result = [];
+    // Slot 1: local tag
+    if(localTag && tagList.includes(localTag)){ result.push(localTag); used.add(localTag); }
+    // Slot 2-N: priority tags (skip if same as local)
+    for(const p of PRIORITY_AFTER_LOCAL){
+      if(tagList.includes(p) && !used.has(p)){ result.push(p); used.add(p); }
+    }
+    // Remaining: alphabetical
+    for(const t of tagList){
+      if(!used.has(t)) result.push(t);
+    }
+    return result;
+  }
+
+  const countryTags = sortedCountryTags(tags.filter(t => isCountryTag(t)));
   const generalTags = tags.filter(t => !isCountryTag(t));
 
   function pill(t){
@@ -3525,8 +3631,7 @@ function _buildTagBar(cats){
     html  = `<div class="tag-row">${allPill}${generalTags.map(pill).join('')}</div>`;
     html += `<div class="tag-row">${countryTags.map(pill).join('')}</div>`;
   } else {
-    // Only one type — single row
-    html = `<div class="tag-row">${allPill}${tags.map(pill).join('')}</div>`;
+    html = `<div class="tag-row">${allPill}${(countryTags.length ? countryTags : generalTags).map(pill).join('')}</div>`;
   }
 
   bar.style.display='flex';
