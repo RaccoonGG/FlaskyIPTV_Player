@@ -169,6 +169,33 @@ def check_system_deps():
         info("Open http://127.0.0.1:5000 in your browser")
 
 
+# ── Required addon presence checks ───────────────────────────────────────────
+def check_required_addons() -> bool:
+    """Check that the three required addon files are present alongside the script."""
+    hdr("Checking required addon files …")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    REQUIRED = [
+        ("portal_clients.py",  "Portal client classes — MAC/Stalker, Xtream, M3U"),
+        ("proxy_addon.py",     "Image proxy, HLS proxy, video proxy, ffmpeg stream transcode"),
+        ("download_addon.py",  "MKV/M3U download, quick record, ffmpeg/yt-dlp helpers"),
+        ("epg_addon.py",       "EPG, Catch-up TV, What's On Now, XMLTV support"),
+        ("subtitles_addon.py", "Subtitle UI, OpenSubtitles search/download, local subtitle file loading"),
+    ]
+
+    all_present = True
+    for filename, desc in REQUIRED:
+        path = os.path.join(script_dir, filename)
+        if os.path.isfile(path):
+            ok(f"{filename} found  ({desc})")
+        else:
+            err(f"{filename} MISSING  ({desc})")
+            info(f"Place {filename} alongside FlaskyIPTV_Player_byGG.py — the app will not work without it")
+            all_present = False
+
+    return all_present
+
+
 # ── cast_addon dependency check/install ───────────────────────────────────────
 def check_cast_addon():
     hdr("Checking cast_addon.py …")
@@ -321,6 +348,9 @@ def main():
                 else:
                     warn(f"{pip_name} — failed to install (optional)  ({desc})")
 
+    addons_ok = check_required_addons()
+    if not addons_ok:
+        all_ok = False
     check_cast_addon()
     check_multiview_addon()
     check_dvr_addon()
