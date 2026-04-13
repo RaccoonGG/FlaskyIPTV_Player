@@ -161,7 +161,7 @@ class AppState:
         # epg_dict: {channel_id_lower: [(title, start, end, desc), ...]}  ← compact tuples
         # TTL = 1 hour, same as reference app
         self._xmltv_cache: dict = {}
-        self._xmltv_cache_ttl = 1800  # 30 min — matches the -4h/+20h window; no benefit caching longer
+        self._xmltv_cache_ttl = 5400  # 90 min — matches the -2h/+14h window
         # Portals whose xmltv.php has channel defs but zero programme entries —
         # marked after first download so we never re-download this session.
         self._xmltv_no_data: set = set()
