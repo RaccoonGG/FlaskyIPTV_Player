@@ -487,33 +487,58 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
         """
         now = time.time()
 
-        # If ext_epg_url is configured but not yet in cache, kick off background download
+        # Build the combined EPG URL string: external URLs + portal's own xmltv.php
+        # (Xtream and M3U-with-Xtream only — MAC/Stalker portals don't expose xmltv.php)
         ek = state.ext_epg_url
-        if ek and ek not in state._xmltv_cache and ek not in state._xmltv_no_data:
-            if ek not in state._xmltv_downloading:
-                state._xmltv_downloading.add(ek)
-                _ek_urls = [u.strip() for u in ek.splitlines() if u.strip()]
-                if len(_ek_urls) > 1:
-                    for _i, _u in enumerate(_ek_urls, 1):
-                        state.log(f"[WHATS_ON] Launching background EPG download [{_i}/{len(_ek_urls)}]: {_u}")
+        _portal_xmltv = ""
+        _conn = state.conn_type
+        if _conn == "xtream" or (_conn == "m3u_url" and state.m3u_xtream_override):
+            try:
+                from urllib.parse import quote as _q2, urlparse as _up2
+                _creds = state.m3u_xtream_override if _conn == "m3u_url" else None
+                _base  = (_creds["base"] if _creds else state.url).rstrip("/")
+                _user  = _creds["username"] if _creds else state.username
+                _pwd   = _creds["password"] if _creds else state.password
+                if _base and _user and _pwd:
+                    _pn = _up2(_base)
+                    _base_norm = f"{_pn.scheme}://{_pn.netloc}"
+                    _portal_xmltv = (f"{_base_norm}/xmltv.php"
+                                     f"?username={_q2(_user, safe='')}&password={_q2(_pwd, safe='')}")
+            except Exception:
+                _portal_xmltv = ""
+        # Combine: external URLs first, portal xmltv.php last (skip if already in ext list)
+        _all_urls = [u.strip() for u in (ek or "").splitlines() if u.strip()]
+        if _portal_xmltv and _portal_xmltv not in _all_urls:
+            _all_urls.append(_portal_xmltv)
+        # ek_combined is the newline-joined string passed to _build_xmltv_index
+        # (multi-URL logic inside the function handles splitting + parallel fetch)
+        ek_combined = "\n".join(_all_urls)
+
+        # If any URL is not yet cached, kick off background download
+        if ek_combined and ek_combined not in state._xmltv_cache and ek_combined not in state._xmltv_no_data:
+            if ek_combined not in state._xmltv_downloading:
+                state._xmltv_downloading.add(ek_combined)
+                if len(_all_urls) > 1:
+                    for _i, _u in enumerate(_all_urls, 1):
+                        state.log(f"[WHATS_ON] Launching background EPG download [{_i}/{len(_all_urls)}]: {_u}")
                 else:
-                    state.log(f"[WHATS_ON] Launching background EPG download from {ek}")
+                    state.log(f"[WHATS_ON] Launching background EPG download from {ek_combined}")
 
                 def _bg():
                     try:
                         bg_loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(bg_loop)
                         epg_d, ch_n = bg_loop.run_until_complete(
-                            _build_xmltv_index(ek, state.log))
+                            _build_xmltv_index(ek_combined, state.log))
                         bg_loop.close()
-                        state._xmltv_cache[ek] = (time.time(), epg_d, ch_n)
+                        state._xmltv_cache[ek_combined] = (time.time(), epg_d, ch_n)
                         if not epg_d:
-                            state._xmltv_no_data.add(ek)
+                            state._xmltv_no_data.add(ek_combined)
                         state.log(f"[WHATS_ON] Background EPG download complete")
                     except Exception as e:
                         state.log(f"[WHATS_ON] EPG load failed: {e}")
                     finally:
-                        state._xmltv_downloading.discard(ek)
+                        state._xmltv_downloading.discard(ek_combined)
                         state._xmltv_needs.clear()
                         stale = [k for k, v in list(state._epg_cache.items())
                                  if not v[1].get("current") and not v[1].get("next")
@@ -528,7 +553,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
 
         if not state._xmltv_cache:
             msg = ("No EPG data loaded yet. Open any live channel first to trigger EPG load, "
-                   "then re-open What's on Now.") if state.ext_epg_url else (
+                   "then re-open What's on Now.") if (ek or _portal_xmltv) else (
                    "No external EPG URL configured. Add one in Settings (EPG field) and reconnect.")
             return jsonify({"programs": [], "count": 0, "status": "no_epg", "message": msg})
 
@@ -639,7 +664,11 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
 
         # ── Return cached channel list if available for this portal ─────────────
         _portal_key = f"{state.conn_type}:{state.url}:{getattr(state, 'mac', '')}:{getattr(state, 'username', '')}"
-        if _portal_key in state._won_ch_cache:
+        _items_all = state._items_cache.get(("live", "__all__"))
+        if _items_all:
+            channels = _items_all
+            state.log(f"[FIND_CH] Using All Channels cache ({len(channels)} channels)")
+        elif _portal_key in state._won_ch_cache:
             channels = state._won_ch_cache[_portal_key]
             state.log(f"[FIND_CH] Using session-cached {len(channels)} channels for {_portal_key[:60]}")
         else:
@@ -758,6 +787,8 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
             try:
                 channels = run_async(fetch_all_channels())
                 state._won_ch_cache[_portal_key] = channels
+                if channels:
+                    state._items_cache[("live", "__all__")] = channels
                 state.log(f"[FIND_CH] Fetched {len(channels)} live channels — cached for session")
             except Exception as e:
                 state.log(f"[FIND_CH] Fetch error: {e}")
