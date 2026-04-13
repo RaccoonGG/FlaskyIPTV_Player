@@ -516,9 +516,9 @@ _SUBTITLES_UI_JS = r"""
         <span id="sub-status-msg">Ready</span>
         <div class="sub-delay-row" id="sub-delay-row" style="display:none;flex-shrink:0">
           <span>&#9201; Delay:</span>
-          <button onmousedown="subDelayHold(-0.1)" onmouseup="subDelayRelease()" onmouseleave="subDelayRelease()" ontouchstart="subDelayHold(-0.1)" ontouchend="subDelayRelease()" title="-0.1s">&#x2212;</button>
+          <button onmousedown="subDelayHold(-0.1)" onmouseup="subDelayRelease()" onmouseleave="subDelayRelease()" ontouchstart="subDelayTouch(event,-0.1)" ontouchend="subDelayRelease()" title="-0.1s">&#x2212;</button>
           <span id="sub-delay-val">0.0s</span>
-          <button onmousedown="subDelayHold(0.1)" onmouseup="subDelayRelease()" onmouseleave="subDelayRelease()" ontouchstart="subDelayHold(0.1)" ontouchend="subDelayRelease()" title="+0.1s">&#x2b;</button>
+          <button onmousedown="subDelayHold(0.1)" onmouseup="subDelayRelease()" onmouseleave="subDelayRelease()" ontouchstart="subDelayTouch(event,0.1)" ontouchend="subDelayRelease()" title="+0.1s">&#x2b;</button>
           <button onclick="subAdjustDelay(-subDelayMs/1000)" title="Reset" style="font-size:10px;width:34px">Reset</button>
           <button id="sub-toggle-btn" onclick="subToggleVisible()" title="Hide/show subtitles" style="width:auto;padding:0 7px;font-size:11px;margin-left:2px">&#x1F441; On</button>
         </div>
@@ -678,8 +678,12 @@ let _subDelayHoldIval  = null;
 function subDelayHold(deltaSec){
   subAdjustDelay(deltaSec);
   _subDelayHoldTimer = setTimeout(function(){
-    _subDelayHoldIval = setInterval(function(){ subAdjustDelay(deltaSec); }, 80);
-  }, 400);
+    _subDelayHoldIval = setInterval(function(){ subAdjustDelay(deltaSec); }, 100);
+  }, 500);
+}
+function subDelayTouch(e, deltaSec){
+  e.preventDefault();
+  subDelayHold(deltaSec);
 }
 function subDelayRelease(){
   clearTimeout(_subDelayHoldTimer);
