@@ -373,8 +373,9 @@ _SUBTITLES_UI_JS = r"""
 .sub-empty{text-align:center;padding:36px 20px;color:var(--txt3);font-size:13px}
 .sub-empty span{font-size:36px;display:block;margin-bottom:8px;opacity:.3}
 .sub-status-bar{padding:8px 12px;border-top:1px solid var(--bdr);flex-shrink:0;
-  display:flex;align-items:center;justify-content:space-between;gap:8px;
-  background:var(--s2);font-size:11px;color:var(--txt3);flex-wrap:wrap}
+  display:flex;flex-direction:column;gap:6px;
+  background:var(--s2);font-size:11px;color:var(--txt3)}
+.sub-status-bar .sub-top-row{display:flex;align-items:center;gap:8px;min-width:0}
 #sub-status-msg{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sub-status-bar .btn-ghost{flex-shrink:0;white-space:nowrap}
 .sub-active-strip{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.2);
@@ -508,16 +509,29 @@ _SUBTITLES_UI_JS = r"""
       </div>
     </div>
     <div class="sub-status-bar">
-      <span id="sub-status-msg">Ready</span>
-      <div class="sub-delay-row" id="sub-delay-row" style="display:none">
-        <span>&#9201; Delay:</span>
-        <button onclick="subAdjustDelay(-0.1)" title="-0.1s">&#x2212;</button>
-        <span id="sub-delay-val">0.0s</span>
-        <button onclick="subAdjustDelay(0.1)" title="+0.1s">&#x2b;</button>
-        <button onclick="subAdjustDelay(-subDelayMs/1000)" title="Reset" style="font-size:10px;width:34px">Reset</button>
-        <button id="sub-toggle-btn" onclick="subToggleVisible()" title="Hide/show subtitles" style="width:auto;padding:0 7px;font-size:11px;margin-left:2px">&#x1F441; On</button>
+      <div class="sub-top-row">
+        <span id="sub-status-msg">Ready</span>
+        <div class="sub-delay-row" id="sub-delay-row" style="display:none;flex-shrink:0">
+          <span>&#9201; Delay:</span>
+          <button onclick="subAdjustDelay(-0.1)" title="-0.1s">&#x2212;</button>
+          <span id="sub-delay-val">0.0s</span>
+          <button onclick="subAdjustDelay(0.1)" title="+0.1s">&#x2b;</button>
+          <button onclick="subAdjustDelay(-subDelayMs/1000)" title="Reset" style="font-size:10px;width:34px">Reset</button>
+          <button id="sub-toggle-btn" onclick="subToggleVisible()" title="Hide/show subtitles" style="width:auto;padding:0 7px;font-size:11px;margin-left:2px">&#x1F441; On</button>
+        </div>
+        <button class="btn-ghost" onclick="closeSubSearch()" style="height:28px;padding:0 12px;font-size:12px;flex-shrink:0">Close</button>
       </div>
-      <button class="btn-ghost" onclick="closeSubSearch()" style="height:28px;padding:0 12px;font-size:12px">Close</button>
+      <div id="sub-sync-row" style="display:none;align-items:center;gap:6px;font-size:12px;color:var(--txt2);flex-wrap:wrap;padding-top:4px;border-top:1px solid var(--bdr)">
+        <span style="color:var(--txt3)">&#127916; Movie time on screen:</span>
+        <input id="sub-sync-inp" type="text" placeholder="MM:SS or H:MM:SS"
+          style="width:110px;height:24px;font-size:12px;padding:0 7px;border-radius:var(--rss);
+                 border:1px solid var(--bdr);background:var(--s3);color:var(--txt)"
+          onkeydown="if(event.key==='Enter') subSyncToMovieTime()">
+        <button onclick="subSyncToMovieTime()"
+          style="height:24px;padding:0 10px;font-size:11px;font-weight:700;border-radius:var(--rss);
+                 background:var(--acc);color:#fff;border:none;cursor:pointer">Sync</button>
+        <span id="sub-sync-status" style="font-size:11px;color:var(--green);display:none"></span>
+      </div>
     </div>
   </div>
 </div>
@@ -644,6 +658,8 @@ function _subApplyToPlayer(content, fileName, mime){
   if(_dv) _dv.textContent = '0.0s';
   const _dr = document.getElementById('sub-delay-row');
   if(_dr) _dr.style.display = 'flex';
+  const _sr = document.getElementById('sub-sync-row');
+  if(_sr) _sr.style.display = 'flex';
   const _tb = document.getElementById('sub-toggle-btn');
   if(_tb) _tb.innerHTML = '&#x1F441; On';
 }
@@ -654,6 +670,30 @@ function subAdjustDelay(deltaSec){
   _subLoadCuesToTrack(_subCuesBase);
   const dv = document.getElementById('sub-delay-val');
   if(dv) dv.textContent = (subDelayMs>=0?'+':'') + (subDelayMs/1000).toFixed(1) + 's';
+}
+
+function subSyncToMovieTime(){
+  if(!_subCuesBase.length){ toast('Load a subtitle file first','wrn'); return; }
+  const inp = document.getElementById('sub-sync-inp');
+  const raw = (inp ? inp.value : '').trim();
+  if(!raw){ toast('Enter the movie time shown on screen (e.g. 34:31)','wrn'); return; }
+  const parts = raw.split(':').map(Number);
+  if(parts.some(isNaN) || parts.length < 2){
+    toast('Invalid format — use MM:SS or H:MM:SS','err'); return;
+  }
+  const movieSecs = parts.length === 3
+    ? parts[0]*3600 + parts[1]*60 + parts[2]
+    : parts[0]*60 + parts[1];
+  const vidEl = document.getElementById('vid');
+  if(!vidEl || !vidEl.currentTime){ toast('No stream playing','wrn'); return; }
+  subDelayMs = Math.round((vidEl.currentTime - movieSecs) * 1000);
+  _subLoadCuesToTrack(_subCuesBase);
+  const dv = document.getElementById('sub-delay-val');
+  if(dv) dv.textContent = (subDelayMs>=0?'+':'') + (subDelayMs/1000).toFixed(1) + 's';
+  const ss = document.getElementById('sub-sync-status');
+  if(ss){ ss.textContent = '✓ Synced to ' + raw; ss.style.display='inline'; setTimeout(()=>{ ss.style.display='none'; }, 3000); }
+  toast('✓ Subtitles synced to ' + raw, 'ok');
+  if(inp) inp.value = '';
 }
 
 function subToggleVisible(){
@@ -674,6 +714,8 @@ function clearSubtitle(){
   if(subBtn) subBtn.style.opacity='0.35';
   const _dr = document.getElementById('sub-delay-row');
   if(_dr) _dr.style.display = 'none';
+  const _sr2 = document.getElementById('sub-sync-row');
+  if(_sr2) _sr2.style.display = 'none';
   const _tb = document.getElementById('sub-toggle-btn');
   if(_tb) _tb.innerHTML = '&#x1F441; On';
   toast('Subtitle removed','info');
