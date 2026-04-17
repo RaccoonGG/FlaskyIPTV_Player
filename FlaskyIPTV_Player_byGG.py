@@ -1786,6 +1786,13 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .mt.on{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
   border-color:transparent;box-shadow:0 2px 14px var(--glow2),0 0 28px rgba(124,58,237,.2),
   inset 0 1px 0 rgba(255,255,255,.2)}
+/* Mobile: compact buttons — tighter padding, no icon, text only */
+@media(max-width:899px){
+  .mt{padding:5px 10px;font-size:12px}
+  .mt[data-m="favs"]{padding:4px 7px}
+  .mt-ico{display:none}
+  .mt-txt{display:inline}
+}
 @media(min-width:900px){
   .mtabs{gap:3px}\n  .mt{padding:5px 8px;font-size:11px}\n  .mt[data-m=\"favs\"]{padding:5px 7px}\n}
 /* Desktop: show full labels with icons, nice spacing */
