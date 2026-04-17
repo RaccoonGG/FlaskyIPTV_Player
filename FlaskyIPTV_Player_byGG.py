@@ -1709,6 +1709,8 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   #pctrl-body{overflow:hidden!important;transition:max-height .25s ease;max-height:0!important}
   #pctrl-panel.expanded #pctrl-body{max-height:300px!important}
 }
+/* items-collapse-btn is desktop-only; hide globally so it never creates layout gap on mobile */
+#items-collapse-btn{display:none}
 @media(min-width:900px){
   #main{display:grid!important;grid-template-columns:350px 28px 1fr;height:100%;transition:grid-template-columns .3s ease}
   #main.items-open{grid-template-columns:350px 380px 1fr}
@@ -2303,7 +2305,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
               onclick="outFbQuickApply('/data/data/com.termux/files/home/DVR/')">Termux ~/DVR/</button>
           </div>
           <!-- File/folder list -->
-          <div id="out-fb-list" style="max-height:170px;overflow-y:auto;border:1px solid var(--bdr);border-radius:var(--rss);background:var(--s4)">
+          <div id="out-fb-list" style="max-height:90px;overflow-y:auto;border:1px solid var(--bdr);border-radius:var(--rss);background:var(--s4)">
             <div style="padding:8px;font-size:12px;color:var(--txt3)">Loading&hellip;</div>
           </div>
         </div><!-- /out-fb-wrap -->
@@ -2737,12 +2739,10 @@ function toggleSaveChk(btn){
 function toggleCP(){
   cpOpen=!cpOpen;
   document.getElementById('cpanel').classList.toggle('open',cpOpen);
-  if(!cpOpen && typeof _outFbHideSheet === 'function') _outFbHideSheet();
 }
 function closeCP(){
   cpOpen=false;
   document.getElementById('cpanel').classList.remove('open');
-  if(typeof _outFbHideSheet === 'function') _outFbHideSheet();
 }
 
 function setCT(t){
@@ -5730,15 +5730,6 @@ function _mvSelOpen(callback, forcedMode){
 <script src="/api/epg/ui.js"></script>
 <script src="/api/dvr/ui.js"></script>
 <script src="/api/dlm/ui.js"></script>
-<!-- Mobile output file-browser bottom-sheet — lives at body level so position:fixed always works -->
-<div id="out-fb-sheet-bg" onclick="outFbClose()"
-  style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9990"></div>
-<div id="out-fb-sheet"
-  style="display:none;position:fixed;bottom:52px;left:0;right:0;z-index:9991;
-         background:var(--s1);border-top:2px solid var(--acc);
-         border-radius:14px 14px 0 0;box-shadow:0 -8px 40px rgba(0,0,0,.85);
-         padding:10px 12px 14px;max-height:62vh;overflow-y:auto;
-         display:none;flex-direction:column;gap:5px"></div>
 </body>
 </html>
 """
