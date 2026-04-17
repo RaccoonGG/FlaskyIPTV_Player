@@ -1332,6 +1332,27 @@ def api_browse_folder():
     except Exception as e:
         return jsonify({"path": "", "error": str(e)})
 
+@flask_app.route("/api/browse_m3u_file", methods=["GET"])
+def api_browse_m3u_file():
+    """Desktop only: save-as dialog to set the M3U output path with a predefined filename."""
+    default_name = request.args.get("name", "playlist.m3u")
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.wm_attributes("-topmost", True)
+        path = filedialog.asksaveasfilename(
+            title="Set M3U Output Path",
+            initialfile=default_name,
+            defaultextension=".m3u",
+            filetypes=[("M3U playlist", "*.m3u *.m3u8"), ("All files", "*.*")],
+        )
+        root.destroy()
+        return jsonify({"path": path or ""})
+    except Exception as e:
+        return jsonify({"path": "", "error": str(e)})
+
 
 @flask_app.route("/api/reveal_in_folder", methods=["POST"])
 def api_reveal_in_folder():
@@ -1643,10 +1664,22 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   color:var(--txt);cursor:pointer}
 #conn-btn.connected:hover{background:rgba(34,197,94,.18);border-color:rgba(34,197,94,.5)}
 @media(max-width:899px){#hdr-tags{display:none}}
+/* Short status text — hidden by default, shown on mobile only */
+#hdr-status-short{display:none}
+/* Mobile: compress header so cast + settings are always visible */
+@media(max-width:599px){
+  #hdr-bar{gap:3px!important;padding:5px 8px!important}
+  #activity-status{display:none!important}
+  #conn-btn{max-width:82px!important;padding:0 8px!important}
+  .hdr-r{gap:1px!important}
+  .hdr-ico{width:28px!important;height:28px!important;font-size:13px!important}
+  #hdr-status{display:none!important}
+  #hdr-status-short{display:inline!important}
+}
 
 /* ─── conn panel ─────────────────────────────────────────────── */
 #cpanel{overflow:hidden;max-height:0;transition:max-height .35s cubic-bezier(.4,0,.2,1)}
-#cpanel.open{max-height:560px}
+#cpanel.open{max-height:820px;overflow-y:auto}
 #cpi{padding:4px 12px 14px;display:flex;flex-direction:column;gap:8px}
 .ct-row{display:flex;gap:5px}
 .ct-btn{flex:1;height:32px;font-size:12px;padding:0;border-radius:var(--rsm)}
@@ -1902,7 +1935,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 /* ─── paths area ─────────────────────────────────────────────── */
 #paths{padding:8px 0 4px;border-top:1px solid var(--bdr);flex-shrink:0;display:none}
 .prow{display:flex;align-items:center;gap:5px;margin-bottom:5px;position:relative}
-.plbl{font-size:11px;color:var(--txt2);white-space:nowrap;width:46px;flex-shrink:0}
+.plbl{font-size:11px;color:var(--txt2);white-space:nowrap;min-width:54px;flex-shrink:0}
 .prow input{flex:1;height:30px;font-size:12px;padding:0 8px}
 .psug-btn{width:30px;height:30px;padding:0;font-size:13px;flex-shrink:0;border-radius:var(--rss)}
 .psug{position:absolute;top:calc(100% + 3px);left:46px;right:30px;z-index:300;
@@ -1913,6 +1946,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   border-bottom:1px solid var(--bdr);transition:var(--tr)}
 .psopt:last-child{border-bottom:none}
 .psopt:hover{background:var(--s4);color:var(--txt)}
+.out-fb-tgt.active{background:rgba(124,58,237,.2);border-color:var(--acc);color:var(--txt)}
 
 
 /* ─── player ─────────────────────────────────────────────────── */
@@ -2057,7 +2091,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       cursor:default;flex-shrink:0;transition:var(--tr);outline:none;
       max-width:200px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">
       <span id="cdot"></span>
-      <span id="hdr-status" style="overflow:hidden;text-overflow:ellipsis">Not connected</span>
+      <span id="hdr-status" style="overflow:hidden;text-overflow:ellipsis">Not connected</span><span id="hdr-status-short">Offline</span>
     </button>
     <span id="activity-status" style="
       font-size:11px;color:var(--txt3);white-space:nowrap;overflow:hidden;
@@ -2120,7 +2154,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <label style="flex-shrink:0">File</label>
           <span id="m3u-fp-fname" style="flex:1;font-size:12px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">No file chosen</span>
           <button class="btn-ghost" onclick="m3uOpenPicker()" style="height:28px;padding:0 10px;font-size:12px;flex-shrink:0;white-space:nowrap">📂 Browse…</button>
-          <button class="btn-ghost" onclick="m3uForceFileBrowser()" title="Force mobile file browser" style="height:28px;padding:0 8px;font-size:12px;flex-shrink:0;white-space:nowrap">📁</button>
+          <button id="m3u-force-fb-btn" class="btn-ghost" onclick="m3uForceFileBrowser()" title="Force mobile file browser" style="height:28px;padding:0 8px;font-size:12px;flex-shrink:0;white-space:nowrap">📁</button>
           <button class="btn-ghost" id="m3u-clear-btn" onclick="m3uClearLocal()" style="height:28px;padding:0 8px;font-size:11px;flex-shrink:0;display:none">✕</button>
           <input type="file" id="m3u-local-input" accept=".m3u,.m3u8,audio/x-mpegurl,application/x-mpegurl" style="display:none;position:absolute;width:0;height:0;opacity:0" onchange="m3uLoadLocalFile(this)">
         </div>
@@ -2160,34 +2194,127 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       </div>
       <!-- Output paths — always accessible from settings panel -->
       <div style="border-top:1px solid var(--bdr);padding-top:8px;display:flex;flex-direction:column;gap:6px">
-        <div style="font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1px;color:var(--txt3);padding-bottom:2px">Output Paths</div>
-        <div class="prow" style="position:relative">
-          <span class="plbl">M3U:</span>
-          <input id="o-m3u" type="text" placeholder="/sdcard/Download/playlist.m3u" oninput="saveFP()" style="height:30px;font-size:12px">
-          <button class="btn-ghost psug-btn" onclick="togSug('m3u')" title="Suggestions">📁</button>
-          <div class="psug" id="sg-m3u" style="top:auto;bottom:calc(100% + 3px)">
-            <div class="psopt" onclick="pickP('m3u','/sdcard/Download/playlist.m3u')">/sdcard/Download/playlist.m3u</div>
-            <div class="psopt" onclick="pickP('m3u','/storage/emulated/0/Download/playlist.m3u')">/storage/emulated/0/Download/playlist.m3u</div>
-            <div class="psopt" onclick="pickP('m3u','/data/data/com.termux/files/home/playlist.m3u')">Termux ~/playlist.m3u</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;padding-bottom:2px">
+          <div style="font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1px;color:var(--txt3)">Output Paths</div>
+          <button class="btn-ghost" id="out-fb-toggle" onclick="outFbToggle()"
+            title="Toggle between desktop picker and mobile file browser"
+            style="height:22px;padding:0 8px;font-size:10px;font-weight:700;display:flex;align-items:center;gap:4px;flex-shrink:0
+            ">&#x1F4C1; File browser: Off</button>
+        </div>
+        <!-- DESKTOP: path inputs + tkinter browse buttons -->
+        <div id="out-paths-desktop">
+          <div class="prow" style="position:relative">
+            <span class="plbl">M3U:</span>
+            <input id="o-m3u" type="text" placeholder="/sdcard/Download/playlist.m3u" oninput="saveFP()" style="height:30px;font-size:12px">
+            <button class="btn-ghost psug-btn" onclick="outBrowseRow('m3u')" title="Browse">&#x1F4C2;</button>
+          </div>
+          <div class="prow" style="position:relative">
+            <span class="plbl">Download:</span>
+            <input id="o-dir" type="text" placeholder="/sdcard/Download/" oninput="saveFP()" style="height:30px;font-size:12px">
+            <button class="btn-ghost psug-btn" onclick="outBrowseRow('dir')" title="Browse">&#x1F4C2;</button>
+          </div>
+          <div class="prow" style="position:relative">
+            <span class="plbl">DVR:</span>
+            <input id="o-dvr" type="text" placeholder="/sdcard/Download/DVR/" oninput="saveFP()" style="height:30px;font-size:12px"
+              title="Output folder for DVR scheduled recordings">
+            <button class="btn-ghost psug-btn" onclick="outBrowseRow('dvr')" title="Browse">&#x1F4C2;</button>
           </div>
         </div>
-        <div class="prow" style="position:relative">
-          <span class="plbl">Folder:</span>
-          <input id="o-dir" type="text" placeholder="/sdcard/Download/" oninput="saveFP()" style="height:30px;font-size:12px">
-          <button class="btn-ghost psug-btn" onclick="togSug('dir')" title="Suggestions">📁</button>
-          <div class="psug" id="sg-dir" style="top:auto;bottom:calc(100% + 3px)">
-            <div class="psopt" onclick="pickP('dir','/sdcard/Download/')">/sdcard/Download/</div>
-            <div class="psopt" onclick="pickP('dir','/storage/emulated/0/Download/')">/storage/emulated/0/Download/</div>
-            <div class="psopt" onclick="pickP('dir','/data/data/com.termux/files/home/Downloads/')">Termux ~/Downloads/</div>
+        <!-- MOBILE: inline browser — inputs stay in desktop div (hidden), IDs still accessible -->
+        <div id="out-paths-mobile" style="display:none;flex-direction:column;gap:0">
+        <!-- Path value readouts (read-only display, actual inputs live in desktop div) -->
+        <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:6px">
+          <div style="display:flex;align-items:center;gap:6px">
+            <span class="plbl">M3U:</span>
+            <span id="out-mob-m3u" style="font-size:11px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span class="plbl">Download:</span>
+            <span id="out-mob-dir" style="font-size:11px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span class="plbl">DVR:</span>
+            <span id="out-mob-dvr" style="font-size:11px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
           </div>
         </div>
+        <div id="out-fb-wrap">
+          <!-- Target selector -->
+          <div style="display:flex;gap:4px;margin-bottom:6px;align-items:center">
+            <span style="font-size:10px;color:var(--txt3);white-space:nowrap">Set path for:</span>
+            <button id="out-fb-tgt-m3u" class="btn-ghost out-fb-tgt active" onclick="outFbSetTarget('m3u')"
+              style="height:22px;padding:0 8px;font-size:10px;font-weight:700">M3U</button>
+            <button id="out-fb-tgt-dir" class="btn-ghost out-fb-tgt" onclick="outFbSetTarget('dir')"
+              style="height:22px;padding:0 8px;font-size:10px;font-weight:700">Download</button>
+            <button id="out-fb-tgt-dvr" class="btn-ghost out-fb-tgt" onclick="outFbSetTarget('dvr')"
+              style="height:22px;padding:0 8px;font-size:10px;font-weight:700">DVR</button>
+          </div>
+          <!-- Nav bar -->
+          <div style="display:flex;gap:5px;margin-bottom:5px;align-items:center">
+            <button class="btn-ghost" id="out-fb-up" onclick="outFbUp()" style="height:26px;padding:0 8px;font-size:14px;flex-shrink:0">&#x2191;</button>
+            <span id="out-fb-path" style="font-size:10px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">/sdcard/Download</span>
+            <button class="btn-ghost" id="out-fb-select" onclick="outFbConfirm()"
+              style="height:26px;padding:0 8px;font-size:10px;color:#4ade80;border-color:rgba(34,197,94,.3);flex-shrink:0">&#x2713; Select</button>
+            <button class="btn-ghost" onclick="outFbClose()" style="height:26px;padding:0 8px;font-size:11px;flex-shrink:0">&#x2715;</button>
+          </div>
+          <!-- Quick paths (nav shortcuts — always visible) -->
+          <div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:5px">
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/sdcard/Download')">&#x1F4E5; Download</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/storage/emulated/0/Download')">&#x1F4E5; /0/DL</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/sdcard/Download/DVR')">&#x1F4FC; DVR</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/sdcard')">&#x1F4F1; /sdcard</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/storage/emulated/0')">&#x1F4F1; /storage/0</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/data/data/com.termux/files/home')">&#x1F5A5; Termux</button>
+          </div>
+          <!-- M3U: filename input + quick presets -->
+          <div id="out-fb-fname-row" style="display:none;align-items:center;gap:6px;margin-bottom:5px">
+            <span style="font-size:10px;color:var(--txt3);white-space:nowrap">Filename:</span>
+            <input id="out-fb-fname" type="text" placeholder="playlist.m3u"
+              style="flex:1;height:24px;font-size:11px;padding:0 7px;border-radius:var(--rss);
+                     border:1px solid var(--bdr2);background:var(--s3);color:var(--txt)"
+              autocomplete="off" autocorrect="off" spellcheck="false">
+          </div>
+          <div id="out-fb-m3u-presets" style="display:none;flex-wrap:wrap;gap:3px;margin-bottom:5px">
+            <span style="font-size:10px;color:var(--txt3);width:100%;margin-bottom:2px">&#x26A1; Quick set M3U path:</span>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/sdcard/Download/playlist.m3u')">/sdcard/DL/playlist.m3u</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/storage/emulated/0/Download/playlist.m3u')">/0/DL/playlist.m3u</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/data/data/com.termux/files/home/playlist.m3u')">Termux ~/playlist.m3u</button>
+          </div>
+          <!-- Download dir: quick presets -->
+          <div id="out-fb-dir-presets" style="display:none;flex-wrap:wrap;gap:3px;margin-bottom:5px">
+            <span style="font-size:10px;color:var(--txt3);width:100%;margin-bottom:2px">&#x26A1; Quick set Download folder:</span>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/sdcard/Download/')">/sdcard/Download/</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/storage/emulated/0/Download/')">/0/Download/</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/data/data/com.termux/files/home/')">Termux ~/</button>
+          </div>
+          <!-- DVR dir: quick presets -->
+          <div id="out-fb-dvr-presets" style="display:none;flex-wrap:wrap;gap:3px;margin-bottom:5px">
+            <span style="font-size:10px;color:var(--txt3);width:100%;margin-bottom:2px">&#x26A1; Quick set DVR folder:</span>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/sdcard/Download/DVR/')">/sdcard/Download/DVR/</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/storage/emulated/0/Download/DVR/')">/0/Download/DVR/</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/data/data/com.termux/files/home/DVR/')">Termux ~/DVR/</button>
+          </div>
+          <!-- File/folder list -->
+          <div id="out-fb-list" style="max-height:170px;overflow-y:auto;border:1px solid var(--bdr);border-radius:var(--rss);background:var(--s4)">
+            <div style="padding:8px;font-size:12px;color:var(--txt3)">Loading&hellip;</div>
+          </div>
+        </div><!-- /out-fb-wrap -->
+        </div><!-- /out-paths-mobile -->
         <div class="prow" style="position:relative" id="extplayer-row-desktop">
           <span class="plbl">Player:</span>
           <input id="o-extplayer" type="text" placeholder="C:\\Program Files\\VLC\\vlc.exe"
             autocomplete="new-password" autocorrect="off" spellcheck="false"
             oninput="saveExtPlayer()" style="height:30px;font-size:12px"
             title="Path to external player executable (e.g. VLC, mpv)">
-          <button class="btn-ghost psug-btn" onclick="browseExtPlayer()" title="Browse for player exe" style="font-size:13px">📂</button>
+          <button class="btn-ghost psug-btn" onclick="browseExtPlayer()" title="Browse for player exe" style="font-size:13px">&#x1F4C2;</button>
         </div>
         <div id="extplayer-row-mobile" style="display:none;gap:6px;align-items:center">
           <span class="plbl">Player:</span>
@@ -2200,18 +2327,6 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
             <option value="com.husudosu.mpvremote">mpv</option>
             <option value="copy">Copy URL</option>
           </select>
-        </div>
-        <div class="prow" style="position:relative">
-          <span class="plbl" style="white-space:nowrap;font-size:10px">&#x1F4AC; Sub:</span>
-          <input id="o-subkey" type="text"
-            placeholder="OpenSubtitles API key &mdash; free at opensubtitles.com/en/consumers"
-            autocomplete="new-password" autocorrect="off" spellcheck="false"
-            oninput="saveSubKey()" style="height:30px;font-size:12px"
-            title="Your OpenSubtitles Consumer API key. Get one free at opensubtitles.com/en/consumers">
-          <a href="https://www.opensubtitles.com/en/consumers" target="_blank" rel="noopener"
-            class="btn-ghost psug-btn"
-            style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:var(--rss);text-decoration:none;font-size:13px;flex-shrink:0;border:1px solid var(--bdr);background:var(--s3);color:var(--txt2)"
-            title="Get a free API key at opensubtitles.com/en/consumers">&#x1F511;</a>
         </div>
 
       </div>
@@ -2622,10 +2737,12 @@ function toggleSaveChk(btn){
 function toggleCP(){
   cpOpen=!cpOpen;
   document.getElementById('cpanel').classList.toggle('open',cpOpen);
+  if(!cpOpen && typeof _outFbHideSheet === 'function') _outFbHideSheet();
 }
 function closeCP(){
   cpOpen=false;
   document.getElementById('cpanel').classList.remove('open');
+  if(typeof _outFbHideSheet === 'function') _outFbHideSheet();
 }
 
 function setCT(t){
@@ -5499,15 +5616,22 @@ document.addEventListener('DOMContentLoaded',()=>{
   try{const sm=localStorage.getItem('m3u_path');
     if(sm) document.getElementById('o-m3u').value=sm;
     else document.getElementById('o-m3u').value='/sdcard/Download/playlist.m3u';}catch(e){}
+  try{const sdv=localStorage.getItem('dvr_folder');
+    if(sdv) document.getElementById('o-dvr').value=sdv;
+    else document.getElementById('o-dvr').value='/sdcard/Download/DVR/';}catch(e){}
   try{const se=localStorage.getItem('ext_player');
     if(se) document.getElementById('o-extplayer').value=se;}catch(e){}
-  try{const sk=localStorage.getItem('opensubtitles_key');
-    if(sk) document.getElementById('o-subkey').value=sk;}catch(e){}
   if(_isMobile){
     document.getElementById('extplayer-row-desktop').style.display='none';
     document.getElementById('extplayer-row-mobile').style.display='flex';
     try{const mp=localStorage.getItem('mobile_player');
       if(mp) document.getElementById('o-mobile-player').value=mp;}catch(e){}
+    // Hide desktop-only file browser switch buttons — mobile always uses the
+    // inline file browser and has no access to the tkinter desktop picker.
+    const _fbForceBtn = document.getElementById('m3u-force-fb-btn');
+    if(_fbForceBtn) _fbForceBtn.style.display='none';
+    const _outFbToggleBtn = document.getElementById('out-fb-toggle');
+    if(_outFbToggleBtn) _outFbToggleBtn.style.display='none';
   }
 
   // ── Item name scroll: hover a row → animate long names left to reveal full text ──
@@ -5605,6 +5729,16 @@ function _mvSelOpen(callback, forcedMode){
 <script src="/api/subtitles/ui.js"></script>
 <script src="/api/epg/ui.js"></script>
 <script src="/api/dvr/ui.js"></script>
+<script src="/api/dlm/ui.js"></script>
+<!-- Mobile output file-browser bottom-sheet — lives at body level so position:fixed always works -->
+<div id="out-fb-sheet-bg" onclick="outFbClose()"
+  style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9990"></div>
+<div id="out-fb-sheet"
+  style="display:none;position:fixed;bottom:52px;left:0;right:0;z-index:9991;
+         background:var(--s1);border-top:2px solid var(--acc);
+         border-radius:14px 14px 0 0;box-shadow:0 -8px 40px rgba(0,0,0,.85);
+         padding:10px 12px 14px;max-height:62vh;overflow-y:auto;
+         display:none;flex-direction:column;gap:5px"></div>
 </body>
 </html>
 """
@@ -5623,6 +5757,7 @@ _pre_config_json = json.dumps({
     "ffprobe_ok": _FFPROBE_AVAILABLE,
     "ytdlp_ok":   YTDLP_AVAILABLE,
     "dvr_ok":     _DVR_AVAILABLE,
+    "dlm_ok":     _DOWNLOAD_AVAILABLE,
 })
 _pre_tags: list = []
 _pre_tags.append(
