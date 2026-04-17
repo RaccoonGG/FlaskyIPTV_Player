@@ -2362,6 +2362,7 @@ function forceTab(pid,tid){
   _switchTab(pid,tid);
 }
 function _switchTab(pid,tid){
+  if(typeof closeCP === 'function') closeCP();
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   const panel=document.getElementById(pid);
   if(panel) panel.classList.add('active');
@@ -2408,37 +2409,6 @@ let _outFbMobileMode = false;
 // localStorage key map — source of truth for all three paths
 const _outFbLsKey = {m3u:'m3u_path', dir:'mkv_folder', dvr:'dvr_folder'};
 
-// ── Sheet show/hide ────────────────────────────────────────────────────────
-// #out-fb-sheet is a permanent <div> at body level (never inside cpanel).
-// Moving #out-fb-wrap into it at open-time guarantees position:fixed works
-// regardless of any overflow/compositing ancestor in the cpanel.
-let _outFbSheetHasWrap = false;
-
-function _outFbShowSheet(){
-  if(_outFbSheetHasWrap) return;
-  const sheet = document.getElementById('out-fb-sheet');
-  const bg    = document.getElementById('out-fb-sheet-bg');
-  const wrap  = document.getElementById('out-fb-wrap');
-  if(!sheet || !wrap) return;
-  sheet.appendChild(wrap);
-  sheet.style.display = 'flex';
-  if(bg) bg.style.display = 'block';
-  _outFbSheetHasWrap = true;
-}
-function _outFbHideSheet(){
-  if(!_outFbSheetHasWrap) return;
-  const sheet   = document.getElementById('out-fb-sheet');
-  const bg      = document.getElementById('out-fb-sheet-bg');
-  const wrap    = document.getElementById('out-fb-wrap');
-  const mobile  = document.getElementById('out-paths-mobile');
-  if(sheet && wrap && mobile){
-    mobile.appendChild(wrap);   // return wrap to its original parent
-    sheet.style.display = 'none';
-  }
-  if(bg) bg.style.display = 'none';
-  _outFbSheetHasWrap = false;
-}
-
 // ── State synchronisation ──────────────────────────────────────────────────
 function _outFbSyncReadouts(){
   // Read from localStorage — never from display:none inputs which can return ''
@@ -2462,12 +2432,6 @@ function _outFbApplyState(){
   const epMobile  = document.getElementById('extplayer-row-mobile');
   if(epDesktop) epDesktop.style.display = _outFbOpen ? 'none' : '';
   if(epMobile)  epMobile.style.display  = _outFbOpen ? 'flex' : 'none';
-  // On mobile: move wrap into the body-level sheet overlay
-  if(_outFbOpen && window.innerWidth < 900){
-    _outFbShowSheet();
-  } else {
-    _outFbHideSheet();
-  }
   if(btn){
     btn.textContent = _outFbOpen
       ? '\uD83D\uDCC1 File browser: On'
