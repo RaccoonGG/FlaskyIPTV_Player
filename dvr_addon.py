@@ -397,6 +397,7 @@ def register_dvr_routes(app, state=None) -> None:
             # Also update mkv_folder as fallback so existing logic picks it up
             if not getattr(state, "mkv_folder", ""):
                 state.mkv_folder = folder
+        _storage_cache.clear()
         LOG.info("[DVR] Output folder set: %s", folder)
         return jsonify({"ok": True, "folder": folder})
 
@@ -643,8 +644,9 @@ def register_dvr_routes(app, state=None) -> None:
     @app.route("/api/dvr/storage")
     def dvr_storage():
         nonlocal _storage_cache
-        out_dir = ""
-        if state:
+        # Accept explicit path from frontend (avoids stale state.dvr_folder)
+        out_dir = request.args.get("path", "").strip()
+        if not out_dir and state:
             out_dir = getattr(state, "dvr_folder", "") or getattr(state, "mkv_folder", "")
         if not out_dir:
             out_dir = os.path.join(os.path.expanduser("~"), "Downloads", "DVR")
@@ -1044,21 +1046,6 @@ _DVR_UI_JS = r"""
     <div style="height:5px;background:rgba(255,255,255,.08);border-radius:3px;overflow:hidden;margin-bottom:5px">
       <div id="dvr-storage-bar" style="height:100%;width:0%;border-radius:3px;transition:width .4s"></div>
     </div>
-    <div style="display:flex;align-items:center;gap:6px">
-      <div id="dvr-storage-folder" style="font-size:10px;color:var(--txt3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0"></div>
-      <button class="btn-ghost" onclick="dvrPickFolder()" style="height:22px;padding:0 8px;font-size:10px;flex-shrink:0;display:flex;align-items:center;gap:4px">📂 Change</button>
-      <button class="btn-ghost" onclick="dvrForceFileBrowser()" title="Force inline file browser" style="height:22px;padding:0 8px;font-size:10px;flex-shrink:0;opacity:0.7">📁</button>
-    </div>
-    <!-- Mobile inline folder browser (shown by dvrPickFolder on mobile) -->
-    <div id="dvr-fb-wrap" style="display:none;margin-top:6px">
-      <div style="display:flex;align-items:center;gap:5px;margin-bottom:4px">
-        <button class="btn-ghost" id="dvr-fb-up" onclick="dvrFbUp()" style="height:26px;padding:0 8px;font-size:14px">↑</button>
-        <span id="dvr-fb-path" style="font-size:10px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">/sdcard/Download</span>
-        <button class="btn-ghost" onclick="dvrFbConfirm()" style="height:26px;padding:0 8px;font-size:10px;color:#4ade80;border-color:rgba(34,197,94,.3)">✓ Select</button>
-        <button class="btn-ghost" onclick="document.getElementById('dvr-fb-wrap').style.display='none'" style="height:26px;padding:0 8px;font-size:11px">✕</button>
-      </div>
-      <div id="dvr-fb-list" style="max-height:160px;overflow-y:auto;border:1px solid var(--bdr);border-radius:var(--rss);background:var(--s3)"></div>
-    </div>
   </div>
 
   <div style="flex:1;overflow-y:auto;padding:10px 12px 12px">
@@ -1133,6 +1120,9 @@ async function dvrInit(){
   if(!_DVR_OK) return;
   if(_dvrInited){ dvrRefresh(); return; }
   _dvrInited = true;
+  // Sync DVR output path from settings to backend on first open
+  const _dvrPathEl = document.getElementById('o-dvr');
+  if(_dvrPathEl && _dvrPathEl.value.trim()) await dvrSetFolder(_dvrPathEl.value.trim());
   await dvrRefresh();
   // Pre-fill start to now + 1 min rounded, end to +1 hour
   const pad = n => String(n).padStart(2,'0');
@@ -1152,7 +1142,7 @@ async function dvrRefresh(){
     const fetches = [
       fetch('/api/dvr/jobs').then(r=>r.json()),
       fetch('/api/dvr/recordings').then(r=>r.json()),
-      overlayOpen ? fetch('/api/dvr/storage').then(r=>r.json()) : Promise.resolve(null),
+      overlayOpen ? fetch('/api/dvr/storage?path='+encodeURIComponent(document.getElementById('o-dvr')?.value||'')).then(r=>r.json()) : Promise.resolve(null),
     ];
     const [jr, rr, sr] = await Promise.all(fetches);
     _dvrJobs = Array.isArray(jr) ? jr : [];
@@ -1384,8 +1374,6 @@ function _dvrRenderStorage(s){
   bar.style.background = pct>90?'#dc2626':pct>75?'#ca8a04':'var(--acc)';
   document.getElementById('dvr-storage-text').textContent =
     `${_dvrFmtBytes(s.used)} of ${_dvrFmtBytes(s.total)} used`;
-  const fl = document.getElementById('dvr-storage-folder');
-  if(fl && s.folder) fl.textContent = s.folder;
 }
 
 function _dvrBadgeUpdate(){
@@ -1428,83 +1416,36 @@ setInterval(async ()=>{
 }, 20000);
 
 // ── Storage folder picker ──────────────────────────────────────────────────
-let _dvrFbCurrentPath = '/sdcard/Download';
-
 async function dvrPickFolder(){
-  // Always try the native desktop picker first (server-side tkinter).
-  // _isMobile is unreliable — DevTools device emulation and touch-screen
-  // laptops set maxTouchPoints/ontouchstart, wrongly triggering mobile mode.
+  // Desktop: try tkinter picker; mobile/fallback: shared output file browser
   try{
     const r = await fetch('/api/browse_folder');
     const d = await r.json();
-    if(d.path){ dvrSetFolder(d.path); dvrRefresh(); return; }
+    if(d.path){ await dvrSetFolder(d.path); dvrRefresh(); return; }
     if(d.error) throw new Error(d.error);
-    // d.path==='' with no error: user cancelled native dialog — do nothing
   } catch(e){
-    // tkinter unavailable (Android/Termux) — show inline folder browser
-    document.getElementById('dvr-fb-wrap').style.display = '';
-    await dvrFbNav(_dvrFbCurrentPath);
+    if(typeof outFbSetTarget === 'function'){
+      _outFbMobileMode = true;
+      _outFbOpen = true;
+      if(typeof _outFbApplyState === 'function') _outFbApplyState();
+      outFbSetTarget('dvr');
+    }
   }
-}
-
-async function dvrForceFileBrowser(){
-  // Force the inline folder browser regardless of platform —
-  // mirrors subForceFileBrowser() for the DVR folder picker.
-  document.getElementById('dvr-fb-wrap').style.display = '';
-  await dvrFbNav(_dvrFbCurrentPath);
-}
-
-async function dvrFbNav(path){
-  _dvrFbCurrentPath = path;
-  document.getElementById('dvr-fb-path').textContent = path;
-  const listEl = document.getElementById('dvr-fb-list');
-  const upBtn  = document.getElementById('dvr-fb-up');
-  listEl.innerHTML = '<div style="padding:8px 12px;font-size:11px;color:var(--txt3)">Loading…</div>';
-  try{
-    const r = await fetch('/api/browse_dir',{
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({path, dirs_only: true}),
-    });
-    const d = await r.json();
-    if(upBtn) upBtn.disabled = !d.parent;
-    const rows = (d.dirs||[]).map(name=>{
-      const full = path.replace(/\/+$/,'') + '/' + name;
-      return `<div class="sub-fb-row sub-fb-dir" onclick="dvrFbNav('${esc(full)}')">
-        <span class="sub-fb-icon">📁</span>
-        <span class="sub-fb-name">${esc(name)}</span>
-        <span class="sub-fb-arr">›</span>
-      </div>`;
-    });
-    if(!rows.length) rows.push('<div style="padding:10px 12px;font-size:11px;color:var(--txt3)">No subfolders here</div>');
-    listEl.innerHTML = rows.join('');
-  } catch(e){
-    listEl.innerHTML = `<div style="padding:8px;font-size:11px;color:#f87171">⚠ ${esc(String(e))}</div>`;
-  }
-}
-
-function dvrFbUp(){
-  const cur = _dvrFbCurrentPath;
-  const parent = cur.replace(/\/[^/]+$/, '') || '/';
-  dvrFbNav(parent);
-}
-
-function dvrFbConfirm(){
-  dvrSetFolder(_dvrFbCurrentPath);
-  document.getElementById('dvr-fb-wrap').style.display = 'none';
-  dvrRefresh();
 }
 
 async function dvrSetFolder(path){
-  // Tell the backend about the new DVR folder
   try{
     await fetch('/api/dvr/set_folder',{
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({folder: path}),
     });
   } catch(e){}
-  document.getElementById('dvr-storage-folder').textContent = path;
-  toast('DVR folder set: '+path.split(/[\\/]/).pop(),'ok');
+  // Also keep the settings o-dvr field in sync
+  const el = document.getElementById('o-dvr');
+  if(el && path) el.value = path;
+  if(typeof saveFP === 'function') saveFP();
 }
+
 let _dvrPickedItem = null;  // full item object from channel selector
 let _dvrEpgTitle   = '';    // programme title selected from DVR EPG
 
