@@ -70,11 +70,13 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import string
 import subprocess
 import threading
 import time
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from urllib.parse import quote as _qe
 
 from flask import request, jsonify
@@ -84,6 +86,104 @@ from flask import request, jsonify
 _time_re    = re.compile(r"time=(\d+):(\d+):(\d+\.?\d*)")
 _bitrate_re = re.compile(r"bitrate=\s*([\d.]+)kbits/s")
 _size_re    = re.compile(r"size=\s*(\d+)kB")
+
+
+# ── Download Manager job persistence ──────────────────────────────────────────
+# Mirrors dvr_addon pattern: JSON file on disk, in-memory cache, dirty flag.
+
+DLM_JOBS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dlm_jobs.json")
+
+_dlm_jobs_lock  = threading.Lock()
+_dlm_jobs_cache = None   # type: ignore
+_dlm_jobs_dirty = True
+
+
+def _dlm_load_jobs():
+    global _dlm_jobs_cache, _dlm_jobs_dirty
+    if not _dlm_jobs_dirty and _dlm_jobs_cache is not None:
+        return _dlm_jobs_cache
+    if not os.path.exists(DLM_JOBS_FILE):
+        _dlm_jobs_cache = []
+        _dlm_jobs_dirty = False
+        return _dlm_jobs_cache
+    try:
+        with open(DLM_JOBS_FILE, "r", encoding="utf-8") as fh:
+            _dlm_jobs_cache = json.load(fh).get("jobs", [])
+        _dlm_jobs_dirty = False
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).error("[DLM] Failed to load jobs: %s", exc)
+        _dlm_jobs_cache = []
+    return _dlm_jobs_cache
+
+
+def _dlm_save_jobs(jobs):
+    global _dlm_jobs_cache, _dlm_jobs_dirty
+    try:
+        with open(DLM_JOBS_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"jobs": jobs}, fh, indent=2, ensure_ascii=False)
+        _dlm_jobs_cache = jobs
+        _dlm_jobs_dirty = False
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).error("[DLM] Failed to save jobs: %s", exc)
+        _dlm_jobs_dirty = True
+
+
+def _dlm_add_job(job_id, job_type, name, file_path, started_at=None):
+    """Register a new in-progress job."""
+    t = started_at or time.time()
+    job = {
+        "id":            job_id,
+        "type":          job_type,   # "recording" | "mkv"
+        "name":          name,
+        "status":        "in_progress",
+        "filePath":      file_path,
+        "filename":      os.path.basename(file_path),
+        "fileSizeBytes": 0,
+        "startedAt":     datetime.fromtimestamp(t, tz=timezone.utc).isoformat(),
+        "completedAt":   "",
+        "errorMessage":  "",
+    }
+    with _dlm_jobs_lock:
+        jobs = _dlm_load_jobs()
+        jobs.append(job)
+        _dlm_save_jobs(jobs)
+
+
+def _dlm_complete_job(job_id, file_path=None):
+    """Mark a job completed, update file size and path."""
+    updates = {
+        "status":      "completed",
+        "completedAt": datetime.now(tz=timezone.utc).isoformat(),
+    }
+    fp = file_path or ""
+    if fp and os.path.exists(fp):
+        try:
+            updates["fileSizeBytes"] = os.path.getsize(fp)
+            updates["filePath"]      = fp
+            updates["filename"]      = os.path.basename(fp)
+        except Exception:
+            pass
+    with _dlm_jobs_lock:
+        jobs = _dlm_load_jobs()
+        for j in jobs:
+            if j["id"] == job_id:
+                j.update(updates)
+                break
+        _dlm_save_jobs(jobs)
+
+
+def _dlm_error_job(job_id, message=""):
+    with _dlm_jobs_lock:
+        jobs = _dlm_load_jobs()
+        for j in jobs:
+            if j["id"] == job_id:
+                j["status"]       = "error"
+                j["completedAt"]  = datetime.now(tz=timezone.utc).isoformat()
+                j["errorMessage"] = message
+                break
+        _dlm_save_jobs(jobs)
 
 
 # ── Filename sanitiser ────────────────────────────────────────────────────────
@@ -490,6 +590,10 @@ def register_download_routes(flask_app, state, run_async, run_worker, _make_clie
                 state.task_speed        = ""
                 state.log(f"[MKV] ({idx}/{len(resolved_items)}) Downloading: {name}")
                 state.set_status(f"MKV {idx}/{len(resolved_items)}: {name}")
+                # ── DLM: register this file ────────────────────────────────
+                _mkv_jid = str(uuid.uuid4())
+                state._dlm_current_mkv_jid = _mkv_jid
+                _dlm_add_job(_mkv_jid, "mkv", name, out_path)
 
                 state.log("[MKV]   Probing codecs…")
                 codecs = probe_stream_codecs(url, pre_input_args=pre_args,
@@ -588,10 +692,14 @@ def register_download_routes(flask_app, state, run_async, run_worker, _make_clie
                         break
 
                 if state.stop_flag.is_set():
+                    _dlm_error_job(_mkv_jid, "stopped by user")
+                    state._dlm_current_mkv_jid = None
                     break
 
                 if rc == 0:
                     state.log(f"[MKV] ✓ Saved: {out_path}")
+                    _dlm_complete_job(_mkv_jid, out_path)
+                    state._dlm_current_mkv_jid = None
                 else:
                     state.log(f"[MKV] ✗ Failed after {MAX_RETRIES} attempt(s): {name}")
                     if use_fallback and YTDLP_AVAILABLE and not state.stop_flag.is_set():
@@ -632,10 +740,17 @@ def register_download_routes(flask_app, state, run_async, run_worker, _make_clie
                                                       on_progress=_ytdlp_progress)
                         if ok:
                             state.log(f"[MKV]   ✓ yt-dlp saved: {out_path}")
+                            _dlm_complete_job(_mkv_jid, out_path)
                         elif err == "stopped":
                             state.log("[MKV]   yt-dlp stopped by user.")
+                            _dlm_error_job(_mkv_jid, "stopped by user")
                         else:
                             state.log(f"[MKV]   ✗ yt-dlp failed: {err}")
+                            _dlm_error_job(_mkv_jid, f"yt-dlp: {err}")
+                        state._dlm_current_mkv_jid = None
+                    else:
+                        _dlm_error_job(_mkv_jid, f"ffmpeg exit {rc}")
+                        state._dlm_current_mkv_jid = None
 
             if not state.stop_flag.is_set():
                 state.task_done = len(resolved_items)
@@ -689,6 +804,10 @@ def register_download_routes(flask_app, state, run_async, run_worker, _make_clie
         state.record_file_path  = out_path
         state.log(f"[REC] ⏺ Recording started: {out_path}")
         state.set_status(f"⏺ Recording → {fname}")
+        # ── DLM: track this recording ──────────────────────────────────────
+        _rec_jid = str(uuid.uuid4())
+        state.record_job_id = _rec_jid
+        _dlm_add_job(_rec_jid, "recording", stream_name, out_path, state.record_start_time)
         return jsonify({"ok": True, "file": out_path, "filename": fname})
 
     # ── /api/record/stop ──────────────────────────────────────────────────────
@@ -713,6 +832,11 @@ def register_download_routes(flask_app, state, run_async, run_worker, _make_clie
         saved = state.record_file_path
         state.log(f"[REC] ⏹ Recording stopped. Saved: {saved}")
         state.set_status(f"Recording stopped. Saved: {os.path.basename(saved)}")
+        # ── DLM: mark completed ────────────────────────────────────────────
+        _rec_jid = getattr(state, "record_job_id", None)
+        if _rec_jid:
+            _dlm_complete_job(_rec_jid, saved)
+            state.record_job_id = None
         return jsonify({"ok": True, "file": saved})
 
     # ── /api/record/status ────────────────────────────────────────────────────
@@ -731,6 +855,669 @@ def register_download_routes(flask_app, state, run_async, run_worker, _make_clie
         })
 
     _register_dl_ui_route(flask_app)
+    _register_dlm_routes(flask_app, state)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Download Manager routes + UI  (served as /api/dlm/ui.js)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DLM_UI_JS_BYTES: bytes = b""
+
+
+def _register_dlm_routes(app, state) -> None:
+    """Register all /api/dlm/* routes and the /api/dlm/ui.js frontend."""
+    import logging
+    LOG = logging.getLogger(__name__)
+
+    # ── Startup recovery: fix jobs stuck in_progress from a previous crash ─────
+    with _dlm_jobs_lock:
+        jobs    = _dlm_load_jobs()
+        changed = False
+        for job in jobs:
+            if job.get("status") != "in_progress":
+                continue
+            fp = job.get("filePath", "")
+            if fp and os.path.exists(fp):
+                job["status"]       = "completed"
+                job["completedAt"]  = datetime.now(tz=timezone.utc).isoformat()
+                try:
+                    job["fileSizeBytes"] = os.path.getsize(fp)
+                except Exception:
+                    pass
+                LOG.info("[DLM] Recovered completed job on startup: %s", job.get("name"))
+            else:
+                job["status"]       = "error"
+                job["completedAt"]  = datetime.now(tz=timezone.utc).isoformat()
+                job["errorMessage"] = "Interrupted (app restarted)"
+                LOG.warning("[DLM] Ghost job cleared on startup: %s", job.get("name"))
+            changed = True
+        if changed:
+            _dlm_save_jobs(jobs)
+
+    # ── GET /api/dlm/jobs  (in-progress) ──────────────────────────────────────
+    @app.route("/api/dlm/jobs")
+    def dlm_list_jobs():
+        jobs = _dlm_load_jobs()
+        return jsonify([j for j in jobs if j["status"] == "in_progress"])
+
+    # ── GET /api/dlm/completed  (finished jobs, newest first) ─────────────────
+    @app.route("/api/dlm/completed")
+    def dlm_list_completed():
+        jobs = _dlm_load_jobs()
+        done = [j for j in jobs if j["status"] != "in_progress"]
+        done.sort(key=lambda j: j.get("completedAt") or j.get("startedAt") or "", reverse=True)
+        return jsonify(done)
+
+    # ── POST /api/dlm/set_folder ───────────────────────────────────────────────
+    @app.route("/api/dlm/set_folder", methods=["POST"])
+    def dlm_set_folder():
+        d      = request.get_json(force=True)
+        folder = (d.get("folder") or "").strip()
+        if not folder:
+            return jsonify({"error": "folder is required"}), 400
+        if state:
+            state.mkv_folder = folder
+        _storage_cache.clear()
+        LOG.info("[DLM] Output folder set: %s", folder)
+        return jsonify({"ok": True, "folder": folder})
+
+    # ── GET /api/dlm/storage ──────────────────────────────────────────────────
+    _storage_cache: dict = {}
+
+    @app.route("/api/dlm/storage")
+    def dlm_storage():
+        nonlocal _storage_cache
+        # Accept explicit path from frontend (avoids stale state.mkv_folder)
+        out_dir = request.args.get("path", "").strip()
+        if not out_dir and state:
+            out_dir = getattr(state, "mkv_folder", "") or getattr(state, "dvr_folder", "")
+        if not out_dir:
+            out_dir = os.path.expanduser("~/Downloads")
+        cached = _storage_cache
+        if cached.get("folder") == out_dir and time.time() - cached.get("_ts", 0) < 60:
+            return jsonify({k: v for k, v in cached.items() if k != "_ts"})
+        try:
+            tgt   = out_dir if os.path.exists(out_dir) else os.path.expanduser("~")
+            usage = shutil.disk_usage(tgt)
+            pct   = round(usage.used / usage.total * 100, 1) if usage.total else 0
+            result = {"total": usage.total, "used": usage.used, "free": usage.free,
+                      "percentage": pct, "folder": out_dir, "_ts": time.time()}
+            _storage_cache = result
+            return jsonify({k: v for k, v in result.items() if k != "_ts"})
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    # ── GET /api/dlm/progress  (live stats for active jobs) ───────────────────
+    @app.route("/api/dlm/progress")
+    def dlm_progress():
+        if not state:
+            return jsonify({})
+        now    = time.time()
+        result = {}
+        for job in _dlm_load_jobs():
+            if job["status"] != "in_progress":
+                continue
+            jid  = job["id"]
+            fp   = job.get("filePath", "")
+            size = 0
+            if fp and os.path.exists(fp):
+                try:
+                    size = os.path.getsize(fp)
+                except Exception:
+                    pass
+
+            if job["type"] == "recording":
+                if (getattr(state, "recording", False) and
+                        getattr(state, "record_job_id", None) == jid):
+                    elapsed = max(0, int(now - getattr(state, "record_start_time", now)))
+                    result[jid] = {"type": "recording",
+                                   "fileSizeBytes":  size,
+                                   "elapsedSeconds": elapsed}
+
+            elif job["type"] == "mkv":
+                if (getattr(state, "task_type", "") == "mkv" and
+                        getattr(state, "_dlm_current_mkv_jid", None) == jid):
+                    result[jid] = {
+                        "type":          "mkv",
+                        "fileSizeBytes": size,
+                        "pct":           getattr(state, "task_file_pct",     0),
+                        "elapsed":       getattr(state, "task_file_elapsed", ""),
+                        "speed":         getattr(state, "task_speed",        ""),
+                        "label":         getattr(state, "task_label",        ""),
+                        "done":          getattr(state, "task_done",         0),
+                        "total":         getattr(state, "task_total",        0),
+                    }
+        return jsonify(result)
+
+    # ── DELETE /api/dlm/completed/all ─────────────────────────────────────────
+    @app.route("/api/dlm/completed/all", methods=["DELETE"])
+    def dlm_clear_all():
+        with_files = request.args.get("files", "false").lower() == "true"
+        with _dlm_jobs_lock:
+            jobs   = _dlm_load_jobs()
+            to_del = [j for j in jobs if j["status"] != "in_progress"]
+            if with_files:
+                for j in to_del:
+                    fp = j.get("filePath", "")
+                    if fp and os.path.exists(fp):
+                        try:
+                            os.remove(fp)
+                        except Exception as exc:
+                            LOG.warning("[DLM] Could not delete %s: %s", fp, exc)
+            _dlm_save_jobs([j for j in jobs if j["status"] == "in_progress"])
+        return jsonify({"ok": True})
+
+    # ── DELETE /api/dlm/completed/<id>  (remove entry, keep file) ─────────────
+    @app.route("/api/dlm/completed/<job_id>", methods=["DELETE"])
+    def dlm_remove_entry(job_id):
+        with _dlm_jobs_lock:
+            jobs = _dlm_load_jobs()
+            _dlm_save_jobs([j for j in jobs if j["id"] != job_id])
+        return jsonify({"ok": True})
+
+    # ── DELETE /api/dlm/completed/<id>/file  (remove entry + delete file) ─────
+    @app.route("/api/dlm/completed/<job_id>/file", methods=["DELETE"])
+    def dlm_delete_file(job_id):
+        with _dlm_jobs_lock:
+            jobs = _dlm_load_jobs()
+            job  = next((j for j in jobs if j["id"] == job_id), None)
+            if not job:
+                return jsonify({"error": "Job not found"}), 404
+            fp = job.get("filePath", "")
+            if fp and os.path.exists(fp):
+                try:
+                    os.remove(fp)
+                    LOG.info("[DLM] Deleted file: %s", fp)
+                except Exception as exc:
+                    LOG.warning("[DLM] Could not delete file %s: %s", fp, exc)
+            _dlm_save_jobs([j for j in jobs if j["id"] != job_id])
+        return jsonify({"ok": True})
+
+    # ── GET /api/dlm/ui.js ────────────────────────────────────────────────────
+    global _DLM_UI_JS_BYTES
+    _DLM_UI_JS_BYTES = _DLM_UI_JS.encode("utf-8")
+
+    @app.route("/api/dlm/ui.js")
+    def dlm_ui_js():
+        from flask import Response
+        return Response(
+            _DLM_UI_JS_BYTES,
+            content_type="application/javascript; charset=utf-8",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    LOG.info("[DLM] Routes registered (jobs_file=%s)", DLM_JOBS_FILE)
+
+
+_DLM_UI_JS = r"""
+/* ── Inject CSS ─────────────────────────────────────────────────────── */
+(function(){
+  const s = document.createElement('style');
+  s.textContent = `
+/* ─── Download Manager ──────────────────────────────────────────────────────── */
+.dlm-card{display:flex;flex-direction:column;gap:3px;padding:9px 11px;
+  background:rgba(255,255,255,.02);border:1px solid var(--bdr);border-radius:var(--rsm);
+  transition:var(--tr)}
+.dlm-card:hover{border-color:rgba(124,58,237,.25);background:rgba(124,58,237,.04)}
+.dlm-card-top{display:flex;align-items:center;gap:6px;min-width:0}
+.dlm-card-title{flex:1;font-size:12px;font-weight:600;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.dlm-card-meta{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:1px}
+.dlm-card-time{font-size:10px;color:var(--txt3)}
+.dlm-badge{display:inline-block;padding:1px 7px;border-radius:20px;font-size:9px;
+  font-weight:800;text-transform:uppercase;letter-spacing:.5px;flex-shrink:0}
+.dlm-badge.rec-active{background:rgba(220,38,38,.2);color:#f87171;
+  border:1px solid rgba(220,38,38,.4);animation:dlm-pulse 1.4s ease infinite}
+.dlm-badge.mkv-active{background:rgba(59,130,246,.2);color:#60a5fa;
+  border:1px solid rgba(59,130,246,.4);animation:dlm-pulse 1.4s ease infinite}
+@keyframes dlm-pulse{0%,100%{opacity:1}50%{opacity:.55}}
+.dlm-badge.done{background:rgba(34,197,94,.12);color:#4ade80;
+  border:1px solid rgba(34,197,94,.25)}
+.dlm-badge.err{background:rgba(239,68,68,.15);color:#fca5a5;
+  border:1px solid rgba(239,68,68,.3)}
+.dlm-badge.stopped{background:rgba(107,114,128,.15);color:#9ca3af;
+  border:1px solid rgba(107,114,128,.25)}
+.dlm-card-btns{display:flex;gap:4px;flex-shrink:0;margin-top:3px;justify-content:flex-end}
+.dlm-card-btns button{height:24px;padding:0 8px;font-size:10px;
+  font-weight:700;border-radius:var(--rss)}
+`;
+  document.head.appendChild(s);
+})();
+
+/* ── Inject HTML ────────────────────────────────────────────────────── */
+(function(){
+  /* Modal */
+  const d = document.createElement('div');
+  d.innerHTML = `
+<div id="dlm-overlay" style="display:none;position:fixed;inset:0;z-index:850;
+  background:rgba(0,0,0,.6);align-items:center;justify-content:center">
+<div style="background:var(--bg);border:1px solid var(--bdr);border-radius:var(--r);
+  width:min(440px,96vw);max-height:92vh;display:flex;flex-direction:column;
+  overflow:hidden;box-shadow:0 24px 64px rgba(0,0,0,.7)">
+
+  <!-- Header -->
+  <div style="display:flex;align-items:center;gap:8px;padding:10px 14px;
+    border-bottom:1px solid var(--bdr);flex-shrink:0">
+    <span style="font-size:16px">📥</span>
+    <h3 style="flex:1;font-size:14px;font-weight:700;margin:0">Downloads</h3>
+    <span id="dlm-hdr-badge" style="display:none;background:var(--acc);color:#fff;
+      border-radius:20px;font-size:10px;padding:1px 6px;font-weight:800;margin-right:4px"></span>
+    <button class="btn-ghost" onclick="dlmClose()"
+      style="height:28px;width:28px;padding:0;font-size:15px">✕</button>
+  </div>
+
+  <!-- Storage bar -->
+  <div style="padding:7px 14px 6px;flex-shrink:0;border-bottom:1px solid var(--bdr)">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">
+      <span style="font-size:10px;font-weight:700;text-transform:uppercase;
+        letter-spacing:.5px;color:var(--txt3)">Storage</span>
+      <span id="dlm-storage-text" style="font-size:10px;color:var(--txt3)"></span>
+    </div>
+    <div style="height:5px;background:rgba(255,255,255,.08);border-radius:3px;
+      overflow:hidden;margin-bottom:5px">
+      <div id="dlm-storage-bar" style="height:100%;width:0%;border-radius:3px;transition:width .4s"></div>
+    </div>
+  </div>
+
+  <div style="flex:1;overflow-y:auto;padding:10px 12px 12px">
+
+    <!-- In progress -->
+    <div style="font-size:11px;font-weight:800;text-transform:uppercase;
+      letter-spacing:.7px;color:var(--txt3);margin-bottom:5px">In Progress</div>
+    <div id="dlm-active-empty" style="text-align:center;padding:14px;
+      color:var(--txt3);font-size:12px;display:none">Nothing active right now</div>
+    <div id="dlm-active-list" style="display:flex;flex-direction:column;
+      gap:4px;margin-bottom:12px"></div>
+
+    <!-- Completed -->
+    <div style="font-size:11px;font-weight:800;text-transform:uppercase;
+      letter-spacing:.7px;color:var(--txt3);margin-bottom:5px;
+      display:flex;justify-content:space-between;align-items:center">
+      <span>Completed</span>
+      <div style="display:flex;gap:4px">
+        <button class="btn-ghost" onclick="dlmClearAll(false)"
+          style="height:22px;padding:0 7px;font-size:10px;opacity:.7">Clear list</button>
+        <button class="btn-ghost" onclick="dlmClearAll(true)"
+          style="height:22px;padding:0 7px;font-size:10px;opacity:.7;color:#f87171">Delete files</button>
+      </div>
+    </div>
+    <div id="dlm-done-empty" style="text-align:center;padding:14px;
+      color:var(--txt3);font-size:12px;display:none">No completed downloads yet</div>
+    <div id="dlm-done-list" style="display:flex;flex-direction:column;gap:4px"></div>
+
+  </div>
+</div>
+</div>
+`;
+  while(d.firstChild) document.body.appendChild(d.firstChild);
+
+  /* ── Inject "Downloads" button into the action drawer after DVR button ── */
+  function _injectBtn(){
+    const dvrBtn = document.getElementById('adr-dvr-btn');
+    if(!dvrBtn) return;
+    if(document.getElementById('adr-dlm-btn')) return; // already injected
+    const btn = document.createElement('button');
+    btn.id = 'adr-dlm-btn';
+    btn.setAttribute('onclick','closeDrawer();dlmOpen()');
+    btn.style.cssText = [
+      'margin-top:8px','width:100%','height:auto','padding:8px 12px',
+      'font-size:13px','font-weight:700',
+      'background:linear-gradient(135deg,rgba(59,130,246,.2),rgba(37,99,235,.2))',
+      'border:1px solid rgba(59,130,246,.35)','border-radius:var(--rsm)',
+      'cursor:pointer','color:var(--txt)',
+      'display:flex','align-items:center','gap:7px','flex-direction:column'
+    ].join(';');
+    btn.innerHTML =
+      '<span style="display:flex;align-items:center;gap:7px;width:100%;justify-content:center">' +
+        '📥 Downloads' +
+        '<span id="dlm-badge-adr" style="display:none;background:#3b82f6;color:#fff;' +
+          'border-radius:20px;font-size:10px;padding:1px 6px;font-weight:800"></span>' +
+      '</span>' +
+      '<span id="dlm-adr-status" style="display:none;font-size:10px;font-weight:600;' +
+        'color:#60a5fa;width:100%;text-align:center"></span>';
+    dvrBtn.insertAdjacentElement('afterend', btn);
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _injectBtn);
+  else _injectBtn();
+})();
+
+// ── State ──────────────────────────────────────────────────────────────────
+const _DLM_OK = (typeof CFG !== 'undefined') && CFG.dlm_ok === true;
+let _dlmInited = false;
+let _dlmActive = [];
+let _dlmDone   = [];
+
+function dlmOpen(){
+  if(!_DLM_OK){ toast('Download Manager not available','wrn'); return; }
+  document.getElementById('dlm-overlay').style.display = 'flex';
+  dlmInit();
+}
+function dlmClose(){
+  document.getElementById('dlm-overlay').style.display = 'none';
+}
+async function dlmInit(){
+  if(!_DLM_OK) return;
+  if(_dlmInited){ await dlmRefresh(); return; }
+  _dlmInited = true;
+  // Sync download output path from settings to backend on first open
+  const _dlmPathEl = document.getElementById('o-dir');
+  if(_dlmPathEl && _dlmPathEl.value.trim()) await dlmSetFolder(_dlmPathEl.value.trim());
+  await dlmRefresh();
+}
+
+async function dlmRefresh(){
+  try{
+    const open = document.getElementById('dlm-overlay')?.style.display === 'flex';
+    const [ar, dr, sr] = await Promise.all([
+      fetch('/api/dlm/jobs').then(r=>r.json()),
+      fetch('/api/dlm/completed').then(r=>r.json()),
+      open ? fetch('/api/dlm/storage?path='+encodeURIComponent(document.getElementById('o-dir')?.value||'')).then(r=>r.json()) : Promise.resolve(null),
+    ]);
+    _dlmActive = Array.isArray(ar) ? ar : [];
+    _dlmDone   = Array.isArray(dr) ? dr : [];
+    _dlmRenderActive();
+    _dlmRenderDone();
+    if(sr) _dlmRenderStorage(sr);
+    _dlmBadgeUpdate();
+  }catch(e){
+    if(document.getElementById('dlm-overlay')?.style.display==='flex')
+      toast('DLM: could not load data','err');
+  }
+}
+
+// ── Formatters ─────────────────────────────────────────────────────────────
+function _dlmFmtBytes(b){
+  if(!b) return '';
+  const k=1024, u=['B','KB','MB','GB'];
+  const i=Math.floor(Math.log(b)/Math.log(k));
+  return (b/Math.pow(k,i)).toFixed(1)+' '+u[i];
+}
+function _dlmFmtDate(iso){
+  if(!iso) return '—';
+  return new Date(iso).toLocaleString([],{month:'short',day:'numeric',
+    hour:'2-digit',minute:'2-digit'});
+}
+
+// ── Render active ──────────────────────────────────────────────────────────
+function _dlmRenderActive(){
+  const el = document.getElementById('dlm-active-list');
+  const em = document.getElementById('dlm-active-empty');
+  if(!_dlmActive.length){ el.innerHTML=''; em.style.display=''; return; }
+  em.style.display = 'none';
+  el.innerHTML = _dlmActive.map(j=>{
+    const isRec  = j.type === 'recording';
+    const badgeCls = isRec ? 'rec-active' : 'mkv-active';
+    const badgeTxt = isRec ? '⏺ REC' : '⬇ MKV';
+    const prog = isRec
+      ? `<div style="margin-top:5px">
+           <div style="display:flex;justify-content:space-between;font-size:9px;
+             color:var(--txt3);margin-bottom:2px">
+             <span id="dlm-t-${esc(j.id)}">Recording…</span>
+             <span id="dlm-sz-${esc(j.id)}"></span>
+           </div>
+           <div style="height:3px;background:rgba(255,255,255,.1);border-radius:2px;overflow:hidden">
+             <div style="height:100%;width:100%;background:#f87171;border-radius:2px"></div>
+           </div>
+         </div>`
+      : `<div style="margin-top:5px">
+           <div style="display:flex;justify-content:space-between;font-size:9px;
+             color:var(--txt3);margin-bottom:2px">
+             <span id="dlm-t-${esc(j.id)}">Downloading…</span>
+             <span id="dlm-sp-${esc(j.id)}"></span>
+           </div>
+           <div style="height:3px;background:rgba(255,255,255,.1);border-radius:2px;overflow:hidden">
+             <div id="dlm-bar-${esc(j.id)}" style="height:100%;width:0%;
+               background:#60a5fa;border-radius:2px;transition:width .5s"></div>
+           </div>
+           <div id="dlm-lbl-${esc(j.id)}"
+             style="font-size:9px;color:var(--txt3);margin-top:2px"></div>
+         </div>`;
+    return `<div class="dlm-card">
+      <div class="dlm-card-top">
+        <span class="dlm-card-title">${esc(j.name||j.filename||'Download')}</span>
+        <span class="dlm-badge ${badgeCls}">${badgeTxt}</span>
+      </div>
+      <div class="dlm-card-meta">
+        <span class="dlm-card-time">${_dlmFmtDate(j.startedAt)}</span>
+        <span id="dlm-sz-meta-${esc(j.id)}" class="dlm-card-time"></span>
+      </div>
+      ${prog}
+    </div>`;
+  }).join('');
+  _dlmPollProgress();
+}
+
+// ── Render completed ───────────────────────────────────────────────────────
+function _dlmRenderDone(){
+  const el = document.getElementById('dlm-done-list');
+  const em = document.getElementById('dlm-done-empty');
+  if(!_dlmDone.length){ el.innerHTML=''; em.style.display=''; return; }
+  em.style.display = 'none';
+  el.innerHTML = _dlmDone.map(j=>{
+    const isRec = j.type === 'recording';
+    const ico   = isRec ? '⏺' : '🎬';
+    const lbl   = isRec ? 'REC' : 'MKV';
+    const bc    = j.status==='completed' ? 'done' : j.status==='error' ? 'err' : 'stopped';
+    const meta  = [_dlmFmtBytes(j.fileSizeBytes),
+                   j.status!=='completed' ? j.status : ''].filter(Boolean).join(' · ');
+    const err   = (j.status==='error'&&j.errorMessage)
+      ? `<div style="font-size:10px;color:#fca5a5;margin-top:2px">${esc(j.errorMessage)}</div>` : '';
+    const canReveal = j.status === 'completed';
+    return `<div class="dlm-card">
+      <div class="dlm-card-top">
+        <span style="font-size:11px;flex-shrink:0">${ico}</span>
+        <span class="dlm-card-title">${esc(j.name||j.filename||'Download')}</span>
+        <span class="dlm-badge ${bc}">${lbl}</span>
+      </div>
+      <div class="dlm-card-meta">
+        <span class="dlm-card-time">${_dlmFmtDate(j.completedAt||j.startedAt)}</span>
+        ${meta?`<span class="dlm-card-time">· ${esc(meta)}</span>`:''}
+      </div>
+      ${err}
+      <div class="dlm-card-btns">
+        ${canReveal?`<button class="btn-ghost" onclick="dlmReveal('${esc(j.id)}')"
+          title="Show in folder" style="font-size:11px">📂</button>`:''}
+        <button class="btn-ghost" onclick="dlmRemoveEntry('${esc(j.id)}')"
+          title="Remove from list">🗑</button>
+        ${canReveal?`<button class="btn-ghost" onclick="dlmDeleteFile('${esc(j.id)}')"
+          title="Delete file" style="color:#f87171;font-size:10px">🗑 file</button>`:''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── Render storage bar ─────────────────────────────────────────────────────
+function _dlmRenderStorage(s){
+  if(!s||s.error) return;
+  const pct = s.percentage || 0;
+  const bar = document.getElementById('dlm-storage-bar');
+  if(bar){ bar.style.width=pct+'%';
+    bar.style.background=pct>90?'#dc2626':pct>75?'#ca8a04':'var(--acc)'; }
+  const txt = document.getElementById('dlm-storage-text');
+  if(txt) txt.textContent = `${_dlmFmtBytes(s.used)} of ${_dlmFmtBytes(s.total)} used`;
+}
+
+// ── Badge update ───────────────────────────────────────────────────────────
+function _dlmBadgeUpdate(){
+  const n = _dlmActive.length;
+  const hb = document.getElementById('dlm-hdr-badge');
+  if(hb){ hb.textContent=n; hb.style.display=n?'':'none'; }
+  const ab = document.getElementById('dlm-badge-adr');
+  if(ab){ ab.textContent=n; ab.style.display=n?'':'none'; }
+  const st = document.getElementById('dlm-adr-status');
+  if(st){
+    if(n){
+      const recs = _dlmActive.filter(j=>j.type==='recording');
+      const mkvs = _dlmActive.filter(j=>j.type==='mkv');
+      const parts = [];
+      if(recs.length) parts.push('⏺ '+recs.map(j=>j.name).join(', ').slice(0,28));
+      if(mkvs.length) parts.push('⬇ '+mkvs.map(j=>j.name).join(', ').slice(0,28));
+      st.textContent = parts.join(' · ').slice(0,56);
+      st.style.display = '';
+    } else {
+      st.style.display = 'none';
+    }
+  }
+}
+
+// ── Live progress polling ──────────────────────────────────────────────────
+let _dlmProgTimer    = null;
+let _dlmRefreshPend  = false;
+
+async function _dlmPollProgress(){
+  clearTimeout(_dlmProgTimer);
+  if(!_dlmActive.length ||
+     document.getElementById('dlm-overlay')?.style.display !== 'flex') return;
+  try{
+    const prog = await fetch('/api/dlm/progress').then(r=>r.json());
+
+    // Job gone from progress → finished, trigger refresh
+    const missing = _dlmActive.map(j=>j.id).filter(id=>!(id in prog));
+    if(missing.length && !_dlmRefreshPend){
+      _dlmRefreshPend = true;
+      setTimeout(()=>{ _dlmRefreshPend=false; dlmRefresh(); }, 1200);
+    }
+
+    for(const [id, p] of Object.entries(prog)){
+      if(p.type === 'recording'){
+        const e = p.elapsedSeconds||0;
+        const h=Math.floor(e/3600), m=Math.floor((e%3600)/60), s=e%60;
+        const ts=(h>0?`${h}h `:'')+`${String(m).padStart(2,'0')}m ${String(s).padStart(2,'0')}s`;
+        const t  = document.getElementById(`dlm-t-${id}`);
+        const sz = document.getElementById(`dlm-sz-${id}`);
+        const sm = document.getElementById(`dlm-sz-meta-${id}`);
+        if(t)  t.textContent  = ts;
+        if(sz) sz.textContent = p.fileSizeBytes ? _dlmFmtBytes(p.fileSizeBytes) : '';
+        if(sm) sm.textContent = p.fileSizeBytes ? '· '+_dlmFmtBytes(p.fileSizeBytes) : '';
+
+      } else if(p.type === 'mkv'){
+        const bar = document.getElementById(`dlm-bar-${id}`);
+        const t   = document.getElementById(`dlm-t-${id}`);
+        const sp  = document.getElementById(`dlm-sp-${id}`);
+        const lb  = document.getElementById(`dlm-lbl-${id}`);
+        const sm  = document.getElementById(`dlm-sz-meta-${id}`);
+        const pct   = p.pct   || 0;
+        const total = p.total || 0;
+        const done  = p.done  || 0;
+        if(bar) bar.style.width = pct + '%';
+        if(t){
+          const fi = total>1 ? `File ${done+1}/${total}` : 'Downloading…';
+          t.textContent = p.elapsed ? `${fi} · ${p.elapsed}` : fi;
+        }
+        if(sp) sp.textContent = p.speed || '';
+        if(lb) lb.textContent = p.label || '';
+        if(sm) sm.textContent = p.fileSizeBytes ? '· '+_dlmFmtBytes(p.fileSizeBytes) : '';
+      }
+    }
+  }catch(e){}
+  _dlmProgTimer = setTimeout(_dlmPollProgress, 3000);
+}
+
+// ── Background badge poll when modal is closed ─────────────────────────────
+setInterval(async ()=>{
+  if(!_DLM_OK || !_dlmInited) return;
+  if(document.getElementById('dlm-overlay')?.style.display === 'flex') return;
+  if(!_dlmActive.length) return;
+  try{
+    const j = await fetch('/api/dlm/jobs').then(r=>r.json());
+    if(Array.isArray(j)){ _dlmActive=j; _dlmBadgeUpdate(); }
+  }catch(e){}
+}, 15000);
+
+// ── Folder picker (mirrors DVR exactly) ───────────────────────────────────
+async function dlmPickFolder(){
+  // Desktop: try tkinter picker; mobile/fallback: shared output file browser
+  try{
+    const r = await fetch('/api/browse_folder');
+    const d = await r.json();
+    if(d.path){ await dlmSetFolder(d.path); dlmRefresh(); return; }
+    if(d.error) throw new Error(d.error);
+  }catch(e){
+    // Open shared output browser targeting Download
+    if(typeof outFbSetTarget === 'function'){
+      _outFbMobileMode = true;
+      _outFbOpen = true;
+      if(typeof _outFbApplyState === 'function') _outFbApplyState();
+      outFbSetTarget('dir');
+    }
+  }
+}
+async function dlmSetFolder(path){
+  try{
+    await fetch('/api/dlm/set_folder',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({folder:path})});
+  }catch(e){}
+  // Also keep the settings o-dir field in sync
+  const el = document.getElementById('o-dir');
+  if(el && path) el.value = path;
+  if(typeof saveFP === 'function') saveFP();
+}
+
+// ── Actions ────────────────────────────────────────────────────────────────
+async function dlmRemoveEntry(id){
+  await fetch(`/api/dlm/completed/${id}`,{method:'DELETE'});
+  toast('Removed from list','ok');
+  dlmRefresh();
+}
+async function dlmDeleteFile(id){
+  const j = _dlmDone.find(x=>x.id===id);
+  const name = j ? (j.name||j.filename||'file') : 'file';
+  _mvConfirm('Delete File',`Permanently delete "${name}"?`, async ()=>{
+    await fetch(`/api/dlm/completed/${id}/file`,{method:'DELETE'});
+    toast('File deleted','ok');
+    dlmRefresh();
+  });
+}
+async function dlmClearAll(withFiles){
+  const title = withFiles ? 'Delete All Files' : 'Clear List';
+  const msg   = withFiles
+    ? 'Permanently delete ALL completed download files?'
+    : 'Remove all completed entries from the list? Files will be kept.';
+  _mvConfirm(title, msg, async ()=>{
+    await fetch('/api/dlm/completed/all'+(withFiles?'?files=true':''),{method:'DELETE'});
+    toast(withFiles?'All files deleted':'List cleared','ok');
+    dlmRefresh();
+  });
+}
+async function dlmReveal(id){
+  const j = _dlmDone.find(x=>x.id===id);
+  if(!j||!j.filePath) return;
+  if(typeof _isMobile !== 'undefined' && _isMobile){
+    toast('Show in folder is a desktop feature','wrn'); return;
+  }
+  try{
+    const r = await fetch('/api/reveal_in_folder',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path:j.filePath})});
+    const d = await r.json();
+    if(d.error) toast(d.error,'err');
+  }catch(e){ toast('Could not open folder: '+e,'err'); }
+}
+
+// ── Auto-refresh while overlay open ───────────────────────────────────────
+let _dlmAutoTimer = null;
+function _dlmScheduleAuto(){
+  clearTimeout(_dlmAutoTimer);
+  _dlmAutoTimer = setTimeout(async ()=>{
+    if(_dlmInited && document.getElementById('dlm-overlay')?.style.display==='flex'){
+      await dlmRefresh();
+    }
+    _dlmScheduleAuto();
+  }, _dlmActive.length ? 10000 : 60000);
+}
+const _dlmRefreshOrig = dlmRefresh;
+dlmRefresh = async function(){
+  await _dlmRefreshOrig();
+  _dlmScheduleAuto();
+};
+
+// ── Backdrop click ─────────────────────────────────────────────────────────
+document.getElementById('dlm-overlay').addEventListener('click', e=>{
+  if(e.target === document.getElementById('dlm-overlay')) dlmClose();
+});
+"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1466,6 +2253,14 @@ function setStatus(m){
   btn.style.cursor=connected?'pointer':'default';
   const isConnMsg = m.startsWith('Connected') || m.startsWith('Connecting') ||
                     m.startsWith('Error') || !connected;
+  // Short label for mobile header (hdr-status-short shown via CSS on <600px screens)
+  const shortEl=document.getElementById('hdr-status-short');
+  if(shortEl){
+    if(m.startsWith('Connected')) shortEl.textContent='Online';
+    else if(m.startsWith('Connecting')) shortEl.textContent='Wait…';
+    else if(m.startsWith('Error')) shortEl.textContent='Error';
+    else shortEl.textContent='Offline';
+  }
   if(!isConnMsg){
     const act=document.getElementById('activity-status');
     if(act){
@@ -1591,9 +2386,9 @@ function togSug(w){
   if(!was) el.classList.add('open');
 }
 function pickP(w,v){
-  document.getElementById({m3u:'o-m3u',dir:'o-dir'}[w]).value=v;
+  document.getElementById({m3u:'o-m3u',dir:'o-dir',dvr:'o-dvr'}[w]).value=v;
   document.getElementById('sg-'+w).classList.remove('open');
-  if(w==='dir') saveFP();
+  saveFP();
 }
 document.addEventListener('click',e=>{
   if(!e.target.closest('.prow'))
@@ -1602,14 +2397,256 @@ document.addEventListener('click',e=>{
 function saveFP(){
   try{localStorage.setItem('mkv_folder',document.getElementById('o-dir').value);}catch(e){}
   try{localStorage.setItem('m3u_path',document.getElementById('o-m3u').value);}catch(e){}
+  try{const dv=document.getElementById('o-dvr');if(dv)localStorage.setItem('dvr_folder',dv.value);}catch(e){}
 }
+// ── Shared output-path mobile browser ─────────────────────────────────────
+let _outFbTarget     = 'm3u';
+let _outFbCurPath    = '/sdcard/Download';
+let _outFbOpen       = false;
+let _outFbMobileMode = false;
+
+// localStorage key map — source of truth for all three paths
+const _outFbLsKey = {m3u:'m3u_path', dir:'mkv_folder', dvr:'dvr_folder'};
+
+// ── Sheet show/hide ────────────────────────────────────────────────────────
+// #out-fb-sheet is a permanent <div> at body level (never inside cpanel).
+// Moving #out-fb-wrap into it at open-time guarantees position:fixed works
+// regardless of any overflow/compositing ancestor in the cpanel.
+let _outFbSheetHasWrap = false;
+
+function _outFbShowSheet(){
+  if(_outFbSheetHasWrap) return;
+  const sheet = document.getElementById('out-fb-sheet');
+  const bg    = document.getElementById('out-fb-sheet-bg');
+  const wrap  = document.getElementById('out-fb-wrap');
+  if(!sheet || !wrap) return;
+  sheet.appendChild(wrap);
+  sheet.style.display = 'flex';
+  if(bg) bg.style.display = 'block';
+  _outFbSheetHasWrap = true;
+}
+function _outFbHideSheet(){
+  if(!_outFbSheetHasWrap) return;
+  const sheet   = document.getElementById('out-fb-sheet');
+  const bg      = document.getElementById('out-fb-sheet-bg');
+  const wrap    = document.getElementById('out-fb-wrap');
+  const mobile  = document.getElementById('out-paths-mobile');
+  if(sheet && wrap && mobile){
+    mobile.appendChild(wrap);   // return wrap to its original parent
+    sheet.style.display = 'none';
+  }
+  if(bg) bg.style.display = 'none';
+  _outFbSheetHasWrap = false;
+}
+
+// ── State synchronisation ──────────────────────────────────────────────────
+function _outFbSyncReadouts(){
+  // Read from localStorage — never from display:none inputs which can return ''
+  const spanMap = {m3u:'out-mob-m3u', dir:'out-mob-dir', dvr:'out-mob-dvr'};
+  for(const [k, lsKey] of Object.entries(_outFbLsKey)){
+    const span = document.getElementById(spanMap[k]);
+    if(span){
+      const v = localStorage.getItem(lsKey) || '';
+      span.textContent = v || '(not set)';
+    }
+  }
+}
+
+function _outFbApplyState(){
+  const desktop = document.getElementById('out-paths-desktop');
+  const mobile  = document.getElementById('out-paths-mobile');
+  const btn     = document.getElementById('out-fb-toggle');
+  if(desktop) desktop.style.display = _outFbOpen ? 'none' : '';
+  if(mobile)  mobile.style.display  = _outFbOpen ? 'flex' : 'none';
+  const epDesktop = document.getElementById('extplayer-row-desktop');
+  const epMobile  = document.getElementById('extplayer-row-mobile');
+  if(epDesktop) epDesktop.style.display = _outFbOpen ? 'none' : '';
+  if(epMobile)  epMobile.style.display  = _outFbOpen ? 'flex' : 'none';
+  // On mobile: move wrap into the body-level sheet overlay
+  if(_outFbOpen && window.innerWidth < 900){
+    _outFbShowSheet();
+  } else {
+    _outFbHideSheet();
+  }
+  if(btn){
+    btn.textContent = _outFbOpen
+      ? '\uD83D\uDCC1 File browser: On'
+      : '\uD83D\uDCC1 File browser: Off';
+    btn.style.background  = _outFbOpen ? 'rgba(124,58,237,.25)' : '';
+    btn.style.borderColor = _outFbOpen ? 'var(--acc)' : '';
+    btn.style.color       = _outFbOpen ? 'var(--txt)' : '';
+  }
+  if(_outFbOpen) _outFbSyncReadouts();
+}
+
+function outFbToggle(){
+  _outFbOpen = !_outFbOpen;
+  _outFbApplyState();
+  if(_outFbOpen) outFbSetTarget(_outFbTarget);
+}
+function outFbClose(){
+  _outFbOpen = false;
+  _outFbApplyState();
+}
+
+function outFbSetTarget(t){
+  _outFbTarget = t;
+  document.querySelectorAll('.out-fb-tgt').forEach(b=>b.classList.remove('active'));
+  const tb = document.getElementById('out-fb-tgt-'+t);
+  if(tb) tb.classList.add('active');
+  // Filename row — only for M3U
+  const fnRow = document.getElementById('out-fb-fname-row');
+  if(fnRow) fnRow.style.display = (t==='m3u') ? 'flex' : 'none';
+  // Show only the correct preset group, hide the others
+  ['m3u','dir','dvr'].forEach(k=>{
+    const el = document.getElementById('out-fb-'+k+'-presets');
+    if(el) el.style.display = (k===t) ? 'flex' : 'none';
+  });
+  if(t==='m3u'){
+    // Pre-fill filename from localStorage
+    const cur  = localStorage.getItem('m3u_path') || '';
+    const base = cur.split('/').pop() || 'playlist.m3u';
+    const inp  = document.getElementById('out-fb-fname');
+    if(inp) inp.value = base;
+    // Start path = directory of saved M3U path
+    const dir = cur.includes('/') ? cur.replace(/\/[^/]+$/, '') : _outFbCurPath;
+    if(dir && dir !== _outFbCurPath){
+      _outFbCurPath = dir;
+      const pathEl = document.getElementById('out-fb-path');
+      if(pathEl) pathEl.textContent = dir;
+    }
+  }
+  outFbNav(_outFbCurPath);
+}
+
+function outFbUp(){
+  const cur = document.getElementById('out-fb-path')?.textContent || _outFbCurPath;
+  outFbNav(cur.replace(/\/[^/]+\/?$/, '') || '/');
+}
+
+async function outFbNav(path){
+  path = path.replace(/\/+$/, '') || '/';
+  _outFbCurPath = path;
+  const listEl = document.getElementById('out-fb-list');
+  const pathEl = document.getElementById('out-fb-path');
+  const upBtn  = document.getElementById('out-fb-up');
+  if(pathEl) pathEl.textContent = path;
+  if(listEl) listEl.innerHTML = '<div style="padding:8px;font-size:12px;color:var(--txt3)">Loading\u2026</div>';
+  const dirsOnly = (_outFbTarget !== 'm3u');
+  try{
+    const r = await fetch('/api/browse_dir',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path, dirs_only:dirsOnly})});
+    const d = await r.json();
+    if(upBtn) upBtn.disabled = !d.parent;
+    const rows = [];
+    for(const name of (d.dirs||[])){
+      const fp = path.replace(/\/+$/,'') + '/' + name;
+      rows.push(`<div class="sub-fb-row sub-fb-dir" onclick="outFbNav('${esc(fp)}')">
+        <span class="sub-fb-icon">\uD83D\uDCC1</span><span class="sub-fb-name">${esc(name)}</span><span class="sub-fb-arr">\u203a</span>
+      </div>`);
+    }
+    for(const name of (d.files||[])){
+      const fp = path.replace(/\/+$/,'') + '/' + name;
+      rows.push(`<div class="sub-fb-row sub-fb-file" onclick="outFbPickFile('${esc(fp)}')">
+        <span class="sub-fb-icon">\uD83D\uDCC4</span><span class="sub-fb-name">${esc(name)}</span>
+      </div>`);
+    }
+    if(!rows.length) rows.push('<div style="padding:8px;font-size:12px;color:var(--txt3)">No items here.</div>');
+    if(listEl) listEl.innerHTML = rows.join('');
+    if(d.error && !d.dirs.length && !d.files.length && listEl){
+      listEl.innerHTML = `<div style="padding:8px;font-size:12px;color:#f87171">\u26a0 ${esc(d.error)}</div>`;
+    }
+  }catch(e){
+    if(listEl) listEl.innerHTML = `<div style="padding:8px;font-size:12px;color:#f87171">\u26a0 ${esc(String(e))}</div>`;
+  }
+}
+
+function outFbConfirm(){
+  const dir = (document.getElementById('out-fb-path')?.textContent || _outFbCurPath).replace(/\/+$/,'');
+  if(_outFbTarget === 'm3u'){
+    const inp   = document.getElementById('out-fb-fname');
+    const fname = (inp && inp.value.trim()) || 'playlist.m3u';
+    outFbApply(dir + '/' + fname);
+  } else {
+    outFbApply(dir + '/');
+  }
+}
+function outFbPickFile(fp){ outFbApply(fp); }
+
+function outFbApply(val){
+  const lsKey = _outFbLsKey[_outFbTarget];
+  const idMap  = {m3u:'o-m3u', dir:'o-dir', dvr:'o-dvr'};
+  const spanMap= {m3u:'out-mob-m3u', dir:'out-mob-dir', dvr:'out-mob-dvr'};
+  // 1. Write to localStorage — primary storage, bypasses all hidden-input issues
+  try{ localStorage.setItem(lsKey, val); }catch(e){}
+  // 2. Update the hidden desktop input so desktop view and saveFP() stay in sync
+  const inp = document.getElementById(idMap[_outFbTarget]);
+  if(inp) inp.value = val;
+  // 3. Update the visible readout span directly — do NOT re-read inp.value
+  const span = document.getElementById(spanMap[_outFbTarget]);
+  if(span) span.textContent = val;
+  toast('Path set \u2014 ' + (val.split('/').filter(Boolean).pop()||val), 'ok');
+}
+
+// Quick-apply a preset path for any target (replaces old outFbApplyM3uPreset)
+function outFbQuickApply(fullPath){
+  outFbApply(fullPath);
+}
+
+// Keep old name as alias in case anything else calls it
+function outFbApplyM3uPreset(fullPath){ outFbQuickApply(fullPath); }
+
+// ── Per-row browse button: desktop=tkinter, mobile=shared browser ─────────
+async function outBrowseRow(target){
+  // Use shared browser if: Mobile toggle is on, or actual mobile device
+  const useBrowser = _outFbMobileMode || (typeof _isMobile !== 'undefined' && _isMobile);
+  if(useBrowser){
+    // Ensure panel is open
+    if(!_outFbOpen){
+      _outFbOpen = true;
+      _outFbApplyState();
+    }
+    outFbSetTarget(target);
+    return;
+  }
+  // Desktop without mobile mode: try tkinter picker
+  const _m3uBase = (document.getElementById('o-m3u')?.value||'').split('/').pop()||'playlist.m3u';
+  const apiUrl = (target === 'm3u')
+    ? '/api/browse_m3u_file?name='+encodeURIComponent(_m3uBase)
+    : '/api/browse_folder';
+  try{
+    const r = await fetch(apiUrl);
+    const d = await r.json();
+    if(d.path && d.path.length){
+      const idMap = {m3u:'o-m3u', dir:'o-dir', dvr:'o-dvr'};
+      const el = document.getElementById(idMap[target]);
+      if(el){ el.value = d.path; saveFP(); }
+      toast('Path set', 'ok');
+      return;
+    }
+    // d.path empty = user cancelled tkinter dialog — do nothing
+    if(!d.error) return;
+    // d.error = tkinter unavailable (Android/headless) — open shared browser
+  }catch(e){ /* fall through */ }
+  // Tkinter unavailable fallback: open shared browser
+  _outFbMobileMode = true;
+  _outFbOpen = true;
+  _outFbApplyState();
+  outFbSetTarget(target);
+}
+
 function saveExtPlayer(){
   try{localStorage.setItem('ext_player',document.getElementById('o-extplayer').value);}catch(e){}
 }
 function saveSubKey(){
-  try{localStorage.setItem('opensubtitles_key',document.getElementById('o-subkey').value.trim());}catch(e){}
+  // API key field now lives inside the subtitle modal (#sub-apikey)
+  try{
+    const el=document.getElementById('sub-apikey');
+    if(el) localStorage.setItem('opensubtitles_key',el.value.trim());
+  }catch(e){}
 }
 function _getSubKey(){
+  // Always read from localStorage; modal input is populated from it on open
   try{return localStorage.getItem('opensubtitles_key')||'';}catch(e){return '';}
 }
 function saveMobilePlayer(){
@@ -1627,7 +2664,20 @@ async function browseExtPlayer(){
 }
 const _isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
   || ('ontouchstart' in window)
-  || (navigator.maxTouchPoints > 1);
+  || (navigator.maxTouchPoints > 1)
+  || window.innerWidth <= 900;
+// Auto-switch output paths to mobile browser if on mobile — deferred to DOM ready
+function _outFbAutoInit(){
+  if(_isMobile && !_outFbOpen){
+    outFbToggle();
+    outFbSetTarget('m3u');
+  }
+}
+if(document.readyState === 'loading'){
+  document.addEventListener('DOMContentLoaded', _outFbAutoInit);
+} else {
+  _outFbAutoInit();
+}
 
 /* ─── Orientation manager (mobile only) ──────────────────────────────────────
    • On player tab  : unlock orientation; auto-fullscreen on landscape rotation.
