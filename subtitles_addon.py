@@ -392,11 +392,18 @@ _SUBTITLES_UI_JS = r"""
 #sub-delay-val{min-width:52px;text-align:center;font-weight:700;color:var(--acc);font-size:12px;
   font-variant-numeric:tabular-nums}
 /* subtitle tab row */
-.sub-tab-row{display:flex;gap:6px;flex-shrink:0;border-bottom:1px solid var(--bdr);padding-bottom:8px;margin-bottom:2px}
+.sub-tab-row{display:flex;gap:6px;flex-shrink:0;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--bdr);padding-bottom:8px;margin-bottom:2px}
+.sub-api-key-wrap{display:flex;gap:6px;align-items:center;flex:1;min-width:0}
 .sub-tab-btn{height:30px;padding:0 14px;font-size:12px;font-weight:700;border-radius:var(--rss);
   border:1px solid var(--bdr2);background:var(--s3);color:var(--txt2);cursor:pointer;transition:var(--tr)}
 .sub-tab-btn.active{background:var(--acc);border-color:var(--acc);color:#fff}
 .sub-tab-btn:hover:not(.active){background:var(--s4);color:var(--txt)}
+/* On mobile: API key + icon take full first row; divider hidden; tabs share second row */
+@media(max-width:599px){
+  .sub-api-key-wrap{flex:1 1 100%;order:-1;display:flex;gap:6px;align-items:center}
+  .sub-tab-divider-v{display:none!important}
+  .sub-tab-btn{flex:1}
+}
 /* mobile subtitle file browser */
 .sub-fb-row{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--bdr);
   cursor:pointer;transition:background .12s;font-size:13px}
@@ -432,6 +439,20 @@ _SUBTITLES_UI_JS = r"""
     </div>
     <div class="sub-body">
       <div class="sub-tab-row" id="sub-tab-row">
+        <div class="sub-api-key-wrap">
+          <input id="sub-apikey" type="text"
+            placeholder="OpenSubtitles API key &mdash; get one free at opensubtitles.com"
+            autocomplete="new-password" autocorrect="off" spellcheck="false"
+            oninput="saveSubKey()" title="Your OpenSubtitles Consumer API key"
+            style="flex:1;height:30px;font-size:12px;min-width:0">
+          <a href="https://www.opensubtitles.com/en/consumers" target="_blank" rel="noopener"
+            class="btn-ghost"
+            style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;
+                   border-radius:var(--rss);text-decoration:none;font-size:13px;flex-shrink:0;
+                   border:1px solid var(--bdr);background:var(--s3);color:var(--txt2)"
+            title="Get a free API key at opensubtitles.com/en/consumers">&#x1F511;</a>
+        </div>
+        <div class="sub-tab-divider-v" style="width:1px;background:var(--bdr);align-self:stretch;flex-shrink:0"></div>
         <button class="sub-tab-btn active" id="sub-tab-online" onclick="subSwitchTab('online')">&#x1F50D; Online Search</button>
         <button class="sub-tab-btn" id="sub-tab-local" onclick="subSwitchTab('local')">&#x1F4C2; Local File</button>
       </div>
@@ -482,7 +503,7 @@ _SUBTITLES_UI_JS = r"""
         <div id="sub-local-desktop">
           <div style="margin-bottom:8px;font-size:12px;color:var(--txt2);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px">
             <span>Choose a local subtitle file (.srt, .vtt, .ass, .ssa).</span>
-            <button class="btn-ghost" style="font-size:10px;height:22px;padding:0 8px;opacity:0.7" onclick="subForceFileBrowser()" title="Switch to file browser (Android)">&#x1F4C1; File browser</button>
+            <button id="sub-fb-toggle-btn" class="btn-ghost" style="font-size:10px;height:22px;padding:0 8px" onclick="subToggleFileBrowser()" title="Switch to inline file browser">&#x1F4C1; File browser: Off</button>
           </div>
           <div class="sub-search-row" style="align-items:center;gap:8px">
             <button class="btn-ghost" style="height:32px;padding:0 14px;font-size:12px;display:inline-flex;align-items:center;gap:6px;flex-shrink:0"
@@ -493,6 +514,9 @@ _SUBTITLES_UI_JS = r"""
           </div>
         </div>
         <div id="sub-local-mobile" style="display:none">
+          <div style="display:flex;justify-content:flex-end;margin-bottom:6px">
+            <button id="sub-fb-toggle-btn2" class="btn-ghost" style="font-size:10px;height:22px;padding:0 8px;background:rgba(124,58,237,.2);border-color:var(--acc);color:var(--txt)" onclick="subToggleFileBrowser()" title="Switch back to desktop file picker">&#x1F4C1; File browser: On</button>
+          </div>
           <div class="sub-search-row" style="gap:5px;margin-bottom:6px">
             <button class="btn-ghost" id="sub-fb-up" style="height:30px;padding:0 10px;font-size:16px;flex-shrink:0" onclick="subFbUp()" title="Up">&#x2191;</button>
             <span id="sub-fb-path" style="font-size:11px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;align-self:center">/sdcard/Download</span>
@@ -741,11 +765,32 @@ function clearSubtitle(){
 }
 
 // ── SUBTITLE TAB SWITCHER ──────────────────────────────────
-function subForceFileBrowser(){
-  document.getElementById('sub-local-desktop').style.display = 'none';
-  document.getElementById('sub-local-mobile').style.display  = '';
+// Auto-detect mobile on first use (includes 900px width emulation)
+let _subFbMode = (typeof _isMobile !== 'undefined' && _isMobile) || window.innerWidth <= 900;
+function subForceFileBrowser(){ _subFbMode=false; subToggleFileBrowser(); }
+function subToggleFileBrowser(){
+  _subFbMode = !_subFbMode;
+  document.getElementById('sub-local-desktop').style.display = _subFbMode ? 'none' : '';
+  document.getElementById('sub-local-mobile').style.display  = _subFbMode ? ''     : 'none';
   document.getElementById('sub-local-status').textContent = '';
-  subFbNav(_subFbCurrentPath);
+  // Update both toggle buttons
+  const label = _subFbMode ? '\uD83D\uDCC1 File browser: On' : '\uD83D\uDCC1 File browser: Off';
+  const b1 = document.getElementById('sub-fb-toggle-btn');
+  const b2 = document.getElementById('sub-fb-toggle-btn2');
+  if(b1){ b1.textContent=label;
+    b1.style.background=_subFbMode?'rgba(124,58,237,.2)':'';
+    b1.style.borderColor=_subFbMode?'var(--acc)':'';
+    b1.style.color=_subFbMode?'var(--txt)':''; }
+  if(b2){ b2.textContent=label;
+    b2.style.background=_subFbMode?'rgba(124,58,237,.2)':'';
+    b2.style.borderColor=_subFbMode?'var(--acc)':'';
+    b2.style.color=_subFbMode?'var(--txt)':''; }
+  // On mobile there is no tkinter picker — keep switch buttons hidden
+  if(typeof _isMobile !== 'undefined' && _isMobile){
+    if(b1) b1.style.display='none';
+    if(b2) b2.style.display='none';
+  }
+  if(_subFbMode) subFbNav(_subFbCurrentPath);
 }
 
 function subSwitchTab(tab){
@@ -755,10 +800,27 @@ function subSwitchTab(tab){
   document.getElementById('sub-tab-online').classList.toggle('active', isOnline);
   document.getElementById('sub-tab-local').classList.toggle('active', !isOnline);
   if(!isOnline){
-    document.getElementById('sub-local-desktop').style.display = _isMobile ? 'none' : '';
-    document.getElementById('sub-local-mobile').style.display  = _isMobile ? ''     : 'none';
+    // Use _isMobile (includes width<=900) or user's forced browser mode
+    const _subUseMobile = _subFbMode || (typeof _isMobile!=='undefined' && _isMobile) || window.innerWidth<=900;
+    document.getElementById('sub-local-desktop').style.display = _subUseMobile ? 'none' : '';
+    document.getElementById('sub-local-mobile').style.display  = _subUseMobile ? ''     : 'none';
+    // Sync button states
+    const _subLabel = _subUseMobile ? '\uD83D\uDCC1 File browser: On' : '\uD83D\uDCC1 File browser: Off';
+    [document.getElementById('sub-fb-toggle-btn'),document.getElementById('sub-fb-toggle-btn2')].forEach(b=>{
+      if(!b) return;
+      b.textContent=_subLabel;
+      b.style.background=_subUseMobile?'rgba(124,58,237,.2)':'';
+      b.style.borderColor=_subUseMobile?'var(--acc)':'';
+      b.style.color=_subUseMobile?'var(--txt)':'';
+    });
+    // On mobile there is no tkinter picker — hide switch buttons entirely
+    if(typeof _isMobile !== 'undefined' && _isMobile){
+      [document.getElementById('sub-fb-toggle-btn'),document.getElementById('sub-fb-toggle-btn2')].forEach(b=>{
+        if(b) b.style.display='none';
+      });
+    }
     document.getElementById('sub-local-status').textContent = '';
-    if(_isMobile){
+    if(_subUseMobile){
       subFbNav(_subFbCurrentPath);
     } else {
       const inp = document.getElementById('sub-local-input');
@@ -910,6 +972,11 @@ function _subInitLangGrid(){
 
 function openSubSearch(){
   _subInitLangGrid();
+  // Populate API key field from localStorage each time modal opens
+  try{
+    const ak = document.getElementById('sub-apikey');
+    if(ak && !ak.value) ak.value = localStorage.getItem('opensubtitles_key')||'';
+  }catch(e){}
   const q = document.getElementById('sub-query');
   if(pName && !q.value){
     let cleaned = pName
