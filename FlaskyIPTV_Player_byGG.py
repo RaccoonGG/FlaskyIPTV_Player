@@ -2508,8 +2508,6 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <!-- Mobile-only: Record and MKV row shown below controls on small screens -->
         <div class="pctrl-mobile-rec recrow" style="display:none;padding:0 0 4px 0">
           <button class="btn-red" onclick="togRec()" id="rbtn-mob" style="height:28px;padding:0 12px;font-size:12px">⏺ Record</button>
-          <span class="rtimer" id="rtimer-mob"></span>
-          <span class="rfname" id="rfname-mob"></span>
           <button class="btn-ghost" onclick="window._mobMkvClick()" title="Download MKV" disabled id="dl-now-btn-mob" style="height:28px;padding:0 10px;font-size:12px">⬇ MKV</button>
         </div>
       </div>
