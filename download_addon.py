@@ -1611,17 +1611,14 @@ _DL_UI_JS = r"""
 .adr-prog-speed{font-size:11px;color:var(--acc2);font-weight:700;text-align:right}
 /* Recording section in action drawer */
 #adr-rec-section{margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--bdr)}
-#adr-rec-btn{width:100%;height:42px;font-size:13px;font-weight:700;border-radius:var(--rsm);
-  display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:8px;
+#adr-rec-btn{width:100%;height:auto;min-height:42px;font-size:13px;font-weight:700;border-radius:var(--rsm);
+  padding:8px 12px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
   background:rgba(220,50,50,.15);border:1px solid rgba(220,50,50,.35);color:#f06060;cursor:pointer;transition:background .15s}
 #adr-rec-btn:hover{background:rgba(220,50,50,.3)}
 #adr-rec-btn.rec{background:rgba(220,50,50,.3);border-color:rgba(220,50,50,.7);animation:recpulse 1.2s ease-in-out infinite}
 @keyframes recpulse{0%,100%{box-shadow:0 0 0 0 rgba(220,50,50,.4)}50%{box-shadow:0 0 0 6px rgba(220,50,50,0)}}
 #adr-rec-info{display:none;flex-direction:column;gap:4px}
 #adr-rec-info.vis{display:flex}
-#adr-rec-fname{font-size:11px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#adr-rec-timer{font-size:13px;font-weight:700;color:#f06060;letter-spacing:1px}
-#adr-rec-open{width:100%;height:34px;font-size:12px;font-weight:600;margin-top:4px}
 /* FAB — floating action button to open drawer */
 .fab{position:absolute;bottom:70px;right:60px;z-index:50;
   width:48px;height:48px;border-radius:50%;padding:0;font-size:20px;
@@ -1699,7 +1696,11 @@ _DL_UI_JS = r"""
     <!-- Recording section — always visible -->
     <div id="adr-rec-section">
       <div class="adr-section-title">⏺ Recording</div>
-      <button id="adr-rec-btn" onclick="togRec()">⏺ Record</button>
+      <button id="adr-rec-btn" onclick="togRec()"
+        style="display:flex;flex-direction:column;align-items:center;gap:3px;width:100%;padding:8px 12px">
+        <span id="adr-rec-btn-label">⏺ Record</span>
+        <span id="adr-rec-fname" style="font-size:10px;font-weight:600;opacity:.85;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;display:none"></span>
+      </button>
       <button id="adr-dvr-btn" onclick="closeDrawer();dvrOpen()"
         style="margin-top:6px;width:100%;height:auto;padding:8px 12px;font-size:13px;font-weight:700;
         background:linear-gradient(135deg,rgba(124,58,237,.25),rgba(99,46,188,.25));
@@ -1714,9 +1715,6 @@ _DL_UI_JS = r"""
           color:#f87171;width:100%;text-align:center"></span>
       </button>
       <div id="adr-rec-info">
-        <div id="adr-rec-timer">00:00:00</div>
-        <div id="adr-rec-fname"></div>
-        <button class="btn-ghost adr-rec-open" onclick="openDrawer();closeDrawer();" style="width:100%;height:34px;font-size:12px;font-weight:600;margin-top:4px" id="adr-rec-open">📂 Open player controls</button>
       </div>
     </div>
     <!-- UNIFIED ACTIONS — categories + items together -->
@@ -1844,9 +1842,8 @@ async function startRec(){
   isRec=true;
   _syncRecBtn(true);
   document.getElementById('rfname').textContent=d.filename||'';
-  const rfmob=document.getElementById('rfname-mob'); if(rfmob) rfmob.textContent=d.filename||'';
   const adrFname=document.getElementById('adr-rec-fname');
-  if(adrFname) adrFname.textContent=d.filename||'';
+  if(adrFname){ adrFname.textContent=d.filename||''; adrFname.style.display=d.filename?'':'none'; }
   toast('⏺ Recording: '+(d.filename||''),'ok');
   let s=0;
   recTmr=setInterval(()=>{
@@ -1856,15 +1853,11 @@ async function startRec(){
     const sc=String(s%60).padStart(2,'0');
     const ts=h+':'+m2+':'+sc;
     document.getElementById('rtimer').textContent=ts;
-    const rtmob=document.getElementById('rtimer-mob');
-    if(rtmob) rtmob.textContent=ts;
-    const adrTimer=document.getElementById('adr-rec-timer');
-    if(adrTimer) adrTimer.textContent=ts;
-    // Keep button text in sync with elapsed time
+    // Keep button texts in sync — time in label only, no separate timer div
     const btn=document.getElementById('rbtn');
     if(btn) btn.textContent=`⏹ Stop Recording ${ts}`;
-    const adrBtn=document.getElementById('adr-rec-btn');
-    if(adrBtn) adrBtn.textContent=`⏹ Stop Recording ${ts}`;
+    const adrLabel=document.getElementById('adr-rec-btn-label');
+    if(adrLabel) adrLabel.textContent=`⏹ Stop Recording ${ts}`;
   },1000);
 }
 
@@ -1876,11 +1869,8 @@ async function stopRec(){
   isRec=false;
   _syncRecBtn(false);
   document.getElementById('rfname').textContent='';
-  const rfmob2=document.getElementById('rfname-mob'); if(rfmob2) rfmob2.textContent='';
   const adrFname=document.getElementById('adr-rec-fname');
-  if(adrFname) adrFname.textContent='';
-  const adrTimer=document.getElementById('adr-rec-timer');
-  if(adrTimer) adrTimer.textContent='00:00:00';
+  if(adrFname){ adrFname.textContent=''; adrFname.style.display='none'; }
   if(recTmr){clearInterval(recTmr);recTmr=null;}
 }
 
@@ -1888,9 +1878,7 @@ function _syncRecBtn(recording){
   const btn=document.getElementById('rbtn');
   const btnMob=document.getElementById('rbtn-mob');
   const timer=document.getElementById('rtimer');
-  const timerMob=document.getElementById('rtimer-mob');
   const adrBtn=document.getElementById('adr-rec-btn');
-  const adrInfo=document.getElementById('adr-rec-info');
   if(btn){
     if(recording){
       btn.textContent='⏹ Stop Recording';
@@ -1906,23 +1894,22 @@ function _syncRecBtn(recording){
     if(recording){
       btnMob.textContent='⏹ Stop';
       btnMob.classList.add('rec');
-      if(timerMob) timerMob.classList.add('vis');
     } else {
       btnMob.textContent='⏺ Record';
       btnMob.classList.remove('rec');
-      if(timerMob){timerMob.classList.remove('vis'); timerMob.textContent='00:00:00';}
     }
   }
   if(adrBtn){
+    const adrLabel=document.getElementById('adr-rec-btn-label');
     if(recording){
-      adrBtn.textContent='⏹ Stop Recording';
+      if(adrLabel) adrLabel.textContent='⏹ Stop Recording';
       adrBtn.classList.add('rec');
     } else {
-      adrBtn.textContent='⏺ Record';
+      if(adrLabel) adrLabel.textContent='⏺ Record';
       adrBtn.classList.remove('rec');
     }
   }
-  if(adrInfo) adrInfo.classList.toggle('vis', !!recording);
+  // adr-rec-info intentionally NOT toggled — div is empty, nothing to show
 }
 
 // ── DOWNLOADS ──────────────────────────────────────────────
@@ -2144,7 +2131,7 @@ async function _statusPoll(){
       if(rs.recording){
         document.getElementById('rfname').textContent=rs.filename||'';
         const adrFname=document.getElementById('adr-rec-fname');
-        if(adrFname) adrFname.textContent=rs.filename||'';
+        if(adrFname){ adrFname.textContent=rs.filename||''; adrFname.style.display=rs.filename?'':'none'; }
         // Restart timer from server elapsed
         if(recTmr){clearInterval(recTmr);recTmr=null;}
         const parts=(rs.elapsed||'00:00:00').split(':').map(Number);
@@ -2156,12 +2143,10 @@ async function _statusPoll(){
           const sc=String(s%60).padStart(2,'0');
           const ts=h+':'+m2+':'+sc;
           document.getElementById('rtimer').textContent=ts;
-          const adrTimer=document.getElementById('adr-rec-timer');
-          if(adrTimer) adrTimer.textContent=ts;
           const btn=document.getElementById('rbtn');
           if(btn) btn.textContent=`⏹ Stop Recording ${ts}`;
-          const adrBtn=document.getElementById('adr-rec-btn');
-          if(adrBtn) adrBtn.textContent=`⏹ Stop Recording ${ts}`;
+          const adrLabel=document.getElementById('adr-rec-btn-label');
+          if(adrLabel) adrLabel.textContent=`⏹ Stop Recording ${ts}`;
         },1000);
       }
     }).catch(()=>{});
