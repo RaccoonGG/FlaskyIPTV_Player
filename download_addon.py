@@ -1276,7 +1276,13 @@ function _dlmRenderActive(){
     return `<div class="dlm-card">
       <div class="dlm-card-top">
         <span class="dlm-card-title">${esc(j.name||j.filename||'Download')}</span>
-        <span class="dlm-badge ${badgeCls}">${badgeTxt}</span>
+        <span class="dlm-badge ${badgeCls}" style="flex-shrink:0">${badgeTxt}</span>
+        <button onclick="${isRec?'stopRec()':'doStop()'}"
+          title="${isRec?'Stop recording':'Stop download'}"
+          style="flex-shrink:0;height:20px;padding:0 7px;font-size:10px;font-weight:700;
+                 background:none;border:1px solid ${isRec?'rgba(220,38,38,.5)':'rgba(59,130,246,.5)'};
+                 border-radius:4px;cursor:pointer;color:${isRec?'#f87171':'#60a5fa'};
+                 line-height:1">⏹</button>
       </div>
       <div class="dlm-card-meta">
         <span class="dlm-card-time">${_dlmFmtDate(j.startedAt)}</span>
@@ -1418,12 +1424,11 @@ async function _dlmPollProgress(){
 setInterval(async ()=>{
   if(!_DLM_OK || !_dlmInited) return;
   if(document.getElementById('dlm-overlay')?.style.display === 'flex') return;
-  if(!_dlmActive.length) return;
   try{
     const j = await fetch('/api/dlm/jobs').then(r=>r.json());
     if(Array.isArray(j)){ _dlmActive=j; _dlmBadgeUpdate(); }
   }catch(e){}
-}, 15000);
+}, 5000);
 
 // ── Folder picker (mirrors DVR exactly) ───────────────────────────────────
 async function dlmPickFolder(){
@@ -1845,6 +1850,11 @@ async function startRec(){
   const adrFname=document.getElementById('adr-rec-fname');
   if(adrFname){ adrFname.textContent=d.filename||''; adrFname.style.display=d.filename?'':'none'; }
   toast('⏺ Recording: '+(d.filename||''),'ok');
+  // Immediately update the Downloads button badge/status — works even before the overlay
+  // has ever been opened (dlmRefresh requires _dlmInited which dlmInit sets on first open)
+  fetch('/api/dlm/jobs').then(r=>r.json()).then(j=>{
+    if(Array.isArray(j)){ _dlmActive=j; _dlmBadgeUpdate(); }
+  }).catch(()=>{});
   let s=0;
   recTmr=setInterval(()=>{
     s++;
@@ -1872,6 +1882,9 @@ async function stopRec(){
   const adrFname=document.getElementById('adr-rec-fname');
   if(adrFname){ adrFname.textContent=''; adrFname.style.display='none'; }
   if(recTmr){clearInterval(recTmr);recTmr=null;}
+  fetch('/api/dlm/jobs').then(r=>r.json()).then(j=>{
+    if(Array.isArray(j)){ _dlmActive=j; _dlmBadgeUpdate(); }
+  }).catch(()=>{});
 }
 
 function _syncRecBtn(recording){
