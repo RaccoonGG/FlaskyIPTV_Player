@@ -1667,6 +1667,16 @@ _DL_UI_JS = r"""
   .ph{padding:8px 10px;gap:5px;justify-content:space-between}
 }
 
+/* M3U export progress panel inside action drawer */
+#adr-m3u-progress{display:none;background:var(--s3);border:1px solid var(--bdr);
+  border-radius:var(--rsm);padding:10px 12px;margin-top:10px}
+#adr-m3u-progress.active{display:block}
+#adr-m3u-prog-bar-wrap{background:rgba(0,0,0,.5);border-radius:8px;height:6px;
+  overflow:hidden;margin:6px 0;position:relative}
+#adr-m3u-prog-bar{height:100%;border-radius:8px;width:0%;transition:width .35s ease;
+  background:linear-gradient(90deg,var(--acc2),var(--acc),var(--cyan))}
+@keyframes adr-m3u-indeterminate{
+  0%{transform:translateX(-110%)} 100%{transform:translateX(200%)}}
 /* ─── toasts ──────────────────────────────────────────────────── */
 #toasts{position:fixed;bottom:72px;left:50%;transform:translateX(-50%);
   z-index:9999;display:flex;flex-direction:column;gap:5px;pointer-events:none;width:min(90vw,300px)}
@@ -1789,6 +1799,28 @@ _DL_UI_JS = r"""
           <span class="adr-lbl">Manage hidden</span>
           <span class="adr-sub" id="adr-hidden-count"></span>
         </button>
+      </div>
+    </div>
+    <!-- M3U export inline progress — only shown during M3U saves -->
+    <div id="adr-m3u-progress">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+        <span style="font-size:10px;font-weight:800;text-transform:uppercase;
+          letter-spacing:1px;color:var(--acc)">💾 Saving M3U…</span>
+        <button onclick="dismissM3uProgress()" title="Dismiss"
+          style="background:none;border:none;color:var(--txt3);cursor:pointer;
+                 font-size:13px;line-height:1;padding:0">✕</button>
+      </div>
+      <div id="adr-m3u-prog-label" style="font-size:11px;color:var(--txt2);
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:4px"></div>
+      <div id="adr-m3u-prog-bar-wrap">
+        <div id="adr-m3u-prog-bar"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span id="adr-m3u-prog-count" style="font-size:11px;color:var(--txt3);font-weight:600"></span>
+        <button onclick="doStop()" title="Stop"
+          style="height:22px;padding:0 8px;font-size:10px;font-weight:700;
+                 background:rgba(255,80,80,.15);border:1px solid rgba(255,80,80,.3);
+                 border-radius:4px;cursor:pointer;color:#f06060">⏹ Stop</button>
       </div>
     </div>
   </div>
@@ -1961,8 +1993,19 @@ function _syncRecBtn(recording){
 // Show the progress panel immediately (before the server responds)
 // so even very fast exports are always visible.
 function _showProgressNow(ctx, title, label, total){
-  // Progress is now tracked in the Downloads manager — open it automatically
-  if(typeof dlmOpen === 'function') dlmOpen();
+  if(ctx !== 'm3u_inline'){ if(typeof dlmOpen === 'function') dlmOpen(); return; }
+  const panel = document.getElementById('adr-m3u-progress');
+  if(!panel) return;
+  panel.classList.add('active');
+  const lbl   = document.getElementById('adr-m3u-prog-label');
+  const bar   = document.getElementById('adr-m3u-prog-bar');
+  const count = document.getElementById('adr-m3u-prog-count');
+  if(lbl)   lbl.textContent = label;
+  if(bar){  bar.style.width = '0%'; bar.style.animation = 'adr-m3u-indeterminate 1.2s linear infinite'; bar.style.opacity='0.55'; }
+  if(count) count.textContent = total > 0 ? `0 / ${total} items` : 'Starting\u2026';
+  // Open actions drawer so the panel is visible
+  if(typeof openDrawer === 'function') openDrawer('items');
+  else if(typeof openActTab === 'function') openActTab();
 }
 
 async function dlM3U(){
@@ -1970,7 +2013,7 @@ async function dlM3U(){
   if(!op){toast('Set M3U output path first','wrn');return;}
   if(!selSet.size){toast('Select items first','wrn');return;}
   setBusy(true);
-  _showProgressNow('items','💾 Saving M3U…', curCat?curCat.title:'', selSet.size);
+  _showProgressNow('m3u_inline','💾 Saving M3U…', curCat?curCat.title:'', selSet.size);
   const r=await fetch('/api/download/m3u',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({items:[...selSet],category:curCat,mode,out_path:op,total_hint:selSet.size})});
@@ -2034,6 +2077,18 @@ async function pollBusy(){
     setTimeout(pollBusy,800);
   } else {
     setBusy(false);
+    // Freeze M3U progress panel with final count, then auto-dismiss after 3s
+    const _m3uPanel = document.getElementById('adr-m3u-progress');
+    if(_m3uPanel && _m3uPanel.classList.contains('active')){
+      const _ls = await fetch('/api/status').then(r=>r.json()).catch(()=>({}));
+      const _fd=_ls.task_done||0, _ft=_ls.task_total||0, _fs=_ls.task_skipped||0;
+      const _bar=document.getElementById('adr-m3u-prog-bar');
+      const _cnt=document.getElementById('adr-m3u-prog-count');
+      if(_bar){ _bar.style.animation=''; _bar.style.opacity='1'; _bar.style.width='100%'; }
+      if(_cnt){ const _sk=_fs>0?` \u00b7 ${_fs} skipped`:'';
+        _cnt.textContent=_ft>0?`${_fd} / ${_ft} items${_sk}`:(_fd>0?`${_fd} items${_sk}`:'Complete'); }
+      // Panel stays visible — user dismisses via the ✕ button
+    }
     // Refresh Downloads manager to show completed jobs
     fetch('/api/dlm/jobs').then(r=>r.json()).then(j=>{
       if(Array.isArray(j)){ _dlmActive=j; _dlmBadgeUpdate(); }
@@ -2042,8 +2097,29 @@ async function pollBusy(){
       dlmRefresh().catch(()=>{});
   }
 }
-function dismissProgress(ctx){ /* no-op — progress tracked in Downloads manager */ }
-function updateTaskProgress(d){ /* no-op — progress tracked in Downloads manager */ }
+function dismissM3uProgress(){
+  const panel = document.getElementById('adr-m3u-progress');
+  if(panel) panel.classList.remove('active');
+}
+function dismissProgress(ctx){ dismissM3uProgress(); }
+function updateTaskProgress(d){
+  if(!document.getElementById('adr-m3u-progress')?.classList.contains('active')) return;
+  const type    = d.task_type    || '';
+  const done    = d.task_done    || 0;
+  const total   = d.task_total   || 0;
+  const skipped = d.task_skipped || 0;
+  if(type !== 'm3u') return;
+  const bar   = document.getElementById('adr-m3u-prog-bar');
+  const count = document.getElementById('adr-m3u-prog-count');
+  const pct   = total > 0 ? Math.round(done / total * 100) : 0;
+  if(bar){ bar.style.animation = ''; bar.style.width = pct + '%'; }
+  if(count){
+    const skipTxt = skipped > 0 ? ` \u00b7 ${skipped} skipped` : '';
+    count.textContent = total > 0
+      ? `${done} / ${total} items${skipTxt}`
+      : (done > 0 ? `${done} items saved${skipTxt}` : 'Starting\u2026');
+  }
+}
 // Adaptive status poll: 4s when busy or recording, 15s when idle.
 // Replaces the old fixed 5s setInterval which hammered /api/status
 // even when nothing was happening.
