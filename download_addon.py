@@ -1851,6 +1851,8 @@ async function startRec(){
   const adrFname=document.getElementById('adr-rec-fname');
   if(adrFname){ adrFname.textContent=d.filename||''; adrFname.style.display=d.filename?'':'none'; }
   toast('⏺ Recording: '+(d.filename||''),'ok');
+  // Open Downloads manager so the live recording card is immediately visible
+  if(typeof dlmOpen === 'function') dlmOpen();
   // Immediately update the Downloads button badge/status — works even before the overlay
   // has ever been opened (dlmRefresh requires _dlmInited which dlmInit sets on first open)
   fetch('/api/dlm/jobs').then(r=>r.json()).then(j=>{
