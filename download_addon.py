@@ -442,11 +442,40 @@ def register_download_routes(flask_app, state, run_async, run_worker, _make_clie
                         if label:
                             state.task_label = label
 
-                    await client.dump_category_to_file(
-                        mode, cat, out_path,
-                        stop_flag=state.stop_flag,
-                        progress_cb=_m3u_pcb,
-                    )
+                    # ── "All Channels" fast-path ──────────────────────────────
+                    # cat_id "__all__" is a synthetic sentinel unknown to portals;
+                    # fetch all channels in one shot via get_all_channels() and
+                    # write each entry directly, mirroring api_items()'s behaviour.
+                    if (cat.get("id") == "__all__"
+                            and mode == "live"
+                            and hasattr(client, "get_all_channels")):
+                        try:
+                            channels = await client.get_all_channels("live")
+                        except Exception as _gac_e:
+                            state.log(f"[M3U] get_all_channels failed: {_gac_e}")
+                            channels = []
+                        if channels:
+                            state.task_total = len(channels)
+                            for _ch in channels:
+                                if state.stop_flag.is_set():
+                                    state.log("Stopped by user.")
+                                    break
+                                _ch_name = (_ch.get("name") or _ch.get("o_name")
+                                            or _ch.get("fname") or "?")
+                                state.task_label = _ch_name
+                                await client.dump_single_item_to_file(
+                                    mode, _ch, cat, out_path,
+                                    stop_flag=state.stop_flag,
+                                )
+                                state.task_done += 1
+                        else:
+                            state.log("[M3U] get_all_channels returned empty — nothing to write")
+                    else:
+                        await client.dump_category_to_file(
+                            mode, cat, out_path,
+                            stop_flag=state.stop_flag,
+                            progress_cb=_m3u_pcb,
+                        )
                 else:
                     for item in items:
                         if state.stop_flag.is_set():
