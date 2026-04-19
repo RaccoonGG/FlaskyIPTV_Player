@@ -1130,21 +1130,42 @@ _DLM_UI_JS = r"""
     <div id="dlm-active-list" style="display:flex;flex-direction:column;
       gap:4px;margin-bottom:12px"></div>
 
-    <!-- Completed -->
-    <div style="font-size:11px;font-weight:800;text-transform:uppercase;
-      letter-spacing:.7px;color:var(--txt3);margin-bottom:5px;
-      display:flex;justify-content:space-between;align-items:center">
-      <span>Completed</span>
-      <div style="display:flex;gap:4px">
+    <!-- Completed: tabbed by type -->
+    <div style="margin-top:4px;margin-bottom:8px">
+      <div style="display:flex;gap:0;border-bottom:1px solid var(--bdr);margin-bottom:8px">
+        <button id="dlm-tab-rec" onclick="dlmSwitchDoneTab('rec')"
+          style="flex:1;height:30px;font-size:11px;font-weight:700;background:none;
+                 border:none;border-bottom:2px solid var(--acc);color:var(--txt);
+                 cursor:pointer;padding:0;transition:color .15s">
+          ⏺ Recordings <span id="dlm-tab-rec-count" style="opacity:.6;font-weight:400"></span>
+        </button>
+        <button id="dlm-tab-mkv" onclick="dlmSwitchDoneTab('mkv')"
+          style="flex:1;height:30px;font-size:11px;font-weight:700;background:none;
+                 border:none;border-bottom:2px solid transparent;color:var(--txt2);
+                 cursor:pointer;padding:0;transition:color .15s">
+          🎬 MKV <span id="dlm-tab-mkv-count" style="opacity:.6;font-weight:400"></span>
+        </button>
+      </div>
+      <!-- per-tab clear/delete row -->
+      <div style="display:flex;justify-content:flex-end;gap:4px;margin-bottom:6px">
         <button class="btn-ghost" onclick="dlmClearAll(false)"
           style="height:22px;padding:0 7px;font-size:10px;opacity:.7">Clear list</button>
         <button class="btn-ghost" onclick="dlmClearAll(true)"
           style="height:22px;padding:0 7px;font-size:10px;opacity:.7;color:#f87171">Delete files</button>
       </div>
+      <!-- Recordings tab -->
+      <div id="dlm-done-rec-panel">
+        <div id="dlm-done-rec-empty" style="text-align:center;padding:14px;
+          color:var(--txt3);font-size:12px;display:none">No completed recordings yet</div>
+        <div id="dlm-done-rec-list" style="display:flex;flex-direction:column;gap:4px"></div>
+      </div>
+      <!-- MKV tab -->
+      <div id="dlm-done-mkv-panel" style="display:none">
+        <div id="dlm-done-mkv-empty" style="text-align:center;padding:14px;
+          color:var(--txt3);font-size:12px;display:none">No completed MKV downloads yet</div>
+        <div id="dlm-done-mkv-list" style="display:flex;flex-direction:column;gap:4px"></div>
+      </div>
     </div>
-    <div id="dlm-done-empty" style="text-align:center;padding:14px;
-      color:var(--txt3);font-size:12px;display:none">No completed downloads yet</div>
-    <div id="dlm-done-list" style="display:flex;flex-direction:column;gap:4px"></div>
 
   </div>
 </div>
@@ -1294,13 +1315,43 @@ function _dlmRenderActive(){
   _dlmPollProgress();
 }
 
+// ── Completed tab state ────────────────────────────────────────────────────
+let _dlmDoneTab = 'rec'; // 'rec' | 'mkv'
+
+function dlmSwitchDoneTab(tab){
+  _dlmDoneTab = tab;
+  const recBtn = document.getElementById('dlm-tab-rec');
+  const mkvBtn = document.getElementById('dlm-tab-mkv');
+  const recPnl = document.getElementById('dlm-done-rec-panel');
+  const mkvPnl = document.getElementById('dlm-done-mkv-panel');
+  if(recBtn){ recBtn.style.borderBottomColor = tab==='rec' ? 'var(--acc)' : 'transparent'; recBtn.style.color = tab==='rec' ? 'var(--txt)' : 'var(--txt2)'; }
+  if(mkvBtn){ mkvBtn.style.borderBottomColor = tab==='mkv' ? 'var(--acc)' : 'transparent'; mkvBtn.style.color = tab==='mkv' ? 'var(--txt)' : 'var(--txt2)'; }
+  if(recPnl) recPnl.style.display = tab==='rec' ? '' : 'none';
+  if(mkvPnl) mkvPnl.style.display = tab==='mkv' ? '' : 'none';
+}
+
 // ── Render completed ───────────────────────────────────────────────────────
 function _dlmRenderDone(){
-  const el = document.getElementById('dlm-done-list');
-  const em = document.getElementById('dlm-done-empty');
-  if(!_dlmDone.length){ el.innerHTML=''; em.style.display=''; return; }
+  const recs = _dlmDone.filter(j=>j.type==='recording');
+  const mkvs = _dlmDone.filter(j=>j.type!=='recording');
+
+  // Update tab count badges
+  const rc = document.getElementById('dlm-tab-rec-count');
+  const mc = document.getElementById('dlm-tab-mkv-count');
+  if(rc) rc.textContent = recs.length ? `(${recs.length})` : '';
+  if(mc) mc.textContent = mkvs.length ? `(${mkvs.length})` : '';
+
+  _renderDoneGroup('rec', recs);
+  _renderDoneGroup('mkv', mkvs);
+}
+
+function _renderDoneGroup(key, jobs){
+  const el = document.getElementById('dlm-done-'+key+'-list');
+  const em = document.getElementById('dlm-done-'+key+'-empty');
+  if(!el||!em) return;
+  if(!jobs.length){ el.innerHTML=''; em.style.display=''; return; }
   em.style.display = 'none';
-  el.innerHTML = _dlmDone.map(j=>{
+  el.innerHTML = jobs.map(j=>{
     const isRec = j.type === 'recording';
     const ico   = isRec ? '⏺' : '🎬';
     const lbl   = isRec ? 'REC' : 'MKV';
@@ -1332,7 +1383,6 @@ function _dlmRenderDone(){
     </div>`;
   }).join('');
 }
-
 // ── Render storage bar ─────────────────────────────────────────────────────
 function _dlmRenderStorage(s){
   if(!s||s.error) return;
