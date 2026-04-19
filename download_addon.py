@@ -1717,7 +1717,7 @@ _DL_UI_JS = r"""
     <!-- Recording section — always visible -->
     <div id="adr-rec-section">
       <div class="adr-section-title">⏺ Recording</div>
-      <button id="adr-rec-btn" onclick="togRec()"
+      <button id="adr-rec-btn" onclick="adrRecBtn()"
         style="display:flex;flex-direction:column;align-items:center;gap:3px;width:100%;padding:8px 12px">
         <span id="adr-rec-btn-label">⏺ Record</span>
         <span id="adr-rec-fname" style="font-size:10px;font-weight:600;opacity:.85;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;display:none"></span>
@@ -1836,6 +1836,35 @@ _DL_UI_JS = r"""
 
 // ── RECORDING ──────────────────────────────────────────────
 async function togRec(){isRec?stopRec():startRec();}
+
+// Record button in the Actions drawer — extends togRec with selected-item support.
+// If 1 item is selected and no stream is playing, resolves its URL and records that.
+async function adrRecBtn(){
+  if(isRec){ stopRec(); return; }
+  // If a stream is already playing, record it as normal
+  if(pUrl){ startRec(); return; }
+  // If exactly 1 item is selected, resolve and record it
+  if(typeof selSet !== 'undefined' && selSet.size === 1){
+    const it = [...selSet][0];
+    if(!it){ startRec(); return; } // fallback — will show the "play first" toast
+    toast('Resolving stream…','info');
+    try{
+      const r = await fetch('/api/resolve_url',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({item:it, mode:typeof mode!=='undefined'?mode:'live',
+                             category:typeof curCat!=='undefined'?curCat:{}})});
+      const d = await r.json();
+      if(d.error){ toast('Could not resolve stream: '+d.error,'err'); return; }
+      // Temporarily set pUrl/pName so startRec() picks them up
+      pUrl = d.url;
+      pName = it.name || it.o_name || '';
+      startRec();
+    }catch(e){ toast('Resolve error: '+e.message,'err'); }
+    return;
+  }
+  // Nothing playing, nothing selected — fall through to normal error toast
+  startRec();
+}
 
 async function startRec(){
   if(!pUrl){toast('Play a stream first','wrn');return;}
