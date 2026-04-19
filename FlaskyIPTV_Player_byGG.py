@@ -1788,9 +1788,8 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   inset 0 1px 0 rgba(255,255,255,.2)}
 /* Mobile: compact buttons — tighter padding, no icon, text only */
 @media(max-width:899px){
-  .mt{padding:5px 10px;font-size:12px}
+  .mt{padding:5px 10px;font-size:11px}
   .mt[data-m="favs"]{padding:4px 7px}
-  .mt-ico{display:none}
   .mt-txt{display:inline}
 }
 @media(min-width:900px){
