@@ -1360,7 +1360,7 @@ function _renderDoneGroup(key, jobs){
                    j.status!=='completed' ? j.status : ''].filter(Boolean).join(' · ');
     const err   = (j.status==='error'&&j.errorMessage)
       ? `<div style="font-size:10px;color:#fca5a5;margin-top:2px">${esc(j.errorMessage)}</div>` : '';
-    const canReveal = j.status === 'completed';
+    const canReveal = !!(j.filename || j.fileSizeBytes);
     return `<div class="dlm-card">
       <div class="dlm-card-top">
         <span style="font-size:11px;flex-shrink:0">${ico}</span>
@@ -1630,40 +1630,6 @@ _DL_UI_JS = r"""
 .adr-sel-row button{flex:1;height:30px;font-size:11px;padding:0 4px}
 .adr-count{font-size:12px;color:var(--acc);font-weight:700;
   text-align:center;padding:6px 0 2px}
-/* Progress panel inside action drawer */
-.adr-progress{background:var(--s3);border:1px solid var(--bdr);border-radius:var(--rsm);
-  padding:12px 14px;margin-bottom:14px;display:none}
-.adr-progress.active{display:block}
-.adr-prog-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:5px}
-.adr-prog-title{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1px;
-  color:var(--acc)}
-.adr-prog-stop{background:rgba(255,80,80,.15);border:1px solid rgba(255,80,80,.3);
-  color:#f06060;border-radius:6px;height:22px;padding:0 8px;font-size:11px;cursor:pointer;
-  flex-shrink:0;transition:background .15s}
-.adr-prog-stop:hover{background:rgba(255,80,80,.35)}
-.adr-prog-dismiss{background:rgba(120,120,140,.15);border:1px solid rgba(120,120,140,.3);
-  color:var(--txt3);border-radius:6px;height:22px;padding:0 8px;font-size:11px;cursor:pointer;
-  flex-shrink:0;transition:background .15s}
-.adr-prog-dismiss:hover{background:rgba(120,120,140,.35);color:var(--txt)}
-.adr-prog-label{font-size:11px;color:var(--txt2);margin-bottom:7px;
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.adr-prog-bar-wrap{background:rgba(0,0,0,.5);border-radius:8px;height:7px;overflow:hidden;
-  margin-bottom:6px;position:relative;border:1px solid rgba(255,255,255,.05)}
-.adr-prog-bar{height:100%;border-radius:8px;width:0%;transition:width .35s ease;
-  background:linear-gradient(90deg,var(--acc2),var(--acc),var(--cyan));
-  box-shadow:0 0 10px rgba(124,58,237,.5);position:relative;overflow:hidden}
-.adr-prog-bar::after{content:'';position:absolute;top:0;left:0;width:100%;height:100%;
-  background:linear-gradient(90deg,transparent,rgba(255,255,255,.45),transparent);
-  transform:translateX(-120%);will-change:transform;
-  animation:progSweep 1.6s ease infinite}
-@keyframes progSweep{to{transform:translateX(120%)}}
-@keyframes adr-indeterminate{
-  0%{transform:translateX(-110%)}
-  100%{transform:translateX(200%)}
-}
-.adr-prog-footer{display:flex;align-items:center;justify-content:space-between;gap:6px}
-.adr-prog-count{font-size:11px;color:var(--txt3);font-weight:600}
-.adr-prog-speed{font-size:11px;color:var(--acc2);font-weight:700;text-align:right}
 /* Recording section in action drawer */
 #adr-rec-section{margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--bdr)}
 #adr-rec-btn{width:100%;height:auto;min-height:42px;font-size:13px;font-weight:700;border-radius:var(--rsm);
@@ -1824,21 +1790,6 @@ _DL_UI_JS = r"""
           <span class="adr-sub" id="adr-hidden-count"></span>
         </button>
       </div>
-      <div class="adr-progress" id="adr-progress-items">
-        <div class="adr-prog-hdr">
-          <div class="adr-prog-title" id="adr-prog-items-title">Downloading...</div>
-          <div style="display:flex;gap:5px;align-items:center">
-            <button class="adr-prog-stop" id="adr-prog-items-stop" onclick="doStop()" title="Stop download">⏹</button>
-            <button class="adr-prog-dismiss" id="adr-prog-items-dismiss" onclick="dismissProgress('items')" title="Dismiss" style="display:none">✕</button>
-          </div>
-        </div>
-        <div class="adr-prog-label" id="adr-prog-items-label"></div>
-        <div class="adr-prog-bar-wrap"><div class="adr-prog-bar" id="adr-prog-items-bar"></div></div>
-        <div class="adr-prog-footer">
-          <div class="adr-prog-count" id="adr-prog-items-count"></div>
-          <div class="adr-prog-speed" id="adr-prog-items-speed"></div>
-        </div>
-      </div>
     </div>
   </div>
 </div>
@@ -1979,24 +1930,8 @@ function _syncRecBtn(recording){
 // Show the progress panel immediately (before the server responds)
 // so even very fast exports are always visible.
 function _showProgressNow(ctx, title, label, total){
-  const panel=document.getElementById("adr-progress-"+ctx); if(!panel) return;
-  panel.classList.add("active");
-  const titleEl=document.getElementById("adr-prog-"+ctx+"-title");
-  const labelEl=document.getElementById("adr-prog-"+ctx+"-label");
-  const bar=document.getElementById("adr-prog-"+ctx+"-bar");
-  const countEl=document.getElementById("adr-prog-"+ctx+"-count");
-  const speedEl=document.getElementById("adr-prog-"+ctx+"-speed");
-  const stopBtn=document.getElementById("adr-prog-"+ctx+"-stop");
-  const dismissBtn=document.getElementById("adr-prog-"+ctx+"-dismiss");
-  if(titleEl) titleEl.textContent=title;
-  if(labelEl) labelEl.textContent=label;
-  if(bar){ bar.style.width="0%"; bar.style.animation="adr-indeterminate 1.2s linear infinite"; bar.style.opacity="0.55"; }
-  if(countEl) countEl.textContent=total>0?`0 / ${total} items`:"Starting…";
-  if(speedEl) speedEl.textContent="";
-  if(stopBtn) stopBtn.style.display="";
-  if(dismissBtn) dismissBtn.style.display="none";
-  // Always open the drawer to the right context so progress is visible on all screen sizes
-  openDrawer(ctx);
+  // Progress is now tracked in the Downloads manager — open it automatically
+  if(typeof dlmOpen === 'function') dlmOpen();
 }
 
 async function dlM3U(){
@@ -2009,7 +1944,7 @@ async function dlM3U(){
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({items:[...selSet],category:curCat,mode,out_path:op,total_hint:selSet.size})});
   const d=await r.json();
-  d.ok?(toast(d.message,'ok'),pollBusy()):(toast(d.error,'err'),setBusy(false),dismissProgress('items'));
+  if(d.ok){toast(d.message,'ok');pollBusy();setTimeout(()=>dlmRefresh().catch(()=>{}),1000);}else{toast(d.error,'err');setBusy(false);}
 }
 
 // Mobile MKV button — opens Actions drawer if download in progress, else downloads
@@ -2031,7 +1966,7 @@ async function dlNowMKV(){
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({items:[nowItem],category:curCat,mode,out_dir:od,use_fallback:true})});
   const d=await r.json();
-  d.ok?(toast(d.message,'ok'),pollBusy()):(toast(d.error,'err'),setBusy(false),dismissProgress('items'));
+  if(d.ok){toast(d.message,'ok');pollBusy();setTimeout(()=>dlmRefresh().catch(()=>{}),1000);}else{toast(d.error,'err');setBusy(false);}
 }
 
 async function dlMKV(){
@@ -2045,7 +1980,7 @@ async function dlMKV(){
     body:JSON.stringify({items:[...selSet],category:curCat,mode,out_dir:od,
       use_fallback:true})});
   const d=await r.json();
-  d.ok?(toast(d.message,'ok'),pollBusy()):(toast(d.error,'err'),setBusy(false),dismissProgress('items'));
+  if(d.ok){toast(d.message,'ok');pollBusy();setTimeout(()=>dlmRefresh().catch(()=>{}),1000);}else{toast(d.error,'err');setBusy(false);}
 }
 
 
@@ -2068,112 +2003,16 @@ async function pollBusy(){
     setTimeout(pollBusy,800);
   } else {
     setBusy(false);
-    // Fetch final authoritative numbers before freezing the panel
-    const lastStatus = await fetch('/api/status').then(r=>r.json()).catch(()=>({}));
-    const finalDone    = lastStatus.task_done    || 0;
-    const finalTotal   = lastStatus.task_total   || 0;
-    const finalSkipped = lastStatus.task_skipped || 0;
-    ["cats","items"].forEach(ctx=>{
-      const panel=document.getElementById("adr-progress-"+ctx);
-      if(panel && panel.classList.contains("active")){
-        const titleEl=document.getElementById("adr-prog-"+ctx+"-title");
-        const bar=document.getElementById("adr-prog-"+ctx+"-bar");
-        const speedEl=document.getElementById("adr-prog-"+ctx+"-speed");
-        const countEl=document.getElementById("adr-prog-"+ctx+"-count");
-        const stopBtn=document.getElementById("adr-prog-"+ctx+"-stop");
-        const dismissBtn=document.getElementById("adr-prog-"+ctx+"-dismiss");
-        if(titleEl) titleEl.textContent="✓ Done";
-        if(bar){ bar.style.width="100%"; bar.style.animation=""; bar.style.opacity="1"; }
-        if(speedEl) speedEl.textContent="";
-        // Always overwrite count with the real final numbers
-        if(countEl){
-          const skipTxt = finalSkipped > 0 ? ` · ${finalSkipped} skipped` : "";
-          countEl.textContent = finalTotal > 0
-            ? `${finalDone} / ${finalTotal} items${skipTxt}`
-            : (finalDone > 0 ? `${finalDone} items${skipTxt}` : "Complete");
-        }
-        if(stopBtn) stopBtn.style.display="none";
-        if(dismissBtn) dismissBtn.style.display="";
-      }
-    });
+    // Refresh Downloads manager to show completed jobs
+    fetch('/api/dlm/jobs').then(r=>r.json()).then(j=>{
+      if(Array.isArray(j)){ _dlmActive=j; _dlmBadgeUpdate(); }
+    }).catch(()=>{});
+    if(typeof dlmRefresh==='function' && document.getElementById('dlm-overlay')?.style.display==='flex')
+      dlmRefresh().catch(()=>{});
   }
 }
-function dismissProgress(ctx){
-  const panel=document.getElementById("adr-progress-"+ctx);
-  if(!panel) return;
-  panel.classList.remove("active");
-  // Reset for next run
-  const stopBtn=document.getElementById("adr-prog-"+ctx+"-stop");
-  const dismissBtn=document.getElementById("adr-prog-"+ctx+"-dismiss");
-  if(stopBtn) stopBtn.style.display="";
-  if(dismissBtn) dismissBtn.style.display="none";
-}
-function updateTaskProgress(d){
-  const type     = d.task_type       || "";
-  const done     = d.task_done       || 0;
-  const total    = d.task_total      || 0;
-  const label    = d.task_label      || "";
-  const filePct  = d.task_file_pct   || 0;
-  const elapsed  = d.task_file_elapsed || "";
-  const speed    = d.task_speed      || "";
-  const active   = type !== "";
-
-  let barPct, countTxt, speedTxt, indeterminate;
-
-  if(type === "mkv"){
-    // For MKV: bar = per-file download progress from ffmpeg
-    const hasDuration = filePct > 0;
-    indeterminate = !hasDuration;
-    barPct   = hasDuration ? filePct : 0;
-    // Item counter: "File 1 / 3" — shown in count area
-    const itemTxt = total > 1 ? `File ${done+1} / ${total}` : (total===1 ? "Downloading…" : "Resolving…");
-    // Elapsed time if available
-    const elapsedTxt = elapsed ? ` · ${elapsed}` : "";
-    countTxt = itemTxt + elapsedTxt;
-    speedTxt = speed;
-  } else if(type === "m3u"){
-    // For M3U: bar = items saved / total
-    const skipped = d.task_skipped || 0;
-    const hasTot = total > 0;
-    indeterminate = !hasTot;
-    barPct   = hasTot ? Math.round(done / total * 100) : 0;
-    const skipTxt = skipped > 0 ? ` · ${skipped} skipped` : "";
-    countTxt = hasTot ? `${done} / ${total} items${skipTxt}` : (done > 0 ? `${done} items saved${skipTxt}` : "Starting…");
-    speedTxt = "";
-  } else {
-    indeterminate = false; barPct = 0; countTxt = ""; speedTxt = "";
-  }
-
-  ["cats","items"].forEach(ctx => {
-    const panel = document.getElementById("adr-progress-"+ctx);
-    if(!panel) return;
-    if(active){
-      panel.classList.add("active");
-      // Reset stop/dismiss to "running" state when a new task starts
-      const stopBtn=document.getElementById("adr-prog-"+ctx+"-stop");
-      const dismissBtn=document.getElementById("adr-prog-"+ctx+"-dismiss");
-      if(stopBtn && stopBtn.style.display==="none"){ stopBtn.style.display=""; }
-      if(dismissBtn && dismissBtn.style.display!=="" && d.busy){ dismissBtn.style.display="none"; }
-      const title  = type === "mkv" ? "⬇ Downloading MKV…" : "💾 Saving M3U…";
-      document.getElementById("adr-prog-"+ctx+"-title").textContent = title;
-      document.getElementById("adr-prog-"+ctx+"-label").textContent = label;
-      const bar = document.getElementById("adr-prog-"+ctx+"-bar");
-      if(indeterminate){
-        bar.style.width = "40%";
-        bar.style.opacity = "0.55";
-        bar.style.animation = "adr-indeterminate 1.2s linear infinite";
-      } else {
-        bar.style.width   = barPct + "%";
-        bar.style.opacity = "1";
-        bar.style.animation = "";
-      }
-      document.getElementById("adr-prog-"+ctx+"-count").textContent = countTxt;
-      const speedEl = document.getElementById("adr-prog-"+ctx+"-speed");
-      if(speedEl) speedEl.textContent = speedTxt;
-    }
-    // Never auto-hide here — only pollBusy (Done state) and dismissProgress (✕) hide the panel.
-  });
-}
+function dismissProgress(ctx){ /* no-op — progress tracked in Downloads manager */ }
+function updateTaskProgress(d){ /* no-op — progress tracked in Downloads manager */ }
 // Adaptive status poll: 4s when busy or recording, 15s when idle.
 // Replaces the old fixed 5s setInterval which hammered /api/status
 // even when nothing was happening.
