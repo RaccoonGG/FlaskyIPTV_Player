@@ -91,6 +91,12 @@ from portal_clients import (
 
 # ===================== REGISTRATION =====================
 
+# Set by register_epg_routes once _build_xmltv_index is defined as a closure.
+# start_epg_prefetch() uses this to run the download without duplicating the
+# function or restructuring the module.
+_build_xmltv_index_ref = None
+
+
 def register_epg_routes(flask_app, state, run_async, _make_client):
     """Register all EPG/catchup/WON Flask routes and serve the UI JS."""
 
@@ -557,6 +563,24 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                    "No external EPG URL configured. Add one in Settings (EPG field) and reconnect.")
             return jsonify({"programs": [], "count": 0, "status": "no_epg", "message": msg})
 
+        # ── Build name→logo lookup from pre-fetched channel pool (no HTTP call) ──
+        # Preference order: _won_ch_cache for current portal key, then __all__ pool.
+        # Keyed by lowercase channel name so display_name matches work without fuzzy logic.
+        _won_pk = (f"{state.conn_type}:{state.url}"
+                   f":{getattr(state, 'mac', '')}:{getattr(state, 'username', '')}")
+        _won_chans = (state._won_ch_cache.get(_won_pk)
+                      or state._items_cache.get(("live", "__all__"))
+                      or [])
+        _won_logo: dict = {}
+        for _wc in _won_chans:
+            _wn = (_wc.get("name") or _wc.get("stream_name") or
+                   _wc.get("title") or "").strip().lower()
+            _wl = (_wc.get("logo") or _wc.get("stream_icon") or
+                   _wc.get("screenshot_uri") or _wc.get("tv_logo") or
+                   _wc.get("pic") or "").strip()
+            if _wn and _wl:
+                _won_logo[_wn] = _wl
+
         results = []
         seen = set()
 
@@ -582,6 +606,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                 "title": p_title,
                                 "channel_id": channel_id,
                                 "channel_name": display_name,
+                                "logo": _won_logo.get(display_name.lower(), ""),
                                 "start": p_start,
                                 "end": p_end,
                                 "desc": p_desc,
@@ -2258,6 +2283,168 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
             headers={"Cache-Control": "public, max-age=3600"},
         )
 
+    # Expose _build_xmltv_index at module level so start_epg_prefetch() can
+    # call it without being inside this closure.
+    import epg_addon as _self
+    _self._build_xmltv_index_ref = _build_xmltv_index
+
+
+# ===================== EPG CONNECT-TIME PREFETCH =====================
+
+def start_epg_prefetch(state):
+    """Called from api_connect after a successful portal connect.
+
+    Builds the same ek_combined URL that api_whats_on uses, registers it
+    (and each constituent URL) in state._xmltv_downloading, then downloads
+    and indexes the EPG in a daemon thread.
+
+    All EPG consumers already guard against their target URL being in
+    _xmltv_downloading before spawning their own download — so they get an
+    immediate "loading" response and retry rather than issuing a parallel
+    HTTP request to the same source.
+
+    After the download completes the result is stored under ek_combined AND
+    under each individual URL, so every consumer's cache lookup hits:
+      • api_whats_on            → keyed on ek_combined
+      • _fetch_xmltv_epg        → keyed on state.ext_epg_url  (method 3)
+      • _fetch_xmltv_epg        → keyed on base_norm          (Xtream method 2)
+      • api_epg exception path  → checks state.ext_epg_url
+    """
+    if _build_xmltv_index_ref is None:
+        return  # register_epg_routes not yet called
+
+    from urllib.parse import quote as _q2, urlparse as _up2
+
+    ek = state.ext_epg_url
+    _portal_xmltv = ""
+    _base_norm = ""
+    _conn = state.conn_type
+
+    if _conn == "xtream" or (_conn == "m3u_url" and state.m3u_xtream_override):
+        try:
+            _creds = state.m3u_xtream_override if _conn == "m3u_url" else None
+            _base  = (_creds["base"] if _creds else state.url).rstrip("/")
+            _user  = _creds["username"] if _creds else state.username
+            _pwd   = _creds["password"] if _creds else state.password
+            if _base and _user and _pwd:
+                _pn = _up2(_base)
+                _base_norm = f"{_pn.scheme}://{_pn.netloc}"
+                _portal_xmltv = (f"{_base_norm}/xmltv.php"
+                                 f"?username={_q2(_user, safe='')}"
+                                 f"&password={_q2(_pwd, safe='')}")
+        except Exception:
+            _portal_xmltv = ""
+            _base_norm = ""
+
+    _all_urls = [u.strip() for u in (ek or "").splitlines() if u.strip()]
+    if _portal_xmltv and _portal_xmltv not in _all_urls:
+        _all_urls.append(_portal_xmltv)
+
+    if not _all_urls:
+        return  # no EPG URLs configured for this portal
+
+    ek_combined = "\n".join(_all_urls)
+
+    # All the distinct cache keys that EPG consumers will look up.
+    # Registering every key in _xmltv_downloading before the thread starts
+    # ensures no consumer spawns a parallel download for any of them.
+    _keys: set = {ek_combined}
+    if ek:
+        _keys.add(ek)
+    if _base_norm:
+        _keys.add(_base_norm)        # Xtream method-2 cache key
+    if _portal_xmltv:
+        _keys.add(_portal_xmltv)
+    _keys_list = list(_keys)
+
+    # Skip if already cached or in flight for every key
+    if all(k in state._xmltv_cache or k in state._xmltv_no_data
+           for k in _keys_list):
+        return
+    if any(k in state._xmltv_downloading for k in _keys_list):
+        return   # prefetch (or another consumer) already started
+
+    # Register all keys atomically before the thread starts
+    for _k in _keys_list:
+        state._xmltv_downloading.add(_k)
+
+    if len(_all_urls) > 1:
+        for _i, _u in enumerate(_all_urls, 1):
+            state.log(f"[EPG] Connect-time prefetch [{_i}/{len(_all_urls)}]: {_u}")
+    else:
+        state.log(f"[EPG] Connect-time prefetch: {ek_combined}")
+
+    # Capture portal identity and mutable-object references NOW, before the
+    # thread starts.  If the user reconnects while the download is in flight:
+    # - The portal-key check aborts the write phase silently.
+    # - The finally block uses the CAPTURED set/dict references, not
+    #   state._xmltv_downloading (which api_connect replaces with a new set),
+    #   so it cannot contaminate the new portal's fresh state.
+    _pf_key          = (f"{state.conn_type}:{state.url}"
+                        f":{getattr(state,'mac','')}:{getattr(state,'username','')}")
+    _downloading_ref = state._xmltv_downloading
+    _cache_ref       = state._xmltv_cache
+    _no_data_ref     = state._xmltv_no_data
+    _epg_cache_ref   = state._epg_cache
+    _needs_ref       = state._xmltv_needs
+
+    def _bg_epg():
+        try:
+            bg_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(bg_loop)
+
+            # Abort if portal changed since connect (user reconnected quickly)
+            _cur_key = (f"{state.conn_type}:{state.url}"
+                        f":{getattr(state,'mac','')}:{getattr(state,'username','')}")
+            if _cur_key != _pf_key:
+                state.log("[EPG] Prefetch: portal changed — aborting")
+                return
+
+            epg_d, ch_n = bg_loop.run_until_complete(
+                _build_xmltv_index_ref(ek_combined, state.log))
+            bg_loop.close()
+
+            # Verify portal still matches after the (potentially long) download
+            _cur_key2 = (f"{state.conn_type}:{state.url}"
+                         f":{getattr(state,'mac','')}:{getattr(state,'username','')}")
+            if _cur_key2 != _pf_key:
+                state.log("[EPG] Prefetch: portal changed during download — discarding")
+                return
+
+            _ts_now = time.time()
+            # Store under every key so all consumers get a cache hit.
+            # Use the captured dict reference so a concurrent reconnect
+            # (which replaces state._xmltv_cache) does not get stale data.
+            for _k in _keys_list:
+                if _k not in _cache_ref:
+                    _cache_ref[_k] = (_ts_now, epg_d, ch_n)
+            if not epg_d:
+                for _k in _keys_list:
+                    _no_data_ref.add(_k)
+                state.log("[EPG] Prefetch: XMLTV has no programme data")
+            else:
+                state.log(f"[EPG] Prefetch complete — "
+                          f"{len(epg_d)} channels indexed across "
+                          f"{len(_keys_list)} cache key(s)")
+
+        except Exception as _e:
+            state.log(f"[EPG] Prefetch error: {_e}")
+        finally:
+            # Always unblock all registered keys — even on failure — so no
+            # consumer hangs waiting for a download that died.
+            for _k in _keys_list:
+                _downloading_ref.discard(_k)
+            _needs_ref.clear()
+            # Evict stale empty per-channel EPG cache entries so every
+            # channel gets a fresh lookup now that the index is available.
+            stale = [k for k, v in list(_epg_cache_ref.items())
+                     if not v[1].get("current") and not v[1].get("next")
+                     and not v[1].get("schedule")]
+            for k in stale:
+                _epg_cache_ref.pop(k, None)
+
+    threading.Thread(target=_bg_epg, daemon=True, name="epg-prefetch").start()
+
 
 # ===================== FRONTEND (CSS + HTML + JS) =====================
 
@@ -2364,6 +2551,9 @@ _EPG_UI_JS = r"""
   box-shadow:0 0 10px rgba(124,58,237,.07)}
 .won-item:hover::before{transform:translateX(100%)}
 .won-item:active{transform:scale(.98)}
+.won-item-logo{flex-shrink:0;width:36px;height:36px;display:flex;align-items:center;justify-content:center}
+.won-ch-logo{width:36px;height:36px;object-fit:contain;border-radius:4px}
+.won-ch-logo-placeholder{width:36px;height:36px;border-radius:4px;background:rgba(255,255,255,.04)}
 .won-item-info{flex:1;min-width:0}
 .won-item-title{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .won-item-ch{font-size:11px;color:var(--txt3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -3249,7 +3439,12 @@ function wonRender(list){
   const parts = shown.map((p, i) => {
     const start = _wonFmt(p.start);
     const end   = _wonFmt(p.end);
+    const logoHtml = p.logo
+      ? `<img src="${esc(p.logo)}" class="won-ch-logo" alt="" loading="lazy"
+              onerror="this.style.display='none'">`
+      : `<div class="won-ch-logo-placeholder"></div>`;
     return `<div class="won-item" title="${esc(p.desc||'')}">
+      <div class="won-item-logo">${logoHtml}</div>
       <div class="won-item-info">
         <div class="won-item-title">${esc(p.title)}</div>
         <div class="won-item-ch">${esc(p.channel_name)}</div>
