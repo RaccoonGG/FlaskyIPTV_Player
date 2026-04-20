@@ -201,11 +201,17 @@ class AppState:
         #
         # _logo_cache_live: {ch_id: logo_url} for live channels.
         #   None  = get_all_channels not yet attempted this session.
+        #   {}    = prefetch in progress (shared dict being filled in-place).
         #   dict  = already fetched (may be empty if portal returned nothing).
         # _logo_cache_vod: {item_id: logo_url} for VOD / series / Xtream.
         #   Built lazily from items that arrive with logos; zero extra requests.
         self._logo_cache_live: dict | None = None
         self._logo_cache_vod: dict = {}
+        # Event set by the background prefetch once _logo_cache_live is fully
+        # populated.  Any concurrent _fetch_ch_logo_cache() call that finds the
+        # shared dict empty (prefetch in progress) waits on this instead of
+        # issuing a second get_all_channels HTTP request.
+        self._all_channels_ready: threading.Event = threading.Event()
         # Cache for all-channels list used by What's on Now → Find Channel.
         # Keyed by portal base URL so the walk only happens ONCE per connected portal
         # for the entire session — not on a TTL. Cleared on disconnect/reconnect.
@@ -281,6 +287,10 @@ async def _make_client(do_handshake=True):
         # _vod_logo_cache is always a dict — share by reference.
         client._ch_logo_cache = state._logo_cache_live
         client._vod_logo_cache = state._logo_cache_vod
+        # Inject the prefetch ready-event so _fetch_ch_logo_cache() can wait
+        # on it instead of firing a concurrent get_all_channels HTTP call when
+        # state._logo_cache_live is an empty dict (prefetch in progress).
+        client._all_channels_ready_event = state._all_channels_ready
         # Pre-seed _all_channels_raw from the __all__ pool if already fetched.
         # Prevents _fetch_ch_logo_cache() from issuing a redundant get_all_channels
         # call on any code path (api_items, api_global_search, etc.).
@@ -609,6 +619,7 @@ def api_connect():
         state.stop_flag.clear()
         # Reset logo caches so a new portal starts fresh
         state._logo_cache_live = None
+        state._all_channels_ready.clear()
         state._logo_cache_vod = {}
         state._portal_utc_offset = 0
         state._xmltv_catchup_cache = {}
@@ -663,6 +674,82 @@ def api_connect():
                     state.cats_cache["live"] = [{"id": "__all__", "title": "All Channels"}] + live
                     state.log(f"[CONNECT] Injected 'All Channels' category ({len(live)} real categories)")
                 result["categories"] = state.cats_cache
+
+        # ── Background: prefetch full live channel list for logo cache + EPG ──
+        # Only for MAC/Stalker portals — get_all_channels is a dedicated endpoint
+        # that fetches every channel in one call and is expensive on first use.
+        # By doing this now in a daemon thread, the logo cache (state._logo_cache_live)
+        # and channel pool (state._items_cache[("live","__all__")]) are warm before
+        # the user browses any live category, so _fetch_ch_logo_cache() hits the
+        # instance cache immediately instead of triggering a blocking HTTP call.
+        # The same pool is reused by api_find_channel (EPG matching) and api_whats_on.
+        #
+        # Race handling: we set state._logo_cache_live = {} (empty dict) right here
+        # before the thread starts.  _make_client injects this same dict object into
+        # every concurrent client.  _fetch_ch_logo_cache() sees non-None but empty →
+        # waits on state._all_channels_ready (max 20s) instead of firing its own
+        # get_all_channels call.  The prefetch fills the dict in-place then sets the
+        # event so all waiters unblock and return the now-populated dict.
+        if result.get("success") and state.conn_type == "mac":
+            _pf_portal_key = (f"{state.conn_type}:{state.url}"
+                              f":{getattr(state, 'mac', '')}:{getattr(state, 'username', '')}")
+            # Mark cache as "in progress" so concurrent _make_client calls get the
+            # shared empty dict (not None) and know to wait rather than self-fetch.
+            state._logo_cache_live = {}
+            state._all_channels_ready.clear()
+
+            def _bg_prefetch_channels():
+                try:
+                    _pf_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(_pf_loop)
+
+                    async def _prefetch():
+                        if not state.connected:
+                            return
+                        _ck = (f"{state.conn_type}:{state.url}"
+                               f":{getattr(state, 'mac', '')}:{getattr(state, 'username', '')}")
+                        if _ck != _pf_portal_key:
+                            return   # portal changed since connect
+                        if ("live", "__all__") in state._items_cache:
+                            state.log("[PREFETCH] Pool already populated — skipping")
+                            return
+                        state.log("[PREFETCH] Background: fetching full live channel list…")
+                        async with _make_client() as client:
+                            channels = await client.get_all_channels()
+                            if channels:
+                                state._items_cache[("live", "__all__")] = channels
+                                state._won_ch_cache[_pf_portal_key] = channels
+                                # Fill the shared logo dict in-place — same object
+                                # that is already injected into every concurrent client
+                                # via client._ch_logo_cache = state._logo_cache_live.
+                                # Do NOT call _fetch_ch_logo_cache() here; that would
+                                # also check the event and potentially race itself.
+                                logo_count = 0
+                                for _ch in channels:
+                                    _cid = str(_ch.get("id") or "").strip()
+                                    _logo = str(_ch.get("logo") or _ch.get("screenshot_uri") or
+                                                _ch.get("tv_logo") or _ch.get("pic") or "").strip()
+                                    if _cid and _logo:
+                                        state._logo_cache_live[_cid] = _logo
+                                        logo_count += 1
+                                state.log(f"[PREFETCH] {len(channels)} channels cached; "
+                                          f"{logo_count} logos ready")
+                            else:
+                                state.log("[PREFETCH] get_all_channels returned empty")
+
+                    _pf_loop.run_until_complete(_prefetch())
+                    _pf_loop.close()
+                except Exception as _pfe:
+                    state.log(f"[PREFETCH] Background channel prefetch error: {_pfe}")
+                finally:
+                    # Always unblock any waiters, even on failure — they will
+                    # get back an empty dict and proceed without logos rather
+                    # than hanging until the 20s timeout.
+                    state._all_channels_ready.set()
+
+            threading.Thread(target=_bg_prefetch_channels,
+                             daemon=True, name="ch-prefetch").start()
+
         return jsonify(result)
     except Exception as e:
         state.log(f"[CONNECT] Error: {e}")
