@@ -288,9 +288,26 @@ class PortalClient:
     async def _fetch_ch_logo_cache(self) -> dict:
         """Return {channel_id: logo_url} dict, derived from get_all_channels.
 
-        Reuses the already-fetched raw channel list — no extra network call."""
-        if self._ch_logo_cache is not None:
+        Reuses the already-fetched raw channel list — no extra network call.
+
+        Race guard: if _ch_logo_cache is an empty dict (prefetch injected it as
+        a shared placeholder), wait for the background prefetch to finish filling
+        it in-place rather than firing a concurrent get_all_channels call."""
+        if self._ch_logo_cache is not None and self._ch_logo_cache:
+            return self._ch_logo_cache   # populated — fast path
+
+        _evt = getattr(self, "_all_channels_ready_event", None)
+        if self._ch_logo_cache is not None and not self._ch_logo_cache:
+            # Empty dict: prefetch started but not done yet — wait for it.
+            if _evt is not None and not _evt.is_set():
+                self.log("[MAC] Logo cache: waiting for background prefetch…")
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, lambda: _evt.wait(20))
+            # Whether the wait succeeded or timed out, return whatever is in the
+            # shared dict now.  The prefetch either filled it or failed cleanly.
             return self._ch_logo_cache
+
+        # _ch_logo_cache is None — no prefetch, make our own call.
         self._ch_logo_cache = {}
         channels = await self.get_all_channels()
         for ch in channels:
@@ -1563,9 +1580,23 @@ class StalkerPortalClient:
     async def _fetch_ch_logo_cache(self) -> dict:
         """Return {channel_id: logo_url} dict, derived from get_all_channels.
 
-        Reuses the already-fetched raw channel list — no extra network call."""
-        if self._ch_logo_cache is not None:
+        Reuses the already-fetched raw channel list — no extra network call.
+
+        Race guard: if _ch_logo_cache is an empty dict (prefetch injected it as
+        a shared placeholder), wait for the background prefetch to finish filling
+        it in-place rather than firing a concurrent get_all_channels call."""
+        if self._ch_logo_cache is not None and self._ch_logo_cache:
+            return self._ch_logo_cache   # populated — fast path
+
+        _evt = getattr(self, "_all_channels_ready_event", None)
+        if self._ch_logo_cache is not None and not self._ch_logo_cache:
+            if _evt is not None and not _evt.is_set():
+                self.log("[STALKER] Logo cache: waiting for background prefetch…")
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, lambda: _evt.wait(20))
             return self._ch_logo_cache
+
+        # _ch_logo_cache is None — no prefetch, make our own call.
         self._ch_logo_cache = {}
         channels = await self.get_all_channels()
         for ch in channels:
