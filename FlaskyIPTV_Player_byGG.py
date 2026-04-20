@@ -4001,6 +4001,7 @@ async function dlSelCats(type){
   if(type==='m3u'&&!op){toast('Set M3U output path in ⚙ settings','wrn');return;}
   if(type==='mkv'&&!od){toast('Set output folder in ⚙ settings','wrn');return;}
   setBusy(true);
+  if(type==='m3u') _showProgressNow('m3u_inline','💾 Saving M3U\u2026',cats.map(c=>c.title).join(', '),0);
   let done=0;
   const _hidden=loadHidden(mode);
   for(const cat of cats){
