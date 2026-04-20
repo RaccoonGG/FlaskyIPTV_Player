@@ -95,11 +95,12 @@ except ImportError:
     def run_yt_dlp_download(*a, **kw): return False, "unavailable"
 
 try:
-    from epg_addon import register_epg_routes
+    from epg_addon import register_epg_routes, start_epg_prefetch as _epg_prefetch
     _EPG_AVAILABLE = True
 except ImportError:
     _EPG_AVAILABLE = False
     def register_epg_routes(*a, **kw): pass
+    def _epg_prefetch(*a, **kw): pass
 
 # ===================== OPTIONAL DEPS =====================
 
@@ -749,6 +750,16 @@ def api_connect():
 
             threading.Thread(target=_bg_prefetch_channels,
                              daemon=True, name="ch-prefetch").start()
+
+        # ── Background: prefetch external EPG (if configured) ──────────────────
+        # Runs parallel to the channel prefetch. Builds ek_combined the same way
+        # api_whats_on does, registers all relevant keys in _xmltv_downloading so
+        # every EPG consumer sees "loading" rather than spawning a parallel HTTP
+        # request, then downloads and indexes the feed in a daemon thread.
+        # The call is a no-op if no EPG URL is configured or if the data is
+        # already cached / in flight.
+        if result.get("success") and _EPG_AVAILABLE:
+            _epg_prefetch(state)
 
         return jsonify(result)
     except Exception as e:
