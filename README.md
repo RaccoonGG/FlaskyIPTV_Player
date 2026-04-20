@@ -3,6 +3,7 @@
 
 A self-contained Flask web app for browsing and playing MAC/Xtream/M3U IPTV portals. Runs locally on Windows, Linux, or Android (Termux) and is accessed through any browser or WebView. No cloud, no ads, no external dependencies beyond what you install yourself.
 
+
 ---
 
 
