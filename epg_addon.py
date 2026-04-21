@@ -563,23 +563,37 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                    "No external EPG URL configured. Add one in Settings (EPG field) and reconnect.")
             return jsonify({"programs": [], "count": 0, "status": "no_epg", "message": msg})
 
-        # ── Build name→logo lookup from pre-fetched channel pool (no HTTP call) ──
-        # Preference order: _won_ch_cache for current portal key, then __all__ pool.
-        # Keyed by lowercase channel name so display_name matches work without fuzzy logic.
+        # ── Build channel_id→logo lookup from pre-fetched channel pool ──────────
+        # Keyed by epg_channel_id / tvg_id (lowercased) — these are the XMLTV
+        # channel IDs that epg_dict is already keyed on, so the match is exact
+        # rather than a fragile display-name comparison.
+        # Secondary key: stripped lowercase portal name, as a fallback for
+        # portals that don't populate epg_channel_id.
         _won_pk = (f"{state.conn_type}:{state.url}"
                    f":{getattr(state, 'mac', '')}:{getattr(state, 'username', '')}")
         _won_chans = (state._won_ch_cache.get(_won_pk)
                       or state._items_cache.get(("live", "__all__"))
                       or [])
-        _won_logo: dict = {}
+        _won_logo_by_id:   dict = {}   # epg_channel_id / tvg_id → logo
+        _won_logo_by_name: dict = {}   # portal channel name (stripped) → logo
         for _wc in _won_chans:
-            _wn = (_wc.get("name") or _wc.get("stream_name") or
-                   _wc.get("title") or "").strip().lower()
             _wl = (_wc.get("logo") or _wc.get("stream_icon") or
                    _wc.get("screenshot_uri") or _wc.get("tv_logo") or
                    _wc.get("pic") or "").strip()
-            if _wn and _wl:
-                _won_logo[_wn] = _wl
+            if not _wl:
+                continue
+            # Primary: epg_channel_id / tvg_id — exact match against XMLTV channel id
+            _eid = (_wc.get("epg_channel_id") or _wc.get("tvg_id") or "").strip().lower()
+            if _eid:
+                _won_logo_by_id[_eid] = _wl
+            # Secondary: portal channel name stripped of quality/country prefixes
+            _wn = (_wc.get("name") or _wc.get("stream_name") or
+                   _wc.get("title") or "").strip()
+            # Strip common "XX| " prefixes (e.g. "IT| RAI UNO" → "rai uno")
+            import re as _re
+            _wn = _re.sub(r'^[A-Z]{2,4}[|:]\s*', '', _wn).strip().lower()
+            if _wn:
+                _won_logo_by_name[_wn] = _wl
 
         results = []
         seen = set()
@@ -606,7 +620,9 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                 "title": p_title,
                                 "channel_id": channel_id,
                                 "channel_name": display_name,
-                                "logo": _won_logo.get(display_name.lower(), ""),
+                                "logo": (_won_logo_by_id.get(channel_id)
+                                         or _won_logo_by_name.get(display_name.lower())
+                                         or ""),
                                 "start": p_start,
                                 "end": p_end,
                                 "desc": p_desc,
