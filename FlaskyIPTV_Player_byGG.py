@@ -256,6 +256,12 @@ async def _make_client(do_handshake=True):
         # _logo_cache is a plain dict — share the same object so mutations
         # (new entries added during this request) survive after the client exits.
         client._logo_cache = state._logo_cache_vod
+        # Pre-seed live channel pool so get_all_channels() returns from cache
+        # immediately if the connect-time prefetch already populated it.
+        if client._all_channels_raw is None:
+            _xt_pool = state._items_cache.get(("live", "__all__"))
+            if _xt_pool:
+                client._all_channels_raw = _xt_pool
         async with client:
             if do_handshake:
                 await client.handshake()
@@ -266,6 +272,11 @@ async def _make_client(do_handshake=True):
             creds = state.m3u_xtream_override
             client = XtreamClient(creds["base"], creds["username"], creds["password"], state.log)
             client._logo_cache = state._logo_cache_vod
+            # Pre-seed live channel pool from connect-time prefetch if available.
+            if client._all_channels_raw is None:
+                _xt_pool = state._items_cache.get(("live", "__all__"))
+                if _xt_pool:
+                    client._all_channels_raw = _xt_pool
             async with client:
                 if do_handshake:
                     await client.handshake()
@@ -691,15 +702,26 @@ def api_connect():
         # waits on state._all_channels_ready (max 20s) instead of firing its own
         # get_all_channels call.  The prefetch fills the dict in-place then sets the
         # event so all waiters unblock and return the now-populated dict.
-        if result.get("success") and state.conn_type == "mac":
+        _is_mac     = result.get("success") and state.conn_type == "mac"
+        _is_xtream  = result.get("success") and (
+            state.conn_type == "xtream" or
+            (state.conn_type == "m3u_url" and state.m3u_xtream_override))
+
+        if _is_mac or _is_xtream:
             _pf_portal_key = (f"{state.conn_type}:{state.url}"
                               f":{getattr(state, 'mac', '')}:{getattr(state, 'username', '')}")
-            # Mark cache as "in progress" so concurrent _make_client calls get the
-            # shared empty dict (not None) and know to wait rather than self-fetch.
-            state._logo_cache_live = {}
-            state._all_channels_ready.clear()
+
+            # MAC only: pre-initialise the shared logo dict to {} (not None) so
+            # any concurrent _make_client call gets the empty dict injected and
+            # knows to wait on _all_channels_ready rather than fire its own
+            # get_all_channels HTTP request.
+            if _is_mac:
+                state._logo_cache_live = {}
+                state._all_channels_ready.clear()
 
             def _bg_prefetch_channels():
+                # Capture conn_type at thread-creation time; reconnect may change it.
+                _pf_is_mac = _is_mac
                 try:
                     _pf_loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(_pf_loop)
@@ -720,21 +742,22 @@ def api_connect():
                             if channels:
                                 state._items_cache[("live", "__all__")] = channels
                                 state._won_ch_cache[_pf_portal_key] = channels
-                                # Fill the shared logo dict in-place — same object
-                                # that is already injected into every concurrent client
-                                # via client._ch_logo_cache = state._logo_cache_live.
-                                # Do NOT call _fetch_ch_logo_cache() here; that would
-                                # also check the event and potentially race itself.
-                                logo_count = 0
-                                for _ch in channels:
-                                    _cid = str(_ch.get("id") or "").strip()
-                                    _logo = str(_ch.get("logo") or _ch.get("screenshot_uri") or
-                                                _ch.get("tv_logo") or _ch.get("pic") or "").strip()
-                                    if _cid and _logo:
-                                        state._logo_cache_live[_cid] = _logo
-                                        logo_count += 1
-                                state.log(f"[PREFETCH] {len(channels)} channels cached; "
-                                          f"{logo_count} logos ready")
+                                if _pf_is_mac:
+                                    # Fill the shared logo dict in-place — same object
+                                    # already injected into every concurrent MAC client
+                                    # via client._ch_logo_cache = state._logo_cache_live.
+                                    logo_count = 0
+                                    for _ch in channels:
+                                        _cid = str(_ch.get("id") or "").strip()
+                                        _logo = str(_ch.get("logo") or _ch.get("screenshot_uri") or
+                                                    _ch.get("tv_logo") or _ch.get("pic") or "").strip()
+                                        if _cid and _logo:
+                                            state._logo_cache_live[_cid] = _logo
+                                            logo_count += 1
+                                    state.log(f"[PREFETCH] {len(channels)} channels cached; "
+                                              f"{logo_count} logos ready")
+                                else:
+                                    state.log(f"[PREFETCH] {len(channels)} channels cached")
                             else:
                                 state.log("[PREFETCH] get_all_channels returned empty")
 
@@ -743,10 +766,9 @@ def api_connect():
                 except Exception as _pfe:
                     state.log(f"[PREFETCH] Background channel prefetch error: {_pfe}")
                 finally:
-                    # Always unblock any waiters, even on failure — they will
-                    # get back an empty dict and proceed without logos rather
-                    # than hanging until the 20s timeout.
-                    state._all_channels_ready.set()
+                    if _pf_is_mac:
+                        # Always unblock MAC logo-cache waiters, even on failure.
+                        state._all_channels_ready.set()
 
             threading.Thread(target=_bg_prefetch_channels,
                              daemon=True, name="ch-prefetch").start()
