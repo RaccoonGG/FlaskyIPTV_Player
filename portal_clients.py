@@ -2118,6 +2118,12 @@ class XtreamClient:
         # Populated during fetch_items_page so items with missing logos can be
         # filled from the cache without extra network calls.
         self._logo_cache: dict = {}
+        # Full live channel list — cached for the session lifetime.
+        # None  = not yet fetched.
+        # list  = already fetched (may be empty on failure).
+        # Pre-seeded from state._items_cache by _make_client so any call to
+        # get_all_channels() after a connect-time prefetch is a free list return.
+        self._all_channels_raw: list | None = None
 
     async def __aenter__(self):
         _timeout = aiohttp.ClientTimeout(total=30, connect=10)
@@ -2287,8 +2293,18 @@ class XtreamClient:
 
         Xtream's get_live_streams / get_vod_streams / get_series with no
         category_id already returns everything — this is just a named wrapper
-        so api_items() and api_global_search() can call it uniformly."""
-        return await self.fetch_items_page(mode, "", 1)
+        so api_items() and api_global_search() can call it uniformly.
+
+        For live mode, results are cached in _all_channels_raw so repeated calls
+        (from api_items, api_global_search, download_addon, api_find_channel) are
+        free list returns.  _make_client pre-seeds this from state._items_cache
+        so a connect-time prefetch means the first call is already a cache hit."""
+        if mode == "live" and self._all_channels_raw is not None:
+            return self._all_channels_raw
+        result = await self.fetch_items_page(mode, "", 1)
+        if mode == "live":
+            self._all_channels_raw = result
+        return result
 
     def _stream_url(self, mode: str, item: dict) -> str:
         if mode == "live":
