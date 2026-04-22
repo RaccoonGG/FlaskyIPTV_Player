@@ -2924,8 +2924,8 @@ _CAST_UI_JS = r"""
       display:inline-flex;align-items:center;gap:5px;
       background:rgba(26,115,232,.18);color:#82aaff;
       border:1px solid rgba(26,115,232,.3);
-      border-radius:6px;padding:3px 9px;font-size:12px;cursor:pointer;
-      transition:background .12s;margin-left:6px;
+      border-radius:6px;padding:3px 9px;font-size:10px;cursor:pointer;
+      transition:background .12s;
     }
     .cast-ext-btn:hover{background:rgba(26,115,232,.32);}
   `;
