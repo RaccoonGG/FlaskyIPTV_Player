@@ -590,8 +590,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
             _wn = (_wc.get("name") or _wc.get("stream_name") or
                    _wc.get("title") or "").strip()
             # Strip common "XX| " prefixes (e.g. "IT| RAI UNO" → "rai uno")
-            import re as _re
-            _wn = _re.sub(r'^[A-Z]{2,4}[|:]\s*', '', _wn).strip().lower()
+            _wn = re.sub(r'^[A-Z]{2,4}[|:]\s*', '', _wn).strip().lower()
             if _wn:
                 _won_logo_by_name[_wn] = _wl
 
@@ -601,7 +600,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
         for _ck, (ts, epg_dict, chan_names) in list(state._xmltv_cache.items()):
             for channel_id, programmes in epg_dict.items():
                 names = chan_names.get(channel_id, [])
-                display_name = names[0][0].title() if names else channel_id
+                display_name = names[0][2] if names else channel_id
                 for prog in programmes:
                     # Support both tuple (title,start,end,desc) and legacy dict entries
                     if isinstance(prog, tuple):
@@ -1178,7 +1177,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                 # Fallback 1: display-name match (names are (name, lang) tuples)
                                 if not entries:
                                     for cid, names in chan_names.items():
-                                        name_strs = [n for n, _ in names]
+                                        name_strs = [t[0] for t in names]
                                         if (lookup_lower in name_strs or
                                                 any(lookup_lower in n or n in lookup_lower for n in name_strs)):
                                             entries = epg_dict.get(cid)
@@ -1193,7 +1192,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                         if not entries:
                                             for cid, names in chan_names.items():
                                                 cid_norm   = _normalize_ch_name(cid)
-                                                names_norm = [_normalize_ch_name(n) for n, _ in names]
+                                                names_norm = [_normalize_ch_name(t[0]) for t in names]
                                                 if (lookup_norm == cid_norm or lookup_norm in names_norm
                                                         or any(lookup_norm in nn or nn in lookup_norm
                                                                for nn in names_norm if nn)):
@@ -1831,7 +1830,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
 
         Returns: (epg_dict, chan_names)
           epg_dict   = {channel_id_lower: [(title, start, end, desc), ...]}
-          chan_names  = {channel_id_lower: [(display_name_lower, lang_lower), ...]}
+          chan_names  = {channel_id_lower: [(display_name_lower, lang_lower, display_name_original), ...]}
         """
         _log = log_cb or (lambda x: None)
 
@@ -1935,7 +1934,8 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                         if cid:
                             # Store as (name_lower, lang_lower) tuples so matching
                             # can prefer the right language variant over same-named foreign channels.
-                            names = [(dn.text.strip().lower(), (dn.get("lang") or "").strip().lower())
+                            names = [(dn.text.strip().lower(), (dn.get("lang") or "").strip().lower(),
+                                      dn.text.strip())
                                      for dn in elem.findall("display-name") if dn.text]
                             chan_names_[cid] = names
                     elif tag == "programme":
@@ -2125,10 +2125,10 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 lookup_country and (
                     cid.endswith("." + lookup_country) or
                     any(lang and (lang == lookup_country or lang.startswith(lookup_country))
-                        for _, lang in names)
+                        for _, lang, *_ in names)
                 )
             )
-            for n, lang in names:
+            for n, lang, *_ in names:
                 n_core = _epg_strip_noise(n)
                 if not n_core:
                     continue
@@ -2231,7 +2231,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
         if not entries and lookup_core and len(lookup_core) >= _fuzz_min_len:
             _fuzz_best_rank = 999
             for cid, names in chan_names.items():
-                for n, lang in names:
+                for n, lang, *_ in names:
                     n_core = _epg_strip_noise(n)
                     if not n_core or len(n_core) < _fuzz_min_len:
                         continue
@@ -2418,7 +2418,6 @@ def start_epg_prefetch(state):
 
             epg_d, ch_n = bg_loop.run_until_complete(
                 _build_xmltv_index_ref(ek_combined, state.log))
-            bg_loop.close()
 
             # Verify portal still matches after the (potentially long) download
             _cur_key2 = (f"{state.conn_type}:{state.url}"
@@ -2446,6 +2445,7 @@ def start_epg_prefetch(state):
         except Exception as _e:
             state.log(f"[EPG] Prefetch error: {_e}")
         finally:
+            bg_loop.close()
             # Always unblock all registered keys — even on failure — so no
             # consumer hangs waiting for a download that died.
             for _k in _keys_list:
@@ -2559,10 +2559,10 @@ _EPG_UI_JS = r"""
 .won-list{flex:1;overflow-y:auto;padding:6px 8px}
 .won-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;
   cursor:pointer;transition:var(--tr);border:1px solid transparent;
-  position:relative;overflow:hidden}
+  position:relative}
 .won-item::before{content:'';position:absolute;top:0;left:0;width:100%;height:100%;
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.05),transparent);
-  transform:translateX(-100%);transition:transform .45s ease;pointer-events:none}
+  transform:translateX(-100%);transition:transform .45s ease;pointer-events:none;overflow:hidden}
 .won-item:hover{background:rgba(124,58,237,.08);border-color:rgba(124,58,237,.2);
   box-shadow:0 0 10px rgba(124,58,237,.07)}
 .won-item:hover::before{transform:translateX(100%)}
@@ -2584,15 +2584,18 @@ _EPG_UI_JS = r"""
   align-items:center;justify-content:center;transition:background .15s,color .15s}
 .won-find-btn:hover{background:var(--acc);color:#fff;border-color:var(--acc)}
 .won-find-btn.loading{opacity:.5;pointer-events:none}
-.won-find-result{font-size:10px;margin-top:4px;padding:3px 6px;border-radius:4px;display:none}
+.won-find-result{font-size:10px;margin-top:4px;padding:3px 9px;border-radius:6px;border:1px solid transparent;display:none}
 .won-find-result.ok{background:rgba(34,197,94,.18);color:var(--green);display:block;
-  cursor:pointer;transition:background .15s}
+  border-color:rgba(34,197,94,.3);cursor:pointer;transition:background .15s}
 .won-find-result.ok:hover{background:rgba(34,197,94,.32)}
 .won-find-result.ok:active{background:rgba(34,197,94,.45)}
 .won-find-result.fail{background:rgba(239,68,68,.13);color:#f87171;display:block}
 .won-find-result.playing{background:rgba(59,130,246,.18);color:#60a5fa;display:block;cursor:default}
-.won-ext-btn{display:block;font-size:10px;margin-top:0;padding:3px 6px;border-radius:4px;
-  background:rgba(139,92,246,.18);color:#a78bfa;cursor:pointer;transition:background .15s}
+.won-ext-wrap{display:flex;flex-direction:row;gap:6px;align-items:center;margin-top:3px;width:100%}
+.won-ext-wrap>.won-ext-btn{flex:2;text-align:center}
+.won-ext-wrap>.cast-ext-btn{flex:1;justify-content:center}
+.won-ext-btn{display:inline-block;font-size:10px;padding:3px 9px;border-radius:6px;
+  border:1px solid rgba(139,92,246,.3);background:rgba(139,92,246,.18);color:#a78bfa;cursor:pointer;transition:background .15s}
 .won-ext-btn:hover{background:rgba(139,92,246,.32)}
 .won-ext-btn:active{background:rgba(139,92,246,.45)}
 .won-empty{text-align:center;padding:48px 20px;color:var(--txt3);font-size:13px}
@@ -3466,9 +3469,9 @@ function wonRender(list){
         <div class="won-item-ch">${esc(p.channel_name)}</div>
         <div class="won-item-times">${start} – ${end}</div>
         <div class="won-find-result" id="won-res-${i}"></div>
-        <div id="won-ext-${i}" style="display:none;margin-top:3px">
+        <div id="won-ext-${i}" class="won-ext-wrap" style="display:none">
           <span class="won-ext-btn"
-            onclick="wonOpenExternal(${i})">🎬 external player</span>
+            onclick="wonOpenExternal(${i})">🎬 External Player</span>
         </div>
       </div>
       <div class="won-progress">
@@ -3585,7 +3588,7 @@ function wonFindChannel(btn, idx){
     if(data.found){
       const cat = data.cat ? ` · ${data.cat}` : '';
       res.className = 'won-find-result ok';
-      res.textContent = `▶ ${data.name}${cat} (${data.score}%) — tap to play`;
+      res.textContent = `▶ ${data.name}${cat} (${data.score}%) — Tap to Play`;
       res.title = 'Click to play this channel';
       _wonMatches[idx] = data.channel;
       res.onclick = () => wonPlayFound(idx, res, data.name);
