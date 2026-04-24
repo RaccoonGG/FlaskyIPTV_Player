@@ -1243,8 +1243,13 @@ class StalkerPortalClient:
         self.bearer_token = None
         self._random = None
         # Derived IDs — mirroring stalker.py
-        self.serial = hashlib.md5(self.mac.encode()).hexdigest()[:13].upper()
-        self.device_id = hashlib.sha256(self.mac.encode()).hexdigest().upper()
+        self.serial = hashlib.md5(self.mac.encode("utf-8")).hexdigest().upper()
+        self.serialcut = self.serial[:13]
+        self.device_id = hashlib.sha256(self.mac.encode("utf-8")).hexdigest().upper()
+        self.device_id2 = hashlib.sha256(self.serialcut.encode("utf-8")).hexdigest().upper()
+        self.sg = self.serialcut + (mac)
+        self.signature = hashlib.sha256(self.sg .encode("utf-8")).hexdigest().upper()
+        self.log(f"[DEBUG] device_id={self.device_id[:13]} device_id2={self.device_id2[:13]} serial={self.serial[:13]} signature={self.signature}")
         # Cache for channel id → logo URL, populated lazily from get_all_channels
         self._ch_logo_cache: dict | None = None
         # Running in-memory logo cache for VOD / series — populated from items
@@ -1350,10 +1355,6 @@ class StalkerPortalClient:
     def _generate_random(self) -> str:
         return ''.join(random.choices('0123456789abcdef', k=40))
 
-    def _generate_signature(self) -> str:
-        data = f"{self.mac}{self.serial}{self.device_id}{self.device_id}"
-        return hashlib.sha256(data.encode()).hexdigest().upper()
-
     def _generate_metrics(self) -> str:
         if not self._random:
             self._random = self._generate_random()
@@ -1419,7 +1420,7 @@ class StalkerPortalClient:
             "hd": "1",
             "ver": (
                 "ImageDescription: 0.2.18-r23-250; ImageDate: Thu Sep 13 11:31:16 EEST 2018; "
-                "PORTAL version: 5.6.2; API Version: JS API version: 343; "
+                "PORTAL version: 5.6.7; API Version: JS API version: 343; "
                 "STB API version: 146; Player Engine version: 0x58c"
             ),
             "num_banks": "2",
@@ -1430,7 +1431,7 @@ class StalkerPortalClient:
             "video_out": "hdmi",
             "device_id": self.device_id,
             "device_id2": self.device_id,
-            "signature": self._generate_signature(),
+            "signature": self.signature,
             "auth_second_step": "1",
             "hw_version": "1.7-BD-00",
             "not_valid_token": "0",
@@ -2840,5 +2841,3 @@ class M3UClient:
                     try: progress_cb(count, name)
                     except TypeError: progress_cb(count)
         self.log(f"[M3U] Finished {cat_title} (items: {count})")
-
-
