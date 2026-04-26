@@ -1234,7 +1234,50 @@ class StalkerPortalClient:
     LOAD_PHP     = "/stalker_portal/server/load.php"
     LOAD_PHP_ALT = "/stalker_portal/portal.php"
 
-    def __init__(self, base_url: str, mac: str, log_cb):
+    # ── profile variant table ─────────────────────────────────────────────────
+    # Each row: (new_loader, stb_type, image_version, ver_string, prehash, api_sig, hw2)
+    # new_loader=True  → device_id2 param = device_id  (portal registered them equal)
+    # new_loader=False → device_id2 param = sha256(serialcut)  (old-style distinct IDs)
+    # Special prehash sentinels:
+    #   "__allf__"    → override device_id/2 with 64 f's (Go reference default for unchecked portals)
+    #   "__minimal__" → minimal params only (no sig/prehash/ver/metrics) like Go authenticateWithDeviceIDs
+    _V1_VER = ("ImageDescription: 0.2.18-r23-250; ImageDate: Thu Sep 13 11:31:16 EEST 2018; "
+               "PORTAL version: 5.6.7; API Version: JS API version: 343; "
+               "STB API version: 146; Player Engine version: 0x58c")
+    _V0_VER = ("ImageDescription: 0.2.18-r14-pub-250; ImageDate: Fri Jan 15 15:20:44 EET 2016; "
+               "PORTAL version: 5.6.1; API Version: JS API version: 328; "
+               "STB API version: 134; Player Engine version: 0x561")
+    _V2_VER = ("ImageDescription: 0.2.18-r14-pub-254; ImageDate: Fri Jan 15 15:20:44 EET 2016; "
+               "PORTAL version: 5.5.0; API Version: JS API version: 328; "
+               "STB API version: 134; Player Engine version: 0x550")
+    _V3_VER = ("ImageDescription: 2.20.04-pub-520; ImageDate: Thu Jan 06 12:00:00 EET 2022; "
+               "PORTAL version: 5.6.7; API Version: JS API version: 332; "
+               "STB API version: 136; Player Engine version: 0x568")
+    _V4_VER = ("ImageDescription: 2.17.02-pub-254; ImageDate: Fri Jan 15 15:20:44 EET 2016; "
+               "PORTAL version: 5.6.1; API Version: JS API version: 330; "
+               "STB API version: 135; Player Engine version: 0x550")
+    _ALL_F = "f" * 64  # Go reference default when portal does not enforce device_id check
+    _PROFILE_VARIANTS = [
+        # new_loader  stb_type   img_ver      ver          prehash                                    api_sig  hw2
+        # api_sig 262: hw_version_2 = sha1(mac).hexdigest()  — dynamic per MAC (__sha1_mac__ sentinel)
+        (True,  "MAG250", "218",      _V1_VER, "53302b3a8bcca197b7366e83d5e2883f99973f09", "262", "__sha1_mac__"),
+        (False, "MAG250", "218",      _V1_VER, "53302b3a8bcca197b7366e83d5e2883f99973f09", "262", "__sha1_mac__"),
+        # api_sig 263: hw_version_2 is static per STB model
+        (False, "MAG254", "0.2.18",   _V2_VER, "efd15c16dc497e0839ff5accfdc6ed99c32c4e2a", "263", "1.7-BD-00"),
+        (False, "MAG250", "0.2.18",   _V0_VER, "efd15c16dc497e0839ff5accfdc6ed99c32c4e2a", "263", ""),
+        (False, "MAG520", "2.20.04",  _V3_VER, "efd15c16dc497e0839ff5accfdc6ed99c32c4e2a", "263", ""),
+        (False, "MAG254", "2.17.02",  _V4_VER, "efd15c16dc497e0839ff5accfdc6ed99c32c4e2a", "263", "7c431b0aec69b2f0194c0680c32fe4e3"),
+        # Fallback: 64-char all-F device IDs (Go reference default for unchecked portals)
+        (True,  "MAG254", "0.2.18",   _V2_VER, "__allf__",    "263", "1.7-BD-00"),
+        # Fallback: minimal params — no sig/prehash/ver/metrics, like Go authenticateWithDeviceIDs
+        (True,  "MAG254", "0.2.18",   "",       "__minimal__", "263", ""),
+        # Fallback: no device_id params at all — TiviMate style, relies on MAC cookie only
+        (True,  "MAG250", "218",      _V1_VER, "__nodevid__", "262", "__sha1_mac__"),
+    ]
+
+    def __init__(self, base_url: str, mac: str, log_cb,
+                 custom_sn: str = "", custom_device_id: str = "",
+                 custom_device_id2: str = ""):
         self.base = normalize_base_url(base_url)
         self.mac = mac.strip().upper()
         self.log = log_cb
@@ -1242,14 +1285,29 @@ class StalkerPortalClient:
         self.token = None
         self.bearer_token = None
         self._random = None
-        # Derived IDs — mirroring stalker.py
-        self.serial = hashlib.md5(self.mac.encode("utf-8")).hexdigest().upper()
+        self._last_profile_js: dict = {}  # cached from handshake() variant loop
+        # Derived IDs — reference algorithm:
+        #   SN       = md5(MAC).upper()      (full 32-char hex)
+        #   SNCUT    = SN[:13]
+        #   deviceid1= sha256(MAC).upper()
+        #   deviceid2= sha256(SNCUT).upper()  (old loader)
+        #   signature= sha256(SNCUT+MAC).upper()
+        self.serial    = hashlib.md5(self.mac.encode("utf-8")).hexdigest().upper()
         self.serialcut = self.serial[:13]
-        self.device_id = hashlib.sha256(self.mac.encode("utf-8")).hexdigest().upper()
-        self.device_id2 = hashlib.sha256(self.serialcut.encode("utf-8")).hexdigest().upper()
-        self.sg = self.serialcut + (mac)
-        self.signature = hashlib.sha256(self.sg .encode("utf-8")).hexdigest().upper()
-        self.log(f"[DEBUG] device_id={self.device_id[:13]} device_id2={self.device_id2[:13]} serial={self.serial[:13]} signature={self.signature}")
+        self.device_id  = (custom_device_id.strip().upper()
+                           if custom_device_id.strip()
+                           else hashlib.sha256(self.mac.encode("utf-8")).hexdigest().upper())
+        self.device_id2 = (custom_device_id2.strip().upper()
+                           if custom_device_id2.strip()
+                           else hashlib.sha256(self.serialcut.encode("utf-8")).hexdigest().upper())
+        if custom_sn.strip():
+            self.serial    = custom_sn.strip().upper()
+            self.serialcut = self.serial[:13]
+        self.sg        = self.serialcut + self.mac
+        self.signature = hashlib.sha256(self.sg.encode("utf-8")).hexdigest().upper()
+        self.log(f"[STALKER] Computed IDs — SN={self.serial}  SNCUT={self.serialcut}  "
+                 f"deviceid1={self.device_id}  deviceid2={self.device_id2}  "
+                 f"signature={self.signature}")
         # Cache for channel id → logo URL, populated lazily from get_all_channels
         self._ch_logo_cache: dict | None = None
         # Running in-memory logo cache for VOD / series — populated from items
@@ -1310,8 +1368,9 @@ class StalkerPortalClient:
 
     def _cookie_str(self, include_token: bool = True) -> str:
         parts = [
+            "PHPSESSID=null",
             f"mac={quote(self.mac)}",
-            f"sn={quote(self.serial)}",
+            f"sn={quote(self.serialcut)}",   # Go ref: SerialNumber = SNCUT (13-char)
             "stb_lang=en",
             f"timezone={quote('Europe/Paris')}",
         ]
@@ -1355,13 +1414,53 @@ class StalkerPortalClient:
     def _generate_random(self) -> str:
         return ''.join(random.choices('0123456789abcdef', k=40))
 
-    def _generate_metrics(self) -> str:
+    def _generate_metrics(self, stb_type: str = "MAG250") -> str:
         if not self._random:
             self._random = self._generate_random()
         return json.dumps({
-            "mac": self.mac, "sn": self.serial, "type": "STB",
-            "model": "MAG250", "uid": "", "random": self._random
+            "mac": self.mac, "sn": self.serialcut, "type": "STB",
+            "model": stb_type, "uid": self.device_id, "random": self._random
         })
+
+    async def _read_json(self, r: aiohttp.ClientResponse, tag=None):
+        """Read response text, log raw content (when tag is not None), then parse JSON."""
+        try:
+            text = await r.text()
+        except Exception as e:
+            if tag:
+                self.log(f"[STALKER] {tag} read error: {e}")
+            return None
+        if tag:
+            preview = repr(text[:300]) if text else "''"
+            self.log(f"[STALKER] {tag} raw: {preview}")
+        if not text or not text.strip():
+            return None
+        t = text.lstrip()
+        if not (t.startswith("{") or t.startswith("[")):
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+        if not text or not text.strip():
+            return None
+        t = text.lstrip()
+        if not (t.startswith("{") or t.startswith("[")):
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_profile_conflict(js: dict) -> bool:
+        """Return True when the portal signals a device_id mismatch/conflict."""
+        if not isinstance(js, dict):
+            return False
+        msg = str(js.get("msg", "") or js.get("block_msg", "")).lower()
+        status = js.get("status")
+        return (status == 1 and any(kw in msg for kw in
+                                    ("conflict", "mismatch", "device", "hash", "not valid", "not supported")))
 
     # ── auth ──────────────────────────────────────────────────────────────────
 
@@ -1375,12 +1474,11 @@ class StalkerPortalClient:
             async with self.session.get(url, headers=headers) as r:
                 self.log(f"[STALKER] Handshake HTTP {r.status}")
                 if r.status == 429:
-                    _wait = 2 ** _attempt  # 1s, 2s, 4s
+                    _wait = 2 ** _attempt
                     self.log(f"[STALKER] Handshake 429 — backing off {_wait}s (attempt {_attempt+1}/4)")
                     await asyncio.sleep(_wait)
                     continue
                 if r.status == 404:
-                    # Stalker-specific: generate token+prehash and retry
                     self.log("[STALKER] 404 on handshake — retrying with token+prehash")
                     tok = self._generate_token()
                     prehash = self._generate_prehash(tok)
@@ -1388,13 +1486,13 @@ class StalkerPortalClient:
                                           token=tok, prehash=prehash, JsHttpRequest="1-xml")
                     async with self.session.get(url2, headers=headers) as r2:
                         self.log(f"[STALKER] Retry handshake HTTP {r2.status}")
-                        payload = await safe_json(r2)
+                        payload = await self._read_json(r2, "Handshake retry")
                 else:
-                    payload = await safe_json(r)
+                    payload = await self._read_json(r, "Handshake")
                 break
 
         if not isinstance(payload, dict) or "js" not in payload:
-            raise RuntimeError(f"[STALKER] Handshake failed — no valid JSON response")
+            raise RuntimeError("[STALKER] Handshake failed — no valid JSON response")
         js = payload["js"]
         if not isinstance(js, dict):
             raise RuntimeError("[STALKER] Handshake failed — unexpected js structure")
@@ -1406,48 +1504,109 @@ class StalkerPortalClient:
         self.bearer_token = self.token
         self.log(f"[STALKER] Token acquired: {self.token[:16]}…")
 
-        # Call get_profile to confirm/refresh token (required by stalker protocol)
-        await self.get_profile()
+        # Try each profile variant in order; stop at first success
+        self._last_profile_js: dict = {}
+        for idx, (new_loader, stb_type, img_ver, ver_str, prehash, api_sig, hw2) in enumerate(self._PROFILE_VARIANTS):
+            label = prehash if prehash.startswith("__") else prehash[:8] + "…"
+            self.log(f"[STALKER] Getting profile… (variant {idx+1}/{len(self._PROFILE_VARIANTS)}: "
+                     f"new_loader={new_loader} stb={stb_type} prehash={label})")
+            js = await self._get_profile_variant(new_loader, stb_type, img_ver, ver_str, prehash, api_sig, hw2)
+            if self._is_profile_conflict(js):
+                self.log(f"[STALKER] Profile conflict on variant {idx+1} — trying next")
+                continue
+            self._last_profile_js = js  # cache for get_profile() callers
+            break
+
         return self.token
 
-    async def get_profile(self) -> dict:
+    async def _get_profile_variant(self, new_loader: bool, stb_type: str, image_version: str,
+                                    ver_string: str, prehash: str, api_sig: str, hw2: str) -> dict:
+        """Send a get_profile request with the given variant parameters. Returns js dict."""
         assert self.session is not None
-        # Must match stalker.py exactly — ver and metrics are required to activate the token
         from urllib.parse import urlencode
-        params = {
-            "type": "stb",
-            "action": "get_profile",
-            "hd": "1",
-            "ver": (
-                "ImageDescription: 0.2.18-r23-250; ImageDate: Thu Sep 13 11:31:16 EEST 2018; "
-                "PORTAL version: 5.6.7; API Version: JS API version: 343; "
-                "STB API version: 146; Player Engine version: 0x58c"
-            ),
-            "num_banks": "2",
-            "sn": self.serial,
-            "stb_type": "MAG250",
-            "client_type": "STB",
-            "image_version": "218",
-            "video_out": "hdmi",
-            "device_id": self.device_id,
-            "device_id2": self.device_id,
-            "signature": self.signature,
-            "auth_second_step": "1",
-            "hw_version": "1.7-BD-00",
-            "not_valid_token": "0",
-            "metrics": self._generate_metrics(),
-            "hw_version_2": hashlib.sha1(self.mac.encode()).hexdigest(),
-            "timestamp": int(time.time()),
-            "api_signature": "262",
-            "prehash": "",
-            "JsHttpRequest": "1-xml",
-        }
+        if not self._random:
+            self._random = self._generate_random()
+
+        # ── determine device IDs for this variant ──────────────────────────
+        if prehash == "__allf__":
+            dev1 = dev2 = self._ALL_F
+        else:
+            dev1 = self.device_id
+            dev2 = self.device_id if new_loader else self.device_id2
+
+        # Resolve hw2 sentinel before building params
+        if hw2 == "__sha1_mac__":
+            hw2 = hashlib.sha1(self.mac.encode("utf-8")).hexdigest()
+
+        # ── minimal-params sentinel — Go authenticateWithDeviceIDs style ───
+        if prehash == "__minimal__":
+            params = {
+                "type": "stb",
+                "action": "get_profile",
+                "hd": "1",
+                "sn": self.serialcut,
+                "stb_type": stb_type,
+                "device_id": dev1,
+                "device_id2": dev2,
+                "auth_second_step": "1",
+                "random": self._random,
+                "JsHttpRequest": "1-xml",
+            }
+        # ── no device_id params — TiviMate style, relies on MAC cookie only ──
+        elif prehash == "__nodevid__":
+            params = {
+                "type": "stb",
+                "action": "get_profile",
+                "hd": "1",
+                "ver": ver_string,
+                "num_banks": "2",
+                "sn": self.serialcut,
+                "stb_type": stb_type,
+                "client_type": "STB",
+                "image_version": image_version,
+                "video_out": "hdmi",
+                "auth_second_step": "1",
+                "hw_version": "1.7-BD-00",
+                "metrics": self._generate_metrics(stb_type),
+                "hw_version_2": hw2,
+                "timestamp": int(time.time()),
+                "api_signature": api_sig,
+                "prehash": "53302b3a8bcca197b7366e83d5e2883f99973f09",
+                "random": self._random,
+                "JsHttpRequest": "1-xml",
+            }
+        else:
+            params = {
+                "type": "stb",
+                "action": "get_profile",
+                "hd": "1",
+                "ver": ver_string,
+                "num_banks": "2",
+                "sn": self.serialcut,
+                "stb_type": stb_type,
+                "client_type": "STB",
+                "image_version": image_version,
+                "video_out": "hdmi",
+                "device_id": dev1,
+                "device_id2": dev2,
+                "signature": self.signature,
+                "auth_second_step": "1",
+                "hw_version": "1.7-BD-00",
+                "not_valid_token": "0",
+                "metrics": self._generate_metrics(stb_type),
+                "hw_version_2": hw2,
+                "timestamp": int(time.time()),
+                "api_signature": api_sig,
+                "prehash": prehash,
+                "random": self._random,
+                "JsHttpRequest": "1-xml",
+            }
+
         url = f"{self.base}{self.LOAD_PHP}?{urlencode(params)}"
         headers = self._headers(include_auth=True, include_token=False)
-        self.log("[STALKER] Getting profile…")
         async with self.session.get(url, headers=headers) as r:
             self.log(f"[STALKER] Profile HTTP {r.status}")
-            payload = await safe_json(r)
+            payload = await self._read_json(r, "Profile")
         if isinstance(payload, dict):
             js = payload.get("js", {})
             if isinstance(js, dict):
@@ -1459,6 +1618,15 @@ class StalkerPortalClient:
                 return js
         return {}
 
+    async def get_profile(self) -> dict:
+        """Return the profile js cached by handshake(). If called before handshake, run variant 1."""
+        if self._last_profile_js:
+            return self._last_profile_js
+        new_loader, stb_type, img_ver, ver_str, prehash, api_sig, hw2 = self._PROFILE_VARIANTS[0]
+        js = await self._get_profile_variant(new_loader, stb_type, img_ver, ver_str, prehash, api_sig, hw2)
+        self._last_profile_js = js
+        return js
+
     async def account_info(self):
         assert self.session is not None
         url = self._load_url(type="account_info", action="get_main_info", JsHttpRequest="1-xml")
@@ -1466,24 +1634,51 @@ class StalkerPortalClient:
         self.log("[STALKER] Fetching account info…")
         async with self.session.get(url, headers=headers) as r:
             self.log(f"[STALKER] Account info HTTP {r.status}")
-            payload = await safe_json(r)
+            payload = await self._read_json(r, "Account info")
+
+        def _extract_max_conn(js: dict) -> int:
+            try:
+                # Top-level fields first
+                raw = (js.get("max_online") or js.get("playback_limit") or
+                       js.get("max_connections") or js.get("con_per_device") or
+                       js.get("max_con") or js.get("connections_limit") or 0)
+                if raw:
+                    return int(raw)
+                # profile.json shows max_online nested inside storages dict
+                storages = js.get("storages")
+                if isinstance(storages, dict):
+                    for store in storages.values():
+                        if isinstance(store, dict):
+                            v = store.get("max_online")
+                            if v:
+                                return int(v)
+            except Exception:
+                pass
+            return 0
+
         if isinstance(payload, dict):
             js = payload.get("js", {})
             if isinstance(js, dict):
                 mac = str(js.get("mac") or js.get("device_mac") or self.mac)
                 exp = str(js.get("phone") or js.get("end_date") or js.get("expire_billing_date") or "unknown")
-                max_conn = 0
-                try:
-                    raw = (js.get("max_online") or js.get("playback_limit") or js.get("max_connections")
-                           or js.get("con_per_device") or js.get("max_con")
-                           or js.get("connections_limit") or 0)
-                    max_conn = int(raw) if raw else 0
-                except Exception:
-                    pass
+                max_conn = _extract_max_conn(js)
                 active = js.get("active_cons") or js.get("online_streams") or "?"
+                # Fallback: if account_info was blocked, pull from cached profile js
+                if not max_conn and self._last_profile_js:
+                    max_conn = _extract_max_conn(self._last_profile_js)
                 self.log(f"[STALKER] Account: MAC={mac}  expiry={exp}  connections={active}/{max_conn or '?'}")
                 return (mac, exp, max_conn)
-        return (self.mac, "unknown", 0)
+
+        # account_info endpoint blocked — pull what we can from cached profile
+        mac = self.mac
+        exp = "unknown"
+        max_conn = 0
+        if self._last_profile_js:
+            js = self._last_profile_js
+            mac = str(js.get("mac") or js.get("device_mac") or self.mac)
+            exp = str(js.get("phone") or js.get("end_date") or js.get("expire_billing_date") or "unknown")
+            max_conn = _extract_max_conn(js)
+        return (mac, exp, max_conn)
 
     # ── categories ────────────────────────────────────────────────────────────
 
@@ -1502,7 +1697,7 @@ class StalkerPortalClient:
         self.log(f"[STALKER] Fetching {mode.upper()} categories…")
         async with self.session.get(url, headers=headers) as r:
             self.log(f"[STALKER] Categories HTTP {r.status} ({mode.upper()})")
-            payload = await safe_json(r)
+            payload = await self._read_json(r, f"Categories ({mode.upper()})")
         cats = normalize_js(payload)
         # Fallback: try /stalker_portal/portal.php if server/load.php returned nothing
         if not cats:
@@ -1513,7 +1708,7 @@ class StalkerPortalClient:
             self.log(f"[STALKER] Categories empty — retrying via portal.php ({mode.upper()})")
             async with self.session.get(alt_url, headers=headers) as r2:
                 self.log(f"[STALKER] Categories (alt) HTTP {r2.status} ({mode.upper()})")
-                payload = await safe_json(r2)
+                payload = await self._read_json(r2, f"Categories alt ({mode.upper()})")
             cats = normalize_js(payload)
         result = []
         for c in cats:
@@ -1553,7 +1748,7 @@ class StalkerPortalClient:
             async with self.session.get(url, headers=headers,
                                         timeout=aiohttp.ClientTimeout(total=30)) as r:
                 self.log(f"[STALKER] get_all_channels load.php HTTP {r.status}")
-                payload = await safe_json(r)
+                payload = await self._read_json(r, "get_all_channels (load.php)")
             self._all_channels_raw = [ch for ch in normalize_js(payload)
                                       if isinstance(ch, dict)]
             self.log(f"[STALKER] get_all_channels (load.php): {len(self._all_channels_raw)} channels")
@@ -1569,7 +1764,7 @@ class StalkerPortalClient:
                 async with self.session.get(url2, headers=headers,
                                             timeout=aiohttp.ClientTimeout(total=30)) as r2:
                     self.log(f"[STALKER] get_all_channels portal.php HTTP {r2.status}")
-                    payload2 = await safe_json(r2)
+                    payload2 = await self._read_json(r2, "get_all_channels (portal.php)")
                 self._all_channels_raw = [ch for ch in normalize_js(payload2)
                                           if isinstance(ch, dict)]
                 self.log(f"[STALKER] get_all_channels (portal.php): {len(self._all_channels_raw)} channels")
@@ -1624,7 +1819,7 @@ class StalkerPortalClient:
         async with self.session.get(url, headers=headers) as r:
             if page == 1:
                 self.log(f"[STALKER] Items HTTP {r.status} ({mode.upper()} cat={cat_id} p={page})")
-            payload = await safe_json(r)
+            payload = await self._read_json(r, f"Items ({mode.upper()} cat={cat_id} p={page})" if page == 1 else None)
         items = normalize_js(payload)
         # Fallback: try /stalker_portal/portal.php if server/load.php returned nothing
         if not items and page == 1:
@@ -1637,8 +1832,20 @@ class StalkerPortalClient:
             self.log(f"[STALKER] Items empty — retrying via portal.php ({mode.upper()} cat={cat_id})")
             async with self.session.get(alt_url, headers=headers) as r2:
                 self.log(f"[STALKER] Items (alt) HTTP {r2.status} ({mode.upper()} cat={cat_id})")
-                payload = await safe_json(r2)
+                payload = await self._read_json(r2, f"Items alt ({mode.upper()} cat={cat_id})")
             items = normalize_js(payload)
+        # Final fallback for live categories: filter _all_channels_raw by tv_genre_id.
+        # Triggered when get_ordered_list returns "Access denied" or similar block — portal
+        # allows get_all_channels but not per-category listing (seen on 4k1.new4k.cc).
+        if not items and page == 1 and mode == "live" and cat_id not in ("*", "__all__"):
+            raw_all = getattr(self, "_all_channels_raw", [])
+            if raw_all:
+                filtered = [ch for ch in raw_all
+                            if isinstance(ch, dict) and str(ch.get("tv_genre_id", "")) == str(cat_id)]
+                if filtered:
+                    self.log(f"[STALKER] Items fallback: filtered {len(filtered)} channels "
+                             f"from _all_channels_raw for cat={cat_id}")
+                    items = filtered
         for it in items:
             if not isinstance(it, dict):
                 continue
@@ -1729,52 +1936,93 @@ class StalkerPortalClient:
         """Resolve a Stalker stub URL like http:///ch/27063_ or http://localhost/ch/27063_
         by making a second create_link call with the forced_storage/series params."""
         assert self.session is not None
-        # Extract channel id from /ch/{id}_ pattern
         m = re.search(r'/ch/(\d+)_?', stub)
         if not m:
             return stub
         cid = m.group(1)
         cmd = f"ffmpeg http://localhost/ch/{cid}_"
         from urllib.parse import urlencode
-        params = {
-            "type": "itv",
-            "action": "create_link",
-            "cmd": cmd,
-            "series": "",
-            "forced_storage": "0",
-            "disable_ad": "0",
-            "download": "0",
-            "force_ch_link_check": "0",
-            "JsHttpRequest": "1-xml",
-        }
-        url = f"{self.base}{self.LOAD_PHP}?{urlencode(params)}"
-        headers = self._headers(include_auth=True)
-        self.log(f"[STALKER] Resolving stub ch={cid}…")
-        async with self.session.get(url, headers=headers) as r:
-            self.log(f"[STALKER] Stub resolve HTTP {r.status} (ch={cid})")
-            payload = await safe_json(r)
-        if not isinstance(payload, dict):
-            return stub
-        js = payload.get("js", {})
-        if isinstance(js, list) and js:
-            js = js[0]
-        if not isinstance(js, dict):
-            return stub
-        resolved = js.get("cmd") or js.get("url") or ""
-        if not resolved:
-            return stub
-        resolved = resolved.strip()
-        for _pfx in ("ffmpeg ", "auto ", "ffrt "):
-            if resolved.lower().startswith(_pfx):
-                resolved = resolved.split(" ", 1)[1].strip()
-                break
-        resolved = resolved.replace("\\/", "/")
-        if resolved.startswith(("http://", "https://", "rtsp://")):
-            self.log(f"[STALKER] Resolved ch={cid} → {resolved[:120]}")
-            return resolved
-        extracted = _extract_url_from_text(resolved)
-        if extracted:
-            return extracted
+
+        async def _try_resolve(base_url: str) -> str:
+            params = {
+                "type": "itv",
+                "action": "create_link",
+                "cmd": cmd,
+                "series": "",
+                "forced_storage": "0",
+                "disable_ad": "0",
+                "download": "0",
+                "force_ch_link_check": "0",
+                "JsHttpRequest": "1-xml",
+            }
+            url = f"{base_url}?{urlencode(params)}"
+            headers = self._headers(include_auth=True)
+            self.log(f"[STALKER] Resolving stub ch={cid} via {base_url.split('/')[-1]}")
+            async with self.session.get(url, headers=headers) as r:
+                self.log(f"[STALKER] Stub resolve HTTP {r.status} (ch={cid})")
+                payload = await self._read_json(r, f"Stub resolve ch={cid}")
+            if not isinstance(payload, dict):
+                return ""
+            js = payload.get("js", {})
+            if isinstance(js, list) and js:
+                js = js[0]
+            if not isinstance(js, dict):
+                return ""
+            resolved = js.get("cmd") or js.get("url") or ""
+            if not resolved:
+                return ""
+            resolved = resolved.strip()
+            for _pfx in ("ffmpeg ", "auto ", "ffrt "):
+                if resolved.lower().startswith(_pfx):
+                    resolved = resolved.split(" ", 1)[1].strip()
+                    break
+            resolved = resolved.replace("\\/", "/")
+            # Fix hostless URL: http://:/path or http:///path → prepend portal base
+            if re.match(r'https?://[:/]', resolved):
+                path_part = re.sub(r'^https?://[^/]*', '', resolved)
+                resolved = self.base.rstrip('/') + '/' + path_part.lstrip('/')
+                self.log(f"[STALKER] Fixed hostless stub URL → {resolved[:120]}")
+            if resolved.startswith(("http://", "https://", "rtsp://")):
+                # Reject if still a localhost/stub
+                if "localhost" in resolved or re.search(r'https?:///ch/', resolved):
+                    return ""
+                self.log(f"[STALKER] Resolved ch={cid} → {resolved[:120]}")
+                return resolved
+            extracted = _extract_url_from_text(resolved)
+            return extracted or ""
+
+        # Try load.php first, then portal.php as fallback
+        for endpoint in (f"{self.base}{self.LOAD_PHP}",
+                         f"{self.base}{self.LOAD_PHP_ALT}"):
+            result = await _try_resolve(endpoint)
+            if result:
+                return result
+
+        # Final fallback: request http://portal_host/ch/{cid}_ directly with
+        # full session headers (Authorization + Cookie). The portal may serve
+        # the stream at this path when the request carries a valid session.
+        try:
+            from urllib.parse import urlparse as _up3
+            _p3 = _up3(self.base)
+            direct_url = f"{_p3.scheme}://{_p3.netloc}/ch/{cid}_"
+            headers = self._headers(include_auth=True)
+            self.log(f"[STALKER] Stub direct attempt → {direct_url}")
+            async with self.session.get(direct_url, headers=headers,
+                                        allow_redirects=True,
+                                        timeout=aiohttp.ClientTimeout(total=6)) as r:
+                if r.status in (200, 206):
+                    # Portal served the stream directly — return the URL
+                    self.log(f"[STALKER] Stub direct succeeded (HTTP {r.status}) → {direct_url}")
+                    return direct_url
+                final_url = str(r.url)
+                if final_url != direct_url and final_url.startswith(("http://", "https://")):
+                    self.log(f"[STALKER] Stub direct redirected → {final_url}")
+                    return final_url
+                self.log(f"[STALKER] Stub direct HTTP {r.status} — no stream at portal host")
+        except Exception as e:
+            self.log(f"[STALKER] Stub direct error: {e}")
+
+        self.log(f"[STALKER] Could not resolve stub ch={cid} — returning original")
         return stub
 
     async def create_catchup_link(self, cmd: str, start_str: str, duration_min: int,
@@ -1868,33 +2116,49 @@ class StalkerPortalClient:
 
     async def create_stream_link(self, cmd: str, ptype: str = "itv") -> str:
         assert self.session is not None
-        # Pass raw cmd — _load_url uses urlencode() which encodes it correctly once.
-        # Do NOT quote_plus() here or the cmd gets double-encoded.
-        url = self._load_url(type=ptype, action="create_link",
-                             cmd=cmd, JsHttpRequest="1-xml")
         headers = self._headers(include_auth=True)
         self.log(f"[STALKER] create_link ({ptype}) cmd={cmd[:40]}…")
-        async with self.session.get(url, headers=headers) as r:
-            self.log(f"[STALKER] create_link HTTP {r.status}")
-            payload = await safe_json(r)
-        if not isinstance(payload, dict):
-            return ""
-        js = payload.get("js", {})
+
+        async def _try_endpoint(base_url: str) -> dict:
+            from urllib.parse import urlencode
+            params = {"type": ptype, "action": "create_link", "cmd": cmd,
+                      "series": "", "forced_storage": "0", "disable_ad": "0",
+                      "download": "0", "force_ch_link_check": "0", "JsHttpRequest": "1-xml"}
+            url = f"{base_url}?{urlencode(params)}"
+            async with self.session.get(url, headers=headers) as r:
+                self.log(f"[STALKER] create_link HTTP {r.status} ({base_url.split('/')[-1]})")
+                return await self._read_json(r, "create_link") or {}
+
+        # Go reference (channels.go): create_link goes to portal.php (c.Portal.Location),
+        # NOT server/load.php. Try portal.php first, fall back to load.php.
+        payload = await _try_endpoint(f"{self.base}{self.LOAD_PHP_ALT}")
+        js = payload.get("js", {}) if isinstance(payload, dict) else {}
         if isinstance(js, list) and js:
             js = js[0]
-        if not isinstance(js, dict):
-            return ""
-        cmd_value = js.get("cmd") or js.get("url") or ""
+        cmd_value = (js.get("cmd") or js.get("url") or "") if isinstance(js, dict) else ""
+
         if not cmd_value:
+            # Fallback to load.php
+            payload = await _try_endpoint(f"{self.base}{self.LOAD_PHP}")
+            js = payload.get("js", {}) if isinstance(payload, dict) else {}
+            if isinstance(js, list) and js:
+                js = js[0]
+            cmd_value = (js.get("cmd") or js.get("url") or "") if isinstance(js, dict) else ""
+
+        if not cmd_value:
+            # Both endpoints failed. Check what the raw responses said to give
+            # a useful diagnostic instead of silently returning empty.
+            self.log("[STALKER] create_link failed on all endpoints — stream unavailable for this account "
+                     "(access denied 126 = account has no streaming permission / subscription restriction / "
+                     "concurrent connection limit reached on portal side)")
             return ""
-        # Strip 'ffmpeg '/'auto ' prefix
+
         cmd_value = cmd_value.strip()
         for _pfx in ("ffmpeg ", "auto ", "ffrt "):
             if cmd_value.lower().startswith(_pfx):
                 cmd_value = cmd_value.split(" ", 1)[1].strip()
                 break
         cmd_value = cmd_value.replace("\\/", "/")
-        # Detect stub: empty host (http:///ch/...) or localhost/ch/...
         is_stub = (
             re.search(r'https?:///ch/', cmd_value) is not None or
             re.search(r'https?://localhost/ch/', cmd_value) is not None
@@ -1902,9 +2166,8 @@ class StalkerPortalClient:
         if is_stub:
             return await self._resolve_stub_url(cmd_value)
         if cmd_value.startswith(("http://", "https://", "rtsp://")):
+            self.log(f"[STALKER] create_link resolved → {cmd_value[:120]}")
             return cmd_value
-        # Relative path (e.g. /media/7382.mpg) — build full URL.
-        # stalker.py derives stream_base_url as {scheme}://{netloc}/vod4
         if cmd_value.startswith("/"):
             from urllib.parse import urlparse as _up
             p = _up(self.base)
@@ -2841,3 +3104,4 @@ class M3UClient:
                     try: progress_cb(count, name)
                     except TypeError: progress_cb(count)
         self.log(f"[M3U] Finished {cat_title} (items: {count})")
+
