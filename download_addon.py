@@ -2282,7 +2282,7 @@ function setStatus(m){
     if(m.startsWith('Connected')) shortEl.textContent='Online';
     else if(m.startsWith('Connecting')) shortEl.textContent='Wait…';
     else if(m.startsWith('Error')) shortEl.textContent='Error';
-    else shortEl.textContent='Offline';
+    else shortEl.textContent=connected?'Online':'Offline';
   }
   if(!isConnMsg){
     const act=document.getElementById('activity-status');
