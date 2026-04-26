@@ -131,8 +131,13 @@ class AppState:
         self.ext_epg_url = ""  # User-supplied external XMLTV EPG URL (overrides portal's own)
         self.connected = False
         self.is_stalker_portal = False  # True when URL contains 'stalker_portal'
+        # Optional user-supplied Stalker device IDs (override computed values when non-empty)
+        self.stalker_device_id:  str = ""
+        self.stalker_device_id2: str = ""
+        self.stalker_sn:         str = ""
         self.cats_cache: dict = {}
         self._items_cache: dict = {}  # (mode, cat_id) → list of items, session-wide
+        self._prefetch_running: bool = False  # True while bg channel prefetch is in-flight
         self.m3u_cache = None
         self.m3u_is_local = False
         self.m3u_xtream_override = None
@@ -290,7 +295,12 @@ async def _make_client(do_handshake=True):
                 yield client
     else:  # mac
         if state.is_stalker_portal:
-            client = StalkerPortalClient(state.url, state.mac, state.log)
+            client = StalkerPortalClient(
+                state.url, state.mac, state.log,
+                custom_sn=state.stalker_sn,
+                custom_device_id=state.stalker_device_id,
+                custom_device_id2=state.stalker_device_id2,
+            )
         else:
             client = PortalClient(state.url, state.mac, state.log)
         # Inject both caches from AppState so this request can read what
@@ -466,6 +476,13 @@ async def _connect_async():
                     try:
                         raw = (prof.get('max_online') or prof.get('playback_limit') or prof.get('max_connections')
                                or prof.get('con_per_device') or prof.get('connections_limit') or 0)
+                        if not raw:
+                            storages = prof.get('storages')
+                            if isinstance(storages, dict):
+                                for store in storages.values():
+                                    if isinstance(store, dict) and store.get('max_online'):
+                                        raw = store['max_online']
+                                        break
                         max_conn = int(raw) if raw else 0
                     except Exception:
                         pass
@@ -473,10 +490,11 @@ async def _connect_async():
                     'type': 'stalker',
                     'mac': client.mac,
                     'login': login or ident,
+                    'password': str(prof.get('password', '') or ''),
                     'exp': exp,
                     'exp_label': exp_label,
                     'status': prof.get('status', ''),
-                    'max_conn': str(max_conn) if max_conn else '',
+                    'max_conn': str(max_conn) if max_conn else '–',
                     'active_cons': str(prof.get('active_cons') or prof.get('online_streams') or ''),
                     'settings_password': str(prof.get('settings_password', '') or ''),
                     'adult_password': str(prof.get('parent_password', '') or prof.get('adult_password', '') or ''),
@@ -610,6 +628,9 @@ def api_connect():
             state.conn_type == "mac" and
             "stalker_portal" in state.url.lower()
         )
+        state.stalker_device_id  = data.get("stalker_device_id",  "").strip()
+        state.stalker_device_id2 = data.get("stalker_device_id2", "").strip()
+        state.stalker_sn         = data.get("stalker_sn",         "").strip()
         state.cats_cache = {}
         state._items_cache = {}
         state.m3u_cache = None
@@ -737,11 +758,23 @@ def api_connect():
                             state.log("[PREFETCH] Pool already populated — skipping")
                             return
                         state.log("[PREFETCH] Background: fetching full live channel list…")
+                        state._prefetch_running = True
                         async with _make_client() as client:
                             channels = await client.get_all_channels()
                             if channels:
                                 state._items_cache[("live", "__all__")] = channels
                                 state._won_ch_cache[_pf_portal_key] = channels
+                                # Invalidate any empty-result Stalker category caches that
+                                # were populated before this prefetch completed — they will
+                                # re-fetch and use the _all_channels_raw fallback next time.
+                                if _pf_is_mac:
+                                    stale = [k for k, v in state._items_cache.items()
+                                             if k[0] == "live" and k[1] != "__all__"
+                                             and isinstance(v, list) and len(v) == 0]
+                                    for k in stale:
+                                        del state._items_cache[k]
+                                    if stale:
+                                        state.log(f"[PREFETCH] Cleared {len(stale)} empty category cache(s) — will re-fetch with full channel pool")
                                 if _pf_is_mac:
                                     # Fill the shared logo dict in-place — same object
                                     # already injected into every concurrent MAC client
@@ -766,6 +799,7 @@ def api_connect():
                 except Exception as _pfe:
                     state.log(f"[PREFETCH] Background channel prefetch error: {_pfe}")
                 finally:
+                    state._prefetch_running = False
                     if _pf_is_mac:
                         # Always unblock MAC logo-cache waiters, even on failure.
                         state._all_channels_ready.set()
@@ -919,6 +953,15 @@ def api_items():
         result = run_async(fetch())
         items = result["items"] if isinstance(result, dict) else result
         has_more = result.get("has_more", False) if isinstance(result, dict) else False
+        # For Stalker portals: don't cache empty category results while the background
+        # prefetch is still running — the channel pool isn't ready yet. Return a
+        # "pending" signal so the frontend retries after a short delay.
+        if (not items and not has_more
+                and state.is_stalker_portal
+                and state._prefetch_running
+                and mode == "live" and cat_id != "__all__"):
+            state.log(f"[ITEMS] '{cat.get('title','?')}': 0 items — prefetch still running, returning pending")
+            return jsonify({"items": [], "count": 0, "has_more": False, "pending": True})
         if not has_more:
             state._items_cache[_cache_key] = items
         return jsonify({"items": items, "count": len(items), "has_more": has_more})
@@ -1292,6 +1335,29 @@ def api_resolve():
                 except Exception as pe:
                     state.log(f"[RESOLVE] TS probe failed: {pe}")
             
+            # ── Fresh token for short-lived Stalker CDN URLs ─────────────────────
+            # CDNs like lx20.net issue single-use or connection-bound tokens.
+            # ffprobe above opened a connection and consumed/bound the token.
+            # Re-call resolve_item_url now to get a fresh token URL for actual
+            # playback — skip all probing this time since we have codec info.
+            _is_stalker_token_url = (
+                state.conn_type == 'mac'
+                and 'token=' in url
+                and not url.lower().split('?')[0].endswith('.m3u8')
+            )
+            if _is_stalker_token_url:
+                try:
+                    async def _refetch():
+                        async with _make_client() as client:
+                            return await client.resolve_item_url(mode, item, cat)
+                    fresh_url = run_async(_refetch())
+                    if fresh_url and isinstance(fresh_url, str) and fresh_url != url:
+                        state.log(f"[RESOLVE] Fresh token URL obtained for playback (probe used previous token)")
+                        url = fresh_url
+                except Exception as _rfe:
+                    state.log(f"[RESOLVE] Fresh token re-fetch failed ({_rfe}) — using probe URL")
+            # ─────────────────────────────────────────────────────────────────────
+
             # Apply transcode if needed
             if needs_transcode:
                 vod_flag = "1" if is_vod else "0"
@@ -2157,12 +2223,11 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 #pl-overlay.open{display:flex}
 #pl-modal{background:var(--s2);border:1px solid var(--bdr2);border-radius:var(--r);
   width:min(480px,100%);max-height:88dvh;display:flex;flex-direction:column;
-  box-shadow:0 24px 64px rgba(0,0,0,.8);animation:slide-up .25s cubic-bezier(.34,1.56,.64,1)}
+  box-shadow:0 24px 64px rgba(0,0,0,.8);animation:slide-up .25s cubic-bezier(.34,1.56,.64,1);
+  transform:translateZ(0);-webkit-transform:translateZ(0);backface-visibility:hidden;-webkit-backface-visibility:hidden}
 .plm-hdr{display:flex;align-items:center;gap:8px;padding:14px 16px;
   border-bottom:1px solid var(--bdr);flex-shrink:0}
-.plm-hdr h2{flex:1;font-size:14px;font-weight:800;
-  background:linear-gradient(90deg,var(--txt),var(--acc));
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.plm-hdr h2{flex:1;font-size:14px;font-weight:800;color:var(--txt)}
 .pl-list{flex:1;overflow-y:auto;padding:10px;min-height:60px}
 .pl-empty{text-align:center;padding:32px 16px;color:var(--txt3);font-size:12px}
 .pl-empty span{font-size:40px;display:block;margin-bottom:8px;opacity:.2}
@@ -2252,6 +2317,13 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <label>URL</label><input id="i-url" type="text" inputmode="url" placeholder="http://portal.host:8080" autocomplete="new-password" autocorrect="off" spellcheck="false">
           <label>MAC</label><span style="position:relative;display:inline-flex;align-items:center;max-width:200px;width:200px"><input id="i-mac" type="password" placeholder="00:1A:79:XX:XX:XX" style="width:100%;padding-right:28px" autocomplete="new-password" autocorrect="off" spellcheck="false"><button type="button" onclick="(function(b){var i=document.getElementById('i-mac');var shown=i.getAttribute('data-shown')==='1';if(shown){i.setAttribute('type','password');i.setAttribute('data-shown','0');b.textContent='👁';}else{i.setAttribute('type','text');i.setAttribute('data-shown','1');b.textContent='🙈';};})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button></span>
         </div>
+        <details style="margin:4px 0 2px"><summary style="font-size:11px;color:var(--txt3);cursor:pointer;user-select:none;padding:3px 0;list-style:none;display:flex;align-items:center;gap:4px"><span style="font-size:9px;opacity:.6">▶</span>Stalker overrides (optional)</summary>
+          <div style="display:flex;flex-direction:column;gap:4px;margin-top:6px;padding:8px;background:rgba(255,255,255,.03);border-radius:6px;border:1px solid var(--bdr)">
+            <div style="display:flex;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">SN</label><input id="i-sn" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px;flex:1"></div>
+            <div style="display:flex;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">Device ID</label><input id="i-devid" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px;flex:1"></div>
+            <div style="display:flex;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">Device ID2</label><input id="i-devid2" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px;flex:1"></div>
+          </div>
+        </details>
         <div style="display:flex;gap:6px;align-items:center">
           <label title="Optional: external XMLTV EPG URL(s). One URL per line. Leave blank to use portal's own EPG.">EPG</label><textarea id="i-mac-epg" rows="2" placeholder="https://… xmltv URL (optional, one per line)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;width:100%"></textarea>
         </div>
@@ -2504,6 +2576,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
         <div class="bcrum" id="bcrum" style="flex:1;min-width:0"><span class="bc-s">Categories</span></div>
         <button class="epg-layout-btn" id="epg-grid-btn" onclick="toggleEpgGrid()" title="EPG Grid view" style="display:none">📅 EPG</button>
+        <button class="epg-layout-btn" id="epg-expand-btn" onclick="openEpgExpandOverlay()" title="Expand EPG" style="display:none">⛶</button>
       </div>
       <div class="sbar" id="items-sbar"><span class="sico">🔍</span>
         <input id="isrch" type="search" placeholder="Search items…" oninput="filterItems()">
@@ -2641,6 +2714,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <h3 style="font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1.5px;color:var(--txt2);margin:0">Activity Log</h3>
         </div>
         <div style="display:flex;gap:6px" onclick="event.stopPropagation()">
+          <button class="btn-ghost" onclick="copyLog()" style="height:22px;padding:0 8px;font-size:11px;border-radius:var(--rss)">Copy</button>
           <button class="btn-ghost" onclick="clearLog()" style="height:22px;padding:0 8px;font-size:11px;border-radius:var(--rss)">Clear</button>
           <button class="btn-ghost" onclick="toggleDesktopLog()" style="height:22px;padding:0 8px;font-size:11px;border-radius:var(--rss)">✕</button>
         </div>
@@ -2673,6 +2747,8 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   <div class="panel" id="p-log" style="background:var(--bg)">
     <div class="ph">
       <h3>Activity Log</h3>
+      <button class="btn-ghost" onclick="copyLog()"
+        style="height:24px;padding:0 8px;font-size:11px;border-radius:var(--rss)">Copy</button>
       <button class="btn-ghost" onclick="clearLog()"
         style="height:24px;padding:0 8px;font-size:11px;border-radius:var(--rss)">Clear</button>
     </div>
@@ -2754,6 +2830,13 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <div id="plf-mac">
           <div class="pl-row"><label>URL</label><input id="pl-url" type="text" inputmode="url" placeholder="http://portal.host:8080" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
           <div class="pl-row"><label>MAC</label><span style="position:relative;display:inline-flex;align-items:center;flex:1"><input id="pl-mac" type="password" placeholder="00:1A:79:XX:XX:XX" autocomplete="new-password" autocorrect="off" spellcheck="false" style="flex:1;padding-right:28px"><button type="button" onclick="(function(b){var i=document.getElementById('pl-mac');var shown=i.getAttribute('data-shown')==='1';if(shown){i.setAttribute('type','password');i.setAttribute('data-shown','0');b.textContent='👁';}else{i.setAttribute('type','text');i.setAttribute('data-shown','1');b.textContent='🙈';};})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button></span></div>
+          <details style="margin:4px 0 2px"><summary style="font-size:11px;color:var(--txt3);cursor:pointer;user-select:none;padding:2px 0">Stalker overrides (optional)</summary>
+            <div style="display:flex;flex-direction:column;gap:4px;margin-top:6px">
+              <div class="pl-row"><label style="min-width:80px;font-size:11px">SN</label><input id="pl-sn" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
+              <div class="pl-row"><label style="min-width:80px;font-size:11px">Device ID</label><input id="pl-devid" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
+              <div class="pl-row"><label style="min-width:80px;font-size:11px">Device ID2</label><input id="pl-devid2" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
+            </div>
+          </details>
           <div class="pl-row"><label>EPG</label><textarea id="pl-mac-epg" rows="2" placeholder="External EPG URL(s), one per line (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;width:100%"></textarea></div>
         </div>
         <div id="plf-xtream" class="hidden">
@@ -2904,6 +2987,9 @@ async function doConnect(){
       : CT==='mac'
         ? document.getElementById('i-mac-epg').value.trim()
         : document.getElementById('i-m3u-epg').value.trim()),
+    stalker_sn:         CT==='mac' ? (document.getElementById('i-sn')?.value.trim()||'')     : '',
+    stalker_device_id:  CT==='mac' ? (document.getElementById('i-devid')?.value.trim()||'')  : '',
+    stalker_device_id2: CT==='mac' ? (document.getElementById('i-devid2')?.value.trim()||'') : '',
   };
   const saveBtn = document.getElementById('save-profile-chk');
   const saveToProfile = saveBtn._on || false;
@@ -4178,20 +4264,33 @@ function browseC(cj){
   }
 
   // Not cached -> fetch
-  fetch('/api/items',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({mode, category:cat, browse:true})})
-  .then(r=>r.json()).then(d=>{
-    _setLoadingHeader(null);
-    if(d.error){ toast(d.error,'err'); setStatus('Error: '+d.error); return; }
-    allItems = d.items || [];
-    // store into cache
-    categoryItemsCache[mode][key] = allItems;
-    setStatus("'"+cat.title+"' — "+allItems.length+' items');
-    showItems(cat.title, allItems);
-  }).catch(e=>{
-    _setLoadingHeader(null);
-    toast(e.message,'err');
-  }).finally(()=> setBusy(false));
+  function _doFetchItems(attempt){
+    fetch('/api/items',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({mode, category:cat, browse:true})})
+    .then(r=>r.json()).then(d=>{
+      if(d.error){ _setLoadingHeader(null); setBusy(false); toast(d.error,'err'); setStatus('Error: '+d.error); return; }
+      // pending: prefetch still running — show spinner and retry in 2s
+      if(d.pending){
+        const retryIn = Math.min(2000 * attempt, 8000);
+        _setLoadingHeader(`Loading ${esc(cat.title)} — waiting for channel list…`);
+        setStatus(`Waiting for channel list (${cat.title})…`);
+        setTimeout(()=>{ if(state.connected) _doFetchItems(attempt+1); else{_setLoadingHeader(null);setBusy(false);} }, retryIn);
+        return;
+      }
+      _setLoadingHeader(null);
+      allItems = d.items || [];
+      // store into cache
+      categoryItemsCache[mode][key] = allItems;
+      setStatus("'"+cat.title+"' — "+allItems.length+' items');
+      showItems(cat.title, allItems);
+      setBusy(false);
+    }).catch(e=>{
+      _setLoadingHeader(null);
+      setBusy(false);
+      toast(e.message,'err');
+    });
+  }
+  _doFetchItems(1);
 }
 
 function showSkels(count=10, small=false){
@@ -5557,9 +5656,11 @@ async function openProfileModal(){
     if(d.type==='stalker'){
       html+=row('MAC',d.mac);
       html+=row('Login',d.login);
+      html+=row('Password',d.password,pwdStyle);
       html+=row(d.exp_label==='last_billing'?'Last Billing':'Expiry',d.exp);
       html+=d.status?`<div style="display:flex;gap:8px;align-items:center;border-bottom:1px solid var(--bdr);padding-bottom:6px"><span style="color:var(--txt3);min-width:120px;flex-shrink:0;font-size:11px">Status</span>${statusBadge(d.status)}</div>`:'';
-      html+=row('Active connections',d.active_cons&&d.max_conn?d.active_cons+' / '+d.max_conn:d.active_cons||d.max_conn);
+      html+=row('Active connections', d.active_cons||'');
+      html+=row('Max connections', d.max_conn && d.max_conn!=='–' ? d.max_conn : '');
       html+=row('Settings password',d.settings_password,pwdStyle);
       html+=row('Adult password',d.adult_password,pwdStyle);
     } else {
@@ -5661,6 +5762,9 @@ function plSave(){
       : plCT==='mac'
         ? document.getElementById('pl-mac-epg').value.trim()
         : document.getElementById('pl-m3u-epg').value.trim()),
+    stalker_sn:         plCT==='mac' ? (document.getElementById('pl-sn')?.value.trim()||'')    : '',
+    stalker_device_id:  plCT==='mac' ? (document.getElementById('pl-devid')?.value.trim()||'') : '',
+    stalker_device_id2: plCT==='mac' ? (document.getElementById('pl-devid2')?.value.trim()||''): '',
   };
   if(plEditId){
     const idx=arr.findIndex(p=>p.id===plEditId);
@@ -5688,6 +5792,9 @@ function plEdit(i){
   document.getElementById('pl-epg').value=p.ext_epg_url||'';
   document.getElementById('pl-mac-epg').value=p.ext_epg_url||'';
   document.getElementById('pl-m3u-epg').value=p.ext_epg_url||'';
+  if(document.getElementById('pl-sn'))     document.getElementById('pl-sn').value=p.stalker_sn||'';
+  if(document.getElementById('pl-devid'))  document.getElementById('pl-devid').value=p.stalker_device_id||'';
+  if(document.getElementById('pl-devid2')) document.getElementById('pl-devid2').value=p.stalker_device_id2||'';
   // scroll form into view
   document.querySelector('.pl-add').scrollIntoView({behavior:'smooth'});
 }
@@ -5700,14 +5807,14 @@ function plDelete(i){
 function plClearForm(){
   plEditId=null;
   ['pl-name','pl-url','pl-mac','pl-xu','pl-us','pl-pw','pl-m3u',
-   'pl-epg','pl-mac-epg','pl-m3u-epg'].forEach(id=>
-    document.getElementById(id).value='');
+   'pl-epg','pl-mac-epg','pl-m3u-epg','pl-sn','pl-devid','pl-devid2'].forEach(id=>{
+    const el=document.getElementById(id); if(el) el.value='';
+  });
 }
 
 async function plConnect(i){
   const arr=plLoadAll(); const p=arr[i]; if(!p) return;
   closePL();
-  // Fill in the connection form
   setCT(p.type||'mac');
   document.getElementById('i-url').value=p.url||'';
   document.getElementById('i-mac').value=p.mac||'';
@@ -5718,7 +5825,10 @@ async function plConnect(i){
   document.getElementById('i-epg').value=p.ext_epg_url||'';
   document.getElementById('i-mac-epg').value=p.ext_epg_url||'';
   document.getElementById('i-m3u-epg').value=p.ext_epg_url||'';
-  // Auto-connect
+  // Stalker override hidden inputs
+  const sn=document.getElementById('i-sn'); if(sn) sn.value=p.stalker_sn||'';
+  const di=document.getElementById('i-devid'); if(di) di.value=p.stalker_device_id||'';
+  const di2=document.getElementById('i-devid2'); if(di2) di2.value=p.stalker_device_id2||'';
   await doConnect();
 }
 
