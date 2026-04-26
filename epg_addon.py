@@ -2599,6 +2599,18 @@ _EPG_UI_JS = r"""
 .won-ext-btn:hover{background:rgba(139,92,246,.32)}
 .won-ext-btn:active{background:rgba(139,92,246,.45)}
 .won-empty{text-align:center;padding:48px 20px;color:var(--txt3);font-size:13px}
+/* ── EPG expand overlay ─────────────────────────────────────────────── */
+#epg-expand-overlay{position:fixed;inset:0;z-index:600;background:rgba(0,0,0,.65);
+  display:none;align-items:center;justify-content:center}
+#epg-expand-overlay.open{display:flex}
+#epg-expand-modal{background:var(--s2);border-radius:14px;
+  width:min(1400px,96vw);height:90vh;
+  display:flex;flex-direction:column;overflow:hidden;
+  box-shadow:0 24px 80px rgba(0,0,0,.7);animation:pop-in .2s ease}
+#epg-expand-hdr{display:flex;align-items:center;gap:10px;padding:10px 16px;
+  border-bottom:1px solid var(--s4);flex-shrink:0}
+#epg-expand-hdr h3{flex:1;margin:0;font-size:14px;font-weight:700}
+#epg-expand-body{flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden}
 .won-empty span{font-size:40px;display:block;margin-bottom:10px;opacity:.3}
 .won-loading{display:flex;align-items:center;justify-content:center;gap:10px;
   padding:40px 20px;color:var(--txt3);font-size:13px}
@@ -2651,6 +2663,15 @@ _EPG_UI_JS = r"""
     </div>
   </div>
 
+<div id="epg-expand-overlay" onclick="if(event.target===this)closeEpgExpandOverlay()">
+  <div id="epg-expand-modal">
+    <div id="epg-expand-hdr">
+      <h3>📅 EPG Grid</h3>
+      <button class="btn-ghost" onclick="closeEpgExpandOverlay()" style="height:28px;padding:0 10px;font-size:12px">✕ Restore</button>
+    </div>
+    <div id="epg-expand-body"></div>
+  </div>
+</div>
 <div id="won-overlay" onclick="if(event.target===this)closeWhatsOn()">
   <div id="won-modal">
     <div class="won-hdr">
@@ -2791,6 +2812,11 @@ function _openEpgGrid(){
   document.getElementById('epg-grid-btn').textContent    = '✕ List';
   document.getElementById('icount').style.display        = 'none';
   document.getElementById('items-sbar').style.display    = 'none';
+  // Show expand button on desktop only
+  if(!_isMobile){
+    const _eb = document.getElementById('epg-expand-btn');
+    if(_eb) _eb.style.display = '';
+  }
   _buildEpgGrid(filtItems);
 
   // ── Click-drag scroll on desktop (on the timeline column) ────────────────
@@ -2891,6 +2917,10 @@ function _closeEpgGrid(){
   document.getElementById('epg-grid-btn').textContent    = '📅 EPG';
   document.getElementById('icount').style.display        = '';
   document.getElementById('items-sbar').style.display    = '';
+  // Hide expand button and close overlay silently if open
+  const _eb3 = document.getElementById('epg-expand-btn');
+  if(_eb3) _eb3.style.display = 'none';
+  _closeEpgExpandOverlaySilent();
 }
 
 function _buildEpgGrid(channels){
@@ -3158,6 +3188,84 @@ async function _loadEpgRow(ch, idx){
         <span style="font-size:10px;color:var(--txt3);opacity:.5">${msg}</span>
       </div>`);
   }
+}
+
+// ── EPG expand overlay (desktop only) ────────────────────────────────────────
+let _epgExpandOpen = false;
+
+function openEpgExpandOverlay(){
+  if(_isMobile || !_epgGridActive) return;
+  const overlay = document.getElementById('epg-expand-overlay');
+  const body    = document.getElementById('epg-expand-body');
+  const wrap    = document.getElementById('epg-grid-wrap');
+  if(!overlay || !body || !wrap) return;
+  // Move epg-grid-wrap into the overlay body
+  body.appendChild(wrap);
+  wrap.classList.add('active');
+  overlay.classList.add('open');
+  document.body.style.overflow = 'hidden';
+  _epgExpandOpen = true;
+  // Rebuild grid to fill the new (larger) dimensions
+  _buildEpgGrid(filtItems);
+}
+
+function closeEpgExpandOverlay(){
+  if(!_epgExpandOpen) return;
+  _restoreEpgGridWrap();
+  const overlay = document.getElementById('epg-expand-overlay');
+  if(overlay) overlay.classList.remove('open');
+  document.body.style.overflow = '';
+  _epgExpandOpen = false;
+  // Rebuild grid to fit the restored panel dimensions
+  if(_epgGridActive) _buildEpgGrid(filtItems);
+}
+
+// Called by _closeEpgGrid — no rebuild needed since grid is closing anyway
+function _closeEpgExpandOverlaySilent(){
+  if(!_epgExpandOpen) return;
+  _restoreEpgGridWrap();
+  const overlay = document.getElementById('epg-expand-overlay');
+  if(overlay) overlay.classList.remove('open');
+  document.body.style.overflow = '';
+  _epgExpandOpen = false;
+}
+
+function _restoreEpgGridWrap(){
+  const wrap   = document.getElementById('epg-grid-wrap');
+  const pItems = document.getElementById('p-items');
+  if(!wrap || !pItems) return;
+  // Move epg-grid-wrap back into p-items (after ilist div)
+  const ilist = document.getElementById('ilist');
+  if(ilist && ilist.nextSibling){
+    pItems.insertBefore(wrap, ilist.nextSibling);
+  } else {
+    pItems.appendChild(wrap);
+  }
+}
+
+// ── Copy activity log ─────────────────────────────────────────────────────────
+function copyLog(){
+  const d = document.getElementById('desktop-logout');
+  const m = document.getElementById('logout');
+  const text = [d,m].map(el=>el?el.innerText.trim():'').filter(Boolean).join('\n');
+  if(!text){ toast('Log is empty','wrn'); return; }
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text)
+      .then(()=>toast('Log copied','ok'))
+      .catch(()=>_copyLogFallback(text));
+  } else {
+    _copyLogFallback(text);
+  }
+}
+function _copyLogFallback(text){
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  try{ document.execCommand('copy'); toast('Log copied','ok'); }
+  catch(e){ toast('Copy failed: '+e,'err'); }
+  document.body.removeChild(ta);
 }
 
 // Show/hide EPG grid button based on mode and whether items are loaded
