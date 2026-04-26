@@ -304,9 +304,18 @@ def register_proxy_routes(flask_app, state):
                     "Connection":      "keep-alive",
                 }
             else:
+                # Build a Referer from the stream URL itself — many CDN/streaming
+                # servers (e.g. lx20.net) return 403 when no Referer is present.
+                try:
+                    _sp = urlparse(url)
+                    _ref_path = _sp.path.rsplit("/", 1)[0] + "/"
+                    _stream_referer = f"{_sp.scheme}://{_sp.netloc}{_ref_path}"
+                except Exception:
+                    _stream_referer = url
                 headers = {
                     "User-Agent": "VLC/3.0.0 LibVLC/3.0.0",
                     "Accept":     "*/*",
+                    "Referer":    _stream_referer,
                     "Connection": "keep-alive",
                 }
             if "Range" in request.headers:
