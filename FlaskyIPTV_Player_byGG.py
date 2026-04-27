@@ -841,6 +841,18 @@ def api_clear_cache():
     import proxy_addon as _px
     with _px._proxy_img_cache_lock:
         _px._proxy_img_cache.clear()
+    with _px._HOTLINK_BLOCKED_HOSTS_LOCK:
+        _px._HOTLINK_BLOCKED_HOSTS.clear()
+        _px._HOTLINK_403_COUNTS.clear()
+    with _px._DNS_FAIL_BLOCKED_HOSTS_LOCK:
+        _px._DNS_FAIL_BLOCKED_HOSTS.clear()
+        _px._DNS_FAIL_COUNTS.clear()
+    with _px._TIMEOUT_BLOCKED_HOSTS_LOCK:
+        _px._TIMEOUT_BLOCKED_HOSTS.clear()
+        _px._TIMEOUT_COUNTS.clear()
+    with _px._HOST_404_LOCK:
+        _px._HOST_404_BLOCKED.clear()
+        _px._HOST_404_COUNTS.clear()
     state._logo_cache_live = None
     state._logo_cache_vod  = {}
     state.cats_cache        = {}
@@ -2576,7 +2588,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
         <div class="bcrum" id="bcrum" style="flex:1;min-width:0"><span class="bc-s">Categories</span></div>
         <button class="epg-layout-btn" id="epg-grid-btn" onclick="toggleEpgGrid()" title="EPG Grid view" style="display:none">📅 EPG</button>
-        <button class="epg-layout-btn" id="epg-expand-btn" onclick="openEpgExpandOverlay()" title="Expand EPG" style="display:none">⛶</button>
+        <button class="epg-layout-btn" id="epg-expand-btn" onclick="openEpgExpandOverlay()" title="Expand EPG" style="display:none">⤢</button>
       </div>
       <div class="sbar" id="items-sbar"><span class="sico">🔍</span>
         <input id="isrch" type="search" placeholder="Search items…" oninput="filterItems()">
