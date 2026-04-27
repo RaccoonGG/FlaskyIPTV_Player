@@ -106,6 +106,25 @@ _HOTLINK_BLOCKED_HOSTS_LOCK = threading.Lock()
 _HOTLINK_403_COUNTS: dict = {}
 _HOTLINK_403_THRESHOLD = 10
 
+# ── 404-silence detection ──────────────────────────────────────────────────────
+# Logo hosts that consistently return 404 (wrong path prefix) are silenced after
+# _HOST_404_THRESHOLD hits — transparent PNG returned without logging.
+_HOST_404_COUNTS: dict = {}
+_HOST_404_BLOCKED: set = set()
+_HOST_404_LOCK = threading.Lock()
+_HOST_404_THRESHOLD = 5
+
+
+def _record_host_404(host: str) -> bool:
+    """Increment 404 counter for host; silence after threshold. Returns True on first cross."""
+    with _HOST_404_LOCK:
+        _HOST_404_COUNTS[host] = _HOST_404_COUNTS.get(host, 0) + 1
+        if _HOST_404_COUNTS[host] >= _HOST_404_THRESHOLD:
+            if host not in _HOST_404_BLOCKED:
+                _HOST_404_BLOCKED.add(host)
+                return True
+    return False
+
 
 def _record_host_403(host: str):
     """Increment 403 counter for host; mark blocked once threshold is reached."""
@@ -269,6 +288,8 @@ def register_proxy_routes(flask_app, state):
             _is_blocked = _is_blocked or (_host in _DNS_FAIL_BLOCKED_HOSTS)
         with _TIMEOUT_BLOCKED_HOSTS_LOCK:
             _is_blocked = _is_blocked or (_host in _TIMEOUT_BLOCKED_HOSTS)
+        with _HOST_404_LOCK:
+            _is_blocked = _is_blocked or (_host in _HOST_404_BLOCKED)
         if _is_blocked:
             hdrs = dict(cors)
             hdrs["Content-Type"]  = "image/png"
@@ -388,7 +409,18 @@ def register_proxy_routes(flask_app, state):
                     hdrs["Cache-Control"] = "public, max-age=3600"
                     return Response(_TRANSPARENT_PNG, status=200, headers=hdrs)
                 else:
-                    if (_DNS_FAIL_COUNTS.get(_host, 0) < 2 and
+                    if is_img_url and resp.status_code == 404:
+                        crossed = _record_host_404(_host)
+                        if crossed:
+                            state.log(f"[Proxy] 404 x{_HOST_404_THRESHOLD} for {_host} — silencing future logo 404s")
+                        elif _HOST_404_COUNTS.get(_host, 0) <= _HOST_404_THRESHOLD:
+                            state.log(f"[Proxy] HTTP {resp.status_code} ← {url[:120]}")
+                        # return transparent PNG silently once blocked
+                        hdrs = dict(cors)
+                        hdrs["Content-Type"]  = "image/png"
+                        hdrs["Cache-Control"] = "public, max-age=3600"
+                        return Response(_TRANSPARENT_PNG, status=200, headers=hdrs)
+                    elif (_DNS_FAIL_COUNTS.get(_host, 0) < 2 and
                             _HOTLINK_403_COUNTS.get(_host, 0) < 2):
                         state.log(f"[Proxy] HTTP {resp.status_code} ← {url[:120]}")
                     hdrs = dict(cors)
