@@ -1506,7 +1506,9 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 return s
             try:
                 decoded = base64.b64decode(s + "==").decode("utf-8", errors="replace")
-                if decoded.isprintable() and len(decoded) >= 1:
+                # Use replacement-char ratio rather than isprintable() — the latter rejects
+                # newlines (U+000A, Cc) which are valid in EPG descriptions (e.g. "S02 E19\n...").
+                if decoded and decoded.count('\ufffd') / max(len(decoded), 1) < 0.1:
                     return decoded.strip()
             except Exception:
                 pass
@@ -2961,7 +2963,7 @@ function _buildEpgGrid(channels){
       ? `<img class="epg-ch-logo" src="${esc(logoSrc)}" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
          <div class="epg-ch-logo-ph" style="display:none">📺</div>`
       : `<div class="epg-ch-logo-ph">📺</div>`;
-    return `<div class="epg-ch-cell" id="epg-ch-${i}" onclick="playItem(${i})" title="Play ${esc(name)}">
+    return `<div class="epg-ch-cell" id="epg-ch-${i}" onclick="if(_epgExpandOpen)closeEpgExpandOverlay();playItem(${i})" title="Play ${esc(name)}">
       ${logoEl}
       <div class="epg-ch-name">${esc(name)}</div>
     </div>`;
@@ -3170,7 +3172,7 @@ async function _loadEpgRow(ch, idx){
       el.style.left  = x1 + 'px';
       el.style.width = w  + 'px';
       el.title = `${prog.title||'—'}\n${startLbl} – ${endLbl}${prog.desc ? '\n'+prog.desc : ''}`;
-      el.onclick = (e) => { e.stopPropagation(); playItem(idx); };
+      el.onclick = (e) => { e.stopPropagation(); if(_epgExpandOpen) closeEpgExpandOverlay(); playItem(idx); };
       el.innerHTML = w > 30
         ? `<div class="epg-prog-title">${progTitle}</div>`
           + (w > 70 ? `<div class="epg-prog-time">${startLbl}–${endLbl}</div>` : '')
