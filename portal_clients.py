@@ -1459,9 +1459,12 @@ class StalkerPortalClient:
             return False
         msg = str(js.get("msg", "") or js.get("block_msg", "")).lower()
         status = js.get("status")
-        return (status == 1 and any(kw in msg for kw in
-                                    ("conflict", "mismatch", "device", "hash", "not valid", "not supported")))
-
+        return (status in (1, 2)) and any(
+            kw in msg for kw in (
+                "conflict", "authentication request", "mismatch",
+                "device", "hash", "not valid", "old firmware", "not supported"
+            )
+        )
     # ── auth ──────────────────────────────────────────────────────────────────
 
     async def handshake(self) -> str:
@@ -1688,13 +1691,46 @@ class StalkerPortalClient:
 
     async def fetch_categories(self, mode: str):
         assert self.session is not None
+        headers = self._headers(include_auth=True)
+        self.log(f"[STALKER] Fetching {mode.upper()} categories…")
+
+        # For series: try the dedicated type=series endpoint first.
+        # Many Stalker portals have it, and it returns the correct full list
+        # without needing keyword-based splitting (which drops "Drama", "Action", etc.)
+        if mode == "series":
+            try:
+                ser_url = self._load_url(type="series", action="get_categories", JsHttpRequest="1-xml")
+                async with self.session.get(ser_url, headers=headers) as r:
+                    self.log(f"[STALKER] Series endpoint HTTP {r.status}")
+                    payload = await self._read_json(r, "Categories (SERIES)")
+                ser_cats = normalize_js(payload)
+                if not ser_cats:
+                    ser_url2 = self._load_url_alt(type="series", action="get_categories", JsHttpRequest="1-xml")
+                    self.log("[STALKER] Series endpoint empty — retrying via portal.php")
+                    async with self.session.get(ser_url2, headers=headers) as r2:
+                        self.log(f"[STALKER] Series endpoint (alt) HTTP {r2.status}")
+                        payload = await self._read_json(r2, "Categories alt (SERIES)")
+                    ser_cats = normalize_js(payload)
+                if ser_cats:
+                    result = []
+                    for c in ser_cats:
+                        if not isinstance(c, dict):
+                            continue
+                        cid = str(c.get("id") or c.get("category_id") or "").strip()
+                        name = str(c.get("title") or c.get("name") or c.get("category_name") or "").strip()
+                        if cid and name:
+                            result.append({"id": cid, "title": name})
+                    self.log(f"[STALKER] SERIES categories: {len(result)} found (dedicated endpoint)")
+                    return result
+            except Exception as e:
+                self.log(f"[STALKER] Series dedicated endpoint failed ({e}) — falling back to vod+split")
+
+        # For live: dedicated genre endpoint. For vod/series fallback: shared vod endpoint.
         if mode == "live":
             url = self._load_url(type="itv", action="get_genres", JsHttpRequest="1-xml")
         else:
-            # Both vod and series use the same endpoint — filtered by name below
             url = self._load_url(type="vod", action="get_categories", JsHttpRequest="1-xml")
-        headers = self._headers(include_auth=True)
-        self.log(f"[STALKER] Fetching {mode.upper()} categories…")
+
         async with self.session.get(url, headers=headers) as r:
             self.log(f"[STALKER] Categories HTTP {r.status} ({mode.upper()})")
             payload = await self._read_json(r, f"Categories ({mode.upper()})")
@@ -1718,13 +1754,15 @@ class StalkerPortalClient:
             name = str(c.get("title") or c.get("name") or c.get("category_name") or "").strip()
             if not cid or not name:
                 continue
-            # Filter: series tab gets TV/series/show categories; vod tab gets the rest
+            # Keyword split only used as fallback when the dedicated series endpoint failed.
+            # This is imperfect — categories like "Drama" or "Action" won't match — but it
+            # is better than returning nothing for portals that have no dedicated endpoint.
             if mode == "series" and not self._is_series_cat(name):
                 continue
             if mode == "vod" and self._is_series_cat(name):
                 continue
             result.append({"id": cid, "title": name})
-        self.log(f"[STALKER] {mode.upper()} categories: {len(result)} found")
+        self.log(f"[STALKER] {mode.upper()} categories: {len(result)} found (vod+split fallback)")
         return result
 
     # ── items ─────────────────────────────────────────────────────────────────
