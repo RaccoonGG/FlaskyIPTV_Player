@@ -2735,7 +2735,7 @@ async function showEPG(){
     const r=await fetch('/api/epg',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({item:_epgItem})});
     const d=await r.json();
-    if(d.error&&!d.current&&!d.next&&!d.schedule?.length){
+    if(d.error&&!d.current&&!d.next&&!(d.schedule&&d.schedule.length)){
       document.getElementById('epg-body').innerHTML=`<div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">${d.error}</div>`;
       return;
     }
@@ -2963,7 +2963,7 @@ function _buildEpgGrid(channels){
       ? `<img class="epg-ch-logo" src="${esc(logoSrc)}" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
          <div class="epg-ch-logo-ph" style="display:none">📺</div>`
       : `<div class="epg-ch-logo-ph">📺</div>`;
-    return `<div class="epg-ch-cell" id="epg-ch-${i}" onclick="if(_epgExpandOpen)closeEpgExpandOverlay();playItem(${i})" title="Play ${esc(name)}">
+    return `<div class="epg-ch-cell" id="epg-ch-${i}" onclick="epgExpandCloseForPlay();playItem(${i})" title="Play ${esc(name)}">
       ${logoEl}
       <div class="epg-ch-name">${esc(name)}</div>
     </div>`;
@@ -3172,7 +3172,7 @@ async function _loadEpgRow(ch, idx){
       el.style.left  = x1 + 'px';
       el.style.width = w  + 'px';
       el.title = `${prog.title||'—'}\n${startLbl} – ${endLbl}${prog.desc ? '\n'+prog.desc : ''}`;
-      el.onclick = (e) => { e.stopPropagation(); if(_epgExpandOpen) closeEpgExpandOverlay(); playItem(idx); };
+      el.onclick = (e) => { e.stopPropagation(); epgExpandCloseForPlay(); playItem(idx); };
       el.innerHTML = w > 30
         ? `<div class="epg-prog-title">${progTitle}</div>`
           + (w > 70 ? `<div class="epg-prog-time">${startLbl}–${endLbl}</div>` : '')
@@ -3194,37 +3194,40 @@ async function _loadEpgRow(ch, idx){
 }
 
 // ── EPG expand overlay (desktop only) ────────────────────────────────────────
-let _epgExpandOpen = false;
+// var (not let/const) so inline onclick="..." attribute handlers can reach it
+// through window scope — let/const at script top-level are NOT window properties.
+var _epgExpandOpen = false;
 
-function openEpgExpandOverlay(){
+// Public helper — open the expanded overlay.
+function epgExpandOpen(){
   if(_isMobile || !_epgGridActive) return;
   const overlay = document.getElementById('epg-expand-overlay');
   const body    = document.getElementById('epg-expand-body');
   const wrap    = document.getElementById('epg-grid-wrap');
   if(!overlay || !body || !wrap) return;
-  // Move epg-grid-wrap into the overlay body
   body.appendChild(wrap);
   wrap.classList.add('active');
   overlay.classList.add('open');
   document.body.style.overflow = 'hidden';
   _epgExpandOpen = true;
-  // Rebuild grid to fill the new (larger) dimensions
   _buildEpgGrid(filtItems);
 }
 
-function closeEpgExpandOverlay(){
+// Public helper — close and restore, with grid rebuild.
+// Use for the Restore button; caller stays in EPG view so rebuild is needed.
+function epgExpandClose(){
   if(!_epgExpandOpen) return;
   _restoreEpgGridWrap();
   const overlay = document.getElementById('epg-expand-overlay');
   if(overlay) overlay.classList.remove('open');
   document.body.style.overflow = '';
   _epgExpandOpen = false;
-  // Rebuild grid to fit the restored panel dimensions
   if(_epgGridActive) _buildEpgGrid(filtItems);
 }
 
-// Called by _closeEpgGrid — no rebuild needed since grid is closing anyway
-function _closeEpgExpandOverlaySilent(){
+// Public helper — close silently, NO grid rebuild.
+// Use when caller is about to navigate away (play a channel).
+function epgExpandCloseForPlay(){
   if(!_epgExpandOpen) return;
   _restoreEpgGridWrap();
   const overlay = document.getElementById('epg-expand-overlay');
@@ -3232,6 +3235,11 @@ function _closeEpgExpandOverlaySilent(){
   document.body.style.overflow = '';
   _epgExpandOpen = false;
 }
+
+// Backward-compat aliases for any internal callers using the old names
+function openEpgExpandOverlay()     { epgExpandOpen(); }
+function closeEpgExpandOverlay()    { epgExpandClose(); }
+function _closeEpgExpandOverlaySilent() { epgExpandCloseForPlay(); }
 
 function _restoreEpgGridWrap(){
   const wrap   = document.getElementById('epg-grid-wrap');
@@ -3458,8 +3466,8 @@ function _cuManualForm(){
 }
 
 function doWatchCatchupManual(){
-  const s=document.getElementById('cu-start')?.value;
-  const e=document.getElementById('cu-end')?.value;
+  const s=(document.getElementById('cu-start')||{}).value;
+  const e=(document.getElementById('cu-end')||{}).value;
   if(!s||!e){toast('Set start and end time','wrn');return;}
   const startTs=Math.floor(new Date(s).getTime()/1000);
   const endTs=Math.floor(new Date(e).getTime()/1000);
@@ -3470,12 +3478,12 @@ function doWatchCatchupManual(){
     ||_cuListings.find(p=>p.start&&Math.abs(p.start-startTs)<300);
   // For Xtream: stream_id is the correct cmd value for timeshift.
   // _epgItem.cmd is the full stream URL (not useful here); prefer stream_id.
-  const liveCmd=_epgItem?.stream_id||_epgItem?.cmd||'';
-  const cmd=encodeURIComponent(match?.cmd||liveCmd);
-  const live_cmd=encodeURIComponent(match?.live_cmd||liveCmd);
-  const epg_id=encodeURIComponent(match?.epg_id||match?.id||'');
-  const title=match?.title||'';
-  const useStop=match?.stop||endTs;
+  const liveCmd=(_epgItem&&(_epgItem.stream_id||_epgItem.cmd))||'';
+  const cmd=encodeURIComponent((match&&match.cmd)||liveCmd);
+  const live_cmd=encodeURIComponent((match&&match.live_cmd)||liveCmd);
+  const epg_id=encodeURIComponent((match&&(match.epg_id||match.id))||'');
+  const title=(match&&match.title)||'';
+  const useStop=(match&&match.stop)||endTs;
   doPlayArchiveCmd(cmd, startTs, useStop, title, live_cmd, epg_id);
 }
 
