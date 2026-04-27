@@ -67,6 +67,7 @@ GLOBALS USED FROM MAIN SCRIPT (all available as window.*)
 """
 
 import asyncio
+import base64
 import contextlib
 import gzip as _gzip
 import json
