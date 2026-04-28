@@ -22,42 +22,47 @@ Provides:
 
 Also exports as module-level functions:
   safe_filename(name)              — Sanitise a string for use as a filename.
-  probe_stream_codecs(url, ...)    — ffprobe a URL and return codec/duration info.
   run_ffmpeg_download(url, ...)    — Run an ffmpeg copy-download with progress callback.
   run_yt_dlp_download(url, ...)    — Run a yt-dlp download with progress callback.
 
+Note: probe_stream_codecs is imported from probe_addon (not defined here).
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-INTEGRATION  (three small changes to FlaskyIPTV_Player_byGG.py)
+INTEGRATION  (changes to FlaskyIPTV_Player_byGG.py)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-STEP 1 — add import after the proxy_addon import block:
+STEP 1 — add probe_addon import block BEFORE this import block:
+
+    try:
+        from probe_addon import register_probe_routes, probe_stream_codecs
+        _PROBE_AVAILABLE = True
+    except ImportError:
+        _PROBE_AVAILABLE = False
+        def register_probe_routes(*a, **kw): pass
+        def probe_stream_codecs(*a, **kw): return None
+
+STEP 2 — add this import block (probe_stream_codecs no longer exported here):
 
     try:
         from download_addon import (
             register_download_routes,
-            safe_filename, probe_stream_codecs,
+            safe_filename,
             run_ffmpeg_download, run_yt_dlp_download,
         )
         _DOWNLOAD_AVAILABLE = True
     except ImportError:
         _DOWNLOAD_AVAILABLE = False
         def register_download_routes(*a, **kw): pass
-        # Stubs so api_resolve and _probe_hevc still compile:
         def safe_filename(name): return name[:200]
-        def probe_stream_codecs(*a, **kw): return None
         def run_ffmpeg_download(*a, **kw): return 1
         def run_yt_dlp_download(*a, **kw): return False, "unavailable"
 
-STEP 2 — register routes (after register_proxy_routes call):
+STEP 3 — register routes (after _FFPROBE_PATH is resolved):
 
+    register_probe_routes(flask_app, state, run_async, _make_client, _FFPROBE_PATH)
     register_download_routes(flask_app, state, run_async, run_worker, _make_client,
                              _FFMPEG_PATH, _FFPROBE_PATH,
                              _FFMPEG_AVAILABLE, YTDLP_AVAILABLE)
-
-STEP 3 — remove the now-duplicate definitions of safe_filename, probe_stream_codecs,
-    run_ffmpeg_download, run_yt_dlp_download, and their regex helpers
-    (_time_re, _bitrate_re, _size_re) from the MKV / FFMPEG HELPERS section of main,
-    since they are now imported from this module.
 
 STEP 4 — add script tag as the FIRST external script after the main inline </script>:
 
@@ -80,6 +85,8 @@ from datetime import datetime, timezone
 from urllib.parse import quote as _qe
 
 from flask import request, jsonify
+
+from probe_addon import probe_stream_codecs
 
 
 # ── Progress-parsing regexes ──────────────────────────────────────────────────
@@ -194,45 +201,6 @@ def safe_filename(name: str) -> str:
     if not cleaned:
         cleaned = "stream"
     return cleaned[:200]
-
-
-# ── ffprobe codec inspector ───────────────────────────────────────────────────
-
-def probe_stream_codecs(url: str, pre_input_args=None, timeout=15,
-                        ffprobe_path="ffprobe"):
-    cmd = [ffprobe_path, "-v", "error", "-print_format", "json",
-           "-show_streams", "-show_format"]
-    if pre_input_args:
-        cmd = [ffprobe_path, "-v", "error", "-print_format", "json",
-               "-show_streams", "-show_format"] + pre_input_args + ["-i", url]
-    else:
-        cmd += ["-i", url]
-    try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              text=True, timeout=timeout)
-        if proc.returncode != 0:
-            return None
-        data    = json.loads(proc.stdout)
-        streams = data.get("streams", [])
-        result  = {"audio": [], "video": [], "subtitle": [], "duration": None}
-        for s in streams:
-            typ   = s.get("codec_type")
-            codec = s.get("codec_name")
-            if typ == "audio" and codec:
-                result["audio"].append(codec)
-            elif typ == "video" and codec:
-                result["video"].append(codec)
-            elif typ == "subtitle" and codec:
-                result["subtitle"].append(codec)
-        dur = data.get("format", {}).get("duration")
-        if dur:
-            try:
-                result["duration"] = float(dur)
-            except Exception:
-                pass
-        return result
-    except Exception:
-        return None
 
 
 # ── ffmpeg copy-download ──────────────────────────────────────────────────────
