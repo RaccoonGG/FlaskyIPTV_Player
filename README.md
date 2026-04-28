@@ -53,6 +53,7 @@ It is a local player interface — a front-end that connects to IPTV portals and
 | `portal_clients.py` | ✓ | Portal client classes — MAC/Stalker, Xtream, M3U |
 | `proxy_addon.py` | ✓ | Image proxy, HLS proxy, video proxy, ffmpeg stream transcode |
 | `download_addon.py` | ✓ | MKV/M3U download, quick record, ffmpeg/yt-dlp helpers |
+| `probe_addon.py` | ✓ | Probe addon, check audio and video codec |
 | `epg_addon.py` | ✓ | EPG, Catch-up TV, What's On Now, XMLTV support |
 | `subtitles_addon.py` | ✓ | Subtitle UI, OpenSubtitles search/download, local subtitle file loading |
 | `install_requirements_FlaskyIPTV_Player.py` | — | Run once to install dependencies |
