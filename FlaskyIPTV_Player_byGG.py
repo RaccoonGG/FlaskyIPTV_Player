@@ -80,9 +80,16 @@ except ImportError:
     def rewrite_m3u8(content, base_url): return content
 
 try:
+    from probe_addon import register_probe_routes
+    _PROBE_AVAILABLE = True
+except ImportError:
+    _PROBE_AVAILABLE = False
+    def register_probe_routes(*a, **kw): pass
+
+try:
     from download_addon import (
         register_download_routes,
-        safe_filename, probe_stream_codecs,
+        safe_filename,
         run_ffmpeg_download, run_yt_dlp_download,
     )
     _DOWNLOAD_AVAILABLE = True
@@ -90,7 +97,6 @@ except ImportError:
     _DOWNLOAD_AVAILABLE = False
     def register_download_routes(*a, **kw): pass
     def safe_filename(name): return name[:200]
-    def probe_stream_codecs(*a, **kw): return None
     def run_ffmpeg_download(*a, **kw): return 1
     def run_yt_dlp_download(*a, **kw): return False, "unavailable"
 
@@ -1097,306 +1103,6 @@ def api_episodes():
         return jsonify({"error": str(e), "episodes": []})
 
 
-def _probe_ts_streams(url: str) -> dict:
-    """Read the first ~1880 bytes of a MPEG-TS stream and parse the PMT to identify
-    video and audio stream types — without invoking ffprobe.
-
-    Returns a dict:
-        {
-          "hevc":        bool,  # True if video stream type is 0x24 (HEVC/H.265)
-          "bad_audio":   bool,  # True if audio codec is unsupported by browsers
-          "audio_codec": str,   # human-readable codec name, e.g. "ac3"
-        }
-
-    Audio stream types that browsers cannot decode natively:
-        0x81        AC3  (Dolby Digital) — common on North American cable
-        0x82        DTS
-        0x83        TrueHD / DTS-HD (used by some Dolby streams)
-        0x06 + 0x7a EAC3 (Dolby Digital Plus) — identified via descriptor tag in PMT
-
-    Times out quickly — failure is non-fatal, caller should catch exceptions.
-    """
-    _BAD_AUDIO_TYPES = {
-        0x81: "ac3",
-        0x82: "dts",
-        0x83: "truehd",
-    }
-    result = {"hevc": False, "bad_audio": False, "audio_codec": ""}
-    try:
-        hdrs = {"User-Agent": "VLC/3.0", "Accept": "*/*"}
-        r = _requests_lib.get(url, headers=hdrs, stream=True, timeout=5, verify=False,
-                              proxies={"http": None, "https": None})
-        raw = b""
-        for chunk in r.iter_content(1880):
-            raw += chunk
-            if len(raw) >= 1880:
-                break
-        r.close()
-        pmt_pid = None
-        i = 0
-        while i + 188 <= len(raw):
-            pkt = raw[i:i+188]; i += 188
-            if pkt[0] != 0x47: continue
-            pid = ((pkt[1] & 0x1f) << 8) | pkt[2]
-            has_adapt = bool(pkt[3] & 0x20); has_pay = bool(pkt[3] & 0x10)
-            if not has_pay: continue
-            off = 4
-            if has_adapt: off = 5 + pkt[4]
-            if off >= 188: continue
-            if pkt[1] & 0x40: off += 1  # pointer field
-            # ── PAT: find first non-NIT program PID ──────────────────────────
-            if pid == 0 and pmt_pid is None:
-                pos = off + 8
-                while pos + 3 < 188:
-                    pn = (pkt[pos] << 8) | pkt[pos+1]
-                    pp = ((pkt[pos+2] & 0x1f) << 8) | pkt[pos+3]
-                    pos += 4
-                    if pn != 0: pmt_pid = pp; break
-            # ── PMT: walk stream entries ─────────────────────────────────────
-            elif pmt_pid and pid == pmt_pid:
-                sec = pkt[off:]
-                if len(sec) < 12: continue
-                pi_len = ((sec[10] & 0x0f) << 8) | sec[11]
-                pos = 12 + pi_len
-                while pos + 4 < len(sec) - 4:
-                    st  = sec[pos]                                  # stream_type byte
-                    ei  = ((sec[pos+3] & 0x0f) << 8) | sec[pos+4] # ES info length
-                    # Video: HEVC
-                    if st == 0x24:
-                        result["hevc"] = True
-                    # Audio: hard-coded bad types
-                    elif st in _BAD_AUDIO_TYPES:
-                        result["bad_audio"]  = True
-                        result["audio_codec"] = _BAD_AUDIO_TYPES[st]
-                    # Audio: stream_type 0x06 (private PES) — scan descriptors for
-                    # EAC3 (tag 0x7a).  Many European and IPTV portals use this.
-                    elif st == 0x06 and ei > 0:
-                        desc_end = pos + 5 + ei
-                        dp = pos + 5
-                        while dp + 1 < desc_end and dp + 1 < len(sec):
-                            tag  = sec[dp]
-                            dlen = sec[dp+1]
-                            if tag == 0x7a:  # EAC3 descriptor
-                                result["bad_audio"]  = True
-                                result["audio_codec"] = "eac3"
-                            dp += 2 + dlen
-                    pos += 5 + ei
-                return result   # PMT found and parsed — done
-        return result
-    except Exception:
-        return result
-
-
-@flask_app.route("/api/resolve", methods=["POST"])
-def api_resolve():
-    data = request.get_json(force=True)
-    item = data.get("item", {})
-    mode = data.get("mode", "live")
-    # Validate and sanitize
-    if mode not in ("live", "vod", "series"):
-        mode = "live"
-    cat = data.get("category", {})
-
-    try:
-        async def resolve():
-            async with _make_client() as client:
-                return await client.resolve_item_url(mode, item, cat)
-
-        url = run_async(resolve())
-        is_multiview = request.args.get('mv') == '1'
-        
-        if url and isinstance(url, str):
-            needs_transcode = False
-            detected_codec = None
-            transcode_reason = None
-            is_vod = mode in ('vod', 'series')  # VOD needs different handling than live
-            
-            # Normalise URL for quick extension checks.
-            url_lower_full = url.lower()
-            url_lower      = url_lower_full.split('?')[0]
-
-            # ==== UNIVERSAL CODEC PROBE ====
-            # We probe every URL regardless of extension — HEVC and AC3/DTS/EAC3
-            # audio appear in plain live streams, Xtream URLs, stalker-portal links,
-            # and anything else with no recognisable container hint in the path.
-            # Skipping the probe for "unknown" URLs was the source of missed transcodes.
-            #
-            # Fast path: URL contains an explicit HEVC extension — skip ffprobe entirely.
-            codecs = None   # populated below when ffprobe runs
-            if any(ext in url_lower for ext in ['.hevc', '.265', '.h265']):
-                needs_transcode = True
-                transcode_reason = "hevc by extension"
-                state.log(f"[RESOLVE] HEVC suspected by extension: {url_lower[-20:]}")
-
-            else:
-                # Always run ffprobe — timeout kept short (8 s) so channel-switch
-                # latency stays acceptable even for slow live streams.
-                # Pass User-Agent and protocol_whitelist — many MAC/Xtream portals
-                # reject ffprobe's default Lavf user-agent and ffprobe needs the
-                # whitelist to open http/https/tcp streams without a config file.
-                _probe_pre_args = [
-                    "-user_agent", "VLC/3.0.0 LibVLC/3.0.0",
-                    "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-                ]
-                codecs = probe_stream_codecs(url, pre_input_args=_probe_pre_args, timeout=8,
-                                             ffprobe_path=_FFPROBE_PATH)
-
-                if codecs:
-                    # ── Video codec check ────────────────────────────────────
-                    if codecs.get("video"):
-                        vcodec = codecs["video"][0].lower()
-                        detected_codec = vcodec
-                        hevc_codecs = ("hevc", "h265", "h.265", "hev1", "hvc1", "x265")
-                        if vcodec in hevc_codecs or any(h in vcodec for h in hevc_codecs):
-                            needs_transcode = True
-                            transcode_reason = f"hevc video ({vcodec})"
-                            state.log(f"[RESOLVE] HEVC video detected: {vcodec}")
-
-                    # ── Audio codec check ────────────────────────────────────
-                    # Browsers support: AAC, MP3/MP2, Opus, Vorbis, FLAC.
-                    # Everything else (AC3, EAC3, DTS, TrueHD, PCM…) needs transcode.
-                    if not needs_transcode and codecs.get("audio"):
-                        acodec = codecs["audio"][0].lower()
-                        safe_audio = ("aac", "mp3", "mp2", "opus", "vorbis", "flac")
-                        bad_audio  = ("ac3", "eac3", "dts", "dca", "truehd", "mlp", "pcm")
-                        if acodec not in safe_audio and (
-                                acodec in bad_audio or any(b in acodec for b in bad_audio)):
-                            needs_transcode = True
-                            transcode_reason = f"incompatible audio ({acodec})"
-                            state.log(f"[RESOLVE] Audio codec needs transcode: {acodec}")
-                        else:
-                            state.log(f"[RESOLVE] Audio codec OK: {acodec}")
-
-                    if not needs_transcode:
-                        a_str = codecs.get('audio', ['?'])[0] if codecs.get('audio') else 'none'
-                        state.log(f"[RESOLVE] All codecs playable: v={detected_codec}, a={a_str}")
-
-                else:
-                    # ffprobe timed-out or couldn't open the stream.
-                    # For HLS (m3u8) URLs the TS byte-scan cannot read HLS playlists —
-                    # it always returns all-False, which is misleading.  Instead, retry
-                    # ffprobe once with HLS-specific protocol whitelist args.
-                    _is_hls_url = '.m3u8' in url_lower or '.m3u8' in url_lower_full
-                    if _is_hls_url:
-                        state.log(f"[RESOLVE] ffprobe failed on HLS URL — retrying with HLS protocol args")
-                        _hls_probe_args = [
-                            "-user_agent", "VLC/3.0.0 LibVLC/3.0.0",
-                            "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls,applehttp",
-                            "-allowed_extensions", "ALL",
-                        ]
-                        codecs = probe_stream_codecs(url, pre_input_args=_hls_probe_args, timeout=12,
-                                                     ffprobe_path=_FFPROBE_PATH)
-                        if codecs:
-                            state.log(f"[RESOLVE] ffprobe HLS retry succeeded")
-                            if codecs.get("video"):
-                                vcodec = codecs["video"][0].lower()
-                                detected_codec = vcodec
-                                hevc_codecs = ("hevc", "h265", "h.265", "hev1", "hvc1", "x265")
-                                if vcodec in hevc_codecs or any(h in vcodec for h in hevc_codecs):
-                                    needs_transcode = True
-                                    transcode_reason = f"hevc video ({vcodec})"
-                                    state.log(f"[RESOLVE] HEVC video detected: {vcodec}")
-                            if not needs_transcode and codecs.get("audio"):
-                                acodec = codecs["audio"][0].lower()
-                                safe_audio = ("aac", "mp3", "mp2", "opus", "vorbis", "flac")
-                                bad_audio  = ("ac3", "eac3", "dts", "dca", "truehd", "mlp", "pcm")
-                                if acodec not in safe_audio and (
-                                        acodec in bad_audio or any(b in acodec for b in bad_audio)):
-                                    needs_transcode = True
-                                    transcode_reason = f"incompatible audio ({acodec})"
-                                    state.log(f"[RESOLVE] Audio codec needs transcode: {acodec}")
-                                else:
-                                    state.log(f"[RESOLVE] Audio codec OK: {acodec}")
-                            if not needs_transcode:
-                                a_str = codecs.get('audio', ['?'])[0] if codecs.get('audio') else 'none'
-                                state.log(f"[RESOLVE] HLS retry: all codecs playable: v={detected_codec}, a={a_str}")
-                        else:
-                            state.log(f"[RESOLVE] ffprobe HLS retry also failed — playing direct")
-                    else:
-                        # Non-HLS URL: fall through to TS byte-scan below
-                        state.log(f"[RESOLVE] ffprobe failed, attempting TS probe then direct play")
-
-            # ── TS byte-scan fallback ────────────────────────────────────────────
-            # When ffprobe failed (codecs is None) we fall back to reading the
-            # raw MPEG-TS packet headers directly.  Previously this only ran for
-            # play_token= URLs, leaving every other URL type uncovered when
-            # ffprobe timed out.  Now it runs for ALL URLs — if the stream is not
-            # MPEG-TS the parser just returns all-False within 1880 bytes and we
-            # fall through to direct play as before.
-            # Guard: skip for HLS (m3u8) URLs — the TS parser cannot read HLS
-            # manifests and always returns all-False.  ffprobe retry above is the
-            # correct fallback for HLS; if that also failed, play direct.
-            _is_hls_url = '.m3u8' in url_lower or '.m3u8' in url_lower_full
-            if not needs_transcode and codecs is None and not _is_hls_url:
-                try:
-                    ts_info = _probe_ts_streams(url)
-                    if ts_info["hevc"]:
-                        needs_transcode = True
-                        transcode_reason = "hevc (ts probe)"
-                        if 'play_token=' in url:
-                            is_vod = False
-                        state.log(f"[RESOLVE] TS probe: HEVC video detected")
-                    elif ts_info["bad_audio"]:
-                        needs_transcode = True
-                        transcode_reason = f"incompatible audio ({ts_info['audio_codec']}) (ts probe)"
-                        if 'play_token=' in url:
-                            is_vod = False
-                        state.log(f"[RESOLVE] TS probe: bad audio detected: {ts_info['audio_codec']}")
-                    else:
-                        state.log(f"[RESOLVE] TS probe: no transcode needed (or not MPEG-TS)")
-                except Exception as pe:
-                    state.log(f"[RESOLVE] TS probe failed: {pe}")
-            
-            # ── Fresh token for short-lived Stalker CDN URLs ─────────────────────
-            # CDNs like lx20.net issue single-use or connection-bound tokens.
-            # ffprobe above opened a connection and consumed/bound the token.
-            # Re-call resolve_item_url now to get a fresh token URL for actual
-            # playback — skip all probing this time since we have codec info.
-            _is_stalker_token_url = (
-                state.conn_type == 'mac'
-                and 'token=' in url
-                and not url.lower().split('?')[0].endswith('.m3u8')
-            )
-            if _is_stalker_token_url:
-                try:
-                    async def _refetch():
-                        async with _make_client() as client:
-                            return await client.resolve_item_url(mode, item, cat)
-                    fresh_url = run_async(_refetch())
-                    if fresh_url and isinstance(fresh_url, str) and fresh_url != url:
-                        state.log(f"[RESOLVE] Fresh token URL obtained for playback (probe used previous token)")
-                        url = fresh_url
-                except Exception as _rfe:
-                    state.log(f"[RESOLVE] Fresh token re-fetch failed ({_rfe}) — using probe URL")
-            # ─────────────────────────────────────────────────────────────────────
-
-            # Apply transcode if needed
-            if needs_transcode:
-                vod_flag = "1" if is_vod else "0"
-                audio_only_issue = (transcode_reason or "").startswith("incompatible audio")
-                if is_multiview:
-                    if audio_only_issue:
-                        state.log(f"[RESOLVE] MV audio transcode → hls_proxy: {transcode_reason}")
-                        audio_url = f"/api/hls_proxy?audio_only=1&vod={vod_flag}&url={quote(url, safe='')}"
-                        return jsonify({"url": audio_url, "hevc": False})
-                    else:
-                        # HEVC video: let multiview_addon handle it natively
-                        return jsonify({"url": url, "hevc": True})
-                else:
-                    state.log(f"[RESOLVE] Routing to transcode proxy: {transcode_reason}")
-                    if audio_only_issue:
-                        # Copy video, re-encode audio only — much cheaper than full libx264 re-encode
-                        transcode_url = f"/api/hls_proxy?audio_only=1&vod={vod_flag}&url={quote(url, safe='')}"
-                    else:
-                        transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}&url={quote(url, safe='')}"
-                    return jsonify({"url": transcode_url, "hevc": True})
-                    
-        return jsonify({"url": url})
-    except Exception as e:
-        state.log(f"[RESOLVE] Error: {type(e).__name__}: {e}")
-        return jsonify({"url": "", "error": str(e)})
-
-
 @flask_app.route("/api/stop", methods=["POST"])
 def api_stop():
     state.stop_flag.set()
@@ -1432,6 +1138,7 @@ if _DVR_AVAILABLE:
     import dvr_addon as _dvr_mod
     _dvr_mod._FFMPEG = _FFMPEG_PATH
 
+register_probe_routes(flask_app, state, run_async, _make_client, _FFPROBE_PATH)
 register_download_routes(flask_app, state, run_async, run_worker, _make_client,
                          _FFMPEG_PATH, _FFPROBE_PATH,
                          _FFMPEG_AVAILABLE, YTDLP_AVAILABLE)
@@ -5996,6 +5703,7 @@ _pre_config_json = json.dumps({
     "ytdlp_ok":   YTDLP_AVAILABLE,
     "dvr_ok":     _DVR_AVAILABLE,
     "dlm_ok":     _DOWNLOAD_AVAILABLE,
+    "probe_ok":   _PROBE_AVAILABLE,
 })
 _pre_tags: list = []
 _pre_tags.append(
