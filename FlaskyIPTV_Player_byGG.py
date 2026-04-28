@@ -5684,6 +5684,7 @@ function _mvSelOpen(callback, forcedMode){
 <script src="/api/epg/ui.js"></script>
 <script src="/api/dvr/ui.js"></script>
 <script src="/api/dlm/ui.js"></script>
+<script src="/api/probe/ui.js"></script>
 </body>
 </html>
 """
