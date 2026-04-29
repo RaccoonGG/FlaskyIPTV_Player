@@ -131,10 +131,34 @@ def probe_stream_codecs(url: str, pre_input_args=None, timeout=15,
           "height":        int   | None, # video height in pixels
           "fps":           float | None, # frame rate (parsed from r_frame_rate)
           "video_bitrate": int   | None, # video stream bitrate in bps
-          "audio_bitrate": int   | None, # audio stream bitrate in bps
+          "audio_bitrate": int   | None, # first audio stream bitrate in bps
           "total_bitrate": int   | None, # container total bitrate in bps
+          "audio_tracks":  [             # per-track audio metadata
+            {
+              "index":    int,           # stream index within the container
+              "codec":    str,           # codec name e.g. "aac", "ac3"
+              "language": str | None,    # ISO 639-2 language code e.g. "eng"
+              "title":    str | None,    # human-readable name if tagged
+              "channels": int | None,    # channel count e.g. 2, 6
+              "layout":   str | None,    # channel layout e.g. "stereo", "5.1"
+            }, ...
+          ],
+          "subtitle_tracks": [           # per-track subtitle metadata
+            {
+              "index":          int,
+              "codec":          str,     # e.g. "subrip", "dvd_subtitle", "webvtt"
+              "language":       str | None,
+              "title":          str | None,
+              "is_image_based": bool,    # True for PGS/DVD image subs (not renderable in browser)
+            }, ...
+          ],
         }
     """
+    # Image-based subtitle codecs — cannot be rendered in a browser without
+    # custom demuxing/rendering.  Text-based codecs (subrip, webvtt, ass…)
+    # can potentially be surfaced via addTextTrack() cue injection.
+    _IMAGE_SUB_CODECS = {"dvd_subtitle", "hdmv_pgs_subtitle", "dvbsub",
+                         "xsub", "pgssub", "dvb_subtitle"}
     cmd = [ffprobe_path, "-v", "error", "-print_format", "json",
            "-show_streams", "-show_format"]
     if pre_input_args:
@@ -153,10 +177,13 @@ def probe_stream_codecs(url: str, pre_input_args=None, timeout=15,
             "audio": [], "video": [], "subtitle": [], "duration": None,
             "width": None, "height": None, "fps": None,
             "video_bitrate": None, "audio_bitrate": None, "total_bitrate": None,
+            "audio_tracks": [], "subtitle_tracks": [],
         }
         for s in streams:
             typ   = s.get("codec_type")
             codec = s.get("codec_name")
+            tags  = s.get("tags", {}) or {}
+            idx   = s.get("index", len(result["audio_tracks"]) + len(result["subtitle_tracks"]))
             if typ == "video" and codec:
                 result["video"].append(codec)
                 # Capture resolution and FPS from the first video stream only
@@ -184,8 +211,35 @@ def probe_stream_codecs(url: str, pre_input_args=None, timeout=15,
                         result["audio_bitrate"] = int(s["bit_rate"])
                     except Exception:
                         pass
+                # Collect full per-track metadata for the track-selector UI
+                lang     = (tags.get("language") or tags.get("LANGUAGE") or "").strip() or None
+                title    = (tags.get("title")    or tags.get("TITLE")    or "").strip() or None
+                channels = None
+                layout   = None
+                try:
+                    channels = int(s["channels"])
+                except Exception:
+                    pass
+                layout = s.get("channel_layout") or None
+                result["audio_tracks"].append({
+                    "index":    idx,
+                    "codec":    codec,
+                    "language": lang,
+                    "title":    title,
+                    "channels": channels,
+                    "layout":   layout,
+                })
             elif typ == "subtitle" and codec:
                 result["subtitle"].append(codec)
+                lang  = (tags.get("language") or tags.get("LANGUAGE") or "").strip() or None
+                title = (tags.get("title")    or tags.get("TITLE")    or "").strip() or None
+                result["subtitle_tracks"].append({
+                    "index":          idx,
+                    "codec":          codec,
+                    "language":       lang,
+                    "title":          title,
+                    "is_image_based": codec.lower() in _IMAGE_SUB_CODECS,
+                })
         # Container-level fields
         fmt = data.get("format", {})
         dur = fmt.get("duration")
@@ -381,19 +435,21 @@ def _build_stream_info(codecs: dict, transcode_reason: str | None, is_hls: bool 
         return f"{bps // 1000} kbps"
 
     return {
-        "vcodec":       vcodec,
-        "acodec":       acodec,
-        "res_label":    res_label,
-        "res_str":      res_str,
-        "width":        w,
-        "height":       h,
-        "fps":          fps_str,
-        "bitrate":      _fmt_bitrate(total_bps),
-        "video_bitrate": _fmt_bitrate(video_bps),
-        "audio_bitrate": _fmt_bitrate(audio_bps),
-        "transcode":    bool(transcode_reason),
+        "vcodec":          vcodec,
+        "acodec":          acodec,
+        "res_label":       res_label,
+        "res_str":         res_str,
+        "width":           w,
+        "height":          h,
+        "fps":             fps_str,
+        "bitrate":         _fmt_bitrate(total_bps),
+        "video_bitrate":   _fmt_bitrate(video_bps),
+        "audio_bitrate":   _fmt_bitrate(audio_bps),
+        "transcode":       bool(transcode_reason),
         "transcode_reason": transcode_reason or "",
-        "is_hls":       is_hls,
+        "is_hls":          is_hls,
+        "audio_tracks":    codecs.get("audio_tracks", []),
+        "subtitle_tracks": codecs.get("subtitle_tracks", []),
     }
 
 
@@ -409,8 +465,27 @@ def _log_stream_info(state, info: dict, source: str = "ffprobe") -> None:
     if info.get("acodec"):
         abr  = f"  {info['audio_bitrate']}" if info.get("audio_bitrate") else ""
         lines.append(f"[PROBE] Audio : {info['acodec']}{abr}")
+    # Always log audio track count and per-track detail regardless of count or tags
+    audio_tracks = info.get("audio_tracks", [])
+    lines.append(f"[PROBE] Audio tracks: {len(audio_tracks)}")
+    for i, t in enumerate(audio_tracks):
+        lang  = t.get("language") or f"track {i+1}"
+        title = (' "' + t["title"] + '"') if t.get("title") else ""
+        ch    = f"  {t['channels']}ch" if t.get("channels") else ""
+        lines.append(f"[PROBE]   [{lang}] {t['codec'].upper()}{title}{ch}")
     if info.get("bitrate") and not (info.get("video_bitrate") and info.get("audio_bitrate")):
         lines.append(f"[PROBE] Total : {info['bitrate']}")
+    # Always log subtitle streams — explicitly say none when absent
+    sub_tracks = info.get("subtitle_tracks", [])
+    if sub_tracks:
+        lines.append(f"[PROBE] Subs  : {len(sub_tracks)} embedded stream(s)")
+        for i, t in enumerate(sub_tracks):
+            lang  = t.get("language") or f"track {i+1}"
+            title = (' "' + t["title"] + '"') if t.get("title") else ""
+            kind  = " (image-based)" if t.get("is_image_based") else " (text)"
+            lines.append(f"[PROBE]   [{lang}] {t['codec']}{title}{kind}")
+    else:
+        lines.append(f"[PROBE] Subs  : none embedded")
     if info.get("transcode"):
         lines.append(f"[PROBE] Action: transcode ({info['transcode_reason']})")
     else:
@@ -418,7 +493,6 @@ def _log_stream_info(state, info: dict, source: str = "ffprobe") -> None:
     lines.append(f"[PROBE] ────────────────────────────────────────")
     for line in lines:
         state.log(line)
-
 
 # ── Flask route registration ──────────────────────────────────────────────────
 # CSS is injected by the JS via a <style> element — same pattern as multiview.
@@ -428,7 +502,7 @@ def _log_stream_info(state, info: dict, source: str = "ffprobe") -> None:
 _PROBE_UI_JS_BYTES: bytes = b""   # filled once in register_probe_routes
 
 _PROBE_UI_JS = r"""
-/* ── probe_addon — stream-info toggle button + stats panel ─────────────── */
+/* ── probe_addon — stream-info toggle button + stats + track selector ───── */
 (function(){
 
   /* ── CSS ─────────────────────────────────────────────────────────────── */
@@ -452,7 +526,6 @@ _PROBE_UI_JS = r"""
   white-space:nowrap;
   backdrop-filter:blur(3px);
   -webkit-backdrop-filter:blur(3px);
-  /* hidden by default — revealed on hover or when sticky */
   opacity:0;
   pointer-events:none;
   transition:opacity .2s ease, background .15s, border-color .15s;
@@ -480,7 +553,8 @@ _PROBE_UI_JS = r"""
   white-space:nowrap;
   backdrop-filter:blur(4px);
   -webkit-backdrop-filter:blur(4px);
-  pointer-events:none;
+  /* pointer-events:auto — panel contains clickable track selector buttons */
+  pointer-events:auto;
   animation:si-drop .15s ease;
 }
 #si-panel.si-open{ display:flex; }
@@ -499,6 +573,45 @@ _PROBE_UI_JS = r"""
 #si-panel .si-abr    { color:#64748b; font-size:9px; margin-left:3px; font-style:italic; }
 #si-panel .si-tx     { color:#fb923c; font-size:9px; margin-left:4px; }
 #si-panel .si-divider{ height:1px; background:rgba(255,255,255,.07); margin:3px 0 2px; }
+
+/* Track selector section */
+#si-panel .si-section-hdr{
+  color:#4a5a78; font-size:8.5px; text-transform:uppercase; letter-spacing:.8px;
+  margin-top:4px; margin-bottom:1px;
+}
+#si-panel .si-tracks{ display:flex; flex-direction:column; gap:2px; margin-top:1px; }
+#si-panel .si-track-btn{
+  display:flex; align-items:center; gap:5px;
+  padding:2px 6px 2px 4px;
+  border-radius:3px;
+  cursor:pointer;
+  pointer-events:auto;
+  transition:background .12s;
+  user-select:none;
+}
+#si-panel .si-track-btn:hover{ background:rgba(255,255,255,.07); }
+#si-panel .si-track-btn.si-active{
+  background:rgba(99,179,237,.12);
+  border-left:2px solid #60a5fa;
+  padding-left:2px;
+}
+#si-panel .si-track-btn.si-info-only{ cursor:default; opacity:.6; }
+#si-panel .si-track-btn.si-info-only:hover{ background:none; }
+#si-panel .si-track-dot{
+  width:5px;height:5px;border-radius:50%;
+  background:rgba(255,255,255,.18);flex-shrink:0;
+}
+#si-panel .si-track-btn.si-active .si-track-dot{ background:#60a5fa; }
+#si-panel .si-track-lang{
+  color:#93c5fd; font-size:9px; text-transform:uppercase; font-weight:700;
+  min-width:24px;
+}
+#si-panel .si-track-name{ color:#94a3b8; font-size:9.5px; }
+#si-panel .si-track-codec{ color:#475569; font-size:8.5px; margin-left:auto; }
+#si-panel .si-track-ch{ color:#475569; font-size:8.5px; margin-left:3px; }
+#si-panel .si-img-badge{
+  color:#f59e0b; font-size:8px; margin-left:3px; opacity:.7;
+}
     `;
     document.head.appendChild(s);
   })();
@@ -507,9 +620,14 @@ _PROBE_UI_JS = r"""
   let _btn     = null;
   let _panel   = null;
   let _curInfo = null;
-  let _open    = false;   // panel visible
-  let _sticky  = false;   // user clicked — keep button + panel visible on mouseleave
-  let _hasData = false;   // false until first probe result arrives
+  let _open    = false;
+  let _sticky  = false;
+  let _hasData = false;
+  // Runtime HLS.js track lists — updated via AUDIO_TRACKS_UPDATED event
+  let _hlsAudioTracks = [];   // [{id, name, lang}]
+  let _activeAudio    = -1;   // currently selected HLS audio track index
+  let _hlsSubTracks   = [];   // [{id, name, lang}]
+  let _activeSub      = -1;
 
   /* ── DOM setup ──────────────────────────────────────────────────────── */
   function _ensureEls(){
@@ -526,14 +644,12 @@ _PROBE_UI_JS = r"""
     _panel.id = 'si-panel';
     vwrap.appendChild(_panel);
 
-    /* ── hover: reveal/hide button when player is in focus ── */
     vwrap.addEventListener('mouseenter', function(){
       if(!_hasData) return;
       _btn.classList.add('si-hover');
     });
     vwrap.addEventListener('mouseleave', function(){
       _btn.classList.remove('si-hover');
-      // If not sticky, collapse the panel too
       if(!_sticky && _open){
         _btn.classList.remove('si-open');
         _panel.classList.remove('si-open');
@@ -541,21 +657,16 @@ _PROBE_UI_JS = r"""
       }
     });
 
-    /* ── click: toggle sticky panel ── */
     _btn.addEventListener('click', function(e){
       e.stopPropagation();
       if(_open){
-        // Close and exit sticky mode
         _btn.classList.remove('si-open','si-sticky');
         _panel.classList.remove('si-open');
-        _open   = false;
-        _sticky = false;
+        _open = false; _sticky = false;
       } else {
-        // Open and enter sticky mode
         _btn.classList.add('si-open','si-sticky');
         _panel.classList.add('si-open');
-        _open   = true;
-        _sticky = true;
+        _open = true; _sticky = true;
       }
     });
 
@@ -566,7 +677,7 @@ _PROBE_UI_JS = r"""
   const _BAD_ACODEC = new Set(['AC3','EAC3','DTS','DCA','TRUEHD','MLP','PCM']);
   const _BAD_VCODEC = new Set(['HEVC','H265','HEV1','HVC1','X265']);
 
-  /* ── Button label ───────────────────────────────────────────────────── */
+  /* ── Helpers ────────────────────────────────────────────────────────── */
   function _btnLabel(info){
     const parts = [];
     if(info.res_label) parts.push(info.res_label);
@@ -577,11 +688,35 @@ _PROBE_UI_JS = r"""
     return { text: parts.join(' ') || (info.vcodec || '\u2014'), warn: hasWarn };
   }
 
-  /* ── Panel HTML ─────────────────────────────────────────────────────── */
+  // Format a track label: prefer title, fall back to language code, else "Track N"
+  function _trackLabel(t, n){
+    if(t.title) return t.title;
+    if(t.lang || t.language){
+      const l = (t.lang || t.language).toUpperCase();
+      return l;
+    }
+    return 'Track ' + (n+1);
+  }
+
+  /* ── Audio track switching ──────────────────────────────────────────── */
+  // hlsObj is a module-level let in the main inline script — accessible from here
+  // since both scripts share the same page scope (not wrapped in a module).
+  // For direct (non-HLS) streams, audioTracks switching is not supported in
+  // most browsers; those entries render as informational (si-info-only).
+  function _switchAudio(hlsIdx){
+    if(typeof hlsObj !== 'undefined' && hlsObj && typeof hlsObj.audioTrack === 'number'){
+      hlsObj.audioTrack = hlsIdx;
+      _activeAudio = hlsIdx;
+      _rebuildTracks();
+    }
+  }
+
+  /* ── Build panel HTML ───────────────────────────────────────────────── */
   function _buildPanel(info){
     let html = '';
     const isHLS = info.is_hls;
 
+    // ── Video ─────────────────────────────────────────────────────────
     if(info.res_str || info.fps){
       const res = info.res_str   ? '<span class="si-res">'  + info.res_str  + '</span>' : '';
       const lbl = info.res_label ? '<span class="si-qlbl">' + info.res_label + '</span>' : '';
@@ -599,7 +734,15 @@ _PROBE_UI_JS = r"""
             + '<span class="si-codec' + (bad?' si-bad':'') + '">' + info.vcodec + '</span>'
             + vbr + tx + '</div>';
     }
-    if(info.acodec) html += '<div class="si-divider"></div>';
+
+    html += '<div class="si-divider"></div>';
+
+    // ── Audio ─────────────────────────────────────────────────────────
+    // Prefer runtime HLS.js track list (more accurate for HLS multi-audio),
+    // fall back to ffprobe data for non-HLS or when HLS hasn't fired yet.
+    const useLiveAudio = isHLS && _hlsAudioTracks.length > 0;
+    const audioTracks  = useLiveAudio ? _hlsAudioTracks : (info.audio_tracks || []);
+
     if(info.acodec){
       const bad = _BAD_ACODEC.has(info.acodec.toUpperCase().replace('-',''));
       const abr = info.audio_bitrate ? '<span class="si-br">'  + info.audio_bitrate + '</span>'
@@ -610,37 +753,94 @@ _PROBE_UI_JS = r"""
             + '<span class="si-codec' + (bad?' si-bad':'') + '">' + info.acodec + '</span>'
             + abr + tx + '</div>';
     }
+
+    // Audio track selector — always shown when track data is present,
+    // matching the log which always reports track count and detail.
+    if(audioTracks.length > 0){
+      html += '<div class="si-section-hdr">Audio tracks</div>';
+      html += '<div class="si-tracks" id="si-audio-tracks">';
+      audioTracks.forEach(function(t, i){
+        const hlsId   = (useLiveAudio ? t.id : i);
+        const isActive = useLiveAudio ? (_activeAudio === t.id) : (i === 0);
+        const lang    = (t.lang || t.language || '').toUpperCase() || '—';
+        const name    = t.title || t.name || '';
+        const codec   = (!useLiveAudio && t.codec) ? t.codec.toUpperCase() : '';
+        const ch      = (!useLiveAudio && t.channels) ? t.channels + 'ch' : '';
+        const canSwitch = useLiveAudio; // only HLS supports runtime switching
+        html += '<div class="si-track-btn' + (isActive?' si-active':'') + (canSwitch?'':' si-info-only') + '"'
+              + (canSwitch ? ' onclick="window._siSwitchAudio(' + hlsId + ')"' : '')
+              + '>'
+              + '<span class="si-track-dot"></span>'
+              + '<span class="si-track-lang">' + lang + '</span>'
+              + (name ? '<span class="si-track-name">' + name + '</span>' : '')
+              + (codec ? '<span class="si-track-codec">' + codec + '</span>' : '')
+              + (ch    ? '<span class="si-track-ch">' + ch + '</span>' : '')
+              + '</div>';
+      });
+      html += '</div>';
+    }
+
+    // ── Subtitle tracks ───────────────────────────────────────────────
+    // subtitleTrackController is fully no-op'd in the HLS config (subtitles_addon
+    // owns the subtitle pipeline via addTextTrack + VTT cues for external subs).
+    // Embedded subtitle streams from the container are shown as informational only.
+    // Image-based subs (PGS/DVD) cannot be rendered in a browser at all.
+    const subTracks = info.subtitle_tracks || [];
+    if(subTracks.length > 0){
+      html += '<div class="si-divider"></div>';
+      html += '<div class="si-section-hdr">Subtitle streams</div>';
+      html += '<div class="si-tracks">';
+      subTracks.forEach(function(t, i){
+        const lang  = (t.language || '').toUpperCase() || '—';
+        const name  = t.title || '';
+        const codec = (t.codec || '').toLowerCase();
+        const imgBadge = t.is_image_based ? '<span class="si-img-badge">image</span>' : '';
+        // All embedded subs are informational — use subtitles_addon for external subs
+        html += '<div class="si-track-btn si-info-only">'
+              + '<span class="si-track-dot"></span>'
+              + '<span class="si-track-lang">' + lang + '</span>'
+              + (name  ? '<span class="si-track-name">' + name  + '</span>' : '')
+              + '<span class="si-track-codec">' + codec + '</span>'
+              + imgBadge
+              + '</div>';
+      });
+      html += '</div>';
+    }
+
     return html;
+  }
+
+  /* ── Rebuild only the track section without full panel redraw ───────── */
+  function _rebuildTracks(){
+    if(!_panel || !_curInfo) return;
+    // Rebuild entire panel — it's lightweight enough
+    _panel.innerHTML = _buildPanel(_curInfo);
   }
 
   /* ── Public: show/update ────────────────────────────────────────────── */
   function _siShow(info){
     if(!_ensureEls()) return;
     if(!info || (!info.res_str && !info.vcodec && !info.acodec)){ _siHide(); return; }
-    _curInfo  = info;
-    _hasData  = true;
+    _curInfo = info;
+    _hasData = true;
 
     const { text, warn } = _btnLabel(info);
     document.getElementById('si-btn-lbl').textContent = text;
     _btn.classList.toggle('si-warn', warn);
     _panel.innerHTML = _buildPanel(info);
 
-    // Exit any previous sticky state so the auto-open below starts clean
     _sticky = false;
     _btn.classList.remove('si-sticky');
 
-    // Auto-open panel briefly (non-sticky) — hover-out will close it after 6s
     _btn.classList.add('si-hover','si-open');
     _panel.classList.add('si-open');
     _open = true;
     const snap = info;
     setTimeout(function(){
-      // Only auto-close if the user hasn't clicked to go sticky and channel unchanged
       if(!_sticky && _open && _curInfo === snap){
         _btn.classList.remove('si-open');
         _panel.classList.remove('si-open');
         _open = false;
-        // Also remove hover highlight so button fades if mouse not over vwrap
         const vwrap = document.getElementById('vwrap');
         if(vwrap && !vwrap.matches(':hover')) _btn.classList.remove('si-hover');
       }
@@ -650,8 +850,36 @@ _PROBE_UI_JS = r"""
   /* ── Public: hide (on stop) ─────────────────────────────────────────── */
   function _siHide(){
     _open = false; _sticky = false; _hasData = false; _curInfo = null;
+    _hlsAudioTracks = []; _activeAudio = -1;
+    _hlsSubTracks   = []; _activeSub   = -1;
     if(_btn){ _btn.classList.remove('si-hover','si-open','si-sticky','si-warn'); }
     if(_panel){ _panel.classList.remove('si-open'); }
+  }
+
+  /* ── Hook HLS.js AUDIO_TRACKS_UPDATED + AUDIO_TRACK_SWITCHED ────────── */
+  // hlsObj is reassigned each time doPlay() runs a new HLS stream.
+  // We can't bind events at construction time from here, so we patch the
+  // _createHlsAndPlay flow by intercepting the fetch of /api/resolve and
+  // then scheduling a one-shot MutationObserver on hlsObj creation, OR
+  // more simply: poll for hlsObj to appear and bind once per stream.
+  // The simplest reliable approach: bind after the resolve fetch returns
+  // (hlsObj is created synchronously in the then() handler of doPlay).
+  let _hlsBound = false;
+  function _bindHlsEvents(){
+    if(_hlsBound) return;
+    if(typeof hlsObj === 'undefined' || !hlsObj) return;
+    _hlsBound = true;
+
+    hlsObj.on('hlsAudioTracksUpdated', function(evt, data){
+      _hlsAudioTracks = (data.audioTracks || []).map(function(t){ return t; });
+      // Default active track is whatever hlsObj.audioTrack reports
+      _activeAudio = hlsObj.audioTrack;
+      if(_curInfo) _rebuildTracks();
+    });
+    hlsObj.on('hlsAudioTrackSwitched', function(evt, data){
+      _activeAudio = data.id;
+      if(_curInfo) _rebuildTracks();
+    });
   }
 
   /* ── Intercept /api/resolve ──────────────────────────────────────────── */
@@ -660,10 +888,17 @@ _PROBE_UI_JS = r"""
     const res = await _origFetch.call(this, resource, opts);
     const url = (typeof resource === 'string') ? resource : (resource.url || '');
     if(url.includes('/api/resolve') && !url.includes('/api/resolve_url')){
+      // Reset HLS binding state so we re-bind for the new stream
+      _hlsBound = false; _hlsAudioTracks = []; _activeAudio = -1;
       const clone = res.clone();
       clone.json().then(function(d){
-        if(d && d.stream_info && (d.stream_info.vcodec || d.stream_info.acodec))
+        if(d && d.stream_info && (d.stream_info.vcodec || d.stream_info.acodec)){
           _siShow(d.stream_info);
+          // Schedule HLS event binding — hlsObj is created shortly after
+          // doPlay() receives this response, so defer a few ticks
+          setTimeout(_bindHlsEvents, 200);
+          setTimeout(_bindHlsEvents, 800);  // retry in case of slow init
+        }
       }).catch(function(){});
     }
     return res;
@@ -683,8 +918,10 @@ _PROBE_UI_JS = r"""
     _patchStop('playerStop'); _patchStop('_destroyPlayers');
   }
 
-  window._streamInfoShow = _siShow;
-  window._streamInfoHide = _siHide;
+  /* ── Global exports ─────────────────────────────────────────────────── */
+  window._streamInfoShow  = _siShow;
+  window._streamInfoHide  = _siHide;
+  window._siSwitchAudio   = _switchAudio;
 
 })();
 """
@@ -769,7 +1006,10 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                     if codecs:
                         needs_transcode, transcode_reason, detected_codec = _check_codecs(codecs)
                         _is_hls_url = '.m3u8' in url_lower or '.m3u8' in url_lower_full
-                        stream_info = _build_stream_info(codecs, transcode_reason, is_hls=_is_hls_url)
+                        # is_hls=False when transcoding: delivery is fixed-bitrate MPEG-TS
+                        # from ffmpeg regardless of source format, so ABR label is wrong
+                        stream_info = _build_stream_info(codecs, transcode_reason,
+                                                         is_hls=_is_hls_url and not needs_transcode)
                         _log_stream_info(state, stream_info, "ffprobe")
 
                     else:
@@ -793,7 +1033,9 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                             if codecs:
                                 state.log("[PROBE] ffprobe HLS retry succeeded")
                                 needs_transcode, transcode_reason, detected_codec = _check_codecs(codecs)
-                                stream_info = _build_stream_info(codecs, transcode_reason, is_hls=True)
+                                # is_hls=False when transcoding — delivery is MPEG-TS from ffmpeg
+                                stream_info = _build_stream_info(codecs, transcode_reason,
+                                                                 is_hls=not needs_transcode)
                                 _log_stream_info(state, stream_info, "ffprobe HLS retry")
                             else:
                                 state.log("[PROBE] ffprobe HLS retry also failed — playing direct")
