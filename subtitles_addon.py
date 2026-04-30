@@ -440,11 +440,14 @@ _SUBTITLES_UI_JS = r"""
     <div class="sub-body">
       <div class="sub-tab-row" id="sub-tab-row">
         <div class="sub-api-key-wrap">
-          <input id="sub-apikey" type="text"
-            placeholder="OpenSubtitles API key &mdash; get one free at opensubtitles.com"
-            autocomplete="new-password" autocorrect="off" spellcheck="false"
-            oninput="saveSubKey()" title="Your OpenSubtitles Consumer API key"
-            style="flex:1;height:30px;font-size:12px;min-width:0">
+          <span style="position:relative;display:inline-flex;align-items:center;flex:1;min-width:0">
+            <input id="sub-apikey" type="password"
+              placeholder="OpenSubtitles API key &mdash; get one free at opensubtitles.com"
+              autocomplete="new-password" autocorrect="off" spellcheck="false"
+              oninput="saveSubKey()" title="Your OpenSubtitles Consumer API key"
+              style="width:100%;height:30px;font-size:12px;padding-right:28px">
+            <button type="button" onclick="(function(b){var i=document.getElementById('sub-apikey');i.type=i.type==='password'?'text':'password';b.textContent=i.type==='password'?'👁':'🙈'})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button>
+          </span>
           <a href="https://www.opensubtitles.com/en/consumers" target="_blank" rel="noopener"
             class="btn-ghost"
             style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;
