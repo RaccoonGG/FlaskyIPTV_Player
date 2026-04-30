@@ -532,9 +532,13 @@ def register_proxy_routes(flask_app, state):
         if not ffmpeg:
             return Response("ffmpeg not available", status=503)
 
-        transcode  = request.args.get("transcode",  "0") == "1"
-        audio_only = request.args.get("audio_only", "0") == "1" and not transcode
-        is_vod     = request.args.get("vod",        "0") == "1"
+        transcode   = request.args.get("transcode",   "0") == "1"
+        audio_only  = request.args.get("audio_only",  "0") == "1" and not transcode
+        is_vod      = request.args.get("vod",         "0") == "1"
+        # audio_track=N selects a specific audio stream by zero-based index.
+        # When absent or invalid, ffmpeg falls back to its default (first/best stream).
+        _at = request.args.get("audio_track", "").strip()
+        audio_track = int(_at) if _at.isdigit() else None
 
         cors = _CORS_HEADERS
 
@@ -550,15 +554,22 @@ def register_proxy_routes(flask_app, state):
             "-i", url,
         ]
 
+        # Build -map args when a specific audio track is requested.
+        # -map 0:v:0        — first video stream
+        # -map 0:a:<N>      — audio stream at index N within the audio streams
+        # Without explicit maps ffmpeg auto-selects, which is correct for the
+        # default (no track preference) case.
+        map_args = ["-map", "0:v:0", "-map", f"0:a:{audio_track}"] if audio_track is not None else []
+
         if transcode:
-            cmd = base_input + [
+            cmd = base_input + map_args + [
                 "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23",
                 "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
                 "-f", "mpegts", "-",
             ]
             mode_str = "transcode"
         elif audio_only:
-            cmd = base_input + [
+            cmd = base_input + map_args + [
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
                 "-f", "mpegts", "-",
