@@ -538,6 +538,13 @@ _PROBE_UI_JS = r"""
 #si-btn.si-warn:hover{ border-color:rgba(248,113,113,.6); }
 #si-btn .si-btn-icon{ font-size:9px; opacity:.7; }
 
+/* Touch / no-hover devices (mobile): button always visible when data is present.
+   mouseenter never fires on touch, so the si-hover mechanism doesn't work.
+   si-touch-visible is added by JS when _hasData becomes true. */
+@media (hover: none) {
+  #si-btn.si-touch-visible { opacity:1; pointer-events:auto; }
+}
+
 #si-panel{
   position:absolute;top:32px;right:8px;
   display:none;
@@ -628,6 +635,31 @@ _PROBE_UI_JS = r"""
   let _activeAudio    = -1;   // currently selected HLS audio track index
   let _hlsSubTracks   = [];   // [{id, name, lang}]
   let _activeSub      = -1;
+  // Touch reveal timer — drives si-touch-visible lifecycle on mobile
+  let _revealTimer = null;
+
+  /* ── Touch device detection ─────────────────────────────────────────── */
+  const _isTouch = window.matchMedia('(hover: none)').matches;
+
+  /* ── Touch reveal helper ────────────────────────────────────────────── */
+  // Shows the button on touch devices for `ms` milliseconds, then fades it.
+  // Cancels any pending fade timer first.  When sticky, the fade is never
+  // scheduled — button stays until user closes the panel.
+  function _revealButton(ms){
+    if(!_btn || !_hasData) return;
+    if(_revealTimer){ clearTimeout(_revealTimer); _revealTimer = null; }
+    _btn.classList.add('si-touch-visible');
+    if(_sticky) return;   // don't schedule fade while panel is pinned open
+    _revealTimer = setTimeout(function(){
+      _revealTimer = null;
+      if(!_sticky) _btn.classList.remove('si-touch-visible');
+    }, ms);
+  }
+
+  function _cancelReveal(){
+    if(_revealTimer){ clearTimeout(_revealTimer); _revealTimer = null; }
+    _btn.classList.remove('si-touch-visible');
+  }
 
   /* ── DOM setup ──────────────────────────────────────────────────────── */
   function _ensureEls(){
@@ -644,29 +676,63 @@ _PROBE_UI_JS = r"""
     _panel.id = 'si-panel';
     vwrap.appendChild(_panel);
 
-    vwrap.addEventListener('mouseenter', function(){
-      if(!_hasData) return;
-      _btn.classList.add('si-hover');
-    });
-    vwrap.addEventListener('mouseleave', function(){
-      _btn.classList.remove('si-hover');
-      if(!_sticky && _open){
-        _btn.classList.remove('si-open');
-        _panel.classList.remove('si-open');
-        _open = false;
-      }
-    });
+    // ── Desktop: hover reveals/hides button ───────────────────────────
+    if(!_isTouch){
+      vwrap.addEventListener('mouseenter', function(){
+        if(!_hasData) return;
+        _btn.classList.add('si-hover');
+      });
+      vwrap.addEventListener('mouseleave', function(){
+        _btn.classList.remove('si-hover');
+        if(!_sticky && _open){
+          _btn.classList.remove('si-open');
+          _panel.classList.remove('si-open');
+          _open = false;
+        }
+      });
+    }
 
+    // ── Mobile: any tap on the player area re-reveals the button ─────
+    // This is the fix for Bug 1 — after auto-close removes si-touch-visible,
+    // the next tap on vwrap brings the button back for 4 s.
+    // We listen on vwrap (not document) to avoid triggering on unrelated taps.
+    if(_isTouch){
+      vwrap.addEventListener('touchstart', function(e){
+        if(!_hasData) return;
+        // If the tap is NOT on the button/panel, treat it as "tap to reveal"
+        if(!_btn.contains(e.target) && !_panel.contains(e.target)){
+          _revealButton(4000);
+        }
+      }, {passive: true});
+
+      // Tap outside the panel while open — close panel and brief-reveal button
+      document.addEventListener('touchstart', function(e){
+        if(_open && _panel && !_panel.contains(e.target) && !_btn.contains(e.target)){
+          _btn.classList.remove('si-open','si-sticky');
+          _panel.classList.remove('si-open');
+          _open = false; _sticky = false;
+          // Brief reveal so user can see button fade — gives feedback that close happened
+          _revealButton(2000);
+        }
+      }, {passive: true});
+    }
+
+    // ── Button click/tap: toggle panel ───────────────────────────────
+    // Fix for Bug 2: close no longer permanently removes si-touch-visible.
+    // Instead it calls _revealButton(2000) so the button stays briefly visible,
+    // giving the user a chance to tap again — same feel as tap-outside dismiss.
     _btn.addEventListener('click', function(e){
       e.stopPropagation();
       if(_open){
         _btn.classList.remove('si-open','si-sticky');
         _panel.classList.remove('si-open');
         _open = false; _sticky = false;
+        if(_isTouch) _revealButton(2000);   // brief visibility after close
       } else {
         _btn.classList.add('si-open','si-sticky');
         _panel.classList.add('si-open');
         _open = true; _sticky = true;
+        if(_isTouch) _revealButton(0);      // sticky — cancel fade timer
       }
     });
 
@@ -699,16 +765,48 @@ _PROBE_UI_JS = r"""
   }
 
   /* ── Audio track switching ──────────────────────────────────────────── */
-  // hlsObj is a module-level let in the main inline script — accessible from here
-  // since both scripts share the same page scope (not wrapped in a module).
-  // For direct (non-HLS) streams, audioTracks switching is not supported in
-  // most browsers; those entries render as informational (si-info-only).
-  function _switchAudio(hlsIdx){
-    if(typeof hlsObj !== 'undefined' && hlsObj && typeof hlsObj.audioTrack === 'number'){
-      hlsObj.audioTrack = hlsIdx;
-      _activeAudio = hlsIdx;
+  // Two distinct switching paths:
+  //   1. Live HLS (useLiveAudio=true, hlsObj alive): hlsObj.audioTrack = id directly.
+  //      Zero latency, no stream restart needed.
+  //   2. Everything else (transcoded, direct MPEG-TS, direct HLS without multi-audio):
+  //      Re-resolve with audio_track=N in POST body.  Server forces audio_only
+  //      transcode so ffmpeg applies -map 0:a:<N>.  Stream restarts through hls_proxy.
+  //      Works identically for already-transcoded and previously-direct streams.
+  function _switchAudio(trackIdx){
+    if(!_curInfo) return;
+
+    // Case 1: live HLS — switch HLS.js audio rendition directly, no restart
+    if(typeof hlsObj !== 'undefined' && hlsObj && typeof hlsObj.audioTrack === 'number'
+       && _hlsAudioTracks.length > 0){
+      hlsObj.audioTrack = trackIdx;
+      _activeAudio = trackIdx;
       _rebuildTracks();
+      return;
     }
+
+    // Case 2: all other streams (transcoded or direct MPEG-TS) — re-resolve.
+    // Server forces audio_only transcode when audio_track param is present,
+    // so direct MPEG-TS streams automatically go through hls_proxy with -map 0:a:<N>.
+    if(typeof it === 'undefined' || !it){ return; }
+    const name = it.name || it.o_name || it.fname || '';
+    _activeAudio = trackIdx;   // optimistic highlight before re-resolve completes
+    _rebuildTracks();
+    fetch('/api/resolve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        item:        it,
+        mode:        (typeof mode     !== 'undefined' ? mode     : 'live'),
+        category:    (typeof curCat   !== 'undefined' ? curCat   : {}),
+        audio_track: trackIdx,
+      })
+    }).then(function(r){ return r.json(); }).then(function(d){
+      if(d.url && typeof doPlay === 'function'){
+        doPlay(d.url, name, {isLive: (typeof mode !== 'undefined' ? mode === 'live' : true)});
+      }
+    }).catch(function(e){
+      console.warn('[probe] re-resolve for audio track failed:', e);
+    });
   }
 
   /* ── Build panel HTML ───────────────────────────────────────────────── */
@@ -760,21 +858,32 @@ _PROBE_UI_JS = r"""
       html += '<div class="si-section-hdr">Audio tracks</div>';
       html += '<div class="si-tracks" id="si-audio-tracks">';
       audioTracks.forEach(function(t, i){
-        const hlsId   = (useLiveAudio ? t.id : i);
-        const isActive = useLiveAudio ? (_activeAudio === t.id) : (i === 0);
-        const lang    = (t.lang || t.language || '').toUpperCase() || '—';
-        const name    = t.title || t.name || '';
-        const codec   = (!useLiveAudio && t.codec) ? t.codec.toUpperCase() : '';
-        const ch      = (!useLiveAudio && t.channels) ? t.channels + 'ch' : '';
-        const canSwitch = useLiveAudio; // only HLS supports runtime switching
+        const hlsId    = (useLiveAudio ? t.id : i);
+        const isActive = useLiveAudio
+                         ? (_activeAudio === t.id)
+                         : (_activeAudio === i);      // set when re-resolve completes
+        const lang     = (t.lang || t.language || '').toUpperCase() || '\u2014';
+        const name     = t.title || t.name || '';
+        const codec    = (!useLiveAudio && t.codec)     ? t.codec.toUpperCase() : '';
+        const ch       = (!useLiveAudio && t.channels)  ? t.channels + 'ch'    : '';
+        // Switchable when:
+        //   (a) live HLS with HLS.js track list (instant rendition switch)
+        //   (b) transcoded stream (re-resolve with track index, ffmpeg -map)
+        //   (c) direct MPEG-TS with multiple tracks (re-resolve forces audio_only
+        //       transcode so ffmpeg can apply -map 0:a:<N>)
+        // Single-track direct streams with no language tag: informational only —
+        // clicking would restart the stream identically with no benefit.
+        const isMultiOrTagged = audioTracks.length > 1
+                             || !!(t.lang || t.language);
+        const canSwitch = useLiveAudio || info.transcode || isMultiOrTagged;
         html += '<div class="si-track-btn' + (isActive?' si-active':'') + (canSwitch?'':' si-info-only') + '"'
               + (canSwitch ? ' onclick="window._siSwitchAudio(' + hlsId + ')"' : '')
               + '>'
               + '<span class="si-track-dot"></span>'
               + '<span class="si-track-lang">' + lang + '</span>'
-              + (name ? '<span class="si-track-name">' + name + '</span>' : '')
+              + (name  ? '<span class="si-track-name">'  + name  + '</span>' : '')
               + (codec ? '<span class="si-track-codec">' + codec + '</span>' : '')
-              + (ch    ? '<span class="si-track-ch">' + ch + '</span>' : '')
+              + (ch    ? '<span class="si-track-ch">'    + ch    + '</span>' : '')
               + '</div>';
       });
       html += '</div>';
@@ -832,17 +941,30 @@ _PROBE_UI_JS = r"""
     _sticky = false;
     _btn.classList.remove('si-sticky');
 
-    _btn.classList.add('si-hover','si-open');
+    // Show button + panel for 6s then auto-collapse.
+    // On touch: _revealButton manages si-touch-visible + the fade timer.
+    // On desktop: si-hover is added directly (no timer needed — mouseleave handles it).
+    if(_isTouch){
+      _revealButton(6000);
+    } else {
+      _btn.classList.add('si-hover');
+    }
+    _btn.classList.add('si-open');
     _panel.classList.add('si-open');
     _open = true;
+
     const snap = info;
     setTimeout(function(){
       if(!_sticky && _open && _curInfo === snap){
         _btn.classList.remove('si-open');
         _panel.classList.remove('si-open');
         _open = false;
-        const vwrap = document.getElementById('vwrap');
-        if(vwrap && !vwrap.matches(':hover')) _btn.classList.remove('si-hover');
+        // Desktop: remove si-hover if mouse not over vwrap
+        // Touch: _revealButton timer handles si-touch-visible fade independently
+        if(!_isTouch){
+          const vwrap = document.getElementById('vwrap');
+          if(vwrap && !vwrap.matches(':hover')) _btn.classList.remove('si-hover');
+        }
       }
     }, 6000);
   }
@@ -852,6 +974,7 @@ _PROBE_UI_JS = r"""
     _open = false; _sticky = false; _hasData = false; _curInfo = null;
     _hlsAudioTracks = []; _activeAudio = -1;
     _hlsSubTracks   = []; _activeSub   = -1;
+    if(_isTouch && _btn) _cancelReveal();
     if(_btn){ _btn.classList.remove('si-hover','si-open','si-sticky','si-warn'); }
     if(_panel){ _panel.classList.remove('si-open'); }
   }
@@ -999,9 +1122,14 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                     _probe_pre_args = [
                         "-user_agent", "VLC/3.0.0 LibVLC/3.0.0",
                         "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+                        # Limit analysis window so ffprobe decides quickly on laggy
+                        # live streams — 2 s / 500 KB is enough to read PAT/PMT and
+                        # first frames without waiting for the default 5 s / 5 MB.
+                        "-analyzeduration", "2000000",
+                        "-probesize", "500000",
                     ]
                     codecs = probe_stream_codecs(url, pre_input_args=_probe_pre_args,
-                                                 timeout=8, ffprobe_path=_FFPROBE_PATH)
+                                                 timeout=10, ffprobe_path=_FFPROBE_PATH)
 
                     if codecs:
                         needs_transcode, transcode_reason, detected_codec = _check_codecs(codecs)
@@ -1100,24 +1228,47 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                         state.log(f"[PROBE] Fresh token re-fetch failed ({_rfe}) — using probe URL")
 
                 # ── Route result ──────────────────────────────────────────────
+                # audio_track: optional zero-based audio stream index from the
+                # track selector UI.  Appended to hls_proxy URL so ffmpeg can
+                # select the correct stream with -map 0:a:<N>.
+                req_audio_track = data.get("audio_track")
+                at_param = f"&audio_track={int(req_audio_track)}" if isinstance(req_audio_track, int) else ""
+
+                # If a specific audio track was requested on a stream that wouldn't
+                # otherwise need transcoding (direct MPEG-TS, direct HLS), force an
+                # audio_only transcode so ffmpeg can apply -map 0:a:<N>.
+                # Video is copied (not re-encoded) — cheap remux + audio re-encode only.
+                if req_audio_track is not None and not needs_transcode:
+                    needs_transcode  = True
+                    transcode_reason = f"audio track selection (track {req_audio_track})"
+                    state.log(f"[PROBE] Forcing audio_only transcode for track selection: track {req_audio_track}")
+                    # Rebuild stream_info with transcode=True so JS panel reflects new state
+                    stream_info = dict(stream_info, transcode=True, transcode_reason=transcode_reason)
+
                 if needs_transcode:
                     vod_flag = "1" if is_vod else "0"
-                    audio_only_issue = (transcode_reason or "").startswith("incompatible audio")
+                    # audio_only when: bad audio codec, OR explicit track selection
+                    # (video is browser-compatible so no need for full libx264 re-encode)
+                    audio_only_issue = (
+                        (transcode_reason or "").startswith("incompatible audio")
+                        or (transcode_reason or "").startswith("audio track selection")
+                    )
                     if is_multiview:
                         if audio_only_issue:
                             state.log(f"[PROBE] MV audio → hls_proxy: {transcode_reason}")
-                            audio_url = f"/api/hls_proxy?audio_only=1&vod={vod_flag}&url={quote(url, safe='')}"
+                            audio_url = f"/api/hls_proxy?audio_only=1&vod={vod_flag}{at_param}&url={quote(url, safe='')}"
                             return jsonify({"url": audio_url, "hevc": False, "stream_info": stream_info})
                         else:
                             return jsonify({"url": url, "hevc": True, "stream_info": stream_info})
                     else:
-                        state.log(f"[PROBE] Routing to transcode proxy: {transcode_reason}")
+                        state.log(f"[PROBE] Routing to transcode proxy: {transcode_reason}"
+                                  + (f" [audio track {req_audio_track}]" if at_param else ""))
                         if audio_only_issue:
                             # Copy video stream, re-encode audio only — much cheaper
                             # than a full libx264 video re-encode.
-                            transcode_url = f"/api/hls_proxy?audio_only=1&vod={vod_flag}&url={quote(url, safe='')}"
+                            transcode_url = f"/api/hls_proxy?audio_only=1&vod={vod_flag}{at_param}&url={quote(url, safe='')}"
                         else:
-                            transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}&url={quote(url, safe='')}"
+                            transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}{at_param}&url={quote(url, safe='')}"
                         return jsonify({"url": transcode_url, "hevc": True, "stream_info": stream_info})
 
             return jsonify({"url": url, "stream_info": stream_info})
