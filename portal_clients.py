@@ -1235,12 +1235,23 @@ class StalkerPortalClient:
     LOAD_PHP_ALT = "/stalker_portal/portal.php"
 
     # ── profile variant table ─────────────────────────────────────────────────
-    # Each row: (new_loader, stb_type, image_version, ver_string, prehash, api_sig, hw2)
+    # Each row: (new_loader, stb_type, image_version, ver_string, prehash, api_sig, hw2, sig_mode)
     # new_loader=True  → device_id2 param = device_id  (portal registered them equal)
     # new_loader=False → device_id2 param = sha256(serialcut)  (old-style distinct IDs)
     # Special prehash sentinels:
-    #   "__allf__"    → override device_id/2 with 64 f's (Go reference default for unchecked portals)
-    #   "__minimal__" → minimal params only (no sig/prehash/ver/metrics) like Go authenticateWithDeviceIDs
+    #   "__sha1_mac__"   → sha1(MAC) at request-time (most modern portals)
+    #   "__allf__"       → device_id/2 = 64 f's (Go reference default)
+    #   "__minimal__"    → minimal params only (no sig/prehash/ver/metrics)
+    #   "__mag200__"     → MAG200 diagnostic: auth_second_step=0, empty sig, api_sig=0
+    #   "__nodevid__"    → no device_id params (MAC-cookie-only TiviMate style)
+    # Special hw2 sentinels:
+    #   "__sha1_mac__"   → sha1(MAC) at request-time
+    #   "__sn_lower__"   → sn_full.lower() (reference generate_signature style)
+    # sig_mode:
+    #   "default"        → sha256(sncut + mac)           (current standard)
+    #   "plus"           → sha256(sncut + "+" + mac)     (reference generate_signature style)
+    #   "sha256_mac"     → sha256(MAC) as device_id1, sha256(sncut) as device_id2
+    #   "mag270_static"  → static base64 sig, fixed uid from reference tools
     _V1_VER = ("ImageDescription: 0.2.18-r23-250; ImageDate: Thu Sep 13 11:31:16 EEST 2018; "
                "PORTAL version: 5.6.7; API Version: JS API version: 343; "
                "STB API version: 146; Player Engine version: 0x58c")
@@ -1256,28 +1267,82 @@ class StalkerPortalClient:
     _V4_VER = ("ImageDescription: 2.17.02-pub-254; ImageDate: Fri Jan 15 15:20:44 EET 2016; "
                "PORTAL version: 5.6.1; API Version: JS API version: 330; "
                "STB API version: 135; Player Engine version: 0x550")
-    _ALL_F = "f" * 64  # Go reference default when portal does not enforce device_id check
+    # MAG270 — Dec 2017 firmware
+    _V5_VER = ("ImageDescription: 0.2.18-r22-pub-270; ImageDate: Tue Dec 19 11:33:53 EET 2017; "
+               "PORTAL version: 5.6.6; API Version: JS API version: 328; "
+               "STB API version: 134; Player Engine version: 0x566")
+    # MAG254 r23 — Oct 2018, hw_version=2.6-IB-00
+    _V6_VER = ("ImageDescription: 0.2.18-r23-254; ImageDate: Wed Oct 31 15:22:54 EEST 2018; "
+               "PORTAL version: 5.5.0; API Version: JS API version: 343; "
+               "STB API version: 146; Player Engine version: 0x58c")
+    # MAG250 r14 older portal 5.5.0 variant (seen in some checker tools)
+    _V7_VER = ("ImageDescription: 0.2.18-r14-pub-250; ImageDate: Fri Jan 15 15:20:44 EET 2016; "
+               "PORTAL version: 5.5.0; API Version: JS API version: 328; "
+               "STB API version: 134; Player Engine version: 0x566")
+    _ALL_F = "f" * 64
+
     _PROFILE_VARIANTS = [
-        # new_loader  stb_type   img_ver      ver          prehash                                    api_sig  hw2
-        # api_sig 262: hw_version_2 = sha1(mac).hexdigest()  — dynamic per MAC (__sha1_mac__ sentinel)
-        (True,  "MAG250", "218",      _V1_VER, "53302b3a8bcca197b7366e83d5e2883f99973f09", "262", "__sha1_mac__"),
-        (False, "MAG250", "218",      _V1_VER, "53302b3a8bcca197b7366e83d5e2883f99973f09", "262", "__sha1_mac__"),
-        # api_sig 263: hw_version_2 is static per STB model
-        (False, "MAG254", "0.2.18",   _V2_VER, "efd15c16dc497e0839ff5accfdc6ed99c32c4e2a", "263", "1.7-BD-00"),
-        (False, "MAG250", "0.2.18",   _V0_VER, "efd15c16dc497e0839ff5accfdc6ed99c32c4e2a", "263", ""),
-        (False, "MAG520", "2.20.04",  _V3_VER, "efd15c16dc497e0839ff5accfdc6ed99c32c4e2a", "263", ""),
-        (False, "MAG254", "2.17.02",  _V4_VER, "efd15c16dc497e0839ff5accfdc6ed99c32c4e2a", "263", "7c431b0aec69b2f0194c0680c32fe4e3"),
-        # Fallback: 64-char all-F device IDs (Go reference default for unchecked portals)
-        (True,  "MAG254", "0.2.18",   _V2_VER, "__allf__",    "263", "1.7-BD-00"),
-        # Fallback: minimal params — no sig/prehash/ver/metrics, like Go authenticateWithDeviceIDs
-        (True,  "MAG254", "0.2.18",   "",       "__minimal__", "263", ""),
-        # Fallback: no device_id params at all — TiviMate style, relies on MAC cookie only
-        (True,  "MAG250", "218",      _V1_VER, "__nodevid__", "262", "__sha1_mac__"),
+        # (new_loader, stb_type, img_ver, ver_str, prehash, api_sig, hw2, sig_mode)
+        #
+        # ── TIER 1: sha1(mac) prehash, default sig — most permissive modern portals ───────────
+        (True,  "MAG250", "218",      _V1_VER, "__sha1_mac__",                                     "262", "__sha1_mac__",                                    "default"),
+        (False, "MAG250", "218",      _V1_VER, "__sha1_mac__",                                     "262", "__sha1_mac__",                                    "default"),
+        (False, "MAG254", "0.2.18",   _V2_VER, "__sha1_mac__",                                     "263", "1.7-BD-00",                                       "default"),
+        (False, "MAG254", "2.17.02",  _V4_VER, "__sha1_mac__",                                     "263", "7c431b0aec69b2f0194c0680c32fe4e3",                 "default"),
+        #
+        # ── TIER 2: sha1(mac) prehash, plus-separator sig sha256(sncut+"+"+mac) ────────────────
+        # Reference generate_signature() style: dev1=sha256(MAC), dev2=sha256(sncut), hw2=sn.lower()
+        (True,  "MAG250", "218",      _V1_VER, "__sha1_mac__",                                     "262", "__sn_lower__",                                     "plus"),
+        (False, "MAG250", "218",      _V1_VER, "__sha1_mac__",                                     "262", "__sn_lower__",                                     "plus"),
+        (False, "MAG254", "0.2.18",   _V2_VER, "__sha1_mac__",                                     "263", "1.7-BD-00",                                       "plus"),
+        (False, "MAG254", "2.17.02",  _V4_VER, "__sha1_mac__",                                     "263", "7c431b0aec69b2f0194c0680c32fe4e3",                 "plus"),
+        #
+        # ── TIER 2b: sha1(mac) prehash, base64 sig — base64(sha256(sncut + mac.upper())) ───────
+        # Some portal software expects a URL-safe base64 signature rather than a hex digest.
+        (True,  "MAG250", "218",      _V1_VER, "__sha1_mac__",                                     "262", "__sha1_mac__",                                    "b64"),
+        (False, "MAG250", "218",      _V1_VER, "__sha1_mac__",                                     "262", "__sha1_mac__",                                    "b64"),
+        (False, "MAG254", "0.2.18",   _V2_VER, "__sha1_mac__",                                     "263", "1.7-BD-00",                                       "b64"),
+        #
+        # ── TIER 3: MAG200 / diagnostic style ───────────────────────────────────────────────────
+        (True,  "MAG200", "",         "",       "__mag200__",                                       "0",   "",                                                  "default"),
+        #
+        # ── TIER 4: MAG270 — static base64 sig, fixed uid, distinct hw2 ─────────────────────────
+        (True,  "MAG270", "0.2.18",   _V5_VER, "efd15c16dc497e0839ff5accfdc6ed99c32c4e2a",        "262", "85a284d980bbfb74dca9bc370a6ad160e968d350",          "mag270_static"),
+        (False, "MAG270", "0.2.18",   _V5_VER, "efd15c16dc497e0839ff5accfdc6ed99c32c4e2a",        "262", "85a284d980bbfb74dca9bc370a6ad160e968d350",          "mag270_static"),
+        #
+        # ── TIER 5: MAG254 r23, hw_version=2.6-IB-00, distinct prehash+hw2 ──────────────────────
+        (True,  "MAG254", "0.2.18",   _V6_VER, "4cda0db2375f15f906d2b4df85fc58e05b839d79",        "262", "5ab8c9dceec64b9540bb41bc527e88658aa8c620",          "default"),
+        (False, "MAG254", "0.2.18",   _V6_VER, "4cda0db2375f15f906d2b4df85fc58e05b839d79",        "262", "5ab8c9dceec64b9540bb41bc527e88658aa8c620",          "default"),
+        (True,  "MAG254", "0.2.18",   _V6_VER, "9036d5f7dc752a23dfc087de916552a2de3e70bb",        "262", "39d95ea1affa08953d5951afeb1fbe57f8ffc23a",          "default"),
+        (False, "MAG254", "0.2.18",   _V6_VER, "9036d5f7dc752a23dfc087de916552a2de3e70bb",        "263", "39d95ea1affa08953d5951afeb1fbe57f8ffc23a",          "default"),
+        #
+        # ── TIER 6: static prehashes from real STB firmware ROMs ─────────────────────────────────
+        (True,  "MAG250", "218",      _V1_VER, "53302b3a8bcca197b7366e83d5e2883f99973f09",        "262", "__sha1_mac__",                                    "default"),
+        (False, "MAG250", "218",      _V1_VER, "53302b3a8bcca197b7366e83d5e2883f99973f09",        "262", "__sha1_mac__",                                    "default"),
+        (False, "MAG254", "0.2.18",   _V2_VER, "efd15c16dc497e0839ff5accfdc6ed99c32c4e2a",        "263", "1.7-BD-00",                                       "default"),
+        (False, "MAG250", "0.2.18",   _V0_VER, "efd15c16dc497e0839ff5accfdc6ed99c32c4e2a",        "263", "",                                                  "default"),
+        (False, "MAG520", "2.20.04",  _V3_VER, "efd15c16dc497e0839ff5accfdc6ed99c32c4e2a",        "263", "",                                                  "default"),
+        (False, "MAG254", "2.17.02",  _V4_VER, "efd15c16dc497e0839ff5accfdc6ed99c32c4e2a",        "263", "7c431b0aec69b2f0194c0680c32fe4e3",                 "default"),
+        (True,  "MAG250", "218",      _V1_VER, "6b1e45cc169162c9e876a29707236e54c24631db",        "262", "__sha1_mac__",                                    "default"),
+        (False, "MAG250", "218",      _V1_VER, "6b1e45cc169162c9e876a29707236e54c24631db",        "262", "__sha1_mac__",                                    "default"),
+        #
+        # ── TIER 7: literal prehash strings used by some portal checkers ─────────────────────────
+        (True,  "MAG250", "218",      _V1_VER, "false",                                            "262", "__sha1_mac__",                                    "default"),
+        (True,  "MAG250", "218",      _V1_VER, "0",                                                "262", "__sha1_mac__",                                    "default"),
+        #
+        # ── TIER 8: no device_id params — MAC-cookie-only style ──────────────────────────────────
+        (True,  "MAG250", "218",      _V7_VER, "__nodevid__",                                      "262", "__sha1_mac__",                                    "default"),
+        #
+        # ── TIER 9: allf device IDs fallback ─────────────────────────────────────────────────────
+        (True,  "MAG254", "0.2.18",   _V2_VER, "__allf__",                                         "263", "1.7-BD-00",                                       "default"),
+        #
+        # ── TIER 10: minimal params fallback ─────────────────────────────────────────────────────
+        (True,  "MAG254", "0.2.18",   "",       "__minimal__",                                      "263", "",                                                  "default"),
     ]
 
     def __init__(self, base_url: str, mac: str, log_cb,
                  custom_sn: str = "", custom_device_id: str = "",
-                 custom_device_id2: str = ""):
+                 custom_device_id2: str = "", custom_signature: str = ""):
         self.base = normalize_base_url(base_url)
         self.mac = mac.strip().upper()
         self.log = log_cb
@@ -1285,7 +1350,7 @@ class StalkerPortalClient:
         self.token = None
         self.bearer_token = None
         self._random = None
-        self._last_profile_js: dict = {}  # cached from handshake() variant loop
+        self._last_profile_js: dict | None = None  # cached from handshake() variant loop; {} = tried+failed; None = not yet tried
         # Derived IDs — reference algorithm:
         #   SN       = md5(MAC).upper()      (full 32-char hex)
         #   SNCUT    = SN[:13]
@@ -1304,10 +1369,13 @@ class StalkerPortalClient:
             self.serial    = custom_sn.strip().upper()
             self.serialcut = self.serial[:13]
         self.sg        = self.serialcut + self.mac
-        self.signature = hashlib.sha256(self.sg.encode("utf-8")).hexdigest().upper()
+        self.signature = (custom_signature.strip()
+                          if custom_signature.strip()
+                          else hashlib.sha256(self.sg.encode("utf-8")).hexdigest().upper())
         self.log(f"[STALKER] Computed IDs — SN={self.serial}  SNCUT={self.serialcut}  "
                  f"deviceid1={self.device_id}  deviceid2={self.device_id2}  "
-                 f"signature={self.signature}")
+                 f"signature={self.signature}"
+                 + (" (custom)" if custom_signature.strip() else ""))
         # Cache for channel id → logo URL, populated lazily from get_all_channels
         self._ch_logo_cache: dict | None = None
         # Running in-memory logo cache for VOD / series — populated from items
@@ -1414,13 +1482,26 @@ class StalkerPortalClient:
     def _generate_random(self) -> str:
         return ''.join(random.choices('0123456789abcdef', k=40))
 
-    def _generate_metrics(self, stb_type: str = "MAG250") -> str:
+    def _generate_metrics(self, stb_type: str = "MAG250", uid_override: str = "",
+                          extra: dict | None = None) -> str:
+        """Build the metrics JSON string sent in the get_profile request.
+
+        extra — optional dict of additional fields to include (e.g. hw_version_2,
+        hw_version, image_version — used by the reference generate_signature style).
+        """
         if not self._random:
             self._random = self._generate_random()
-        return json.dumps({
-            "mac": self.mac, "sn": self.serialcut, "type": "STB",
-            "model": stb_type, "uid": self.device_id, "random": self._random
-        })
+        d: dict = {
+            "mac": self.mac,
+            "sn": self.serialcut,
+            "type": "STB",
+            "model": stb_type,
+            "uid": uid_override or self.device_id,
+            "random": self._random,
+        }
+        if extra:
+            d.update(extra)
+        return json.dumps(d)
 
     async def _read_json(self, r: aiohttp.ClientResponse, tag=None):
         """Read response text, log raw content (when tag is not None), then parse JSON."""
@@ -1431,7 +1512,7 @@ class StalkerPortalClient:
                 self.log(f"[STALKER] {tag} read error: {e}")
             return None
         if tag:
-            preview = repr(text[:300]) if text else "''"
+            preview = repr(text[:800]) if text else "''"
             self.log(f"[STALKER] {tag} raw: {preview}")
         if not text or not text.strip():
             return None
@@ -1442,29 +1523,32 @@ class StalkerPortalClient:
             return json.loads(text)
         except Exception:
             return None
-        if not text or not text.strip():
-            return None
-        t = text.lstrip()
-        if not (t.startswith("{") or t.startswith("[")):
-            return None
-        try:
-            return json.loads(text)
         except Exception:
             return None
 
     @staticmethod
     def _is_profile_conflict(js: dict) -> bool:
-        """Return True when the portal signals a device_id mismatch/conflict."""
+        """Return True when this variant should be skipped and the next tried.
+
+        Covers two cases:
+        - status 1 + conflict/rejection keywords: portal recognises the MAC/device but rejects the
+          specific device_id/prehash combination (firmware mismatch, hash error, device conflict,
+          old firmware, etc.)
+        - status 2: portal is issuing an authentication challenge — the session is not
+          authenticated, so all subsequent requests will return 'Authorization failed.'
+          We must keep iterating variants rather than accepting this as a valid profile.
+        """
         if not isinstance(js, dict):
             return False
-        msg = str(js.get("msg", "") or js.get("block_msg", "")).lower()
         status = js.get("status")
-        return (status in (1, 2)) and any(
-            kw in msg for kw in (
-                "conflict", "authentication request", "mismatch",
-                "device", "hash", "not valid", "old firmware", "not supported"
-            )
-        )
+        if status == 2:
+            return True
+        msg = (str(js.get("msg", "") or "") + " " + str(js.get("block_msg", "") or "")).lower()
+        return (status == 1 and any(kw in msg for kw in (
+            "conflict", "mismatch", "device", "hash", "not valid", "not supported",
+            "firmware", "outdated", "old firmware", "update", "not registered",
+        )))
+
     # ── auth ──────────────────────────────────────────────────────────────────
 
     async def handshake(self) -> str:
@@ -1508,41 +1592,106 @@ class StalkerPortalClient:
         self.log(f"[STALKER] Token acquired: {self.token[:16]}…")
 
         # Try each profile variant in order; stop at first success
-        self._last_profile_js: dict = {}
-        for idx, (new_loader, stb_type, img_ver, ver_str, prehash, api_sig, hw2) in enumerate(self._PROFILE_VARIANTS):
+        self._last_profile_js: dict | None = None
+        for idx, (new_loader, stb_type, img_ver, ver_str, prehash, api_sig, hw2, sig_mode) in enumerate(self._PROFILE_VARIANTS):
             label = prehash if prehash.startswith("__") else prehash[:8] + "…"
             self.log(f"[STALKER] Getting profile… (variant {idx+1}/{len(self._PROFILE_VARIANTS)}: "
                      f"new_loader={new_loader} stb={stb_type} prehash={label})")
-            js = await self._get_profile_variant(new_loader, stb_type, img_ver, ver_str, prehash, api_sig, hw2)
+            js = await self._get_profile_variant(new_loader, stb_type, img_ver, ver_str, prehash, api_sig, hw2, sig_mode)
             if self._is_profile_conflict(js):
-                self.log(f"[STALKER] Profile conflict on variant {idx+1} — trying next")
+                status = js.get("status", "?")
+                msg    = js.get("msg") or js.get("block_msg") or ""
+                self.log(f"[STALKER] Profile variant {idx+1} rejected (status={status} msg={msg!r}) — trying next")
                 continue
             self._last_profile_js = js  # cache for get_profile() callers
             break
+        else:
+            # All variants exhausted without a successful profile — portal likely has a strict
+            # device_id lock or requires credentials we cannot satisfy. Proceed so the caller
+            # can still report a partial connection, but log the failure clearly.
+            self.log("[STALKER] ⚠ All profile variants exhausted — no authenticated profile. "
+                     "Subsequent requests will likely return 'Authorization failed.'")
+            self._last_profile_js = {}  # empty dict: signals "tried but failed" without re-triggering
 
         return self.token
 
     async def _get_profile_variant(self, new_loader: bool, stb_type: str, image_version: str,
-                                    ver_string: str, prehash: str, api_sig: str, hw2: str) -> dict:
+                                    ver_string: str, prehash: str, api_sig: str, hw2: str,
+                                    sig_mode: str = "default") -> dict:
         """Send a get_profile request with the given variant parameters. Returns js dict."""
         assert self.session is not None
         from urllib.parse import urlencode
         if not self._random:
             self._random = self._generate_random()
 
-        # ── determine device IDs for this variant ──────────────────────────
+        # ── compute device IDs based on sig_mode ───────────────────────────
         if prehash == "__allf__":
             dev1 = dev2 = self._ALL_F
+        elif sig_mode == "plus":
+            # Reference generate_signature(): dev1=sha256(MAC), dev2=sha256(sncut)
+            dev1 = hashlib.sha256(self.mac.encode("utf-8")).hexdigest().upper()
+            dev2 = hashlib.sha256(self.serialcut.encode("utf-8")).hexdigest().upper()
         else:
             dev1 = self.device_id
             dev2 = self.device_id if new_loader else self.device_id2
 
-        # Resolve hw2 sentinel before building params
+        # ── compute signature based on sig_mode ────────────────────────────
+        if sig_mode == "plus":
+            # sha256(sncut + "+" + mac) — reference generate_signature style
+            computed_sig = hashlib.sha256(
+                (self.serialcut + "+" + self.mac).encode("utf-8")
+            ).hexdigest().upper()
+        elif sig_mode == "b64":
+            # base64(sha256(sncut + MAC.upper())) — some portal software expects base64
+            import base64 as _b64
+            computed_sig = _b64.b64encode(
+                hashlib.sha256((self.serialcut + self.mac.upper()).encode("utf-8")).digest()
+            ).decode()
+        elif sig_mode == "mag270_static":
+            computed_sig = "OaRqL9kBdR5qnMXL+h6b+i8yeRs9/xWXeKPXpI48VVE="
+        else:
+            computed_sig = self.signature
+
+        # ── resolve hw2 sentinel ───────────────────────────────────────────
         if hw2 == "__sha1_mac__":
             hw2 = hashlib.sha1(self.mac.encode("utf-8")).hexdigest()
+        elif hw2 == "__sn_lower__":
+            hw2 = self.serial.lower()  # sn_full.lower() per reference generate_signature
+
+        # ── resolve prehash sentinel ───────────────────────────────────────
+        if prehash == "__sha1_mac__":
+            prehash = hashlib.sha1(self.mac.encode("utf-8")).hexdigest()
+
+        # ── hw_version — 2.6-IB-00 for MAG254-r23, otherwise 1.7-BD-00 ───
+        hw_version = "2.6-IB-00" if stb_type == "MAG254" and image_version == "0.2.18" and "r23" in ver_string else "1.7-BD-00"
+
+        # ── MAG200 / diagnostic style ─────────────────────────────────────
+        # auth_second_step=0, empty signature, api_signature=0, sha1(MAC) prehash.
+        # Uses self.serial (full 32-char SN) not serialcut — matches what diagnostic tools send.
+        if prehash == "__mag200__":
+            params = {
+                "type": "stb",
+                "action": "get_profile",
+                "hd": "1",
+                "not_valid_token": "0",
+                "video_out": "hdmi",
+                "auth_second_step": "0",
+                "num_banks": "2",
+                "metrics": self._generate_metrics("MAG200"),
+                "sn": self.serial,
+                "stb_type": "MAG200",
+                "client_type": "STB",
+                "device_id": dev1,
+                "device_id2": dev2,
+                "signature": "",
+                "timestamp": int(time.time()),
+                "api_signature": "0",
+                "prehash": hashlib.sha1(self.mac.encode("utf-8")).hexdigest(),
+                "JsHttpRequest": "1-xml",
+            }
 
         # ── minimal-params sentinel — Go authenticateWithDeviceIDs style ───
-        if prehash == "__minimal__":
+        elif prehash == "__minimal__":
             params = {
                 "type": "stb",
                 "action": "get_profile",
@@ -1555,6 +1704,7 @@ class StalkerPortalClient:
                 "random": self._random,
                 "JsHttpRequest": "1-xml",
             }
+
         # ── no device_id params — TiviMate style, relies on MAC cookie only ──
         elif prehash == "__nodevid__":
             params = {
@@ -1569,16 +1719,31 @@ class StalkerPortalClient:
                 "image_version": image_version,
                 "video_out": "hdmi",
                 "auth_second_step": "1",
-                "hw_version": "1.7-BD-00",
+                "hw_version": hw_version,
                 "metrics": self._generate_metrics(stb_type),
                 "hw_version_2": hw2,
                 "timestamp": int(time.time()),
                 "api_signature": api_sig,
-                "prehash": "53302b3a8bcca197b7366e83d5e2883f99973f09",
+                "prehash": hashlib.sha1(self.mac.encode("utf-8")).hexdigest(),
                 "random": self._random,
                 "JsHttpRequest": "1-xml",
             }
+
         else:
+            # For "plus" sig_mode, the reference generate_signature() style embeds additional
+            # fields inside the metrics JSON itself (hw_version_2, hw_version, image_version).
+            # For mag270_static, use a fixed uid from the reference tool's hardcoded value.
+            metrics_extra: dict | None = None
+            metrics_uid = ""
+            if sig_mode == "plus":
+                metrics_extra = {
+                    "hw_version_2": hw2,
+                    "hw_version": hw_version,
+                    "image_version": image_version,
+                }
+            elif sig_mode == "mag270_static":
+                metrics_uid = "BB340DE42B8A3032F84F5CAF137AEBA287CE8D51F44E39527B14B6FC0B81171E"
+
             params = {
                 "type": "stb",
                 "action": "get_profile",
@@ -1592,11 +1757,11 @@ class StalkerPortalClient:
                 "video_out": "hdmi",
                 "device_id": dev1,
                 "device_id2": dev2,
-                "signature": self.signature,
+                "signature": computed_sig,
                 "auth_second_step": "1",
-                "hw_version": "1.7-BD-00",
+                "hw_version": hw_version,
                 "not_valid_token": "0",
-                "metrics": self._generate_metrics(stb_type),
+                "metrics": self._generate_metrics(stb_type, uid_override=metrics_uid, extra=metrics_extra),
                 "hw_version_2": hw2,
                 "timestamp": int(time.time()),
                 "api_signature": api_sig,
@@ -1606,6 +1771,7 @@ class StalkerPortalClient:
             }
 
         url = f"{self.base}{self.LOAD_PHP}?{urlencode(params)}"
+        self.log(f"[STALKER] Profile URL: {url}")
         headers = self._headers(include_auth=True, include_token=False)
         async with self.session.get(url, headers=headers) as r:
             self.log(f"[STALKER] Profile HTTP {r.status}")
@@ -1623,10 +1789,10 @@ class StalkerPortalClient:
 
     async def get_profile(self) -> dict:
         """Return the profile js cached by handshake(). If called before handshake, run variant 1."""
-        if self._last_profile_js:
+        if self._last_profile_js is not None:
             return self._last_profile_js
-        new_loader, stb_type, img_ver, ver_str, prehash, api_sig, hw2 = self._PROFILE_VARIANTS[0]
-        js = await self._get_profile_variant(new_loader, stb_type, img_ver, ver_str, prehash, api_sig, hw2)
+        new_loader, stb_type, img_ver, ver_str, prehash, api_sig, hw2, sig_mode = self._PROFILE_VARIANTS[0]
+        js = await self._get_profile_variant(new_loader, stb_type, img_ver, ver_str, prehash, api_sig, hw2, sig_mode)
         self._last_profile_js = js
         return js
 
@@ -3142,4 +3308,3 @@ class M3UClient:
                     try: progress_cb(count, name)
                     except TypeError: progress_cb(count)
         self.log(f"[M3U] Finished {cat_title} (items: {count})")
-
