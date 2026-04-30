@@ -141,6 +141,7 @@ class AppState:
         self.stalker_device_id:  str = ""
         self.stalker_device_id2: str = ""
         self.stalker_sn:         str = ""
+        self.stalker_signature:  str = ""
         self.cats_cache: dict = {}
         self._items_cache: dict = {}  # (mode, cat_id) → list of items, session-wide
         self._prefetch_running: bool = False  # True while bg channel prefetch is in-flight
@@ -306,6 +307,7 @@ async def _make_client(do_handshake=True):
                 custom_sn=state.stalker_sn,
                 custom_device_id=state.stalker_device_id,
                 custom_device_id2=state.stalker_device_id2,
+                custom_signature=state.stalker_signature,
             )
         else:
             client = PortalClient(state.url, state.mac, state.log)
@@ -637,6 +639,7 @@ def api_connect():
         state.stalker_device_id  = data.get("stalker_device_id",  "").strip()
         state.stalker_device_id2 = data.get("stalker_device_id2", "").strip()
         state.stalker_sn         = data.get("stalker_sn",         "").strip()
+        state.stalker_signature  = data.get("stalker_signature",  "").strip()
         state.cats_cache = {}
         state._items_cache = {}
         state.m3u_cache = None
@@ -2041,6 +2044,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
             <div style="display:flex;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">SN</label><input id="i-sn" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px;flex:1"></div>
             <div style="display:flex;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">Device ID</label><input id="i-devid" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px;flex:1"></div>
             <div style="display:flex;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">Device ID2</label><input id="i-devid2" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px;flex:1"></div>
+            <div style="display:flex;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">Signature</label><input id="i-sig" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px;flex:1"></div>
           </div>
         </details>
         <div style="display:flex;gap:6px;align-items:center">
@@ -2554,6 +2558,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
               <div class="pl-row"><label style="min-width:80px;font-size:11px">SN</label><input id="pl-sn" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
               <div class="pl-row"><label style="min-width:80px;font-size:11px">Device ID</label><input id="pl-devid" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
               <div class="pl-row"><label style="min-width:80px;font-size:11px">Device ID2</label><input id="pl-devid2" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
+              <div class="pl-row"><label style="min-width:80px;font-size:11px">Signature</label><input id="pl-sig" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
             </div>
           </details>
           <div class="pl-row"><label>EPG</label><textarea id="pl-mac-epg" rows="2" placeholder="External EPG URL(s), one per line (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;width:100%"></textarea></div>
@@ -2709,6 +2714,7 @@ async function doConnect(){
     stalker_sn:         CT==='mac' ? (document.getElementById('i-sn')?.value.trim()||'')     : '',
     stalker_device_id:  CT==='mac' ? (document.getElementById('i-devid')?.value.trim()||'')  : '',
     stalker_device_id2: CT==='mac' ? (document.getElementById('i-devid2')?.value.trim()||'') : '',
+    stalker_signature:  CT==='mac' ? (document.getElementById('i-sig')?.value.trim()||'')    : '',
   };
   const saveBtn = document.getElementById('save-profile-chk');
   const saveToProfile = saveBtn._on || false;
@@ -5484,6 +5490,7 @@ function plSave(){
     stalker_sn:         plCT==='mac' ? (document.getElementById('pl-sn')?.value.trim()||'')    : '',
     stalker_device_id:  plCT==='mac' ? (document.getElementById('pl-devid')?.value.trim()||'') : '',
     stalker_device_id2: plCT==='mac' ? (document.getElementById('pl-devid2')?.value.trim()||''): '',
+    stalker_signature:  plCT==='mac' ? (document.getElementById('pl-sig')?.value.trim()||'')   : '',
   };
   if(plEditId){
     const idx=arr.findIndex(p=>p.id===plEditId);
@@ -5514,6 +5521,7 @@ function plEdit(i){
   if(document.getElementById('pl-sn'))     document.getElementById('pl-sn').value=p.stalker_sn||'';
   if(document.getElementById('pl-devid'))  document.getElementById('pl-devid').value=p.stalker_device_id||'';
   if(document.getElementById('pl-devid2')) document.getElementById('pl-devid2').value=p.stalker_device_id2||'';
+  if(document.getElementById('pl-sig'))    document.getElementById('pl-sig').value=p.stalker_signature||'';
   // scroll form into view
   document.querySelector('.pl-add').scrollIntoView({behavior:'smooth'});
 }
@@ -5548,6 +5556,7 @@ async function plConnect(i){
   const sn=document.getElementById('i-sn'); if(sn) sn.value=p.stalker_sn||'';
   const di=document.getElementById('i-devid'); if(di) di.value=p.stalker_device_id||'';
   const di2=document.getElementById('i-devid2'); if(di2) di2.value=p.stalker_device_id2||'';
+  const sig=document.getElementById('i-sig'); if(sig) sig.value=p.stalker_signature||'';
   await doConnect();
 }
 
