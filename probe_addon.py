@@ -1093,6 +1093,7 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
             url = run_async(resolve())
             is_multiview = request.args.get('mv') == '1'
 
+            stream_info = {}  # always defined — populated later if ffprobe runs
             if url and isinstance(url, str):
                 needs_transcode  = False
                 detected_codec   = None
@@ -1103,7 +1104,7 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                 url_lower      = url_lower_full.split('?')[0]
 
                 codecs      = None   # populated when ffprobe runs
-                stream_info = {}     # always included in JSON response
+                # stream_info initialized before this block
 
                 # ── Fast path: HEVC by extension ─────────────────────────────
                 if any(ext in url_lower for ext in ['.hevc', '.265', '.h265']):
