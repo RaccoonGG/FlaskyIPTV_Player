@@ -295,9 +295,10 @@ def _start_recording_unlocked(job: dict):
     end_dt   = datetime.fromisoformat(job["endTime"].replace("Z", "+00:00"))
     duration = max(10, int((end_dt - start_dt).total_seconds()))
 
+    _ua = getattr(_app_state, "stream_ua", "VLC/3.0.0 LibVLC/3.0.0") if _app_state else "VLC/3.0.0 LibVLC/3.0.0"
     cmd = [
         ffmpeg, "-hide_banner", "-nostdin",
-        "-user_agent", "VLC/3.0.0 LibVLC/3.0.0",
+        "-user_agent", _ua,
         "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
         "-i", stream_url,
         "-t", str(duration),
