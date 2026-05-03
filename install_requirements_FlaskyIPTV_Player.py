@@ -38,7 +38,7 @@ def err(msg):  print(f"{RED}  ✗  {msg}{RESET}")
 def info(msg): print(f"{CYAN}  →  {msg}{RESET}")
 def hdr(msg):  print(f"\n{BOLD}{msg}{RESET}")
 
-SCRIPT_NAME = "FlaskyIPTV_Player.py"
+SCRIPT_NAME = "FlaskyIPTV_Player_byGG.py"
 
 # ── Termux detection ──────────────────────────────────────────────────────────
 def is_termux() -> bool:
