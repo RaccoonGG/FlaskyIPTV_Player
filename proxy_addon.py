@@ -334,7 +334,7 @@ def register_proxy_routes(flask_app, state):
                 except Exception:
                     _stream_referer = url
                 headers = {
-                    "User-Agent": "VLC/3.0.0 LibVLC/3.0.0",
+                    "User-Agent": state.stream_ua,
                     "Accept":     "*/*",
                     "Referer":    _stream_referer,
                     "Connection": "keep-alive",
@@ -544,7 +544,7 @@ def register_proxy_routes(flask_app, state):
 
         base_input = [
             ffmpeg, "-hide_banner", "-nostdin",
-            "-user_agent", "VLC/3.0.0 LibVLC/3.0.0",
+            "-user_agent", state.stream_ua,
             "-referer", url.rsplit('/', 1)[0] + "/",
             "-reconnect", "1",
             "-reconnect_streamed", "1",
@@ -560,6 +560,8 @@ def register_proxy_routes(flask_app, state):
         # Without explicit maps ffmpeg auto-selects, which is correct for the
         # default (no track preference) case.
         map_args = ["-map", "0:v:0", "-map", f"0:a:{audio_track}"] if audio_track is not None else []
+        if audio_track is not None:
+            state.log(f"[ffmpeg] Audio track: {audio_track} (-map 0:a:{audio_track})")
 
         if transcode:
             cmd = base_input + map_args + [
