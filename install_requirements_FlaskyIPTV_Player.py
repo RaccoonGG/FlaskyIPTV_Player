@@ -179,6 +179,7 @@ def check_required_addons() -> bool:
         ("portal_clients.py",  "Portal client classes — MAC/Stalker, Xtream, M3U"),
         ("proxy_addon.py",     "Image proxy, HLS proxy, video proxy, ffmpeg stream transcode"),
         ("download_addon.py",  "MKV/M3U download, quick record, ffmpeg/yt-dlp helpers"),
+        ("probe_addon.py",     "Stream codec probing, HEVC/AC3 detection, pre-play URL resolution"),
         ("epg_addon.py",       "EPG, Catch-up TV, What's On Now, XMLTV support"),
         ("subtitles_addon.py", "Subtitle UI, OpenSubtitles search/download, local subtitle file loading"),
     ]
