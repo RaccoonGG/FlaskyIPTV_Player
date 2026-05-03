@@ -79,7 +79,7 @@ The installer will:
 - Install all required pip packages (`flask`, `aiohttp`, `requests`)
 - Install `yt-dlp` as an optional package
 - Check if `ffmpeg` and `ffprobe` are available in PATH
-- **Verify required addon files** (`portal_clients.py`, `proxy_addon.py`, `download_addon.py`, `epg_addon.py`, `subtitles_addon.py`) are present
+- **Verify required addon files** (`portal_clients.py`, `proxy_addon.py`, `download_addon.py`, `probe_addon.py`, `epg_addon.py`, `subtitles_addon.py`) are present
 - **Detect `cast_addon.py`** and interactively offer to install each cast protocol package
 - **Detect `multiview_addon.py`** and verify its dependencies (ffmpeg + yt-dlp)
 - **Detect `dvr_addon.py`** and verify its dependencies (ffmpeg required)
@@ -284,6 +284,19 @@ pip install pyatv                 # AirPlay
   3. **IMDb title search** — fallback only when no ID is available; performs a title-name search on IMDb
 - Direct ID lookups are instant and always land on the correct page; the title-search fallback is used only as a last resort
 
+### Stream Probing (`probe_addon.py`)
+
+Automatic codec detection and pre-play URL resolution run before every stream is handed to the player.
+
+- **Codec detection** — inspects each stream before playback to identify video codec (H.264 / H.265 / HEVC) and audio codec (AAC, AC3, EAC3, MP3, etc.) without buffering the full stream
+- **Automatic HEVC routing** — if the stream is detected as HEVC/H.265, it is automatically routed through the ffmpeg HLS proxy so any browser can play it without native HEVC support
+- **AC3 / EAC3 audio routing** — streams with Dolby AC3 or EAC3 audio (which browsers cannot decode natively) are similarly routed through the proxy for transcoding to AAC
+- **Pre-play URL resolution** — resolves `ffrt://` and `ffmpeg://` Stalker pseudo-URLs to real stream addresses before playback; also handles Xtream single-use token URLs that must be freshly resolved on each play
+- **MPEG-TS byte-scan fallback** — when ffprobe is unavailable, a lightweight pure-Python PMT parser reads the first ~1880 bytes of the stream to detect HEVC and bad audio without spawning any subprocess
+- **Two-pass ffprobe strategy** — first pass uses a short analysis window (2 s / 500 KB) for fast detection; if that returns no streams (common for HLS sources), a second pass with full HLS protocol whitelist retries automatically
+
+**Requires:** `probe_addon.py` in the same directory. `ffprobe` (bundled with ffmpeg) is strongly recommended for accurate detection; the pure-Python fallback covers the most common cases when ffprobe is absent.
+
 ### External Player
 - Send any stream to an external player instead of the built-in one
 - **Desktop:** set path to any player executable (VLC, MPV, MPC-HC, etc.)
@@ -349,7 +362,7 @@ All settings are saved in browser localStorage and persist across sessions.
 
 - The app is split across multiple files — the main `.py` entry point plus required and optional addon modules, all in the same directory
 - `cast_addon.py`, `multiview_addon.py`, `dvr_addon.py`, and `subtitles_addon.py` are fully self-contained drop-in modules; the main app degrades gracefully if any of them are absent
-- `portal_clients.py`, `proxy_addon.py`, `download_addon.py`, `epg_addon.py`, and `subtitles_addon.py` are required — the app will not function correctly without them
+- `portal_clients.py`, `proxy_addon.py`, `download_addon.py`, `probe_addon.py`, `epg_addon.py`, and `subtitles_addon.py` are required — the app will not function correctly without them
 - The HTML is a Jinja2 template rendered by Flask's `render_template_string`
 - HLS playback uses **HLS.js** loaded from CDN
 - Multi-View playback uses **mpegts.js** loaded from CDN — each tile decodes an MPEG-TS stream via MSE
