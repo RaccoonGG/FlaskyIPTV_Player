@@ -2453,9 +2453,12 @@ def register_cast_routes(flask_app, app_state, run_async_fn, make_client_fn):
             # Chromecast / AirPlay / HLS: use raw URL, headers injected below
             source_url = url
 
-        # VLC User-Agent for Chromecast: inject into FFmpeg's urllib pump so
-        # it reaches the IPTV server exactly as Flask's /api/proxy would send it.
-        _vlc_ua = {"User-Agent": "VLC/3.0.0 LibVLC/3.0.0", "Accept": "*/*"}
+        # Effective User-Agent for this session: inject into FFmpeg's urllib pump
+        # so it reaches the IPTV server exactly as Flask's /api/proxy would send it.
+        # Without the correct UA the server may return an HTML error page and
+        # FFmpeg fails with "Invalid data found when processing input".
+        _eff_ua = getattr(app_state, "stream_ua", "VLC/3.0.0 LibVLC/3.0.0")
+        _vlc_ua = {"User-Agent": _eff_ua, "Accept": "*/*"}
 
         # AirPlay: pass the raw URL directly to pyatv (same approach as casting.py).
         # pyatv sends it to the device; the device fetches it.
