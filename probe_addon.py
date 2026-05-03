@@ -259,7 +259,7 @@ def probe_stream_codecs(url: str, pre_input_args=None, timeout=15,
 
 # ── Pure-Python MPEG-TS byte-scan fallback ────────────────────────────────────
 
-def _probe_ts_streams(url: str) -> dict:
+def _probe_ts_streams(url: str, ua: str = "VLC/3.0.0 LibVLC/3.0.0") -> dict:
     """Read the first ~1880 bytes of a MPEG-TS stream and parse the PMT to identify
     video and audio stream types — without invoking ffprobe.
 
@@ -280,7 +280,7 @@ def _probe_ts_streams(url: str) -> dict:
     """
     result = {"hevc": False, "bad_audio": False, "audio_codec": ""}
     try:
-        hdrs = {"User-Agent": "VLC/3.0", "Accept": "*/*"}
+        hdrs = {"User-Agent": ua, "Accept": "*/*"}
         r = _requests_lib.get(url, headers=hdrs, stream=True, timeout=5, verify=False,
                               proxies={"http": None, "https": None})
         raw = b""
@@ -435,21 +435,22 @@ def _build_stream_info(codecs: dict, transcode_reason: str | None, is_hls: bool 
         return f"{bps // 1000} kbps"
 
     return {
-        "vcodec":          vcodec,
-        "acodec":          acodec,
-        "res_label":       res_label,
-        "res_str":         res_str,
-        "width":           w,
-        "height":          h,
-        "fps":             fps_str,
-        "bitrate":         _fmt_bitrate(total_bps),
-        "video_bitrate":   _fmt_bitrate(video_bps),
-        "audio_bitrate":   _fmt_bitrate(audio_bps),
-        "transcode":       bool(transcode_reason),
-        "transcode_reason": transcode_reason or "",
-        "is_hls":          is_hls,
-        "audio_tracks":    codecs.get("audio_tracks", []),
-        "subtitle_tracks": codecs.get("subtitle_tracks", []),
+        "vcodec":             vcodec,
+        "acodec":             acodec,
+        "res_label":          res_label,
+        "res_str":            res_str,
+        "width":              w,
+        "height":             h,
+        "fps":                fps_str,
+        "bitrate":            _fmt_bitrate(total_bps),
+        "video_bitrate":      _fmt_bitrate(video_bps),
+        "audio_bitrate":      _fmt_bitrate(audio_bps),
+        "transcode":          bool(transcode_reason),
+        "transcode_reason":   transcode_reason or "",
+        "is_hls":             is_hls,
+        "audio_tracks":       codecs.get("audio_tracks", []),
+        "subtitle_tracks":    codecs.get("subtitle_tracks", []),
+        "active_audio_track": codecs.get("active_audio_track", 0),
     }
 
 
@@ -467,12 +468,14 @@ def _log_stream_info(state, info: dict, source: str = "ffprobe") -> None:
         lines.append(f"[PROBE] Audio : {info['acodec']}{abr}")
     # Always log audio track count and per-track detail regardless of count or tags
     audio_tracks = info.get("audio_tracks", [])
-    lines.append(f"[PROBE] Audio tracks: {len(audio_tracks)}")
+    active_track = info.get("active_audio_track", 0)
+    lines.append(f"[PROBE] Audio tracks: {len(audio_tracks)} (active: track {active_track})")
     for i, t in enumerate(audio_tracks):
-        lang  = t.get("language") or f"track {i+1}"
-        title = (' "' + t["title"] + '"') if t.get("title") else ""
-        ch    = f"  {t['channels']}ch" if t.get("channels") else ""
-        lines.append(f"[PROBE]   [{lang}] {t['codec'].upper()}{title}{ch}")
+        lang   = t.get("language") or f"track {i+1}"
+        title  = (' "' + t["title"] + '"') if t.get("title") else ""
+        ch     = f"  {t['channels']}ch" if t.get("channels") else ""
+        active = " ◀ active" if i == active_track else ""
+        lines.append(f"[PROBE]   [{lang}] {t['codec'].upper()}{title}{ch}{active}")
     if info.get("bitrate") and not (info.get("video_bitrate") and info.get("audio_bitrate")):
         lines.append(f"[PROBE] Total : {info['bitrate']}")
     # Always log subtitle streams — explicitly say none when absent
@@ -635,6 +638,11 @@ _PROBE_UI_JS = r"""
   let _activeAudio    = -1;   // currently selected HLS audio track index
   let _hlsSubTracks   = [];   // [{id, name, lang}]
   let _activeSub      = -1;
+  // Last resolved stream URL — captured by fetch interceptor so _switchAudio
+  // can rebuild the hls_proxy URL without a full re-resolve round-trip.
+  let _curStreamUrl   = null;
+  let _curStreamName  = null;
+  let _curStreamLive  = true;
   // Touch reveal timer — drives si-touch-visible lifecycle on mobile
   let _revealTimer = null;
 
@@ -717,6 +725,22 @@ _PROBE_UI_JS = r"""
       }, {passive: true});
     }
 
+    // ── Track selector: event delegation on _panel ──────────────────────
+    // A single persistent listener on _panel catches clicks on any
+    // .si-track-btn[data-track-idx] child regardless of innerHTML resets.
+    // This eliminates the need for window._siSwitchAudio to be globally
+    // reachable at click time (inline onclick has that fragile dependency).
+    _panel.addEventListener('click', function(e){
+      const btn = e.target.closest('.si-track-btn[data-track-idx]');
+      if(!btn) return;
+      e.stopPropagation();
+      const idx = parseInt(btn.getAttribute('data-track-idx'), 10);
+      if(!isNaN(idx)){
+        console.log('[probe] track row clicked → _switchAudio(' + idx + ')');
+        _switchAudio(idx);
+      }
+    });
+
     // ── Button click/tap: toggle panel ───────────────────────────────
     // Fix for Bug 2: close no longer permanently removes si-touch-visible.
     // Instead it calls _revealButton(2000) so the button stays briefly visible,
@@ -773,39 +797,99 @@ _PROBE_UI_JS = r"""
   //      transcode so ffmpeg applies -map 0:a:<N>.  Stream restarts through hls_proxy.
   //      Works identically for already-transcoded and previously-direct streams.
   function _switchAudio(trackIdx){
-    if(!_curInfo) return;
+    console.log('[probe] _switchAudio called — trackIdx:', trackIdx,
+                'curInfo.transcode:', _curInfo && _curInfo.transcode,
+                'hlsAudioTracks:', _hlsAudioTracks.length,
+                'curStreamUrl:', _curStreamUrl ? _curStreamUrl.substring(0,60)+'…' : '(none)');
+    if(!_curInfo){ console.warn('[probe] _switchAudio: no _curInfo, abort'); return; }
 
-    // Case 1: live HLS — switch HLS.js audio rendition directly, no restart
-    if(typeof hlsObj !== 'undefined' && hlsObj && typeof hlsObj.audioTrack === 'number'
-       && _hlsAudioTracks.length > 0){
+    // ── Case 1: live HLS with native multi-audio renditions ──────────────
+    // HLS.js tracks the renditions; switch directly with zero restart.
+    // SKIP when transcoded: hlsObj feeds off the ffmpeg single-audio output;
+    // hlsObj.audioTrack = N there is a complete no-op.
+    const _isTranscoded = !!(_curInfo && _curInfo.transcode);
+    if(!_isTranscoded && typeof hlsObj !== 'undefined' && hlsObj
+       && typeof hlsObj.audioTrack === 'number' && _hlsAudioTracks.length > 0){
+      console.log('[probe] Case 1: HLS.js direct switch to track', trackIdx);
       hlsObj.audioTrack = trackIdx;
       _activeAudio = trackIdx;
       _rebuildTracks();
       return;
     }
 
-    // Case 2: all other streams (transcoded or direct MPEG-TS) — re-resolve.
-    // Server forces audio_only transcode when audio_track param is present,
-    // so direct MPEG-TS streams automatically go through hls_proxy with -map 0:a:<N>.
-    if(typeof it === 'undefined' || !it){ return; }
-    const name = it.name || it.o_name || it.fname || '';
-    _activeAudio = trackIdx;   // optimistic highlight before re-resolve completes
+    // ── Case 2: transcoded or direct MPEG-TS ─────────────────────────────
+    // Strategy: rebuild the hls_proxy URL directly from _curStreamUrl (cached
+    // by the fetch interceptor when the stream was resolved).  This avoids a
+    // full re-resolve round-trip through the Stalker portal and eliminates the
+    // brittle dependency on 'it' / filtItems[pIdx].
+    //
+    // _curStreamUrl is set in the fetch intercept to d.url (the hls_proxy URL).
+    // Shape: /api/hls_proxy?transcode=1[&audio_track=N]&url=<encoded-origin>
+    // We strip any existing audio_track param and inject the new one.
+    const name = _curStreamName || '';
+    const isLive = _curStreamLive !== false;
+
+    if(_curStreamUrl){
+      // Build new proxy URL with the requested audio track index
+      let newUrl = _curStreamUrl
+        .replace(/[&?]audio_track=\d+/g, '')   // strip existing param
+        .replace(/[&?]$/, '');                   // clean trailing separator
+      // Append audio_track — determine separator
+      newUrl += (newUrl.includes('?') ? '&' : '?') + 'audio_track=' + trackIdx;
+      // Build a display name that includes the track language so the ▶ log line
+      // clearly shows which track was selected (e.g. "EUROSPORT 1 HD [ENG]").
+      const _trackList = (_curInfo && _curInfo.audio_tracks) || [];
+      const _trackMeta = _trackList[trackIdx];
+      const _trackLang = _trackMeta
+        ? ((_trackMeta.language || _trackMeta.lang || '').toUpperCase() || ('track ' + trackIdx))
+        : ('track ' + trackIdx);
+      const _displayName = name ? (name + ' [' + _trackLang + ']') : _trackLang;
+      console.log('[probe] Case 2 (fast-path): doPlay with audio_track=' + trackIdx + ' (' + _trackLang + ')',
+                  '→', newUrl.substring(0, 80) + '…');
+      _activeAudio = trackIdx;
+      _rebuildTracks();
+      // Snapshot _curInfo BEFORE doPlay — doPlay calls _destroyPlayers which triggers
+      // the patched _siHide(), clearing _curInfo and closing the panel.
+      // We rehydrate immediately after with the snapshot (active track updated) so
+      // the panel reappears showing the new active track and remains clickable.
+      const _infoSnapshot = Object.assign({}, _curInfo, { active_audio_track: trackIdx });
+      if(typeof doPlay === 'function'){
+        doPlay(newUrl, _displayName, {isLive: isLive});
+      }
+      // _siHide has now fired — restore panel from snapshot.
+      // Small delay lets doPlay finish its synchronous setup before we re-show.
+      setTimeout(function(){ _siShow(_infoSnapshot); }, 120);
+      return;
+    }
+
+    // ── Case 2 fallback: no cached URL — re-resolve via /api/resolve ─────
+    // Reached only if _curStreamUrl wasn't captured (edge-case race).
+    // Use filtItems[pIdx] (both are true globals set by playItem).
+    console.warn('[probe] Case 2 fallback: no cached URL, falling back to re-resolve');
+    const _curIt = (typeof filtItems !== 'undefined' && typeof pIdx !== 'undefined')
+                   ? filtItems[pIdx] : null;
+    if(!_curIt){
+      console.error('[probe] _switchAudio: no current item (filtItems[' + pIdx + '] is null)');
+      return;
+    }
+    _activeAudio = trackIdx;
     _rebuildTracks();
     fetch('/api/resolve', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
-        item:        it,
-        mode:        (typeof mode     !== 'undefined' ? mode     : 'live'),
-        category:    (typeof curCat   !== 'undefined' ? curCat   : {}),
+        item:        _curIt,
+        mode:        (typeof mode   !== 'undefined' ? mode   : 'live'),
+        category:    (typeof curCat !== 'undefined' ? curCat : {}),
         audio_track: trackIdx,
       })
     }).then(function(r){ return r.json(); }).then(function(d){
+      console.log('[probe] fallback re-resolve response url:', d.url ? d.url.substring(0,80)+'…' : '(none)');
       if(d.url && typeof doPlay === 'function'){
-        doPlay(d.url, name, {isLive: (typeof mode !== 'undefined' ? mode === 'live' : true)});
+        doPlay(d.url, name, {isLive: isLive});
       }
     }).catch(function(e){
-      console.warn('[probe] re-resolve for audio track failed:', e);
+      console.error('[probe] re-resolve for audio track failed:', e);
     });
   }
 
@@ -859,9 +943,12 @@ _PROBE_UI_JS = r"""
       html += '<div class="si-tracks" id="si-audio-tracks">';
       audioTracks.forEach(function(t, i){
         const hlsId    = (useLiveAudio ? t.id : i);
+        // _activeAudio starts at -1; fall back to server-stamped active_audio_track
+        // so the highlight is correct immediately after a switch.
+        const _srvActive = (typeof info.active_audio_track === 'number') ? info.active_audio_track : 0;
         const isActive = useLiveAudio
                          ? (_activeAudio === t.id)
-                         : (_activeAudio === i);      // set when re-resolve completes
+                         : (_activeAudio >= 0 ? _activeAudio === i : _srvActive === i);
         const lang     = (t.lang || t.language || '').toUpperCase() || '\u2014';
         const name     = t.title || t.name || '';
         const codec    = (!useLiveAudio && t.codec)     ? t.codec.toUpperCase() : '';
@@ -876,8 +963,9 @@ _PROBE_UI_JS = r"""
         const isMultiOrTagged = audioTracks.length > 1
                              || !!(t.lang || t.language);
         const canSwitch = useLiveAudio || info.transcode || isMultiOrTagged;
+        // data-track-idx drives event delegation on _panel — no inline onclick needed.
         html += '<div class="si-track-btn' + (isActive?' si-active':'') + (canSwitch?'':' si-info-only') + '"'
-              + (canSwitch ? ' onclick="window._siSwitchAudio(' + hlsId + ')"' : '')
+              + (canSwitch ? ' data-track-idx="' + hlsId + '"' : '')
               + '>'
               + '<span class="si-track-dot"></span>'
               + '<span class="si-track-lang">' + lang + '</span>'
@@ -974,6 +1062,7 @@ _PROBE_UI_JS = r"""
     _open = false; _sticky = false; _hasData = false; _curInfo = null;
     _hlsAudioTracks = []; _activeAudio = -1;
     _hlsSubTracks   = []; _activeSub   = -1;
+    _curStreamUrl = null; _curStreamName = null;
     if(_isTouch && _btn) _cancelReveal();
     if(_btn){ _btn.classList.remove('si-hover','si-open','si-sticky','si-warn'); }
     if(_panel){ _panel.classList.remove('si-open'); }
@@ -1016,6 +1105,20 @@ _PROBE_UI_JS = r"""
       const clone = res.clone();
       clone.json().then(function(d){
         if(d && d.stream_info && (d.stream_info.vcodec || d.stream_info.acodec)){
+          // Cache the resolved stream URL and name so _switchAudio can
+          // rebuild the hls_proxy URL without a full re-resolve round-trip.
+          if(d.url){
+            _curStreamUrl  = d.url;
+            // Recover name from the POST body if possible; fall back to curInfo later
+            try {
+              const bodyStr = (opts && opts.body) ? opts.body : null;
+              const bodyObj = bodyStr ? JSON.parse(bodyStr) : null;
+              const it = bodyObj && bodyObj.item;
+              _curStreamName = (it && (it.name || it.o_name || it.fname)) || '';
+              _curStreamLive = (bodyObj && bodyObj.mode) ? bodyObj.mode === 'live' : true;
+            } catch(_){ _curStreamName = ''; _curStreamLive = true; }
+            console.log('[probe] cached stream url:', _curStreamUrl.substring(0,80)+'…');
+          }
           _siShow(d.stream_info);
           // Schedule HLS event binding — hlsObj is created shortly after
           // doPlay() receives this response, so defer a few ticks
@@ -1104,7 +1207,7 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                 url_lower      = url_lower_full.split('?')[0]
 
                 codecs      = None   # populated when ffprobe runs
-                # stream_info initialized before this block
+                stream_info = {}     # always included in JSON response
 
                 # ── Fast path: HEVC by extension ─────────────────────────────
                 if any(ext in url_lower for ext in ['.hevc', '.265', '.h265']):
@@ -1121,11 +1224,8 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                     # needs the whitelist to open http/https/tcp streams without a
                     # config file present.
                     _probe_pre_args = [
-                        "-user_agent", "VLC/3.0.0 LibVLC/3.0.0",
+                        "-user_agent", state.stream_ua,
                         "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-                        # Limit analysis window so ffprobe decides quickly on laggy
-                        # live streams — 2 s / 500 KB is enough to read PAT/PMT and
-                        # first frames without waiting for the default 5 s / 5 MB.
                         "-analyzeduration", "2000000",
                         "-probesize", "500000",
                     ]
@@ -1153,7 +1253,7 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                             # ── ffprobe pass 2: HLS retry ─────────────────────
                             state.log("[PROBE] ffprobe failed on HLS URL — retrying with HLS args")
                             _hls_probe_args = [
-                                "-user_agent", "VLC/3.0.0 LibVLC/3.0.0",
+                                "-user_agent", state.stream_ua,
                                 "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls,applehttp",
                                 "-allowed_extensions", "ALL",
                             ]
@@ -1184,7 +1284,7 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                 _is_hls_url = '.m3u8' in url_lower or '.m3u8' in url_lower_full
                 if not needs_transcode and codecs is None and not _is_hls_url:
                     try:
-                        ts_info = _probe_ts_streams(url)
+                        ts_info = _probe_ts_streams(url, ua=state.stream_ua)
                         if ts_info["hevc"]:
                             needs_transcode  = True
                             transcode_reason = "hevc (ts probe)"
@@ -1234,6 +1334,12 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                 # select the correct stream with -map 0:a:<N>.
                 req_audio_track = data.get("audio_track")
                 at_param = f"&audio_track={int(req_audio_track)}" if isinstance(req_audio_track, int) else ""
+
+                if req_audio_track is not None:
+                    state.log(f"[PROBE] Audio track switch requested: track {req_audio_track} "
+                              f"(transcode={needs_transcode}, reason={transcode_reason})")
+                    if isinstance(stream_info, dict):
+                        stream_info = dict(stream_info, active_audio_track=int(req_audio_track))
 
                 # If a specific audio track was requested on a stream that wouldn't
                 # otherwise need transcoding (direct MPEG-TS, direct HLS), force an
