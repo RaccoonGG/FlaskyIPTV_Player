@@ -2557,9 +2557,13 @@ async function _mvPlayChannel(wid, channel, cEl){
   //   streamKey = `${userId}::${streamUrl}::${profileId}`
   // We route through multiview_addon.py /api/multiview/stream which handles
   // dedup and reference counting server-side.
+  // Pass the session's effective User-Agent so ffmpeg identifies to the IPTV
+  // server with the same UA that all other session requests use.
+  const _mvUa = (window._mvEffectiveUa || 'VLC/3.0.0 LibVLC/3.0.0');
   const proxyUrl = '/api/multiview/stream?'
     + 'url='        + encodeURIComponent(resolvedUrl)
     + '&client_id=' + encodeURIComponent(mvClientId)
+    + '&ua='        + encodeURIComponent(_mvUa)
     + (channel._mv_transcode ? '&transcode=1' : '')
     + (cEl._mvAudioUrl ? '&audio_url=' + encodeURIComponent(cEl._mvAudioUrl) : '');
 
