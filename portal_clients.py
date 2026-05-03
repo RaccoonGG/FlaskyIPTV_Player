@@ -61,6 +61,173 @@ from urllib.parse import urlparse, quote, quote_plus, unquote, parse_qs
 import asyncio
 import aiohttp
 
+# ── Inlined IPTV device / app UA profiles ────────────────────────────────────
+# Sourced from real-world IPTV client fingerprints.  Used by all three portal
+# clients (Stalker/MAC, Xtream, M3U) to send appropriate headers.
+#
+# For Stalker portals the full profile dict is merged into every request (so
+# X-User-Agent, stb_type, image_version etc. are set).  For Xtream/M3U only
+# the User-Agent string is injected into the session / fetch headers.
+
+_UA_PROFILES: dict = {
+    # ── Original Stalker/MAC default — preserves pre-update hardcoded headers ──
+    "MAG250": {
+        "User-Agent": (
+            "Mozilla/5.0 (QtEmbedded; U; Linux; C) "
+            "AppleWebKit/533.3 (KHTML, like Gecko) "
+            "MAG200 stbapp ver: 2 rev: 250 Safari/533.3"
+        ),
+        "X-User-Agent":    "Model: MAG250; Link: WiFi",
+        "Accept":          "*/*",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "stb_type":        "MAG250",
+        "image_version":   "218",
+    },
+    "MAG254": {
+        "User-Agent": (
+            "Mozilla/5.0 (QtEmbedded; U; Linux; C) "
+            "AppleWebKit/533.3 (KHTML, like Gecko) "
+            "MAG200 stbapp ver: 2 rev: 250 Safari/533.3"
+        ),
+        "X-User-Agent":    "Model: MAG254; Link: WiFi",
+        "Accept":          "*/*",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "stb_type":        "MAG254",
+        "image_version":   "218",
+    },
+    "MAG322": {
+        "User-Agent": (
+            "Mozilla/5.0 (QtEmbedded; U; Linux; C) "
+            "AppleWebKit/538.1 (KHTML, like Gecko) "
+            "MAG200 stbapp ver: 4 rev: 1812 Safari/538.1"
+        ),
+        "X-User-Agent":    "Model: MAG322; Link: WiFi",
+        "Accept":          "*/*",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "stb_type":        "MAG322",
+        "image_version":   "312",
+    },
+    "TiviMate": {
+        "User-Agent":       "TiviMate/4.7.0 (Linux; Android 12; sdk_gphone_x86)",
+        "Accept":           "application/json, text/plain, */*",
+        "Accept-Language":  "en-US,en;q=0.8",
+        "Accept-Encoding":  "gzip, deflate",
+        "X-Requested-With": "ar.tvplayer.tv",
+    },
+    "GSE_IPTV": {
+        "User-Agent":      "GSE IPTV/7.6 CFNetwork/1410.0.3 Darwin/22.6.0",
+        "Accept":          "*/*",
+        "Accept-Language": "en-us",
+        "Accept-Encoding": "gzip, deflate",
+    },
+    "OTTPlayer": {
+        "User-Agent":      "OTTPlayer/2.3 CFNetwork/1209 Darwin/20.2.0",
+        "Accept":          "*/*",
+        "Accept-Encoding": "gzip, deflate",
+    },
+    "IPTVSmarters": {
+        "User-Agent": (
+            "IPTV Smarters Pro Mozilla/5.0 "
+            "(Linux; Android 10; K) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36"
+        ),
+        "Accept":          "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Origin":          "file://",
+    },
+    "VLC": {
+        # Version kept at 3.0.0 to preserve pre-update default stream behaviour.
+        "User-Agent":      "VLC/3.0.0 LibVLC/3.0.0",
+        "Accept":          "*/*",
+        "Accept-Encoding": "gzip, deflate",
+    },
+    "Chrome": {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;"
+            "q=0.9,image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language":           "en-US,en;q=0.9",
+        "Accept-Encoding":           "gzip, deflate, br",
+        "Upgrade-Insecure-Requests": "1",
+    },
+}
+
+# Lead profile name per portal type (used as auto-default when preset is "")
+# "mac" maps to MAG250 to exactly reproduce the pre-update hardcoded headers.
+_UA_DEFAULT: dict = {
+    "mac":     "MAG250",
+    "xtream":  "TiviMate",
+    "m3u_url": "VLC",
+}
+
+# Headers that must never be overwritten by a profile merge in _headers()
+_UA_PRESERVE = frozenset({
+    "Referer", "Cookie", "Connection", "Accept-Encoding",
+    "Accept-Language", "Pragma", "Accept",
+})
+
+
+def get_effective_ua(preset: str, custom: str, conn_type: str = "mac") -> tuple:
+    """
+    Resolve the active User-Agent and auxiliary headers for a portal session.
+
+    Parameters
+    ----------
+    preset    : key from _UA_PROFILES (e.g. "MAG254", "TiviMate"), or
+                "custom" to use the ``custom`` string verbatim, or
+                "" for the auto-default for ``conn_type``.
+    custom    : free-form UA string; only used when preset == "custom".
+    conn_type : "mac" | "xtream" | "m3u_url" — selects the auto-default.
+
+    Returns
+    -------
+    (ua_string: str, headers_dict: dict)
+
+    ``headers_dict`` always contains at least {"User-Agent": ua_string}.
+    STB presets (MAG254, MAG322) also return X-User-Agent / stb_type /
+    image_version which StalkerPortalClient._headers() merges in.
+
+    Custom UA: uses the conn_type default profile as the header base so
+    Xtream/M3U still get correct Accept, Accept-Language etc. — only
+    User-Agent is replaced with the custom string.
+    """
+    p = (preset or "").strip()
+
+    if p == "custom":
+        ua = (custom or "").strip()
+        if ua:
+            # Use the conn_type default profile as the surrounding header base
+            # so the request looks complete (Accept, Accept-Language etc.)
+            # while only the User-Agent string is replaced with the custom value.
+            # STB-specific keys (X-User-Agent, stb_type, image_version) are
+            # excluded so a custom UA on a Stalker portal doesn't accidentally
+            # claim to be a MAG box.
+            _STB_KEYS = frozenset({"X-User-Agent", "stb_type", "image_version"})
+            default_key = _UA_DEFAULT.get(conn_type, "MAG250")
+            profile = {k: v for k, v in _UA_PROFILES[default_key].items()
+                       if k not in _STB_KEYS}
+            profile["User-Agent"] = ua
+            return ua, profile
+        # custom selected but field left blank → fall through to auto-default
+
+    if p and p in _UA_PROFILES:
+        profile = dict(_UA_PROFILES[p])
+        return profile["User-Agent"], profile
+
+    # Auto-default
+    default_key = _UA_DEFAULT.get(conn_type, "MAG250")
+    profile = dict(_UA_PROFILES[default_key])
+    return profile["User-Agent"], profile
+
 # ===================== SHARED HELPERS =====================
 
 def normalize_base_url(url: str) -> str:
@@ -173,7 +340,8 @@ def _extinf_line(name: str, logo: str, tvg_type: str, group: str, item: dict = N
 # ===================== MAC PORTAL CLIENT =====================
 
 class PortalClient:
-    def __init__(self, base_url: str, mac: str, log_cb):
+    def __init__(self, base_url: str, mac: str, log_cb,
+                 ua_preset: str = "", custom_ua: str = ""):
         self.base = normalize_base_url(base_url)
         self.mac = mac.strip().upper()
         self.log = log_cb
@@ -181,6 +349,8 @@ class PortalClient:
         self.session = None
         self.token = None
         self.headers = {}
+        self.ua_preset: str = (ua_preset or "").strip()
+        self.custom_ua: str = (custom_ua or "").strip()
         # Logo caches — keyed by item id → logo URL.
         # _ch_logo_cache: populated once via get_all_channels (live fallback).
         # _vod_logo_cache: built lazily from already-fetched VOD/series items
@@ -194,6 +364,27 @@ class PortalClient:
     async def __aenter__(self):
         _timeout = aiohttp.ClientTimeout(total=15, connect=8)
         self.session = aiohttp.ClientSession(cookies={"mac": self.mac}, timeout=_timeout)
+        # Resolve the effective UA profile for this session.
+        _ua, _profile = get_effective_ua(
+            "custom" if self.custom_ua else self.ua_preset,
+            self.custom_ua,
+            "mac",
+        )
+        # MAG-family presets (MAG250/254/322) carry stb_type, X-User-Agent,
+        # image_version — generic MAC portals run the same Infomir portal stack
+        # as Stalker portals and recognise these headers, so let them through.
+        # Non-MAG presets (TiviMate, VLC, Chrome, custom…) don't emit STB
+        # identity headers — they'd be incongruent alongside a non-MAG UA.
+        _is_mag_profile = "stb_type" in _profile
+        _ALWAYS_SKIP = frozenset({"Connection", "Upgrade-Insecure-Requests"})
+        _NON_MAG_SKIP = frozenset({"stb_type", "image_version", "X-User-Agent"})
+        session_headers = {
+            k: v for k, v in _profile.items()
+            if k not in _ALWAYS_SKIP
+            and (k not in _NON_MAG_SKIP or _is_mag_profile)
+        }
+        session_headers["User-Agent"] = _ua
+        self.session.headers.update(session_headers)
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -1342,7 +1533,8 @@ class StalkerPortalClient:
 
     def __init__(self, base_url: str, mac: str, log_cb,
                  custom_sn: str = "", custom_device_id: str = "",
-                 custom_device_id2: str = "", custom_signature: str = ""):
+                 custom_device_id2: str = "", custom_signature: str = "",
+                 ua_preset: str = "", custom_ua: str = ""):
         self.base = normalize_base_url(base_url)
         self.mac = mac.strip().upper()
         self.log = log_cb
@@ -1369,13 +1561,19 @@ class StalkerPortalClient:
             self.serial    = custom_sn.strip().upper()
             self.serialcut = self.serial[:13]
         self.sg        = self.serialcut + self.mac
-        self.signature = (custom_signature.strip()
-                          if custom_signature.strip()
-                          else hashlib.sha256(self.sg.encode("utf-8")).hexdigest().upper())
+        self.signature = hashlib.sha256(self.sg.encode("utf-8")).hexdigest().upper()
+        # Allow caller to supply a pre-computed signature verbatim (e.g. copied
+        # from a real MAG device or a known-working value for this portal).
+        if custom_signature.strip():
+            self.signature = custom_signature.strip()
         self.log(f"[STALKER] Computed IDs — SN={self.serial}  SNCUT={self.serialcut}  "
                  f"deviceid1={self.device_id}  deviceid2={self.device_id2}  "
                  f"signature={self.signature}"
                  + (" (custom)" if custom_signature.strip() else ""))
+        # UA spoofing — preset name (e.g. "MAG254", "TiviMate") or "" for default,
+        # or "custom" which uses custom_ua string verbatim.
+        self.ua_preset: str = (ua_preset or "").strip()
+        self.custom_ua: str = (custom_ua or "").strip()
         # Cache for channel id → logo URL, populated lazily from get_all_channels
         self._ch_logo_cache: dict | None = None
         # Running in-memory logo cache for VOD / series — populated from items
@@ -1447,20 +1645,35 @@ class StalkerPortalClient:
         return "; ".join(parts)
 
     def _headers(self, include_auth: bool = False, include_token: bool = True) -> dict:
+        # Resolve the effective UA and any extra profile headers for this session.
+        # get_effective_ua returns a (ua_str, profile_dict) tuple where profile_dict
+        # may contain X-User-Agent, stb_type, image_version etc. for STB presets.
+        _ua, _profile = get_effective_ua(self.ua_preset, self.custom_ua, "mac")
         h = {
-            "Accept": "*/*",
-            "User-Agent": (
-                "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 "
-                "(KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3"
-            ),
-            "Referer": f"{self.base}/stalker_portal/c/index.html",
+            "Accept":          "*/*",
+            "User-Agent":      _ua,
+            "Referer":         f"{self.base}/stalker_portal/c/index.html",
             "Accept-Language": "en-US,en;q=0.5",
-            "Pragma": "no-cache",
-            "X-User-Agent": "Model: MAG250; Link: WiFi",
-            "Cookie": self._cookie_str(include_token=include_token),
-            "Connection": "close",
+            "Pragma":          "no-cache",
+            "Cookie":          self._cookie_str(include_token=include_token),
+            "Connection":      "close",
             "Accept-Encoding": "gzip, deflate",
         }
+        # Merge profile headers — allow Accept, Accept-Language, Accept-Encoding
+        # to be overridden by the preset so the full profile is applied correctly.
+        # Only protect headers that are Stalker-protocol-critical and must not
+        # be overwritten by any preset:
+        #   Referer  — portal session anchor, must point at stalker_portal
+        #   Cookie   — auth token, computed per-request
+        #   Connection — always "close" for Stalker (no keep-alive pooling)
+        #   Pragma   — always "no-cache" for Stalker cache-busting
+        _STALK_PRESERVE = frozenset({"Referer", "Cookie", "Connection", "Pragma"})
+        # Also skip internal profile metadata keys that are not HTTP headers
+        _NOT_HTTP = frozenset({"stb_type", "image_version"})
+        for k, v in _profile.items():
+            if k in _STALK_PRESERVE or k in _NOT_HTTP or k == "User-Agent":
+                continue
+            h[k] = v
         if include_auth and self.bearer_token:
             h["Authorization"] = f"Bearer {self.bearer_token}"
         return h
@@ -2042,7 +2255,16 @@ class StalkerPortalClient:
         # Triggered when get_ordered_list returns "Access denied" or similar block — portal
         # allows get_all_channels but not per-category listing (seen on 4k1.new4k.cc).
         if not items and page == 1 and mode == "live" and cat_id not in ("*", "__all__"):
-            raw_all = getattr(self, "_all_channels_raw", [])
+            raw_all = getattr(self, "_all_channels_raw", None)
+            # If _all_channels_raw is None the background prefetch is still in-flight.
+            # Wait on the ready-event (already injected by _make_client) rather than
+            # returning 0 items immediately and poisoning the cache.
+            if raw_all is None:
+                _evt = getattr(self, "_all_channels_ready_event", None)
+                if _evt is not None:
+                    self.log(f"[STALKER] Items fallback waiting for prefetch to complete (cat={cat_id})…")
+                    _evt.wait(timeout=25)
+                raw_all = getattr(self, "_all_channels_raw", None) or []
             if raw_all:
                 filtered = [ch for ch in raw_all
                             if isinstance(ch, dict) and str(ch.get("tv_genre_id", "")) == str(cat_id)]
@@ -2572,12 +2794,16 @@ class StalkerPortalClient:
 # ===================== XTREAM CODES CLIENT =====================
 
 class XtreamClient:
-    def __init__(self, base_url: str, username: str, password: str, log_cb):
+    def __init__(self, base_url: str, username: str, password: str, log_cb,
+                 custom_ua: str = ""):
         self.base = normalize_base_url(base_url)
         self.username = username.strip()
         self.password = password.strip()
         self.log = log_cb
         self.session = None
+        # UA spoofing — empty = auto-default (TiviMate), "custom" preset handled
+        # by FlaskyIPTV which passes the resolved string directly.
+        self.custom_ua: str = (custom_ua or "").strip()
         # Cache the user_info dict returned by the player_api.php auth response.
         # Both handshake() and account_info() hit the identical URL — storing the
         # result here lets account_info() skip the second round-trip entirely.
@@ -2596,6 +2822,24 @@ class XtreamClient:
     async def __aenter__(self):
         _timeout = aiohttp.ClientTimeout(total=30, connect=10)
         self.session = aiohttp.ClientSession(timeout=_timeout)
+        # Apply the full UA profile to all session requests so Xtream servers
+        # see the correct Accept, Accept-Language, X-Requested-With etc.
+        # Skip keys that are STB-specific (meaningless to Xtream), connection-level
+        # (managed by aiohttp), or internal profile metadata (not HTTP headers).
+        _XTREAM_SKIP = frozenset({
+            "stb_type", "image_version", "X-User-Agent",  # STB/Stalker-specific
+            "Connection",                                   # managed by aiohttp
+            "Upgrade-Insecure-Requests",                   # browser-only
+        })
+        _ua, _profile = get_effective_ua(
+            "custom" if self.custom_ua else "",
+            self.custom_ua,
+            "xtream",
+        )
+        session_headers = {k: v for k, v in _profile.items()
+                          if k not in _XTREAM_SKIP}
+        session_headers["User-Agent"] = _ua
+        self.session.headers.update(session_headers)
         return self
 
     async def __aexit__(self, *args):
@@ -2943,7 +3187,7 @@ def _extract_series_name(ep_name: str) -> str:
 
 
 class M3UClient:
-    def __init__(self, m3u_url: str, log_cb, preloaded=None):
+    def __init__(self, m3u_url: str, log_cb, preloaded=None, custom_ua: str = ""):
         self.m3u_url = m3u_url.strip()
         self.log = log_cb
         self.session = None
@@ -2951,6 +3195,8 @@ class M3UClient:
         self._xtream_creds = extract_xtream_from_m3u_url(m3u_url)
         self._xtream_client = None
         self._tvg_url = ""
+        # UA spoofing — empty = auto-default (VLC), or resolved custom string.
+        self.custom_ua: str = (custom_ua or "").strip()
 
     async def __aenter__(self):
         _timeout = aiohttp.ClientTimeout(total=300, connect=20, sock_read=None)
@@ -2990,7 +3236,22 @@ class M3UClient:
                 self.log(f"[M3U] Xtream handshake failed: {e}")
                 self._xtream_client = None
 
-        headers = {"User-Agent": "VLC/3.0.0 LibVLC/3.0.0", "Accept": "*/*"}
+        # Apply the full UA profile to the M3U fetch so servers see the correct
+        # Accept, Accept-Language etc. for the chosen preset.
+        # Skip keys that are STB-specific, connection-level, or browser-only.
+        _M3U_SKIP = frozenset({
+            "stb_type", "image_version", "X-User-Agent",  # STB/Stalker-specific
+            "Connection",                                   # managed by aiohttp session
+            "Upgrade-Insecure-Requests",                   # browser-only
+            "X-Requested-With",                            # app-internal, not needed for plain fetch
+        })
+        _ua, _profile = get_effective_ua(
+            "custom" if self.custom_ua else "",
+            self.custom_ua,
+            "m3u_url",
+        )
+        headers = {k: v for k, v in _profile.items() if k not in _M3U_SKIP}
+        headers["User-Agent"] = _ua
         MAX_MB = 520
 
         try:
