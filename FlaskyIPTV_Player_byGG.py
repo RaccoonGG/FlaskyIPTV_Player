@@ -142,6 +142,13 @@ class AppState:
         self.stalker_device_id2: str = ""
         self.stalker_sn:         str = ""
         self.stalker_signature:  str = ""
+        # UA preset name from _UA_PROFILES keys in portal_clients.py
+        # (e.g. "MAG254", "TiviMate", "VLC", "Chrome") or "" for auto-default,
+        # or "custom" which uses portal_ua_custom verbatim.
+        # For MAC/Stalker portals the full profile (X-User-Agent etc.) is applied.
+        # For Xtream/M3U only the User-Agent string is used.
+        self.portal_ua_preset: str = ""
+        self.portal_ua_custom: str = ""
         self.cats_cache: dict = {}
         self._items_cache: dict = {}  # (mode, cat_id) → list of items, session-wide
         self._prefetch_running: bool = False  # True while bg channel prefetch is in-flight
@@ -253,18 +260,67 @@ class AppState:
         self.status = msg
         self.log(f"[STATUS] {msg}")
 
+    @property
+    def effective_ua(self) -> str:
+        """Resolve the active User-Agent string for portal API/auth requests."""
+        try:
+            from portal_clients import get_effective_ua
+            ua, _ = get_effective_ua(self.portal_ua_preset, self.portal_ua_custom,
+                                     self.conn_type or "mac")
+            return ua
+        except Exception:
+            return "VLC/3.0.0 LibVLC/3.0.0"
+
+    @property
+    def stream_ua(self) -> str:
+        """
+        User-Agent string for direct stream connections: ffmpeg, proxy fetch,
+        ffprobe, DVR recording, cast pump, multiview.
+
+        When no preset is selected (empty string) this always returns the
+        pre-update hardcoded default — 'VLC/3.0.0 LibVLC/3.0.0' — so CDN
+        stream servers see the same UA they saw before the spoofing feature
+        was added.  When the user explicitly selects a preset, that choice
+        propagates through to stream connections as well.
+        """
+        if not (self.portal_ua_preset or "").strip():
+            return "VLC/3.0.0 LibVLC/3.0.0"
+        return self.effective_ua
+
 
 state = AppState()
 if _CAST_AVAILABLE:
     get_cast_proxy().start()
 
-# ===================== ASYNC HELPERS =====================
+
+def _resolve_custom_ua() -> str:
+    """
+    Resolve the UA string to pass as custom_ua to Xtream/M3U clients.
+
+    For non-MAC portals, presets are translated to their UA string so the
+    client receives a plain string (it only uses User-Agent, not the full
+    profile dict). Returns "" when the auto-default should apply.
+    """
+    preset = state.portal_ua_preset
+    custom = state.portal_ua_custom
+    if not preset:
+        return ""
+    if preset == "custom":
+        return custom.strip()
+    # Named preset — resolve to its UA string
+    try:
+        from portal_clients import get_effective_ua
+        ua, _ = get_effective_ua(preset, custom, state.conn_type or "mac")
+        return ua
+    except Exception:
+        return ""
 
 @contextlib.asynccontextmanager
 async def _make_client(do_handshake=True):
     conn = state.conn_type
     if conn == "xtream":
-        client = XtreamClient(state.url, state.username, state.password, state.log)
+        client = XtreamClient(state.url, state.username, state.password, state.log,
+                              custom_ua=_resolve_custom_ua())
         # _logo_cache is a plain dict — share the same object so mutations
         # (new entries added during this request) survive after the client exits.
         client._logo_cache = state._logo_cache_vod
@@ -282,7 +338,8 @@ async def _make_client(do_handshake=True):
     elif conn == "m3u_url":
         if state.m3u_xtream_override:
             creds = state.m3u_xtream_override
-            client = XtreamClient(creds["base"], creds["username"], creds["password"], state.log)
+            client = XtreamClient(creds["base"], creds["username"], creds["password"],
+                                  state.log, custom_ua=_resolve_custom_ua())
             client._logo_cache = state._logo_cache_vod
             # Pre-seed live channel pool from connect-time prefetch if available.
             if client._all_channels_raw is None:
@@ -294,7 +351,8 @@ async def _make_client(do_handshake=True):
                     await client.handshake()
                 yield client
         else:
-            client = M3UClient(state.m3u_url, state.log, preloaded=state.m3u_cache)
+            client = M3UClient(state.m3u_url, state.log, preloaded=state.m3u_cache,
+                               custom_ua=_resolve_custom_ua())
             async with client:
                 if do_handshake:
                     await client.handshake()
@@ -308,9 +366,13 @@ async def _make_client(do_handshake=True):
                 custom_device_id=state.stalker_device_id,
                 custom_device_id2=state.stalker_device_id2,
                 custom_signature=state.stalker_signature,
+                ua_preset=state.portal_ua_preset,
+                custom_ua=state.portal_ua_custom,
             )
         else:
-            client = PortalClient(state.url, state.mac, state.log)
+            client = PortalClient(state.url, state.mac, state.log,
+                                  ua_preset=state.portal_ua_preset,
+                                  custom_ua=state.portal_ua_custom)
         # Inject both caches from AppState so this request can read what
         # previous requests already discovered.
         # _ch_logo_cache may be None (not yet fetched) or a dict — assign directly.
@@ -640,6 +702,17 @@ def api_connect():
         state.stalker_device_id2 = data.get("stalker_device_id2", "").strip()
         state.stalker_sn         = data.get("stalker_sn",         "").strip()
         state.stalker_signature  = data.get("stalker_signature",  "").strip()
+        state.portal_ua_preset   = data.get("portal_ua_preset",   "").strip()
+        state.portal_ua_custom   = data.get("portal_ua_custom",   "").strip()
+        # Log extended details so they're visible in the activity log
+        _ua_label = (f"custom: {state.portal_ua_custom}" if state.portal_ua_preset == "custom"
+                     else state.portal_ua_preset or "Auto (default)")
+        state.log(f"[CONNECT] User-Agent: {_ua_label} → {state.effective_ua}")
+        if state.conn_type == "mac":
+            if state.stalker_sn:        state.log(f"[CONNECT] SN override: {state.stalker_sn}")
+            if state.stalker_device_id: state.log(f"[CONNECT] Device ID override: {state.stalker_device_id}")
+            if state.stalker_device_id2:state.log(f"[CONNECT] Device ID2 override: {state.stalker_device_id2}")
+            if state.stalker_signature: state.log(f"[CONNECT] Signature override: {state.stalker_signature}")
         state.cats_cache = {}
         state._items_cache = {}
         state.m3u_cache = None
@@ -826,6 +899,11 @@ def api_connect():
         if result.get("success") and _EPG_AVAILABLE:
             _epg_prefetch(state)
 
+        # Inject effective UA so the JS can cache it for multiview stream requests
+        if result.get("success"):
+            result["effective_ua"] = state.effective_ua
+            result["stream_ua"]    = state.stream_ua
+
         return jsonify(result)
     except Exception as e:
         state.log(f"[CONNECT] Error: {e}")
@@ -912,6 +990,17 @@ def api_items():
         return jsonify({"items": items, "count": len(items), "has_more": False})
 
     try:
+        # Snapshot prefetch state BEFORE the async fetch begins.
+        # If we check _prefetch_running after the fetch returns, it may already be False
+        # (prefetch completed during our network round-trips) so the guard never fires
+        # and 0-item results from access-denied get permanently cached.
+        _prefetch_was_running = (
+            state.is_stalker_portal
+            and state._prefetch_running
+            and mode == "live"
+            and cat_id != "__all__"
+        )
+
         async def fetch():
             async with _make_client() as client:
                 # Pre-seed client's _all_channels_raw from the state-level pool if
@@ -974,14 +1063,15 @@ def api_items():
         result = run_async(fetch())
         items = result["items"] if isinstance(result, dict) else result
         has_more = result.get("has_more", False) if isinstance(result, dict) else False
-        # For Stalker portals: don't cache empty category results while the background
-        # prefetch is still running — the channel pool isn't ready yet. Return a
-        # "pending" signal so the frontend retries after a short delay.
-        if (not items and not has_more
-                and state.is_stalker_portal
-                and state._prefetch_running
-                and mode == "live" and cat_id != "__all__"):
-            state.log(f"[ITEMS] '{cat.get('title','?')}': 0 items — prefetch still running, returning pending")
+        # For Stalker portals: don't cache empty category results if the background
+        # prefetch was still running when this request started — the channel pool
+        # wasn't ready yet so the fallback had nothing to filter from.
+        # Return a "pending" signal so the frontend retries after a short delay.
+        # NOTE: we check _prefetch_was_running (snapshotted before the fetch), not
+        # state._prefetch_running, because prefetch often completes during our
+        # network round-trips and the flag is already False by the time we get here.
+        if (not items and not has_more and _prefetch_was_running):
+            state.log(f"[ITEMS] '{cat.get('title','?')}': 0 items — prefetch was running at request start, returning pending")
             return jsonify({"items": [], "count": 0, "has_more": False, "pending": True})
         if not has_more:
             state._items_cache[_cache_key] = items
@@ -1166,6 +1256,8 @@ def api_status():
         "task_file_elapsed": state.task_file_elapsed,
         "task_speed":        state.task_speed,
         "ytdlp": YTDLP_AVAILABLE,
+        "effective_ua": state.effective_ua,
+        "stream_ua":    state.stream_ua,
     })
 
 
@@ -1483,14 +1575,33 @@ html,body{height:100dvh;overflow:hidden;background:var(--bg);color:var(--txt);
 ::selection{background:rgba(124,58,237,.3);color:var(--acc)}
 
 /* ─── inputs ─────────────────────────────────────────────────── */
-input,textarea{background:rgba(0,0,0,.55);color:var(--txt);border:1.5px solid rgba(255,255,255,.1);
+input,textarea,select{background:rgba(0,0,0,.55);color:var(--txt);border:1.5px solid rgba(255,255,255,.1);
   border-radius:var(--rsm);padding:9px 12px;font-size:13px;outline:none;width:100%;
   transition:border-color .25s ease,box-shadow .25s ease,transform .2s ease;
   -webkit-appearance:none;box-shadow:inset 0 2px 8px rgba(0,0,0,.35)}
-input:focus,textarea:focus{border-color:var(--acc);
+input:focus,textarea:focus,select:focus{border-color:var(--acc);
   box-shadow:inset 0 2px 10px rgba(0,0,0,.4), 0 0 0 3px var(--glow2), 0 0 20px rgba(124,58,237,.2);
   transform:scale(1.005)}
 input::placeholder,textarea::placeholder{color:var(--txt3);font-style:italic}
+select{cursor:pointer;padding:6px 28px 6px 10px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%237d8a9e'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 8px center;background-size:10px 6px}
+select option{background:var(--bg);color:var(--txt)}
+/* ── Custom UA dropdown (replaces native select to prevent overflow on mobile) */
+.ua-dd{position:relative;flex:1;min-width:0}
+.ua-dd-btn{width:100%;text-align:left;padding:5px 26px 5px 10px;background:rgba(0,0,0,.55);
+  color:var(--txt);border:1.5px solid rgba(255,255,255,.1);border-radius:var(--rsm);
+  font-size:11px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  height:30px;line-height:1.2;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%237d8a9e'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 8px center;background-size:10px 6px}
+.ua-dd-btn:hover{border-color:rgba(255,255,255,.25)}
+.ua-dd-list{display:none;position:absolute;top:calc(100% + 2px);left:0;right:0;z-index:2000;
+  background:var(--s3);border:1.5px solid var(--bdr);border-radius:var(--rsm);
+  max-height:220px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+.ua-dd-list.open{display:block}
+.ua-dd-item{padding:8px 12px;cursor:pointer;font-size:12px;color:var(--txt);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.ua-dd-item:hover{background:rgba(124,58,237,.15);color:var(--acc)}
+.ua-dd-item.sel{background:rgba(124,58,237,.2);color:var(--acc)}
 input[type=range]{background:transparent;border:none;box-shadow:none;padding:0;cursor:pointer;
   -webkit-appearance:auto;appearance:auto;transform:none}
 input[type=checkbox]{width:auto;height:auto;padding:0;accent-color:var(--acc);transform:none;box-shadow:none}
@@ -1583,6 +1694,18 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   .hdr-ico{width:28px!important;height:28px!important;font-size:13px!important}
   #hdr-status{display:none!important}
   #hdr-status-short{display:inline!important}
+  /* UA preset row — custom input field (16px prevents iOS Safari auto-zoom) */
+  .ua-row input{font-size:16px!important;min-width:0!important}
+  /* Custom dropdown button matches .cr input sizing (height:34px, font-size:12px) */
+  .ua-dd-btn{font-size:12px!important;height:34px!important}
+  /* Dropdown list items — touch-friendly tap targets */
+  .ua-dd-item{font-size:14px;padding:10px 12px}
+  /* MAC URL row: the MAC input span has width:200px which overflows on narrow screens.
+     Shrink it to a sensible mobile size so all other cr-mac fields stay in bounds. */
+  #cr-mac>div:first-child>span{width:130px!important;max-width:130px!important;min-width:0!important}
+  /* Details-block inputs: override global .cr input{min-width:120px} so rows
+     don't overflow the padded details container on narrow screens */
+  details input,details select{min-width:0!important}
 }
 
 /* ─── conn panel ─────────────────────────────────────────────── */
@@ -1593,7 +1716,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .ct-btn{flex:1;height:32px;font-size:12px;padding:0;border-radius:var(--rsm)}
 .cr{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 .cr label{font-size:11px;color:var(--txt2);flex-shrink:0;width:28px}
-.cr input{flex:1;min-width:120px;height:34px;font-size:12px}
+.cr input,.cr select{flex:1;min-width:120px;height:34px;font-size:12px}
 .cr-bot{display:flex;gap:7px;align-items:center;justify-content:space-between}
 
 /* ─── main panels ─────────────────────────────────────────────── */
@@ -2041,6 +2164,8 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         </div>
         <details style="margin:4px 0 2px"><summary style="font-size:11px;color:var(--txt3);cursor:pointer;user-select:none;padding:3px 0;list-style:none;display:flex;align-items:center;gap:4px"><span style="font-size:9px;opacity:.6">▶</span>Stalker overrides (optional)</summary>
           <div style="display:flex;flex-direction:column;gap:4px;margin-top:6px;padding:8px;background:rgba(255,255,255,.03);border-radius:6px;border:1px solid var(--bdr)">
+            <div class="ua-row" style="display:flex;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">User-Agent</label><select id="i-ua-preset" onchange="uaPresetChange('i-ua-preset','i-ua-custom')" style="flex:1;font-size:11px"><option value="">Auto (MAG250 default)</option><option value="MAG254">MAG254</option><option value="MAG322">MAG322</option><option value="TiviMate">TiviMate</option><option value="GSE_IPTV">GSE IPTV</option><option value="OTTPlayer">OTT Player</option><option value="IPTVSmarters">IPTV Smarters</option><option value="VLC">VLC</option><option value="Chrome">Chrome</option><option value="custom">Custom…</option></select></div>
+            <div class="ua-row" id="i-ua-custom-row" style="display:none;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">Custom UA</label><input id="i-ua-custom" placeholder="e.g. MyApp/1.0 (Linux)" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px;flex:1"></div>
             <div style="display:flex;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">SN</label><input id="i-sn" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px;flex:1"></div>
             <div style="display:flex;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">Device ID</label><input id="i-devid" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px;flex:1"></div>
             <div style="display:flex;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">Device ID2</label><input id="i-devid2" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px;flex:1"></div>
@@ -2048,17 +2173,29 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           </div>
         </details>
         <div style="display:flex;gap:6px;align-items:center">
-          <label title="Optional: external XMLTV EPG URL(s). One URL per line. Leave blank to use portal's own EPG.">EPG</label><textarea id="i-mac-epg" rows="2" placeholder="https://… xmltv URL (optional, one per line)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;width:100%"></textarea>
+          <label title="Optional: external XMLTV EPG URL(s). One URL per line. Leave blank to use portal's own EPG.">EPG</label><textarea id="i-mac-epg" rows="2" placeholder="https://… xmltv URL (optional, one per line)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;flex:1"></textarea>
         </div>
       </div>
       <div id="cr-xtream" class="cr hidden" style="flex-direction:column;align-items:stretch">
         <div style="display:flex;gap:6px;align-items:center">
           <label>URL</label><input id="i-xu" type="text" inputmode="url" placeholder="http://server.host:8080" autocomplete="new-password" autocorrect="off" spellcheck="false">
-          <label>User</label><input id="i-us" placeholder="username" style="max-width:150px" autocomplete="new-password" autocorrect="off" spellcheck="false">
         </div>
         <div style="display:flex;gap:6px;align-items:center">
+          <div style="flex:1;display:flex;gap:6px;align-items:center;min-width:0">
+            <label>User</label><input id="i-us" placeholder="username" style="flex:1;min-width:0" autocomplete="new-password" autocorrect="off" spellcheck="false">
+          </div>
+          <div style="flex:1;display:flex;gap:6px;align-items:center;min-width:0">
+            <label>Pass</label><span style="position:relative;display:inline-flex;align-items:center;flex:1;min-width:0"><input id="i-pw" type="password" placeholder="password" style="width:100%;padding-right:28px" autocomplete="new-password"><button type="button" onclick="(function(b){var i=document.getElementById('i-pw');i.type=i.type==='password'?'text':'password';b.textContent=i.type==='password'?'👁':'🙈'})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button></span>
+          </div>
+        </div>
+        <details style="margin:4px 0 2px"><summary style="font-size:11px;color:var(--txt3);cursor:pointer;user-select:none;padding:3px 0;list-style:none;display:flex;align-items:center;gap:4px"><span style="font-size:9px;opacity:.6">▶</span>Advanced (optional)</summary>
+          <div style="display:flex;flex-direction:column;gap:4px;margin-top:6px;padding:8px;background:rgba(255,255,255,.03);border-radius:6px;border:1px solid var(--bdr)">
+            <div class="ua-row" style="display:flex;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">User-Agent</label><select id="i-xu-ua-preset" onchange="uaPresetChange('i-xu-ua-preset','i-xu-ua-custom')" style="flex:1;font-size:11px"><option value="">Auto (TiviMate default)</option><option value="TiviMate">TiviMate</option><option value="GSE_IPTV">GSE IPTV</option><option value="OTTPlayer">OTT Player</option><option value="IPTVSmarters">IPTV Smarters</option><option value="VLC">VLC</option><option value="Chrome">Chrome</option><option value="custom">Custom…</option></select></div>
+            <div class="ua-row" id="i-xu-ua-custom-row" style="display:none;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">Custom UA</label><input id="i-xu-ua-custom" placeholder="e.g. MyApp/1.0 (Linux)" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px;flex:1"></div>
+          </div>
+        </details>
+        <div style="display:flex;gap:6px;align-items:center">
           <label title="Optional: external XMLTV EPG URL(s). One URL per line. Leave blank to use provider's own EPG.">EPG</label><textarea id="i-epg" rows="2" placeholder="https://epg.best/xmltv.php?… (optional, one per line)" style="flex:1;resize:vertical" autocomplete="new-password" autocorrect="off" spellcheck="false"></textarea>
-          <label>Pass</label><span style="position:relative;display:inline-flex;align-items:center;max-width:150px;width:150px"><input id="i-pw" type="password" placeholder="password" style="width:100%;padding-right:28px" autocomplete="new-password"><button type="button" onclick="(function(b){var i=document.getElementById('i-pw');i.type=i.type==='password'?'text':'password';b.textContent=i.type==='password'?'👁':'🙈'})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button></span>
         </div>
       </div>
       <div id="cr-m3u" class="cr hidden" style="flex-direction:column;align-items:stretch;gap:5px">
@@ -2067,10 +2204,17 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <label>URL</label>
           <input id="i-m3u" type="text" inputmode="url" placeholder="http://example.com/list.m3u" autocomplete="new-password" autocorrect="off" spellcheck="false">
         </div>
+        <!-- Advanced / UA — before EPG, matching Stalker tab style -->
+        <details style="margin:4px 0 2px"><summary style="font-size:11px;color:var(--txt3);cursor:pointer;user-select:none;padding:3px 0;list-style:none;display:flex;align-items:center;gap:4px"><span style="font-size:9px;opacity:.6">▶</span>Advanced (optional)</summary>
+          <div style="display:flex;flex-direction:column;gap:4px;margin-top:6px;padding:8px;background:rgba(255,255,255,.03);border-radius:6px;border:1px solid var(--bdr)">
+            <div class="ua-row" style="display:flex;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">User-Agent</label><select id="i-m3u-ua-preset" onchange="uaPresetChange('i-m3u-ua-preset','i-m3u-ua-custom')" style="flex:1;font-size:11px"><option value="">Auto (VLC default)</option><option value="TiviMate">TiviMate</option><option value="GSE_IPTV">GSE IPTV</option><option value="OTTPlayer">OTT Player</option><option value="IPTVSmarters">IPTV Smarters</option><option value="VLC">VLC</option><option value="Chrome">Chrome</option><option value="custom">Custom…</option></select></div>
+            <div class="ua-row" id="i-m3u-ua-custom-row" style="display:none;gap:6px;align-items:center"><label style="min-width:68px;font-size:11px;color:var(--txt3)">Custom UA</label><input id="i-m3u-ua-custom" placeholder="e.g. MyApp/1.0 (Linux)" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px;flex:1"></div>
+          </div>
+        </details>
         <!-- EPG row -->
         <div style="display:flex;gap:6px;align-items:center">
           <label title="Optional: external XMLTV EPG URL. Leave blank to use tvg-url from M3U.">EPG</label>
-          <textarea id="i-m3u-epg" rows="2" placeholder="https://epg.best/xmltv.php?… (optional, one per line)" style="max-width:300px;resize:vertical" autocomplete="new-password" autocorrect="off" spellcheck="false"></textarea>
+          <textarea id="i-m3u-epg" rows="2" placeholder="https://epg.best/xmltv.php?… (optional, one per line)" style="flex:1;resize:vertical" autocomplete="new-password" autocorrect="off" spellcheck="false"></textarea>
         </div>
         <!-- File row — always visible -->
         <div style="display:flex;gap:6px;align-items:center">
@@ -2370,7 +2514,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
             <button class="btn-ghost pnav" id="theaterbtn"
               onclick="toggleTheater()"
               title="Theater mode"
-              style="height:26px;width:32px;padding:0;display:flex;
+              style="height:26px;width:32px;padding:0;display:none;
               align-items:center;justify-content:center">
               <svg id="theater-icon" width="16" height="16" viewBox="0 0 16 16"
                    fill="none" stroke="currentColor" stroke-width="1.8">
@@ -2555,6 +2699,8 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <div class="pl-row"><label>MAC</label><span style="position:relative;display:inline-flex;align-items:center;flex:1"><input id="pl-mac" type="password" placeholder="00:1A:79:XX:XX:XX" autocomplete="new-password" autocorrect="off" spellcheck="false" style="flex:1;padding-right:28px"><button type="button" onclick="(function(b){var i=document.getElementById('pl-mac');var shown=i.getAttribute('data-shown')==='1';if(shown){i.setAttribute('type','password');i.setAttribute('data-shown','0');b.textContent='👁';}else{i.setAttribute('type','text');i.setAttribute('data-shown','1');b.textContent='🙈';};})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button></span></div>
           <details style="margin:4px 0 2px"><summary style="font-size:11px;color:var(--txt3);cursor:pointer;user-select:none;padding:2px 0">Stalker overrides (optional)</summary>
             <div style="display:flex;flex-direction:column;gap:4px;margin-top:6px">
+              <div class="pl-row ua-row"><label style="min-width:80px;font-size:11px">User-Agent</label><select id="pl-ua-preset" onchange="uaPresetChange('pl-ua-preset','pl-ua-custom')" style="flex:1;font-size:11px"><option value="">Auto (MAG250 default)</option><option value="MAG254">MAG254</option><option value="MAG322">MAG322</option><option value="TiviMate">TiviMate</option><option value="GSE_IPTV">GSE IPTV</option><option value="OTTPlayer">OTT Player</option><option value="IPTVSmarters">IPTV Smarters</option><option value="VLC">VLC</option><option value="Chrome">Chrome</option><option value="custom">Custom…</option></select></div>
+              <div id="pl-ua-custom-row" style="display:none" class="pl-row ua-row"><label style="min-width:80px;font-size:11px">Custom UA</label><input id="pl-ua-custom" placeholder="e.g. MyApp/1.0 (Linux)" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
               <div class="pl-row"><label style="min-width:80px;font-size:11px">SN</label><input id="pl-sn" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
               <div class="pl-row"><label style="min-width:80px;font-size:11px">Device ID</label><input id="pl-devid" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
               <div class="pl-row"><label style="min-width:80px;font-size:11px">Device ID2</label><input id="pl-devid2" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
@@ -2568,10 +2714,22 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <div class="pl-row"><label>User</label><input id="pl-us" placeholder="username" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
           <div class="pl-row"><label>Pass</label><span style="position:relative;display:inline-flex;align-items:center;flex:1"><input id="pl-pw" type="password" placeholder="password" autocomplete="new-password" style="flex:1;padding-right:28px"><button type="button" onclick="(function(b){var i=document.getElementById('pl-pw');i.type=i.type==='password'?'text':'password';b.textContent=i.type==='password'?'👁':'🙈'})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button></span></div>
           <div class="pl-row"><label>EPG</label><textarea id="pl-epg" rows="2" placeholder="External EPG URL(s), one per line (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;width:100%"></textarea></div>
+          <details style="margin:4px 0 2px"><summary style="font-size:11px;color:var(--txt3);cursor:pointer;user-select:none;padding:2px 0">Advanced (optional)</summary>
+            <div style="display:flex;flex-direction:column;gap:4px;margin-top:6px">
+              <div class="pl-row ua-row"><label style="min-width:80px;font-size:11px">User-Agent</label><select id="pl-xu-ua-preset" onchange="uaPresetChange('pl-xu-ua-preset','pl-xu-ua-custom')" style="flex:1;font-size:11px"><option value="">Auto (TiviMate default)</option><option value="TiviMate">TiviMate</option><option value="GSE_IPTV">GSE IPTV</option><option value="OTTPlayer">OTT Player</option><option value="IPTVSmarters">IPTV Smarters</option><option value="VLC">VLC</option><option value="Chrome">Chrome</option><option value="custom">Custom…</option></select></div>
+              <div id="pl-xu-ua-custom-row" style="display:none" class="pl-row ua-row"><label style="min-width:80px;font-size:11px">Custom UA</label><input id="pl-xu-ua-custom" placeholder="e.g. MyApp/1.0 (Linux)" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
+            </div>
+          </details>
         </div>
         <div id="plf-m3u" class="hidden">
           <div class="pl-row"><label>URL</label><input id="pl-m3u" type="text" inputmode="url" placeholder="http://example.com/list.m3u" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
           <div class="pl-row"><label>EPG</label><textarea id="pl-m3u-epg" rows="2" placeholder="External EPG URL(s), one per line (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;width:100%"></textarea></div>
+          <details style="margin:4px 0 2px"><summary style="font-size:11px;color:var(--txt3);cursor:pointer;user-select:none;padding:2px 0">Advanced (optional)</summary>
+            <div style="display:flex;flex-direction:column;gap:4px;margin-top:6px">
+              <div class="pl-row ua-row"><label style="min-width:80px;font-size:11px">User-Agent</label><select id="pl-m3u-ua-preset" onchange="uaPresetChange('pl-m3u-ua-preset','pl-m3u-ua-custom')" style="flex:1;font-size:11px"><option value="">Auto (VLC default)</option><option value="TiviMate">TiviMate</option><option value="GSE_IPTV">GSE IPTV</option><option value="OTTPlayer">OTT Player</option><option value="IPTVSmarters">IPTV Smarters</option><option value="VLC">VLC</option><option value="Chrome">Chrome</option><option value="custom">Custom…</option></select></div>
+              <div id="pl-m3u-ua-custom-row" style="display:none" class="pl-row ua-row"><label style="min-width:80px;font-size:11px">Custom UA</label><input id="pl-m3u-ua-custom" placeholder="e.g. MyApp/1.0 (Linux)" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
+            </div>
+          </details>
         </div>
         <div class="pl-row" style="justify-content:flex-end;gap:7px">
           <button class="btn-ghost" onclick="plClearForm()" style="height:34px;padding:0 12px;font-size:12px">Clear</button>
@@ -2695,6 +2853,138 @@ function setCT(t){
     .classList.remove('hidden');
 }
 
+// ── UA PRESET HELPERS ───────────────────────────────────────
+// Toggle the custom UA text input visibility when "Custom…" is selected.
+function uaPresetChange(selectId, customRowId) {
+  const sel = document.getElementById(selectId);
+  const row = document.getElementById(customRowId + '-row');
+  if (!sel || !row) return;
+  row.style.display = sel.value === 'custom' ? 'flex' : 'none';
+}
+
+// ── Custom UA dropdown system ──────────────────────────────────────────────
+// Native <select> dropdown popup ignores parent overflow and can render wider
+// than the viewport on mobile. We replace the visible select with a custom
+// div-based dropdown whose list is position:absolute left:0 right:0 — it is
+// physically impossible for it to overflow the parent container.
+// The hidden <select> stays as the value source for all existing JS.
+
+const _UA_SELECT_IDS = [
+  'i-ua-preset','i-xu-ua-preset','i-m3u-ua-preset',
+  'pl-ua-preset','pl-xu-ua-preset','pl-m3u-ua-preset',
+];
+
+function _initUADropdown(selId) {
+  const sel = document.getElementById(selId);
+  if (!sel || sel._ddInit) return;
+  // Desktop: native <select> works perfectly and has correct sizing — leave it alone.
+  // Only replace with custom dropdown on mobile (< 900px) where native popup
+  // renders outside the viewport bounds regardless of any CSS containment.
+  if (window.innerWidth >= 900) return;
+  sel._ddInit = true;
+  sel.style.display = 'none';
+
+  // Create wrapper — takes the select's flex:1 role
+  const wrap = document.createElement('div');
+  wrap.className = 'ua-dd';
+  wrap.dataset.selId = selId;
+  sel.parentNode.insertBefore(wrap, sel);
+  wrap.appendChild(sel);   // sel is now inside wrap
+
+  // Button showing current selection
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'ua-dd-btn';
+  wrap.appendChild(btn);
+
+  // Dropdown list — absolutely positioned, constrained to wrap width
+  const list = document.createElement('div');
+  list.className = 'ua-dd-list';
+  list.id = selId + '-ddlist';
+  wrap.appendChild(list);
+
+  // Build option items from the hidden <select>
+  Array.from(sel.options).forEach(opt => {
+    const item = document.createElement('div');
+    item.className = 'ua-dd-item';
+    item.dataset.value = opt.value;
+    item.textContent = opt.text;
+    item.addEventListener('click', e => {
+      e.stopPropagation();
+      sel.value = opt.value;
+      list.classList.remove('open');
+      _syncUADropdown(selId);
+      // Trigger custom-row visibility (same as native onchange)
+      const customRowId = selId.replace('-preset', '-custom');
+      uaPresetChange(selId, customRowId);
+    });
+    list.appendChild(item);
+  });
+
+  // Toggle list on button click
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    // Close all other open dropdowns first
+    document.querySelectorAll('.ua-dd-list.open').forEach(l => {
+      if (l !== list) l.classList.remove('open');
+    });
+    list.classList.toggle('open');
+  });
+
+  // Close on any outside click
+  document.addEventListener('click', () => list.classList.remove('open'), { passive: true });
+
+  _syncUADropdown(selId);
+}
+
+// Sync the button label and selected-item highlight to the hidden select's value.
+// Call this whenever sel.value is changed programmatically.
+function _syncUADropdown(selId) {
+  const sel = document.getElementById(selId);
+  if (!sel) return;
+  const wrap = sel.parentNode;
+  // If the custom widget was never mounted (desktop), nothing to sync
+  if (!wrap || !wrap.classList.contains('ua-dd')) return;
+  const btn = wrap.querySelector('.ua-dd-btn');
+  const list = document.getElementById(selId + '-ddlist');
+  if (btn) {
+    const opt = sel.options[sel.selectedIndex];
+    btn.textContent = opt ? opt.text : '—';
+  }
+  if (list) {
+    list.querySelectorAll('.ua-dd-item').forEach(item => {
+      item.classList.toggle('sel', item.dataset.value === sel.value);
+    });
+  }
+}
+
+function _initAllUADropdowns() {
+  _UA_SELECT_IDS.forEach(_initUADropdown);
+}
+
+// Initialise after DOM is ready
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', _initAllUADropdowns);
+} else {
+  _initAllUADropdowns();
+}
+
+// Return the active UA preset for the currently visible connect panel.
+function _getUaPreset() {
+  if (CT === 'mac')      return document.getElementById('i-ua-preset')?.value    || '';
+  if (CT === 'xtream')   return document.getElementById('i-xu-ua-preset')?.value || '';
+  if (CT === 'm3u_url')  return document.getElementById('i-m3u-ua-preset')?.value|| '';
+  return '';
+}
+
+// Return the custom UA string for the currently visible connect panel.
+function _getUaCustom() {
+  if (CT === 'mac')      return document.getElementById('i-ua-custom')?.value.trim()    || '';
+  if (CT === 'xtream')   return document.getElementById('i-xu-ua-custom')?.value.trim() || '';
+  if (CT === 'm3u_url')  return document.getElementById('i-m3u-ua-custom')?.value.trim()|| '';
+  return '';
+}
+
 // ── CONNECT ────────────────────────────────────────────────
 async function doConnect(){
   const xurl = document.getElementById('i-xu')?.value.trim()||'';
@@ -2715,6 +3005,8 @@ async function doConnect(){
     stalker_device_id:  CT==='mac' ? (document.getElementById('i-devid')?.value.trim()||'')  : '',
     stalker_device_id2: CT==='mac' ? (document.getElementById('i-devid2')?.value.trim()||'') : '',
     stalker_signature:  CT==='mac' ? (document.getElementById('i-sig')?.value.trim()||'')    : '',
+    portal_ua_preset: _getUaPreset(),
+    portal_ua_custom: _getUaCustom(),
   };
   const saveBtn = document.getElementById('save-profile-chk');
   const saveToProfile = saveBtn._on || false;
@@ -2747,6 +3039,8 @@ async function doConnect(){
       }
       catsCache=d.categories||{};
       categoryItemsCache = {}; 
+      // Cache stream UA for multiview stream requests (separate from portal API UA)
+      window._mvEffectiveUa = d.stream_ua || d.effective_ua || 'VLC/3.0.0 LibVLC/3.0.0';
       // Always land on Live categories after any connect
       mode='live';
       switchMode('live', catsCache['live']||[]);
@@ -3456,6 +3750,35 @@ const _TAG_GROUPS  = (function(){
   return g;
 })();
 
+// ── Content-based general tags ────────────────────────────────────────────────
+// These tags are derived from *anywhere* in the category title (not just prefix),
+// so a category like "USA | SPORT" correctly appears under both USA and SPORT,
+// and "24/7 NEWS" appears under 24/7 even though it starts with a digit.
+//
+// Each entry: { tag: string, test: fn(titleUpperCase) → bool }
+// A category satisfies a content tag if test() returns true.
+// Content tags are shown as general tags in the tag bar with their own pill.
+const _CONTENT_TAGS = [
+  {
+    tag: 'SPORT',
+    test: t => /\bSPORT[S]?\b/.test(t),
+  },
+  {
+    tag: '24/7',
+    test: t => t.includes('24/7') || t.includes('24-7') || t.includes('24X7'),
+  },
+];
+
+// Returns the set of content tags that match a given category title.
+function _contentTagsFor(title){
+  const u = (title||'').toUpperCase();
+  const result = new Set();
+  for(const ct of _CONTENT_TAGS){
+    if(ct.test(u)) result.add(ct.tag);
+  }
+  return result;
+}
+
 function filterCats(){
   const q=document.getElementById('csrch').value.toLowerCase();
   const tag=_activeTag;
@@ -3465,9 +3788,16 @@ function filterCats(){
   const allEntry = cats.find(c=>c.id==='__all__');
   let rest = cats.filter(c=>c.id!=='__all__');
   if(tag){
-    // Expand tag to its group — e.g. RS/SR/SRB also shows EXYU/BALK categories
-    const matchTags = _TAG_GROUPS[tag] || new Set([tag]);
-    rest=rest.filter(c=>matchTags.has(_catTag(c.title)));
+    // Content tags (SPORT, 24/7) match anywhere in the title — a category like
+    // "USA | SPORT" appears under both USA and SPORT.
+    const contentTag = _CONTENT_TAGS.find(ct => ct.tag === tag);
+    if(contentTag){
+      rest = rest.filter(c => contentTag.test((c.title||'').toUpperCase()));
+    } else {
+      // Prefix tag: expand via _TAG_GROUPS (e.g. RS/SR/SRB → EXYU)
+      const matchTags = _TAG_GROUPS[tag] || new Set([tag]);
+      rest=rest.filter(c=>matchTags.has(_catTag(c.title)));
+    }
   }
   if(q)   rest=rest.filter(c=>c.title.toLowerCase().includes(q));
   // Apply custom order only when not actively searching/tag-filtering
@@ -3750,13 +4080,22 @@ const _LOCALE_TAG_CANDIDATES = (function(){
 function _buildTagBar(cats){
   const bar=document.getElementById('tag-bar');
   if(!bar) return;
-  // Raw counts per exact tag
+  // Raw counts per exact prefix tag
   const rawCounts={};
   cats.forEach(c=>{ const t=_catTag(c.title); if(t) rawCounts[t]=(rawCounts[t]||0)+1; });
-  const tags=Object.keys(rawCounts).sort();
-  if(!tags.length){ bar.style.display='none'; _activeTag=''; return; }
 
-  // Group-aware counts: for each tag, sum counts of all tags in its group
+  // Add content tag counts — these match anywhere in the title so a category
+  // like "USA | SPORT" is counted under SPORT even though its prefix tag is USA.
+  const contentTagCounts={};
+  _CONTENT_TAGS.forEach(ct=>{
+    const count = cats.filter(c=> ct.test((c.title||'').toUpperCase())).length;
+    if(count > 0) contentTagCounts[ct.tag] = count;
+  });
+
+  const tags=Object.keys(rawCounts).sort();
+  if(!tags.length && !Object.keys(contentTagCounts).length){ bar.style.display='none'; _activeTag=''; return; }
+
+  // Group-aware counts: for each prefix tag, sum counts of all tags in its group
   // so SR pill shows "SR 15 + EXYU 8 = 23" rather than just "SR 15"
   const counts={};
   for(const t of tags){
@@ -3767,40 +4106,39 @@ function _buildTagBar(cats){
       counts[t] = rawCounts[t];
     }
   }
-  if(!tags.length){ bar.style.display='none'; _activeTag=''; return; }
+  // Merge content tag counts
+  Object.assign(counts, contentTagCounts);
+  if(!Object.keys(counts).length){ bar.style.display='none'; _activeTag=''; return; }
 
   const NOT_COUNTRY = new Set(['4K','8K','UHD','FHD','HD','SD','HQ','4G','VIP','FOR','NEW','TOP','HOT','ALL']);
   function isCountryTag(t){
     if(NOT_COUNTRY.has(t)) return false;
     return _KNOWN_TAG_PREFIXES.has(t);
   }
+  // Content tags (SPORT, 24/7) are always shown as general tags, never country tags
+  const contentTagSet = new Set(Object.keys(contentTagCounts));
+  const allTagKeys = [...new Set([...tags, ...Object.keys(contentTagCounts)])];
 
   // ── Priority ordering for country tags ───────────────────────────────────
   // 1. Local tag (first candidate from locale detection that appears in this portal)
   // 2. US, CA, UK/GB (in that order), skipping any already used as local
   // 3. Rest alphabetical
   const PRIORITY_AFTER_LOCAL = ['US','USA','CA','CAN','UK','GB','GBR'];
-
   const localTag = _LOCALE_TAG_CANDIDATES.find(c => tags.includes(c)) || '';
 
   function sortedCountryTags(tagList){
     const used = new Set();
     const result = [];
-    // Slot 1: local tag
     if(localTag && tagList.includes(localTag)){ result.push(localTag); used.add(localTag); }
-    // Slot 2-N: priority tags (skip if same as local)
     for(const p of PRIORITY_AFTER_LOCAL){
       if(tagList.includes(p) && !used.has(p)){ result.push(p); used.add(p); }
     }
-    // Remaining: alphabetical
-    for(const t of tagList){
-      if(!used.has(t)) result.push(t);
-    }
+    for(const t of tagList){ if(!used.has(t)) result.push(t); }
     return result;
   }
 
-  const countryTags = sortedCountryTags(tags.filter(t => isCountryTag(t)));
-  const generalTags = tags.filter(t => !isCountryTag(t));
+  const countryTags = sortedCountryTags(allTagKeys.filter(t => isCountryTag(t) && !contentTagSet.has(t)));
+  const generalTags = allTagKeys.filter(t => !isCountryTag(t) || contentTagSet.has(t));
 
   function pill(t){
     return `<span class="tag-pill" data-tag="${t}" onclick="setTag(this,'${t}')">${t} <span style="opacity:.55;font-size:9px">${counts[t]}</span></span>`;
@@ -5491,6 +5829,8 @@ function plSave(){
     stalker_device_id:  plCT==='mac' ? (document.getElementById('pl-devid')?.value.trim()||'') : '',
     stalker_device_id2: plCT==='mac' ? (document.getElementById('pl-devid2')?.value.trim()||''): '',
     stalker_signature:  plCT==='mac' ? (document.getElementById('pl-sig')?.value.trim()||'')   : '',
+    portal_ua_preset: _plGetUaPreset(),
+    portal_ua_custom: _plGetUaCustom(),
   };
   if(plEditId){
     const idx=arr.findIndex(p=>p.id===plEditId);
@@ -5522,6 +5862,8 @@ function plEdit(i){
   if(document.getElementById('pl-devid'))  document.getElementById('pl-devid').value=p.stalker_device_id||'';
   if(document.getElementById('pl-devid2')) document.getElementById('pl-devid2').value=p.stalker_device_id2||'';
   if(document.getElementById('pl-sig'))    document.getElementById('pl-sig').value=p.stalker_signature||'';
+  // Restore UA preset fields for all panel types
+  _plSetUaFields(p.portal_ua_preset||'', p.portal_ua_custom||'');
   // scroll form into view
   document.querySelector('.pl-add').scrollIntoView({behavior:'smooth'});
 }
@@ -5534,9 +5876,43 @@ function plDelete(i){
 function plClearForm(){
   plEditId=null;
   ['pl-name','pl-url','pl-mac','pl-xu','pl-us','pl-pw','pl-m3u',
-   'pl-epg','pl-mac-epg','pl-m3u-epg','pl-sn','pl-devid','pl-devid2'].forEach(id=>{
+   'pl-epg','pl-mac-epg','pl-m3u-epg','pl-sn','pl-devid','pl-devid2','pl-sig'].forEach(id=>{
     const el=document.getElementById(id); if(el) el.value='';
   });
+  // Reset all UA preset selectors, hide custom rows, sync custom dropdowns
+  ['pl-ua-preset','pl-xu-ua-preset','pl-m3u-ua-preset'].forEach(id=>{
+    const el=document.getElementById(id); if(el){ el.value=''; _syncUADropdown(id); }
+  });
+  ['pl-ua-custom-row','pl-xu-ua-custom-row','pl-m3u-ua-custom-row'].forEach(id=>{
+    const el=document.getElementById(id); if(el) el.style.display='none';
+  });
+}
+
+// ── Playlist UA helpers ─────────────────────────────────────
+function _plGetUaPreset(){
+  if(plCT==='mac')     return document.getElementById('pl-ua-preset')?.value    ||'';
+  if(plCT==='xtream')  return document.getElementById('pl-xu-ua-preset')?.value ||'';
+  if(plCT==='m3u_url') return document.getElementById('pl-m3u-ua-preset')?.value||'';
+  return '';
+}
+function _plGetUaCustom(){
+  if(plCT==='mac')     return document.getElementById('pl-ua-custom')?.value.trim()    ||'';
+  if(plCT==='xtream')  return document.getElementById('pl-xu-ua-custom')?.value.trim() ||'';
+  if(plCT==='m3u_url') return document.getElementById('pl-m3u-ua-custom')?.value.trim()||'';
+  return '';
+}
+function _plSetUaFields(preset, custom){
+  // Set the correct select + custom input for the current plCT panel
+  let selId, customId, rowId;
+  if(plCT==='mac')      { selId='pl-ua-preset';     customId='pl-ua-custom';     rowId='pl-ua-custom-row'; }
+  else if(plCT==='xtream')  { selId='pl-xu-ua-preset'; customId='pl-xu-ua-custom';  rowId='pl-xu-ua-custom-row'; }
+  else                  { selId='pl-m3u-ua-preset';  customId='pl-m3u-ua-custom'; rowId='pl-m3u-ua-custom-row'; }
+  const sel=document.getElementById(selId);
+  const inp=document.getElementById(customId);
+  const row=document.getElementById(rowId);
+  if(sel){ sel.value=preset||''; _syncUADropdown(selId); }
+  if(inp) inp.value=custom||'';
+  if(row) row.style.display=(preset==='custom')?'flex':'none';
 }
 
 async function plConnect(i){
@@ -5557,6 +5933,19 @@ async function plConnect(i){
   const di=document.getElementById('i-devid'); if(di) di.value=p.stalker_device_id||'';
   const di2=document.getElementById('i-devid2'); if(di2) di2.value=p.stalker_device_id2||'';
   const sig=document.getElementById('i-sig'); if(sig) sig.value=p.stalker_signature||'';
+  // Restore UA preset into the connect-panel fields so doConnect() picks them up
+  const ct=p.type||'mac';
+  const preset=p.portal_ua_preset||'', custom=p.portal_ua_custom||'';
+  if(ct==='mac'){
+    const s=document.getElementById('i-ua-preset'); if(s){s.value=preset; _syncUADropdown('i-ua-preset'); uaPresetChange('i-ua-preset','i-ua-custom');}
+    const c=document.getElementById('i-ua-custom'); if(c) c.value=custom;
+  } else if(ct==='xtream'){
+    const s=document.getElementById('i-xu-ua-preset'); if(s){s.value=preset; _syncUADropdown('i-xu-ua-preset'); uaPresetChange('i-xu-ua-preset','i-xu-ua-custom');}
+    const c=document.getElementById('i-xu-ua-custom'); if(c) c.value=custom;
+  } else {
+    const s=document.getElementById('i-m3u-ua-preset'); if(s){s.value=preset; _syncUADropdown('i-m3u-ua-preset'); uaPresetChange('i-m3u-ua-preset','i-m3u-ua-custom');}
+    const c=document.getElementById('i-m3u-ua-custom'); if(c) c.value=custom;
+  }
   await doConnect();
 }
 
