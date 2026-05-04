@@ -643,6 +643,7 @@ _PROBE_UI_JS = r"""
   let _curStreamUrl   = null;
   let _curStreamName  = null;
   let _curStreamLive  = true;
+  let _snapRestoreTimer = null;  // handle for the fast-path panel-restore setTimeout
   // Touch reveal timer — drives si-touch-visible lifecycle on mobile
   let _revealTimer = null;
 
@@ -829,36 +830,44 @@ _PROBE_UI_JS = r"""
     const name = _curStreamName || '';
     const isLive = _curStreamLive !== false;
 
-    if(_curStreamUrl){
-      // Build new proxy URL with the requested audio track index
-      let newUrl = _curStreamUrl
-        .replace(/[&?]audio_track=\d+/g, '')   // strip existing param
-        .replace(/[&?]$/, '');                   // clean trailing separator
-      // Append audio_track — determine separator
-      newUrl += (newUrl.includes('?') ? '&' : '?') + 'audio_track=' + trackIdx;
-      // Build a display name that includes the track language so the ▶ log line
-      // clearly shows which track was selected (e.g. "EUROSPORT 1 HD [ENG]").
+    // Fast-path: only valid when already routed through hls_proxy.
+    // Direct-play URLs (raw http://...m3u8) must fall through to re-resolve so
+    // the Python route can force-transcode and apply -map 0:a:<N>.
+    const _isProxyUrl = _curStreamUrl && _curStreamUrl.includes('/api/hls_proxy');
+
+    if(_isProxyUrl){
       const _trackList = (_curInfo && _curInfo.audio_tracks) || [];
       const _trackMeta = _trackList[trackIdx];
       const _trackLang = _trackMeta
         ? ((_trackMeta.language || _trackMeta.lang || '').toUpperCase() || ('track ' + trackIdx))
         : ('track ' + trackIdx);
       const _displayName = name ? (name + ' [' + _trackLang + ']') : _trackLang;
-      console.log('[probe] Case 2 (fast-path): doPlay with audio_track=' + trackIdx + ' (' + _trackLang + ')',
+
+      let newUrl = _curStreamUrl
+        .replace(/[&?]audio_track=\d+/g, '')
+        .replace(/[&?]$/, '');
+      newUrl += (newUrl.includes('?') ? '&' : '?') + 'audio_track=' + trackIdx;
+      console.log('[probe] fast-path: audio_track=' + trackIdx + ' (' + _trackLang + ')',
                   '→', newUrl.substring(0, 80) + '…');
       _activeAudio = trackIdx;
       _rebuildTracks();
-      // Snapshot _curInfo BEFORE doPlay — doPlay calls _destroyPlayers which triggers
-      // the patched _siHide(), clearing _curInfo and closing the panel.
-      // We rehydrate immediately after with the snapshot (active track updated) so
-      // the panel reappears showing the new active track and remains clickable.
+
+      // Snapshot everything needed to fully restore the panel after _siHide fires.
+      // _siHide clears _curStreamUrl/_curStreamName too, so we must carry them in
+      // the snapshot and restore them — otherwise the NEXT switch has no fast-path URL.
+      const _snapUrl  = newUrl;
+      const _snapName = name;
       const _infoSnapshot = Object.assign({}, _curInfo, { active_audio_track: trackIdx });
-      if(typeof doPlay === 'function'){
-        doPlay(newUrl, _displayName, {isLive: isLive});
-      }
-      // _siHide has now fired — restore panel from snapshot.
-      // Small delay lets doPlay finish its synchronous setup before we re-show.
-      setTimeout(function(){ _siShow(_infoSnapshot); }, 120);
+      if(typeof doPlay === 'function'){ doPlay(newUrl, _displayName, {isLive: isLive}); }
+      // _siHide has fired. Restore panel + URL state so subsequent switches work.
+      if(_snapRestoreTimer){ clearTimeout(_snapRestoreTimer); }
+      _snapRestoreTimer = setTimeout(function(){
+        _snapRestoreTimer = null;
+        _curStreamUrl  = _snapUrl;
+        _curStreamName = _snapName;
+        _curStreamLive = isLive;
+        _siShow(_infoSnapshot);
+      }, 120);
       return;
     }
 
@@ -1059,6 +1068,9 @@ _PROBE_UI_JS = r"""
 
   /* ── Public: hide (on stop) ─────────────────────────────────────────── */
   function _siHide(){
+    // Cancel any pending fast-path panel-restore before wiping state —
+    // prevents stale snapshot from a previous channel bleeding into the next.
+    if(_snapRestoreTimer){ clearTimeout(_snapRestoreTimer); _snapRestoreTimer = null; }
     _open = false; _sticky = false; _hasData = false; _curInfo = null;
     _hlsAudioTracks = []; _activeAudio = -1;
     _hlsSubTracks   = []; _activeSub   = -1;
@@ -1100,7 +1112,15 @@ _PROBE_UI_JS = r"""
     const res = await _origFetch.call(this, resource, opts);
     const url = (typeof resource === 'string') ? resource : (resource.url || '');
     if(url.includes('/api/resolve') && !url.includes('/api/resolve_url')){
-      // Reset HLS binding state so we re-bind for the new stream
+      // Only restore _activeAudio if this resolve was explicitly an audio-track switch
+      // (body contains audio_track). Without this guard, switching channels inherits
+      // the previous channel's track highlight — the stale UI tag bug.
+      let _reqHadAudioTrack = false;
+      try {
+        const _body = (opts && opts.body) ? JSON.parse(opts.body) : null;
+        _reqHadAudioTrack = (_body && typeof _body.audio_track === 'number');
+      } catch(_){}
+      const _savedAudio = _reqHadAudioTrack ? _activeAudio : -1;
       _hlsBound = false; _hlsAudioTracks = []; _activeAudio = -1;
       const clone = res.clone();
       clone.json().then(function(d){
@@ -1120,6 +1140,8 @@ _PROBE_UI_JS = r"""
             console.log('[probe] cached stream url:', _curStreamUrl.substring(0,80)+'…');
           }
           _siShow(d.stream_info);
+          // Restore active track highlight for audio-switch resolves only.
+          if(_savedAudio >= 0){ _activeAudio = _savedAudio; _rebuildTracks(); }
           // Schedule HLS event binding — hlsObj is created shortly after
           // doPlay() receives this response, so defer a few ticks
           setTimeout(_bindHlsEvents, 200);
