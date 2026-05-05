@@ -128,10 +128,34 @@ On Android (Termux), the server binds to all interfaces so you can also reach it
 
 ### Browsing & Playback
 - Browse Live TV, VOD, and Series categories with search and tag filtering
+- **All Channels** — a synthetic category aggregates every live channel from the portal into a single browsable list, populated from the prefetched channel pool without extra portal API calls
 - HLS.js in-browser playback with automatic ffmpeg fallback for problematic streams
 - HEVC/H.265 streams are routed through an ffmpeg HLS proxy automatically
 - Favourites — saved per portal in browser storage, survive page reloads
 - Playlist manager — save and quickly reconnect to multiple portals
+
+#### Tag Bar Filtering
+Above the category list a pill-based tag bar automatically extracts country and content tags from category titles:
+
+- **Country / region tags** — extracted from category title prefixes (e.g. `US`, `UK`, `CA`, `RS`, `HR`). Related country groups are aliased together — selecting `RS` also shows `SR`, `SRB`, and ex-Yugoslavia regional categories
+- **General content tags** — `SPORT` and `24/7` match anywhere in the category title, so a category like `USA | SPORT` appears under both the `USA` country tag and the `SPORT` general tag simultaneously
+- **Locale-aware ordering** — your local country tag (detected from browser locale) appears first in the tag bar, followed by US, CA, UK, then the rest alphabetically
+- Tags are shown on two rows — general tags (top row) and country tags (bottom row)
+
+#### Global Search
+A search bar above the items list searches across **all categories simultaneously**, not just the currently open one. Results show items from any Live, VOD, or Series category matching the query — no need to switch categories manually.
+
+#### Drag-to-Reorder
+Both category lists and item lists support drag-to-reorder:
+- Drag any category or item row by its handle to reposition it
+- Custom order is saved per portal and persists across sessions
+- Custom ordering is suspended when a tag filter or search is active, restoring the natural portal order for filtered views
+
+#### Hide / Show Items
+Any item in the list can be hidden via its `…` context menu:
+- Hidden items are invisible in the normal browse view
+- A **Hidden Items manager** in the FAB (⚡) actions drawer lists all hidden items for the current mode, with per-item restore buttons and a Clear All option
+- Hidden item lists are saved per portal in browser storage
 
 ### Multi-View (`multiview_addon.py`)
 
@@ -269,13 +293,51 @@ pip install pyatv                 # AirPlay
 
 ### Downloading (`download_addon.py`)
 - **Save M3U** — export selected categories or all channels as a .m3u playlist file
-- **Record MKV** — record a live stream to MKV using ffmpeg with real-time progress (KB/s speed, file size)
-- **Download MKV** — download VOD/series items to MKV
+- **Record MKV** — record a live stream to MKV using ffmpeg with real-time progress (KB/s speed, file size, elapsed time)
+- **Download MKV** — download VOD/series items to MKV; yt-dlp is used as a fallback for YouTube/Twitch URLs
+- **Download Manager** — a persistent job list tracks all active and completed downloads across the session. Each job shows name, progress bar, file size, speed, and a Stop button. Completed downloads are split into Recordings and MKV tabs. The manager auto-opens when a new download or quick-record starts.
+
+### Stalker / MAC Portal Advanced Overrides
+For MAC/Stalker portals, an expandable **Stalker overrides** section in the connect panel lets you supply hardcoded device identity values instead of the auto-computed ones:
+
+| Field | Purpose |
+|---|---|
+| **SN** | Serial number (13-char hex prefix of MD5(MAC) by default) |
+| **Device ID** | SHA-256 of MAC (used as `device_id` in portal requests) |
+| **Device ID2** | SHA-256 of SN (used as `device_id2` in portal requests) |
+| **Signature** | SHA-256 of SN+MAC (used in portal auth) |
+
+All four fields default to blank (auto-computed from the MAC address). Supply values only if you have a known-working set from a real device or a portal that requires specific values.
+These overrides are saved per entry in the Saved Playlists manager and round-trip correctly on reconnect.
+
+### User-Agent Spoofing
+Each portal connection can be configured to identify itself as a specific IPTV client or device. The **User-Agent** field in the connect panel (and in Saved Playlists) offers the following presets:
+
+| Preset | Identifies as | Notes |
+|---|---|---|
+| Auto (MAG250 default) | MAG250 Infomir STB | Default for MAC/Stalker — sends full STB headers (`X-User-Agent`, `stb_type`, `image_version`) |
+| MAG254 | MAG254 Infomir STB | As above, different model |
+| MAG322 | MAG322 Infomir STB | As above, different model |
+| TiviMate | TiviMate Android app | Default for Xtream — includes `X-Requested-With` |
+| GSE IPTV | GSE IPTV iOS app | CFNetwork UA |
+| OTT Player | OTT Player iOS app | CFNetwork UA |
+| IPTV Smarters | IPTV Smarters Pro Android | Includes `Origin: file://` |
+| VLC | VLC 3.0 | Default for M3U |
+| Chrome | Chrome 120 desktop browser | Full browser headers |
+| Custom… | User-supplied string | Enter any UA string; surrounding headers are taken from the portal-type default |
+
+The selected UA applies to all portal API requests (handshake, categories, items) and to direct stream connections (ffmpeg `-user_agent`, proxy fetch headers). MAG-family presets also send the full STB header set to both Stalker and generic MAC portals, which run the same Infomir portal software and recognise them.
 
 ### Subtitles (`subtitles_addon.py`)
 - Search and download subtitles from OpenSubtitles.com (free API key required from opensubtitles.com/en/consumers)
-- Load local subtitle files directly from device storage (.srt / .vtt / .ass / .ssa)
-- Subtitle delay adjustment (+ / −) works for both OpenSubtitles and local files
+- Load local subtitle files directly from device storage — all three common formats parsed client-side:
+  - **SRT** — SubRip text
+  - **VTT** — WebVTT
+  - **ASS / SSA** — Advanced SubStation Alpha (dialogue lines and timing extracted; complex style overrides simplified)
+- **Subtitle delay adjustment** — `+` and `−` buttons shift subtitle timing; tap once for a single step, hold for continuous rapid adjustment
+- **Sync to current time** — snaps the subtitle offset so the currently displaying cue aligns to the current playback position — useful when the delay drift is large
+- **Toggle visibility** — hide/show subtitles without clearing them, so they can be re-enabled without reloading
+- Subtitle state (loaded file, delay offset) persists for the current session
 
 ### VOD / Series Metadata & Links
 - Opens the metadata page for VOD and series items via a priority lookup chain:
@@ -294,6 +356,28 @@ Automatic codec detection and pre-play URL resolution run before every stream is
 - **Pre-play URL resolution** — resolves `ffrt://` and `ffmpeg://` Stalker pseudo-URLs to real stream addresses before playback; also handles Xtream single-use token URLs that must be freshly resolved on each play
 - **MPEG-TS byte-scan fallback** — when ffprobe is unavailable, a lightweight pure-Python PMT parser reads the first ~1880 bytes of the stream to detect HEVC and bad audio without spawning any subprocess
 - **Two-pass ffprobe strategy** — first pass uses a short analysis window (2 s / 500 KB) for fast detection; if that returns no streams (common for HLS sources), a second pass with full HLS protocol whitelist retries automatically
+- **CDN token refresh** — for Stalker portals that issue single-use CDN tokens, the probe re-fetches a fresh token after ffprobe consumes the original, so the player always receives a valid URL
+
+#### Stream Info Panel
+After each stream resolves, an overlay badge appears in the top-right corner of the player showing the detected codec details:
+
+- **Resolution + FPS** — e.g. `1920×1080 @ 25fps`
+- **Video codec** — e.g. `H264`, `HEVC` (shown in red when transcoded)
+- **Audio codec** — e.g. `AAC`, `AC3` (shown in red when transcoded to AAC)
+- **Bitrate** — video and audio bitrate when detected; `ABR` label for HLS adaptive streams
+- **Transcode indicator** — `→ transcode` shown when ffmpeg proxy is active
+- **Hover to reveal (desktop)** — badge appears when hovering over the player area; click to pin open
+- **Tap to reveal (mobile)** — tap anywhere on the player to reveal for 4 seconds; tap the badge to pin open
+
+#### Audio Track Switching
+When a stream contains multiple audio tracks (multi-language, commentary, etc.), the stream info panel shows a **Audio tracks** section with one button per track. Tracks show language code, title, codec, and channel count where available.
+
+Switching uses two paths depending on stream type:
+- **Live HLS multi-audio** — switches the HLS.js audio rendition directly with zero stream restart
+- **Transcoded / direct MPEG-TS** — re-routes through the ffmpeg proxy with `-map 0:a:N` to select the track; video is copied (not re-encoded) — only audio is transcoded
+
+#### Embedded Subtitle Stream Display
+When ffprobe detects embedded subtitle streams in the container (e.g. DVB teletext, PGS, SRT), they are listed as informational entries in the stream info panel. Image-based subtitle formats (PGS/DVD) are flagged as such. These are display-only — use the Subtitles tab for external subtitle loading and display.
 
 **Requires:** `probe_addon.py` in the same directory. `ffprobe` (bundled with ffmpeg) is strongly recommended for accurate detection; the pure-Python fallback covers the most common cases when ffprobe is absent.
 
