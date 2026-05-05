@@ -2264,7 +2264,17 @@ class StalkerPortalClient:
                 if _evt is not None:
                     self.log(f"[STALKER] Items fallback waiting for prefetch to complete (cat={cat_id})…")
                     _evt.wait(timeout=25)
-                raw_all = getattr(self, "_all_channels_raw", None) or []
+                # The prefetch ran on a DIFFERENT client instance (its own _make_client
+                # context), so self._all_channels_raw is still None even after the event
+                # fires.  Seed it from the shared items-cache that _make_client injected
+                # as self._shared_items_cache, then fall back to an empty list.
+                if self._all_channels_raw is None:
+                    _shared = getattr(self, "_shared_items_cache", None)
+                    if _shared is not None:
+                        _pool = _shared.get(("live", "__all__"))
+                        if _pool:
+                            self._all_channels_raw = _pool
+                raw_all = self._all_channels_raw or []
             if raw_all:
                 filtered = [ch for ch in raw_all
                             if isinstance(ch, dict) and str(ch.get("tv_genre_id", "")) == str(cat_id)]
