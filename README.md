@@ -373,8 +373,8 @@ After each stream resolves, an overlay badge appears in the top-right corner of 
 When a stream contains multiple audio tracks (multi-language, commentary, etc.), the stream info panel shows a **Audio tracks** section with one button per track. Tracks show language code, title, codec, and channel count where available.
 
 Switching uses two paths depending on stream type:
-- **Live HLS multi-audio** — switches the HLS.js audio rendition directly with zero stream restart
-- **Transcoded / direct MPEG-TS** — re-routes through the ffmpeg proxy with `-map 0:a:N` to select the track; video is copied (not re-encoded) — only audio is transcoded
+- **Native HLS with multiple audio renditions** — if the stream is a genuine HLS `.m3u8` with multi-audio renditions declared in the manifest, and is not already transcoded, HLS.js switches the rendition directly with zero stream restart
+- **Transcoded streams and MPEG-TS** — for all other cases (already transcoded for HEVC/AC3, direct MPEG-TS, or HLS without declared multi-audio), the stream is re-routed through the ffmpeg proxy with `-map 0:a:N` to select the track; video is copied, only audio is re-encoded. This restarts the stream through the proxy.
 
 #### Embedded Subtitle Stream Display
 When ffprobe detects embedded subtitle streams in the container (e.g. DVB teletext, PGS, SRT), they are listed as informational entries in the stream info panel. Image-based subtitle formats (PGS/DVD) are flagged as such. These are display-only — use the Subtitles tab for external subtitle loading and display.
