@@ -390,6 +390,7 @@ async def _make_client(do_handshake=True):
         # category click after connect returns 0 items even though prefetch
         # completed successfully.
         client._shared_items_cache = state._items_cache
+        
         # Pre-seed _all_channels_raw from the __all__ pool if already fetched.
         # Prevents _fetch_ch_logo_cache() from issuing a redundant get_all_channels
         # call on any code path (api_items, api_global_search, etc.).
@@ -3774,6 +3775,14 @@ const _CONTENT_TAGS = [
     tag: '24/7',
     test: t => t.includes('24/7') || t.includes('24-7') || t.includes('24X7'),
   },
+  {
+    tag: 'MOVIES',
+    test: t => /\bMOVI(?:ES?)?\b|\bFILM[S]?\b|\bVOD\b/.test(t),
+  },
+  {
+    tag: 'SERIES',
+    test: t => /\bSERIE[S]?\b|\bSHOW[S]?\b|\bEPISODE[S]?\b/.test(t),
+  },
 ];
 
 // Returns the set of content tags that match a given category title.
@@ -3881,7 +3890,127 @@ const _KNOWN_TAG_PREFIXES = new Set([
   'PERS','FARS','PASH','DARI','KURD',          // Middle East / Central Asia
   'PORT','CAST','CATA','GALI','BASK',          // Iberian variants
   'NETH','FLEM','WALL',                        // Low Countries
+  'CRB','CARIB',                              // Caribbean regional
+  'KA',                                       // Kazakhstan (provider shorthand)
 ]);
+
+// ── Full country / language name → canonical tag ──────────────────────────────
+// Used when a portal writes the full name as the category title with no separator,
+// e.g. "GERMANY", "NETHERLANDS", "CANADA (LIVE EVENT ONLY)", "RUSSIAN".
+// Keys are UPPER-CASE; values are the same tag codes used in _KNOWN_TAG_PREFIXES.
+// Multi-word names ("UNITED KINGDOM") are sorted longest-first at runtime so the
+// greedy prefix scan always prefers the most-specific match.
+const _COUNTRY_NAME_TO_TAG = {
+  // ── A ──────────────────────────────────────────────────────────────────────
+  'AFGHANISTAN':'AF','ALBANIA':'AL','ALGERIA':'DZ','ANDORRA':'AD',
+  'ANGOLA':'AO','ANTIGUA':'AG','ARGENTINA':'AR','ARMENIA':'AM',
+  'AUSTRALIA':'AU','AUSTRIA':'AT','AZERBAIJAN':'AZ',
+  // ── B ──────────────────────────────────────────────────────────────────────
+  'BAHRAIN':'BH','BANGLADESH':'BD','BARBADOS':'BB','BELARUS':'BY',
+  'BELGIUM':'BE','BELIZE':'BZ','BENIN':'BJ','BHUTAN':'BT',
+  'BOLIVIA':'BO','BOSNIA':'BA','BOTSWANA':'BW','BRAZIL':'BR','BRASIL':'BR',
+  'BRUNEI':'BN','BULGARIA':'BG','BURKINA FASO':'BF','BURUNDI':'BI',
+  // ── C ──────────────────────────────────────────────────────────────────────
+  'CAMBODIA':'KH','CAMEROON':'CM','CANADA':'CA',
+  'CAPE VERDE':'CV','CENTRAL AFRICAN REPUBLIC':'CF','CHAD':'TD',
+  'CHILE':'CL','CHINA':'CN','COLOMBIA':'CO','COMOROS':'KM',
+  'CONGO':'CG','COSTA RICA':'CR','CROATIA':'HR','CUBA':'CU',
+  'CARIBBEAN':'CRB','CARIB':'CRB',
+  'CYPRUS':'CY','CZECH':'CZ','CZECHIA':'CZ','CZECH REPUBLIC':'CZ',
+  // ── D ──────────────────────────────────────────────────────────────────────
+  'DENMARK':'DK','DJIBOUTI':'DJ','DOMINICA':'DM',
+  'DOMINICAN REPUBLIC':'DO','DUTCH':'NL',
+  // ── E ──────────────────────────────────────────────────────────────────────
+  'ECUADOR':'EC','EGYPT':'EG','EL SALVADOR':'SV','ENGLAND':'ENG',
+  'EQUATORIAL GUINEA':'GQ','ERITREA':'ER','ESTONIA':'EE',
+  'ESWATINI':'SZ','ETHIOPIA':'ET',
+  'EXYU':'EXYU','EX-YU':'EXYU','EX YU':'EXYU','YUGOSLAVIA':'EXYU',
+  'EXUSSR':'EXUSSR','EX-USSR':'EXUSSR','EX USSR':'EXUSSR',
+  // ── F ──────────────────────────────────────────────────────────────────────
+  'FIJI':'FJ','FINLAND':'FI','FRANCE':'FR','FRENCH':'FR',
+  // ── G ──────────────────────────────────────────────────────────────────────
+  'GABON':'GA','GAMBIA':'GM','GEORGIA':'GE','GERMANY':'DE',
+  'GHANA':'GH','GREECE':'GR','GRENADA':'GD','GUATEMALA':'GT',
+  'GUINEA':'GN','GUINEA-BISSAU':'GW','GUYANA':'GY',
+  // ── H ──────────────────────────────────────────────────────────────────────
+  'HAITI':'HT','HONDURAS':'HN','HONG KONG':'HK','HUNGARY':'HU',
+  // ── I ──────────────────────────────────────────────────────────────────────
+  'ICELAND':'IS','INDIA':'IN','INDONESIA':'ID','IRAN':'IR',
+  'IRAQ':'IQ','IRELAND':'IE','ISRAEL':'IL','ITALY':'IT',
+  // ── J ──────────────────────────────────────────────────────────────────────
+  'JAMAICA':'JM','JAPAN':'JP','JORDAN':'JO',
+  // ── K ──────────────────────────────────────────────────────────────────────
+  'KAZAKHSTAN':'KZ','KENYA':'KE','KIRIBATI':'KI','KUWAIT':'KW',
+  'KYRGYZSTAN':'KG','NORTH KOREA':'KP','SOUTH KOREA':'KR','KOREA':'KR',
+  // ── L ──────────────────────────────────────────────────────────────────────
+  'LAOS':'LA','LATVIA':'LV','LEBANON':'LB','LESOTHO':'LS',
+  'LIBERIA':'LR','LIBYA':'LY','LIECHTENSTEIN':'LI',
+  'LITHUANIA':'LT','LUXEMBOURG':'LU',
+  // ── M ──────────────────────────────────────────────────────────────────────
+  'MACAU':'MO','MADAGASCAR':'MG','MALAWI':'MW','MALAYSIA':'MY',
+  'MALDIVES':'MV','MALI':'ML','MALTA':'MT','MAURITANIA':'MR',
+  'MAURITIUS':'MU','MEXICO':'MX','MICRONESIA':'FM','MOLDOVA':'MD',
+  'MONACO':'MC','MONGOLIA':'MN','MONTENEGRO':'ME',
+  'MOROCCO':'MA','MOZAMBIQUE':'MZ','MYANMAR':'MM',
+  // ── N ──────────────────────────────────────────────────────────────────────
+  'NAMIBIA':'NA','NAURU':'NR','NEPAL':'NP','NETHERLANDS':'NL',
+  'NEW ZEALAND':'NZ','NICARAGUA':'NI','NIGER':'NE','NIGERIA':'NG',
+  'NORTH MACEDONIA':'MK','NORWAY':'NO',
+  // ── O ──────────────────────────────────────────────────────────────────────
+  'OMAN':'OM',
+  // ── P ──────────────────────────────────────────────────────────────────────
+  'PAKISTAN':'PK','PALAU':'PW','PALESTINE':'PS','PANAMA':'PA',
+  'PAPUA NEW GUINEA':'PG','PARAGUAY':'PY','PERU':'PE',
+  'PHILIPPINES':'PH','POLAND':'PL','PORTUGAL':'PT',
+  // ── Q ──────────────────────────────────────────────────────────────────────
+  'QATAR':'QA',
+  // ── R ──────────────────────────────────────────────────────────────────────
+  'ROMANIA':'RO','RUSSIA':'RU','RUSSIAN':'RU','RWANDA':'RW',
+  // ── S ──────────────────────────────────────────────────────────────────────
+  'SAINT KITTS':'KN','SAINT LUCIA':'LC','SAINT VINCENT':'VC',
+  'SAMOA':'WS','SAN MARINO':'SM','SAO TOME':'ST',
+  'SAUDI ARABIA':'SA','SCOTLAND':'SCO','SENEGAL':'SN','SERBIA':'RS',
+  'SEYCHELLES':'SC','SIERRA LEONE':'SL','SINGAPORE':'SG',
+  'SLOVAKIA':'SK','SLOVENIA':'SI','SOLOMON ISLANDS':'SB',
+  'SOMALIA':'SO','SOUTH AFRICA':'ZA','SOUTH SUDAN':'SS',
+  'SPAIN':'ES','SRI LANKA':'LK','SUDAN':'SD','SURINAME':'SR',
+  'SWEDEN':'SE','SWITZERLAND':'CH','SYRIA':'SY',
+  // ── T ──────────────────────────────────────────────────────────────────────
+  'TAIWAN':'TW','TAJIKISTAN':'TJ','TANZANIA':'TZ','THAILAND':'TH',
+  'TIMOR-LESTE':'TL','TOGO':'TG','TONGA':'TO','TRINIDAD':'TT',
+  'TRINIDAD AND TOBAGO':'TT','TUNISIA':'TN','TURKEY':'TR',
+  'TURKMENISTAN':'TM','TUVALU':'TV',
+  // ── U ──────────────────────────────────────────────────────────────────────
+  'UGANDA':'UG','UKRAINE':'UA','UNITED ARAB EMIRATES':'AE',
+  'UNITED KINGDOM':'GB','UNITED STATES':'US',
+  'URUGUAY':'UY','UZBEKISTAN':'UZ',
+  // ── V ──────────────────────────────────────────────────────────────────────
+  'VANUATU':'VU','VENEZUELA':'VE','VIETNAM':'VN',
+  // ── W / Y / Z ──────────────────────────────────────────────────────────────
+  'WALES':'WAL','YEMEN':'YE','ZAMBIA':'ZM','ZIMBABWE':'ZW',
+  // ── Regional blocs & groupings ─────────────────────────────────────────────
+  'EUROPE':'EU','EUROPEAN':'EU',
+  'BALKANS':'BALK','BALKAN':'BALK',
+  'ARABIC':'ARB','ARAB':'ARB','ARABIAN':'ARB',
+  'LATIN AMERICA':'LATAM','LATINO':'LATAM','LATIN':'LATAM',
+  'SCANDINAVIA':'SCAN','SCANDINAVIAN':'SCAN','NORDIC':'SCAN',
+  'AFRICA':'AFR','AFRICAN':'AFR',
+  'MIDDLE EAST':'MENA','MENA':'MENA',
+  'ASIA':'ASIA','ASIAN':'ASIA',
+  // ── Languages commonly used as category names by IPTV providers ────────────
+  'HINDI':'HINDI','URDU':'URDU','TAMIL':'TAMI','TELUGU':'TELU',
+  'BENGALI':'BENG','MALAYALAM':'MALA','KANNADA':'KANA','GUJARATI':'GUJA',
+  'PUNJABI':'PANJ','MARATHI':'IN','SINHALESE':'LK','SINHALA':'LK',
+  'PERSIAN':'PERS','FARSI':'FARS','PASHTO':'PASH','DARI':'DARI',
+  'KURDISH':'KURD','AMHARIC':'AMHA','SOMALI':'SOMA','SWAHILI':'SWAH',
+  'FLEMISH':'FLEM','WALLOON':'WALL',
+};
+
+// Pre-sorted keys, longest first — ensures "UNITED KINGDOM" is tried before "UNITED"
+// and "SOUTH AFRICA" before "SOUTH". Built once at parse time.
+// Sorted longest-first so "GUINEA-BISSAU" is tested before "GUINEA",
+// "SOUTH KOREA" before "KOREA", etc.
+const _COUNTRY_NAME_KEYS = Object.keys(_COUNTRY_NAME_TO_TAG).sort((a,b)=>b.length-a.length);
 
 function _catTag(title){
   if(!title) return '';
@@ -3906,6 +4035,15 @@ function _catTag(title){
     const candidate = m[1].toUpperCase();
     if(_KNOWN_TAG_PREFIXES.has(candidate)) return candidate;
   }
+
+  // Full country/language name — word-boundary regex, longest key first.
+  // Handles "GERMANY", "CANADA (LIVE EVENT ONLY)", "SOUTH AFRICA 4K", etc.
+  const upper = normalised.toUpperCase();
+  for(const key of _COUNTRY_NAME_KEYS){
+    const re = new RegExp('(?<![A-Z])' + key.replace(/-/g,'[-\\s]?').replace(/ /g,'\\s+') + '(?![A-Z])');
+    if(re.test(upper)) return _COUNTRY_NAME_TO_TAG[key];
+  }
+
   return '';
 }
 
@@ -4145,7 +4283,17 @@ function _buildTagBar(cats){
   }
 
   const countryTags = sortedCountryTags(allTagKeys.filter(t => isCountryTag(t) && !contentTagSet.has(t)));
-  const generalTags = allTagKeys.filter(t => !isCountryTag(t) || contentTagSet.has(t));
+  const CONTENT_TAG_ORDER = _CONTENT_TAGS.map(ct => ct.tag);
+  const generalTags = allTagKeys
+    .filter(t => !isCountryTag(t) || contentTagSet.has(t))
+    .sort((a, b) => {
+      const ai = CONTENT_TAG_ORDER.indexOf(a);
+      const bi = CONTENT_TAG_ORDER.indexOf(b);
+      if(ai !== -1 && bi !== -1) return ai - bi;
+      if(ai !== -1) return -1;
+      if(bi !== -1) return 1;
+      return a.localeCompare(b);
+    });
 
   function pill(t){
     return `<span class="tag-pill" data-tag="${t}" onclick="setTag(this,'${t}')">${t} <span style="opacity:.55;font-size:9px">${counts[t]}</span></span>`;
