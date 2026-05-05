@@ -383,6 +383,13 @@ async def _make_client(do_handshake=True):
         # on it instead of firing a concurrent get_all_channels HTTP call when
         # state._logo_cache_live is an empty dict (prefetch in progress).
         client._all_channels_ready_event = state._all_channels_ready
+        # Inject a reference to the shared items cache so that the items-page
+        # fallback can seed _all_channels_raw from it after waiting on the
+        # prefetch event.  Without this the browsing client's _all_channels_raw
+        # stays None (the prefetch ran on a different instance) and the first
+        # category click after connect returns 0 items even though prefetch
+        # completed successfully.
+        client._shared_items_cache = state._items_cache
         # Pre-seed _all_channels_raw from the __all__ pool if already fetched.
         # Prevents _fetch_ch_logo_cache() from issuing a redundant get_all_channels
         # call on any code path (api_items, api_global_search, etc.).
