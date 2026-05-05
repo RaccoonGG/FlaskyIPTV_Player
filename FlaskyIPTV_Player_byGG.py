@@ -383,6 +383,7 @@ async def _make_client(do_handshake=True):
         # on it instead of firing a concurrent get_all_channels HTTP call when
         # state._logo_cache_live is an empty dict (prefetch in progress).
         client._all_channels_ready_event = state._all_channels_ready
+        
         # Inject a reference to the shared items cache so that the items-page
         # fallback can seed _all_channels_raw from it after waiting on the
         # prefetch event.  Without this the browsing client's _all_channels_raw
@@ -390,7 +391,7 @@ async def _make_client(do_handshake=True):
         # category click after connect returns 0 items even though prefetch
         # completed successfully.
         client._shared_items_cache = state._items_cache
-        
+
         # Pre-seed _all_channels_raw from the __all__ pool if already fetched.
         # Prevents _fetch_ch_logo_cache() from issuing a redundant get_all_channels
         # call on any code path (api_items, api_global_search, etc.).
@@ -3402,7 +3403,7 @@ async function _gsPlayExt(i){
 function switchMode(m, cats){
   mode=m;
   document.querySelectorAll('.mt').forEach(b=>b.classList.toggle('on',b.dataset.m===m));
-  allCats=cats; _activeTag=''; _buildTagBar(cats); filterCats();
+  allCats=cats; _activeTags.clear(); _buildTagBar(cats); filterCats();
   document.getElementById('catlist').scrollTop=0;
 }
 
@@ -3797,27 +3798,33 @@ function _contentTagsFor(title){
 
 function filterCats(){
   const q=document.getElementById('csrch').value.toLowerCase();
-  const tag=_activeTag;
   const _hiddenCats=loadHiddenCats(mode);
   let cats=allCats.filter(c=>!_hiddenCats.has(String(c.id||c.title)));
   // Pull out the All Channels entry — it will always be pinned first
   const allEntry = cats.find(c=>c.id==='__all__');
   let rest = cats.filter(c=>c.id!=='__all__');
-  if(tag){
-    // Content tags (SPORT, 24/7) match anywhere in the title — a category like
-    // "USA | SPORT" appears under both USA and SPORT.
-    const contentTag = _CONTENT_TAGS.find(ct => ct.tag === tag);
-    if(contentTag){
-      rest = rest.filter(c => contentTag.test((c.title||'').toUpperCase()));
-    } else {
-      // Prefix tag: expand via _TAG_GROUPS (e.g. RS/SR/SRB → EXYU)
-      const matchTags = _TAG_GROUPS[tag] || new Set([tag]);
-      rest=rest.filter(c=>matchTags.has(_catTag(c.title)));
+  if(_activeTags.size){
+    const contentTagSet = new Set(_CONTENT_TAGS.map(ct=>ct.tag));
+    const activeContentTags = [..._activeTags].filter(t => contentTagSet.has(t));
+    const activeCountryTags = [..._activeTags].filter(t => !contentTagSet.has(t));
+    // Country/prefix filter — OR logic: union all TAG_GROUP expansions
+    if(activeCountryTags.length){
+      const matchSet = new Set();
+      for(const t of activeCountryTags){
+        const grp = _TAG_GROUPS[t] || new Set([t]);
+        grp.forEach(g => matchSet.add(g));
+      }
+      rest = rest.filter(c => matchSet.has(_catTag(c.title)));
+    }
+    // Content tag filter — OR logic: must pass at least one selected content test
+    if(activeContentTags.length){
+      const cts = activeContentTags.map(ctag => _CONTENT_TAGS.find(c => c.tag === ctag)).filter(Boolean);
+      rest = rest.filter(c => cts.some(ct => ct.test((c.title||'').toUpperCase())));
     }
   }
-  if(q)   rest=rest.filter(c=>c.title.toLowerCase().includes(q));
+  if(q) rest=rest.filter(c=>c.title.toLowerCase().includes(q));
   // Apply custom order only when not actively searching/tag-filtering
-  if(!q&&!tag){
+  if(!q && !_activeTags.size){
     const order=loadCatOrder(mode);
     if(order) rest=_applyOrder(rest, order, c=>String(c.id||c.title));
   }
@@ -3826,7 +3833,7 @@ function filterCats(){
 }
 
 // ── TAG BAR ────────────────────────────────────────────────────
-let _activeTag='';
+let _activeTags = new Set();
 
 // Known tag prefixes recognised when a category name has NO separator.
 // Only tags in this set are extracted from bare-prefix names like "US Sports".
@@ -4238,7 +4245,7 @@ function _buildTagBar(cats){
   });
 
   const tags=Object.keys(rawCounts).sort();
-  if(!tags.length && !Object.keys(contentTagCounts).length){ bar.style.display='none'; _activeTag=''; return; }
+  if(!tags.length && !Object.keys(contentTagCounts).length){ bar.style.display='none'; _activeTags.clear(); return; }
 
   // Group-aware counts: for each prefix tag, sum counts of all tags in its group
   // so SR pill shows "SR 15 + EXYU 8 = 23" rather than just "SR 15"
@@ -4253,7 +4260,7 @@ function _buildTagBar(cats){
   }
   // Merge content tag counts
   Object.assign(counts, contentTagCounts);
-  if(!Object.keys(counts).length){ bar.style.display='none'; _activeTag=''; return; }
+  if(!Object.keys(counts).length){ bar.style.display='none'; _activeTags.clear(); return; }
 
   const NOT_COUNTRY = new Set(['4K','8K','UHD','FHD','HD','SD','HQ','4G','VIP','FOR','NEW','TOP','HOT','ALL']);
   function isCountryTag(t){
@@ -4336,8 +4343,16 @@ function _buildTagBar(cats){
 }
 
 function setTag(el, tag){
-  _activeTag=tag;
-  document.querySelectorAll('#tag-bar .tag-pill').forEach(p=>p.classList.toggle('on',p.dataset.tag===tag));
+  if(tag === ''){
+    _activeTags.clear();
+  } else {
+    if(_activeTags.has(tag)) _activeTags.delete(tag);
+    else _activeTags.add(tag);
+  }
+  document.querySelectorAll('#tag-bar .tag-pill').forEach(p=>{
+    const t = p.dataset.tag;
+    p.classList.toggle('on', t==='' ? _activeTags.size===0 : _activeTags.has(t));
+  });
   filterCats();
 }
 
