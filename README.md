@@ -310,7 +310,7 @@ For MAC/Stalker portals, an expandable **Stalker overrides** section in the conn
 All four fields default to blank (auto-computed from the MAC address). Supply values only if you have a known-working set from a real device or a portal that requires specific values.
 These overrides are saved per entry in the Saved Playlists manager and round-trip correctly on reconnect.
 
-### User-Agent Spoofing
+### User-Agent Configs
 Each portal connection can be configured to identify itself as a specific IPTV client or device. The **User-Agent** field in the connect panel (and in Saved Playlists) offers the following presets:
 
 | Preset | Identifies as | Notes |
