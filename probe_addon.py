@@ -1289,7 +1289,40 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                                                                  is_hls=not needs_transcode)
                                 _log_stream_info(state, stream_info, "ffprobe HLS retry")
                             else:
-                                state.log("[PROBE] ffprobe HLS retry also failed — playing direct")
+                                # HLS playlist probe failed — try the same URL with a .ts extension.
+                                # Some portals expose the actual transport stream at the .ts variant.
+                                def _hls_to_ts_variant(hls_url: str) -> str:
+                                    base, sep, suffix = hls_url.partition('?')
+                                    if '.m3u8' not in base.lower():
+                                        return hls_url
+                                    lower_base = base.lower()
+                                    idx = lower_base.rfind('.m3u8')
+                                    if idx < 0:
+                                        return hls_url
+                                    base = base[:idx] + '.ts' + base[idx + 6:]
+                                    return base + (sep + suffix if sep else '')
+
+                                ts_url = _hls_to_ts_variant(url)
+                                ts_fallback_used = False
+                                if ts_url != url:
+                                    state.log("[PROBE] HLS retry failed — trying .ts variant")
+                                    codecs = probe_stream_codecs(ts_url, pre_input_args=_probe_pre_args,
+                                                                 timeout=10, ffprobe_path=_FFPROBE_PATH)
+                                    if codecs:
+                                        state.log("[PROBE] .ts probe succeeded — using TS URL")
+                                        url = ts_url
+                                        ts_fallback_used = True
+                                        url_lower_full = url.lower()
+                                        url_lower = url_lower_full.split('?')[0]
+                                        needs_transcode, transcode_reason, detected_codec = _check_codecs(codecs)
+                                        _is_hls_url = False
+                                        stream_info = _build_stream_info(codecs, transcode_reason,
+                                                                         is_hls=False)
+                                        _log_stream_info(state, stream_info, ".ts fallback")
+                                    else:
+                                        state.log("[PROBE] .ts probe also failed — playing direct")
+                                else:
+                                    state.log("[PROBE] ffprobe HLS retry also failed — playing direct")
                         else:
                             state.log("[PROBE] ffprobe failed — falling back to TS byte scan")
 
@@ -1337,6 +1370,7 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                     state.conn_type == 'mac'
                     and 'token=' in url
                     and not url.lower().split('?')[0].endswith('.m3u8')
+                    and not locals().get('ts_fallback_used', False)
                 )
                 if _is_stalker_token_url:
                     try:
