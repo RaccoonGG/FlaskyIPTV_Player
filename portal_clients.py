@@ -3031,7 +3031,8 @@ class XtreamClient:
     def _stream_url(self, mode: str, item: dict) -> str:
         if mode == "live":
             sid = item.get("stream_id", "")
-            return f"{self.base}/live/{self.username}/{self.password}/{sid}.m3u8"
+            ext = item.get("container_extension", "m3u8")
+            return f"{self.base}/live/{self.username}/{self.password}/{sid}.{ext}"
         elif mode == "vod":
             sid = item.get("stream_id", "")
             ext = item.get("container_extension", "mp4")
