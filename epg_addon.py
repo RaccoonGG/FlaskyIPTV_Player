@@ -79,7 +79,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from urllib.parse import urlparse, quote, unquote
+from urllib.parse import urlparse, quote, unquote, parse_qs
 
 import aiohttp
 from flask import request, jsonify, Response
@@ -1423,9 +1423,13 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 return {"url": cu_url, "fallback_url": cu_url_fallback, "duration_secs": int(stop_ts - start_ts)}
 
             # ── MAC / Stalker portal ──────────────────────────────────────────────
-            start_dt_utc = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-            start_local  = start_dt_utc.astimezone()   # local tz, same as utc_to_local()
-            start_str    = start_local.strftime("%Y-%m-%d:%H-%M")
+            # Use the same server-UTC-offset approach as the Xtream path above.
+            # astimezone() would use the CLIENT's local timezone (DST-contaminated):
+            # after Belgrade's clock moves UTC+1→UTC+2, start_str shifts +1h,
+            # causing catchup to play one slot ahead on 60-min programmes.
+            _mac_offset_secs = getattr(state, "_portal_utc_offset", 0)
+            _mac_srv_local_ts = start_ts + _mac_offset_secs
+            start_str    = datetime.utcfromtimestamp(_mac_srv_local_ts).strftime("%Y-%m-%d:%H-%M")
             duration_min = max(1, (stop_ts - start_ts) // 60)
 
             state.log(f"[CatchUp/Play] cmd={effective_cmd[:50]} archive_cmd={archive_cmd[:50] if archive_cmd else '(none)'} start={start_str} dur={duration_min}m")
@@ -1529,13 +1533,12 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 return float(s)
             except ValueError:
                 pass
-            # Formatted datetime strings — Xtream sends these in the SERVER'S local time,
-            # NOT UTC. Treat them as naive (local) so they round-trip correctly.
-            # If the consumer needs UTC epoch, use the start_timestamp field instead.
+            # Formatted datetime strings — Xtream sends these in UTC ("YYYY-MM-DD HH:MM:SS").
+            # Must use replace(tzinfo=UTC) so the epoch is UTC-based; .timestamp() alone
+            # uses the CLIENT'S local timezone and is contaminated by DST changes.
             for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
                 try:
-                    # datetime.fromtimestamp(datetime.strptime(...).timestamp()) keeps local tz
-                    return datetime.strptime(s[:19], fmt).timestamp()
+                    return datetime.strptime(s[:19], fmt).replace(tzinfo=timezone.utc).timestamp()
                 except ValueError:
                     continue
             return 0.0
