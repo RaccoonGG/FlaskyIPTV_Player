@@ -1102,10 +1102,20 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                     ep_title = raw_title
                                 ep_title = ep_title.strip() or "Unknown"
                                 _ma2 = "1" if ep_s >= _arch_cutoff else "0"
+                                # Preserve the portal's own server-local datetime string.
+                                # start_timestamp is a UTC epoch, but many portals compute it
+                                # using a pre-DST timezone offset (e.g. CET instead of CEST),
+                                # making it 1 h off after a DST change.  The 'start' string
+                                # field is always the portal's stored local time and is
+                                # timezone-neutral — we use it directly for the timeshift URL
+                                # to avoid the DST mismatch entirely.
+                                _raw_start_str = (ep.get("start") or ep.get("time") or "").strip()
+                                ep_start_str = _raw_start_str[:16] if len(_raw_start_str) >= 13 else ""
                                 results.append({
                                     "title":        ep_title,
                                     "start":        ep_s,
                                     "stop":         ep_e,
+                                    "start_str":    ep_start_str,   # server-local "YYYY-MM-DD HH:MM"
                                     "cmd":          sid,
                                     "live_cmd":     sid,
                                     "mark_archive": _ma2,
@@ -1399,14 +1409,35 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 pwd   = creds["password"] if creds else state.password
                 _p = urlparse(base)
                 dur = max(1, math.ceil((stop_ts - start_ts) / 60))
-                # Convert UTC epoch to server local time using the offset computed at
-                # connect time via calendar.timegm arithmetic (no client-tz contamination).
                 _offset_secs = getattr(state, "_portal_utc_offset", 0)
-                _srv_local_ts = start_ts + _offset_secs
-                start_fmt = datetime.utcfromtimestamp(_srv_local_ts).strftime("%Y-%m-%d:%H-%M")
+
+                # Prefer the portal's own server-local datetime string over the
+                # epoch+offset calculation.  start_timestamp is a UTC epoch that
+                # many portals computed using a *pre-DST* timezone (e.g. CET),
+                # so adding our correctly-updated post-DST offset (+7200 CEST)
+                # pushes the URL 1 hour past the actual content start.
+                # The 'start' string field is the portal's stored local schedule
+                # time — it never changes with DST and matches what the timeshift
+                # engine expects directly.
+                _start_str_raw = str(data.get("start_str") or "").strip()[:16]
+                if len(_start_str_raw) >= 13:
+                    try:
+                        _dt_local = datetime.strptime(_start_str_raw, "%Y-%m-%d %H:%M")
+                        start_fmt = _dt_local.strftime("%Y-%m-%d:%H-%M")
+                    except ValueError:
+                        _start_str_raw = ""  # fall through to epoch+offset below
+
+                if len(_start_str_raw) < 13:
+                    # Fallback: epoch + server-UTC-offset (used when start_str absent,
+                    # e.g. entries coming from get_epg or XMLTV path instead of
+                    # get_simple_data_table).
+                    _srv_local_ts = start_ts + _offset_secs
+                    start_fmt = datetime.utcfromtimestamp(_srv_local_ts).strftime("%Y-%m-%d:%H-%M")
+
                 state.log(f"[CatchUp/Play] Server offset={_offset_secs:+d}s  "
                           f"start_utc={datetime.utcfromtimestamp(start_ts).strftime('%Y-%m-%d %H:%M')}  "
-                          f"start_server={start_fmt}")
+                          f"start_server={start_fmt}"
+                          + (f"  [from start_str]" if len(_start_str_raw) >= 13 else ""))
 
                 # Primary: path-based .ts format — routes through mpegts.js automatically.
                 # Do NOT use quote() on credentials — raw values match what the server expects.
@@ -3357,12 +3388,16 @@ function _renderArchiveListings(listings){
     const liveCmdSafe=encodeURIComponent(p.live_cmd||'');
     const realIdSafe=encodeURIComponent(p.epg_id||p.id||'');
     const titleSafe=(p.title||'').replace(/'/g,"\\'");
+    // start_str is the portal's own server-local datetime string ("YYYY-MM-DD HH:MM").
+    // Passing it bypasses the DST-sensitive epoch+offset conversion in api_catchup_play
+    // so the timeshift URL always uses the portal's stored time directly.
+    const startStrSafe=encodeURIComponent(p.start_str||'');
     const opacity=hasArchive?'1':'0.4';
     const click=hasArchive
-      ?`onclick="doPlayArchiveCmd('${cmdSafe}',${p.start||0},${p.stop||0},'${titleSafe}','${liveCmdSafe}','${realIdSafe}')"`
+      ?`onclick="doPlayArchiveCmd('${cmdSafe}',${p.start||0},${p.stop||0},'${titleSafe}','${liveCmdSafe}','${realIdSafe}','${startStrSafe}')"`
       :'';
     const extBtn=hasArchive
-      ?`<button class="btn-ghost" onclick="event.stopPropagation();doExternalArchiveCmd('${cmdSafe}',${p.start||0},${p.stop||0},'${titleSafe}','${liveCmdSafe}','${realIdSafe}')" title="Play in external player" style="padding:0 6px;font-size:13px;flex-shrink:0">🎬</button>`
+      ?`<button class="btn-ghost" onclick="event.stopPropagation();doExternalArchiveCmd('${cmdSafe}',${p.start||0},${p.stop||0},'${titleSafe}','${liveCmdSafe}','${realIdSafe}','${startStrSafe}')" title="Play in external player" style="padding:0 6px;font-size:13px;flex-shrink:0">🎬</button>`
       :'';
     const cursor=hasArchive?'pointer':'default';
     const archIcon=hasArchive?'<span style="font-size:14px;color:var(--acc)">▶</span>':'';
@@ -3381,15 +3416,16 @@ function _renderArchiveListings(listings){
     rows+'<div style="padding-top:8px;border-top:1px solid var(--bdr)">'+_cuManualForm()+'</div>';
 }
 
-function doPlayArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, encodedRealId){
+function doPlayArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, encodedRealId, encodedStartStr){
   const cmd=decodeURIComponent(encodedCmd||'');
   const liveCmd=decodeURIComponent(encodedLiveCmd||'');
   const realId=decodeURIComponent(encodedRealId||'');
+  const startStr=decodeURIComponent(encodedStartStr||'');
   const status=document.getElementById('catchup-status');
   if(status) status.textContent='Resolving…';
   fetch('/api/catchup/play',{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({cmd, live_cmd:liveCmd, epg_id:realId, start:startTs, stop:stopTs})})
+    body:JSON.stringify({cmd, live_cmd:liveCmd, epg_id:realId, start:startTs, stop:stopTs, start_str:startStr})})
   .then(r=>r.json()).then(d=>{
     if(d.url){
       const label=(_epgItem?_epgItem.name:'')+' — '+title+' [↺]';
@@ -3419,16 +3455,17 @@ function doPlayArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, en
   }).catch(e=>{if(status) status.textContent='❌ '+e.message;});
 }
 
-async function doExternalArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, encodedRealId){
+async function doExternalArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, encodedRealId, encodedStartStr){
   const cmd=decodeURIComponent(encodedCmd||'');
   const liveCmd=decodeURIComponent(encodedLiveCmd||'');
   const realId=decodeURIComponent(encodedRealId||'');
+  const startStr=decodeURIComponent(encodedStartStr||'');
   const status=document.getElementById('catchup-status');
   if(status) status.textContent='Resolving for external player…';
   try{
     const r=await fetch('/api/catchup/play',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({cmd, live_cmd:liveCmd, epg_id:realId, start:startTs, stop:stopTs})});
+      body:JSON.stringify({cmd, live_cmd:liveCmd, epg_id:realId, start:startTs, stop:stopTs, start_str:startStr})});
     const d=await r.json();
     if(!d.url){if(status) status.textContent='❌ '+(d.error||'Not available');return;}
     const url=d.url;
