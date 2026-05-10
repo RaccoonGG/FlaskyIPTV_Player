@@ -2007,6 +2007,8 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   .mt{padding:5px 10px;font-size:11px}
   .mt[data-m="favs"]{padding:4px 7px}
   .mt-txt{display:inline}
+  /* Expanded view not yet mobile-compatible — hidden until updated */
+  #vod-expand-btn,#series-expand-btn{display:none!important}
 }
 @media(min-width:900px){
   .mtabs{gap:3px}\n  .mt{padding:5px 8px;font-size:11px}\n  .mt[data-m=\"favs\"]{padding:5px 7px}\n}
@@ -4566,6 +4568,8 @@ const _LOCALE_TAG_CANDIDATES = (function(){
 function _buildTagBar(cats){
   const bar=document.getElementById('tag-bar');
   if(!bar) return;
+  // Tags are only meaningful for live channels — hide for VOD/Series
+  if(mode!=='live'){ bar.style.display='none'; _activeTags.clear(); return; }
   // Raw counts per exact prefix tag
   const rawCounts={};
   cats.forEach(c=>{ const t=_catTag(c.title); if(t) rawCounts[t]=(rawCounts[t]||0)+1; });
