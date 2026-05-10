@@ -360,6 +360,15 @@ class PortalClient:
         # Full raw channel list from get_all_channels — populated once per session.
         # None = not yet attempted. list = already fetched (may be empty on failure).
         self._all_channels_raw: list | None = None
+        # Full VOD / Series lists — same None/list semantics.
+        # Populated via _extract_xtream_creds() + player_api.php calls when the
+        # MAC portal's stream URLs contain embedded Xtream credentials.
+        self._all_vod_raw: list | None = None
+        self._all_series_raw: list | None = None
+        # Xtream credentials extracted from a VOD stream cmd URL.
+        # None = not yet attempted.  {} = tried and failed (no Xtream API).
+        # dict with keys "base", "username", "password" = success.
+        self._xtream_creds: dict | None = None
 
     async def __aenter__(self):
         _timeout = aiohttp.ClientTimeout(total=15, connect=8)
@@ -453,11 +462,17 @@ class PortalClient:
         return (ident, phone, max_conn, settings_pwd, adult_pwd)
 
     async def get_all_channels(self, mode: str = "live") -> list:
-        """Fetch ALL live channels in one shot via get_all_channels.
+        """Fetch ALL live channels in one shot via type=itv&action=get_all_channels.
+
+        This action is live-only in the MAC/Stalker portal protocol.
+        Returns [] for non-live modes so api_items() falls back to per-category
+        pagination (which is the correct path for VOD/Series on these portals).
 
         Returns the raw list of channel dicts.  Result is cached for the
         lifetime of the client instance so subsequent calls are free.
         Returns [] on error (caller should fall back to pagination)."""
+        if mode != "live":
+            return []
         if self._all_channels_raw is not None:
             return self._all_channels_raw
         self._all_channels_raw = []
@@ -475,6 +490,225 @@ class PortalClient:
         except Exception as e:
             self.log(f"[MAC] get_all_channels error: {e}")
         return self._all_channels_raw
+
+    async def _extract_xtream_creds(self) -> dict | None:
+        """Extract Xtream API credentials from a MAC portal VOD stream.
+
+        Two-step process matching the reference implementation:
+
+        Step 1 — get_ordered_list: fetch one VOD item to get its raw cmd token.
+          The raw cmd from get_ordered_list is an *unresolved* internal token
+          (e.g. "ffrt http://..." or a relative path), NOT a full URL.
+          Trying to parse credentials from it directly always fails.
+
+        Step 2 — create_link: resolve the raw cmd via the portal's create_link
+          action, which returns the final playable URL with credentials embedded:
+            {"cmd": "http://panel/movie/USERNAME/PASSWORD/12345.mp4"}
+          This resolved URL is safe to parse for username/password.
+
+        Returns dict with keys "base", "username", "password" or None on
+        failure.  {} cached in _xtream_creds means "tried and failed"."""
+        if self._xtream_creds is not None:
+            return self._xtream_creds if self._xtream_creds else None
+        self._xtream_creds = {}  # mark as tried
+        assert self.session is not None
+        try:
+            # ── Step 1: get raw cmd token from a VOD item ─────────────────
+            url1 = (f"{self.base}/portal.php?type=vod&action=get_ordered_list"
+                    f"&category=*&JsHttpRequest=1-xml&p=1&sortby=added")
+            async with self.session.get(url1, headers=self.headers,
+                                        timeout=aiohttp.ClientTimeout(total=15)) as r1:
+                payload1 = await safe_json(r1)
+            items = normalize_js(payload1)
+            raw_cmd = ""
+            for item in items:
+                if isinstance(item, dict) and item.get("cmd"):
+                    raw_cmd = str(item["cmd"]).replace("\\/", "/").strip()
+                    if raw_cmd:
+                        break
+            if not raw_cmd:
+                self.log("[MAC] _extract_xtream_creds: no cmd field in VOD items")
+                return None
+
+            # ── Step 2: resolve via create_link → get full URL with creds ─
+            # Exactly mirrors the reference: create_link returns the playable
+            # URL with username/password embedded in the path.
+            url2 = (f"{self.base}/portal.php?type=vod&action=create_link"
+                    f"&cmd={quote(raw_cmd)}&series=&forced_storage="
+                    f"&disable_ad=0&download=0&force_ch_link_check=0"
+                    f"&JsHttpRequest=1-xml")
+            async with self.session.get(url2, headers=self.headers,
+                                        timeout=aiohttp.ClientTimeout(total=15)) as r2:
+                raw2 = await r2.text()
+            # Parse the resolved cmd URL from the create_link response
+            if 'cmd":"' not in raw2:
+                self.log("[MAC] _extract_xtream_creds: create_link returned no cmd field")
+                return None
+            link = raw2.split('cmd":"')[1].split('"')[0].replace("\\/", "/").replace("/", "/")
+            if not link:
+                self.log("[MAC] _extract_xtream_creds: create_link returned empty cmd field")
+                return None
+            # Strip any ffmpeg/ffrt prefix from the RESOLVED link — the portal
+            # may prefix its stream URLs for its own player (e.g. "ffmpeg http://…")
+            # even in the create_link response.  Must strip BEFORE parsing scheme.
+            if " " in link:
+                link = link.split(" ", 1)[-1].strip()
+            if "://" not in link:
+                self.log("[MAC] _extract_xtream_creds: create_link cmd field not a URL after prefix strip")
+                return None
+
+            # ── Step 3: parse username/password from resolved URL ──────────
+            # Reference: link.replace("movie/","").split("/")[3] → username
+            #            link.replace("movie/","").split("/")[4] → password
+            scheme = link.split("://")[0].lower()
+            if scheme not in ("http", "https"):
+                self.log(f"[MAC] _extract_xtream_creds: resolved URL has unexpected scheme {scheme!r} — not an Xtream portal")
+                return None
+            link_norm = link.replace("movie/", "").replace("series/", "")
+            parts = link_norm.split("/")
+            # ["http:", "", "host:port", "username", "password", "id.ext"]
+            if len(parts) < 5:
+                self.log(f"[MAC] _extract_xtream_creds: unexpected URL structure: {link[:80]}")
+                return None
+            host     = parts[2]
+            username = parts[3]
+            password = parts[4].split("?")[0]  # strip any trailing query string
+            # Xtream passwords are opaque alphanumeric tokens — they never contain
+            # query-string metacharacters.  If these appear, the URL is a native
+            # MAC/Stalker stream URL, not an Xtream-format URL.
+            if any(c in password for c in ("?", "=", "&", ".php")):
+                self.log("[MAC] _extract_xtream_creds: password contains query-string chars — native MAC URL, not Xtream")
+                return None
+            try:
+                int(username)  # username should not be a pure number (stream id)
+                self.log("[MAC] _extract_xtream_creds: parsed username is numeric — wrong URL offset")
+                return None
+            except ValueError:
+                pass
+            # Common MAC portal path segments that would indicate wrong offset
+            _MAC_PATH_SEGS = {"play", "c", "live", "movie", "series", "timeshift",
+                               "stalker_portal", "portal", "api"}
+            if username.lower() in _MAC_PATH_SEGS:
+                self.log(f"[MAC] _extract_xtream_creds: username={username!r} is a portal path segment — not an Xtream credential")
+                return None
+            base = f"{scheme}://{host}"
+            self._xtream_creds = {"base": base, "username": username, "password": password}
+            self.log(f"[MAC] Xtream creds extracted via create_link: base={base} user={username}")
+            return self._xtream_creds
+        except Exception as e:
+            self.log(f"[MAC] _extract_xtream_creds error: {e}")
+        self.log("[MAC] _extract_xtream_creds: no Xtream creds found — will paginate")
+        return None
+
+    async def get_all_vod_streams(self) -> list:
+        """Fetch ALL VOD streams via player_api.php?action=get_vod_streams.
+
+        MAC portals built on Xtream Codes software expose player_api.php
+        alongside the MAC portal API.  We extract the Xtream credentials
+        from a VOD item cmd URL and call get_vod_streams with no category_id
+        — returning all VOD items in one shot, analogous to get_live_streams.
+
+        Items are normalised to MAC portal format (id, name, logo, cmd) so
+        the frontend renders and plays them identically to items fetched via
+        the portal API.
+
+        Returns [] on failure (no Xtream creds, HTTP error, non-list response)
+        so api_items() falls back to per-category pagination automatically.
+        Result cached in _all_vod_raw for the session lifetime."""
+        if self._all_vod_raw is not None:
+            return self._all_vod_raw
+        self._all_vod_raw = []
+        creds = await self._extract_xtream_creds()
+        if not creds:
+            return self._all_vod_raw
+        base = creds["base"]; user = creds["username"]; pas = creds["password"]
+        try:
+            url = (f"{base}/player_api.php"
+                   f"?username={user}&password={pas}&action=get_vod_streams")
+            self.log("[MAC] get_vod_streams: fetching all VOD streams…")
+            async with self.session.get(url, headers=self.headers,
+                                        timeout=aiohttp.ClientTimeout(total=60)) as r:
+                self.log(f"[MAC] get_vod_streams HTTP {r.status}")
+                data = await r.json(content_type=None)
+            if isinstance(data, list):
+                out = []
+                for it in data:
+                    if not isinstance(it, dict):
+                        continue
+                    sid = str(it.get("stream_id", "")).strip()
+                    if not sid:
+                        continue
+                    ext = it.get("container_extension") or "mp4"
+                    out.append({
+                        "id": sid,
+                        "name": it.get("name", ""),
+                        "logo": it.get("stream_icon", ""),
+                        "screenshot_uri": it.get("stream_icon", ""),
+                        # Construct cmd URL matching the MAC portal stream format
+                        "cmd": f"{base}/movie/{user}/{pas}/{sid}.{ext}",
+                        "category_id": str(it.get("category_id", "")),
+                        "rating": str(it.get("rating", "")),
+                        "added":  str(it.get("added", "")),
+                    })
+                self._all_vod_raw = out
+                self.log(f"[MAC] get_vod_streams: {len(out)} items")
+            else:
+                self.log(f"[MAC] get_vod_streams: unexpected response type {type(data).__name__}")
+        except Exception as e:
+            self.log(f"[MAC] get_vod_streams error: {e}")
+        return self._all_vod_raw
+
+    async def get_all_series_streams(self) -> list:
+        """Fetch ALL series via player_api.php?action=get_series.
+
+        Same credential extraction and single-shot approach as
+        get_all_vod_streams.  Items normalised to MAC portal format:
+        id = series_id, logo = cover, _is_show_item = True so the frontend
+        treats them as expandable series rather than playable streams.
+
+        Returns [] on failure so api_items() falls back to per-category
+        pagination.  Result cached in _all_series_raw."""
+        if self._all_series_raw is not None:
+            return self._all_series_raw
+        self._all_series_raw = []
+        creds = await self._extract_xtream_creds()
+        if not creds:
+            return self._all_series_raw
+        base = creds["base"]; user = creds["username"]; pas = creds["password"]
+        try:
+            url = (f"{base}/player_api.php"
+                   f"?username={user}&password={pas}&action=get_series")
+            self.log("[MAC] get_series: fetching all series…")
+            async with self.session.get(url, headers=self.headers,
+                                        timeout=aiohttp.ClientTimeout(total=60)) as r:
+                self.log(f"[MAC] get_series HTTP {r.status}")
+                data = await r.json(content_type=None)
+            if isinstance(data, list):
+                out = []
+                for it in data:
+                    if not isinstance(it, dict):
+                        continue
+                    sid = str(it.get("series_id", "")).strip()
+                    if not sid:
+                        continue
+                    out.append({
+                        "id": sid,
+                        "name": it.get("name", ""),
+                        "logo": it.get("cover", ""),
+                        "screenshot_uri": it.get("cover", ""),
+                        "category_id": str(it.get("category_id", "")),
+                        "rating": str(it.get("rating", "")),
+                        "plot": it.get("plot", ""),
+                        "_is_show_item": True,
+                        "series_id": sid,
+                    })
+                self._all_series_raw = out
+                self.log(f"[MAC] get_series: {len(out)} items")
+            else:
+                self.log(f"[MAC] get_series: unexpected response type {type(data).__name__}")
+        except Exception as e:
+            self.log(f"[MAC] get_series error: {e}")
+        return self._all_series_raw
 
     async def _fetch_ch_logo_cache(self) -> dict:
         """Return {channel_id: logo_url} dict, derived from get_all_channels.
@@ -1581,6 +1815,15 @@ class StalkerPortalClient:
         self._vod_logo_cache: dict = {}
         # Full raw channel list from get_all_channels — populated once per session.
         self._all_channels_raw: list | None = None
+        # Full VOD / Series lists — same None/list semantics.
+        # Stalker portals may expose player_api.php if running on Xtream Codes;
+        # _extract_xtream_creds() probes for credentials via a VOD item cmd URL.
+        # Falls back to [] (→ per-category pagination) if no Xtream API found.
+        self._all_vod_raw: list | None = None
+        self._all_series_raw: list | None = None
+        # Xtream credentials extracted from a VOD stream cmd URL.
+        # None = not yet attempted.  {} = tried and failed.  dict = success.
+        self._xtream_creds: dict | None = None
 
     # ── context manager ──────────────────────────────────────────────────────
 
@@ -2147,11 +2390,17 @@ class StalkerPortalClient:
     # ── items ─────────────────────────────────────────────────────────────────
 
     async def get_all_channels(self, mode: str = "live") -> list:
-        """Fetch ALL live channels in one shot via get_all_channels.
+        """Fetch ALL live channels in one shot via type=itv&action=get_all_channels.
+
+        This action is live-only in the Stalker portal protocol.
+        Returns [] for non-live modes so api_items() falls back to per-category
+        pagination (which is the correct path for VOD/Series on these portals).
 
         Tries load.php first, then portal.php as fallback.
         Result is cached for the lifetime of the client instance.
         Returns [] on complete failure (caller should fall back to pagination)."""
+        if mode != "live":
+            return []
         if self._all_channels_raw is not None:
             return self._all_channels_raw
         self._all_channels_raw = []
@@ -2189,6 +2438,207 @@ class StalkerPortalClient:
                 self.log(f"[STALKER] get_all_channels portal.php error: {e2}")
 
         return self._all_channels_raw
+
+    async def _extract_xtream_creds(self) -> dict | None:
+        """Extract Xtream API credentials from a Stalker portal VOD stream.
+
+        Two-step process identical to PortalClient._extract_xtream_creds:
+
+        Step 1 — get_ordered_list: fetch one VOD item to get its raw cmd token
+          via Stalker's load.php endpoint.
+
+        Step 2 — create_link: resolve the raw cmd to a playable URL with
+          credentials embedded in the path segments:
+            http://panel/movie/USERNAME/PASSWORD/stream_id.ext
+          Parse username/password from the resolved URL.
+
+        Returns dict with keys "base", "username", "password" or None.
+        {} cached in _xtream_creds means "tried and failed"."""
+        if self._xtream_creds is not None:
+            return self._xtream_creds if self._xtream_creds else None
+        self._xtream_creds = {}  # mark as tried
+        assert self.session is not None
+        headers = self._headers(include_auth=True)
+        try:
+            # ── Step 1: get raw cmd token from a VOD item (Stalker load.php) ─
+            url1 = self._load_url(type="vod", action="get_ordered_list",
+                                  category="*", p=1, sortby="added",
+                                  JsHttpRequest="1-xml")
+            async with self.session.get(url1, headers=headers,
+                                        timeout=aiohttp.ClientTimeout(total=15)) as r1:
+                payload1 = await self._read_json(r1, "extract_xtream_creds step1")
+            items = normalize_js(payload1)
+            raw_cmd = ""
+            for item in items:
+                if isinstance(item, dict) and item.get("cmd"):
+                    raw_cmd = str(item["cmd"]).replace("\\/", "/").strip()
+                    if raw_cmd:
+                        break
+            if not raw_cmd:
+                self.log("[STALKER] _extract_xtream_creds: no cmd field in VOD items")
+                return None
+
+            # ── Step 2: resolve via create_link → full URL with creds ──────
+            url2 = self._load_url(type="vod", action="create_link",
+                                  cmd=raw_cmd, series="",
+                                  forced_storage="", disable_ad=0,
+                                  download=0, force_ch_link_check=0,
+                                  JsHttpRequest="1-xml")
+            async with self.session.get(url2, headers=headers,
+                                        timeout=aiohttp.ClientTimeout(total=15)) as r2:
+                raw2 = await r2.text()
+            if 'cmd":"' not in raw2:
+                # Fallback: try portal.php create_link
+                url2b = self._load_url_alt(type="vod", action="create_link",
+                                           cmd=raw_cmd, series="",
+                                           forced_storage="", disable_ad=0,
+                                           download=0, force_ch_link_check=0,
+                                           JsHttpRequest="1-xml")
+                async with self.session.get(url2b, headers=headers,
+                                            timeout=aiohttp.ClientTimeout(total=15)) as r2b:
+                    raw2 = await r2b.text()
+            if 'cmd":"' not in raw2:
+                self.log("[STALKER] _extract_xtream_creds: create_link returned no cmd field")
+                return None
+            link = raw2.split('cmd":"')[1].split('"')[0].replace("\\/", "/").replace("/", "/")
+            if not link:
+                self.log("[STALKER] _extract_xtream_creds: create_link returned empty cmd field")
+                return None
+            # Strip any ffmpeg/ffrt prefix from the resolved link before parsing
+            if " " in link:
+                link = link.split(" ", 1)[-1].strip()
+            if "://" not in link:
+                self.log("[STALKER] _extract_xtream_creds: create_link cmd not a URL after prefix strip")
+                return None
+
+            # ── Step 3: parse username/password from resolved URL ──────────
+            scheme = link.split("://")[0].lower()
+            if scheme not in ("http", "https"):
+                self.log(f"[STALKER] _extract_xtream_creds: unexpected scheme {scheme!r} — not Xtream")
+                return None
+            link_norm = link.replace("movie/", "").replace("series/", "")
+            parts = link_norm.split("/")
+            if len(parts) < 5:
+                self.log(f"[STALKER] _extract_xtream_creds: unexpected URL: {link[:80]}")
+                return None
+            host = parts[2]; username = parts[3]; password = parts[4].split("?")[0]
+            if any(c in password for c in ("?", "=", "&", ".php")):
+                self.log("[STALKER] _extract_xtream_creds: password contains query chars — native Stalker URL, not Xtream")
+                return None
+            try:
+                int(username)
+                self.log("[STALKER] _extract_xtream_creds: username is numeric — wrong URL offset")
+                return None
+            except ValueError:
+                pass
+            _MAC_PATH_SEGS = {"play", "c", "live", "movie", "series", "timeshift",
+                               "stalker_portal", "portal", "api"}
+            if username.lower() in _MAC_PATH_SEGS:
+                self.log(f"[STALKER] _extract_xtream_creds: username={username!r} is a portal path segment — not Xtream")
+                return None
+            base = f"{scheme}://{host}"
+            self._xtream_creds = {"base": base, "username": username, "password": password}
+            self.log(f"[STALKER] Xtream creds extracted via create_link: base={base} user={username}")
+            return self._xtream_creds
+        except Exception as e:
+            self.log(f"[STALKER] _extract_xtream_creds error: {e}")
+        self.log("[STALKER] _extract_xtream_creds: no Xtream creds found — will paginate")
+        return None
+
+    async def get_all_vod_streams(self) -> list:
+        """Fetch ALL VOD streams via player_api.php?action=get_vod_streams.
+
+        Stalker portals running on Xtream Codes expose player_api.php.
+        Credentials are extracted from a VOD item cmd URL via
+        _extract_xtream_creds().  Items normalised to MAC portal format.
+        Returns [] on failure so api_items() falls back to per-category
+        pagination.  Result cached in _all_vod_raw."""
+        if self._all_vod_raw is not None:
+            return self._all_vod_raw
+        self._all_vod_raw = []
+        creds = await self._extract_xtream_creds()
+        if not creds:
+            return self._all_vod_raw
+        base = creds["base"]; user = creds["username"]; pas = creds["password"]
+        headers = self._headers(include_auth=True)
+        try:
+            url = (f"{base}/player_api.php"
+                   f"?username={user}&password={pas}&action=get_vod_streams")
+            self.log("[STALKER] get_vod_streams: fetching all VOD streams…")
+            async with self.session.get(url, headers=headers,
+                                        timeout=aiohttp.ClientTimeout(total=60)) as r:
+                self.log(f"[STALKER] get_vod_streams HTTP {r.status}")
+                data = await r.json(content_type=None)
+            if isinstance(data, list):
+                out = []
+                for it in data:
+                    if not isinstance(it, dict): continue
+                    sid = str(it.get("stream_id", "")).strip()
+                    if not sid: continue
+                    ext = it.get("container_extension") or "mp4"
+                    out.append({
+                        "id": sid, "name": it.get("name", ""),
+                        "logo": it.get("stream_icon", ""),
+                        "screenshot_uri": it.get("stream_icon", ""),
+                        "cmd": f"{base}/movie/{user}/{pas}/{sid}.{ext}",
+                        "category_id": str(it.get("category_id", "")),
+                        "rating": str(it.get("rating", "")),
+                        "added": str(it.get("added", "")),
+                    })
+                self._all_vod_raw = out
+                self.log(f"[STALKER] get_vod_streams: {len(out)} items")
+            else:
+                self.log(f"[STALKER] get_vod_streams: unexpected response type {type(data).__name__}")
+        except Exception as e:
+            self.log(f"[STALKER] get_vod_streams error: {e}")
+        return self._all_vod_raw
+
+    async def get_all_series_streams(self) -> list:
+        """Fetch ALL series via player_api.php?action=get_series.
+
+        Same credential extraction approach as get_all_vod_streams.
+        Items normalised to MAC portal format with _is_show_item=True.
+        Returns [] on failure so api_items() falls back to per-category
+        pagination.  Result cached in _all_series_raw."""
+        if self._all_series_raw is not None:
+            return self._all_series_raw
+        self._all_series_raw = []
+        creds = await self._extract_xtream_creds()
+        if not creds:
+            return self._all_series_raw
+        base = creds["base"]; user = creds["username"]; pas = creds["password"]
+        headers = self._headers(include_auth=True)
+        try:
+            url = (f"{base}/player_api.php"
+                   f"?username={user}&password={pas}&action=get_series")
+            self.log("[STALKER] get_series: fetching all series…")
+            async with self.session.get(url, headers=headers,
+                                        timeout=aiohttp.ClientTimeout(total=60)) as r:
+                self.log(f"[STALKER] get_series HTTP {r.status}")
+                data = await r.json(content_type=None)
+            if isinstance(data, list):
+                out = []
+                for it in data:
+                    if not isinstance(it, dict): continue
+                    sid = str(it.get("series_id", "")).strip()
+                    if not sid: continue
+                    out.append({
+                        "id": sid, "name": it.get("name", ""),
+                        "logo": it.get("cover", ""),
+                        "screenshot_uri": it.get("cover", ""),
+                        "category_id": str(it.get("category_id", "")),
+                        "rating": str(it.get("rating", "")),
+                        "plot": it.get("plot", ""),
+                        "_is_show_item": True,
+                        "series_id": sid,
+                    })
+                self._all_series_raw = out
+                self.log(f"[STALKER] get_series: {len(out)} items")
+            else:
+                self.log(f"[STALKER] get_series: unexpected response type {type(data).__name__}")
+        except Exception as e:
+            self.log(f"[STALKER] get_series error: {e}")
+        return self._all_series_raw
 
     async def _fetch_ch_logo_cache(self) -> dict:
         """Return {channel_id: logo_url} dict, derived from get_all_channels.
@@ -2828,6 +3278,12 @@ class XtreamClient:
         # Pre-seeded from state._items_cache by _make_client so any call to
         # get_all_channels() after a connect-time prefetch is a free list return.
         self._all_channels_raw: list | None = None
+        # Full VOD / Series lists — same None/list semantics as _all_channels_raw.
+        # Xtream's get_vod_streams / get_series with empty category_id returns
+        # every item in one call — exactly analogous to get_live_streams for live.
+        # Pre-seeded from state._items_cache by _make_client after prefetch.
+        self._all_vod_raw: list | None = None
+        self._all_series_raw: list | None = None
 
     async def __aenter__(self):
         _timeout = aiohttp.ClientTimeout(total=30, connect=10)
@@ -3011,22 +3467,67 @@ class XtreamClient:
         return data
 
     async def get_all_channels(self, mode: str = "live") -> list:
-        """Return all streams for the given mode in one call (no category filter).
+        """Fetch ALL live channels in one call via get_live_streams (no category filter).
 
-        Xtream's get_live_streams / get_vod_streams / get_series with no
-        category_id already returns everything — this is just a named wrapper
-        so api_items() and api_global_search() can call it uniformly.
+        Delegates VOD/Series to their dedicated methods so the correct Xtream API
+        action and cache are used for each mode.
 
-        For live mode, results are cached in _all_channels_raw so repeated calls
-        (from api_items, api_global_search, download_addon, api_find_channel) are
-        free list returns.  _make_client pre-seeds this from state._items_cache
+        For live: calls get_live_streams with empty category_id, caches in
+        _all_channels_raw.  _make_client pre-seeds this from state._items_cache
         so a connect-time prefetch means the first call is already a cache hit."""
-        if mode == "live" and self._all_channels_raw is not None:
+        if mode == "vod":
+            return await self.get_all_vod_streams()
+        if mode == "series":
+            return await self.get_all_series_streams()
+        # mode == "live"
+        if self._all_channels_raw is not None:
             return self._all_channels_raw
-        result = await self.fetch_items_page(mode, "", 1)
-        if mode == "live":
-            self._all_channels_raw = result
+        result = await self.fetch_items_page("live", "", 1)
+        self._all_channels_raw = result
         return result
+
+    async def get_all_vod_streams(self) -> list:
+        """Fetch ALL VOD streams in one call via get_vod_streams (no category filter).
+
+        Xtream's get_vod_streams with empty category_id returns every VOD item on
+        the server without pagination — analogous to get_live_streams for live.
+
+        Result is cached in _all_vod_raw for the session lifetime so repeated
+        calls (browsing 'All VOD' multiple times) are free list returns.
+        _make_client pre-seeds this from state._items_cache after prefetch.
+        Returns [] on failure — caller should fall back to per-category pagination."""
+        if self._all_vod_raw is not None:
+            return self._all_vod_raw
+        self._all_vod_raw = []
+        try:
+            self.log("[XTREAM] get_vod_streams: fetching all VOD streams…")
+            result = await self.fetch_items_page("vod", "", 1)
+            self._all_vod_raw = result
+            self.log(f"[XTREAM] get_vod_streams: {len(result)} items")
+        except Exception as e:
+            self.log(f"[XTREAM] get_vod_streams error: {e}")
+        return self._all_vod_raw
+
+    async def get_all_series_streams(self) -> list:
+        """Fetch ALL series in one call via get_series (no category filter).
+
+        Xtream's get_series with empty category_id returns every series on the
+        server without pagination — analogous to get_live_streams for live.
+
+        Result is cached in _all_series_raw for the session lifetime.
+        _make_client pre-seeds this from state._items_cache after prefetch.
+        Returns [] on failure — caller should fall back to per-category pagination."""
+        if self._all_series_raw is not None:
+            return self._all_series_raw
+        self._all_series_raw = []
+        try:
+            self.log("[XTREAM] get_series: fetching all series…")
+            result = await self.fetch_items_page("series", "", 1)
+            self._all_series_raw = result
+            self.log(f"[XTREAM] get_series: {len(result)} items")
+        except Exception as e:
+            self.log(f"[XTREAM] get_series error: {e}")
+        return self._all_series_raw
 
     def _stream_url(self, mode: str, item: dict) -> str:
         if mode == "live":
@@ -3452,13 +3953,20 @@ class M3UClient:
         return filtered
 
     async def get_all_channels(self, mode: str = "live") -> list:
-        """Return all items for the given mode without category filtering.
+        """Return all live channels without category filtering.
 
-        Tries the wrapped Xtream client first, then flattens all groups from
-        the preloaded M3U data."""
+        Delegates VOD/Series to their dedicated methods (get_all_vod_streams /
+        get_all_series_streams) so each mode uses the correct Xtream API action
+        and cache.  Tries the wrapped Xtream client first, then flattens all
+        groups from the preloaded M3U data for live mode."""
+        if mode == "vod":
+            return await self.get_all_vod_streams()
+        if mode == "series":
+            return await self.get_all_series_streams()
+        # mode == "live"
         if self._xtream_client:
             try:
-                result = await self._xtream_client.get_all_channels(mode)
+                result = await self._xtream_client.get_all_channels("live")
                 if result:
                     return result
             except Exception:
@@ -3469,6 +3977,48 @@ class M3UClient:
             for it in items:
                 tvg = it.get("tvg_type", "")
                 if tvg in type_filter or (mode == "live" and tvg == ""):
+                    out.append(it)
+        return out
+
+    async def get_all_vod_streams(self) -> list:
+        """Return all VOD items without category filtering.
+
+        Tries the wrapped Xtream client's get_all_vod_streams first
+        (get_vod_streams with empty category_id — single call, all items).
+        Falls back to flattening preloaded M3U groups filtered by VOD type."""
+        if self._xtream_client:
+            try:
+                result = await self._xtream_client.get_all_vod_streams()
+                if result:
+                    return result
+            except Exception:
+                pass
+        type_filter = self._type_filter("vod")
+        out = []
+        for items in self._all_groups.values():
+            for it in items:
+                if it.get("tvg_type", "") in type_filter:
+                    out.append(it)
+        return out
+
+    async def get_all_series_streams(self) -> list:
+        """Return all series items without category filtering.
+
+        Tries the wrapped Xtream client's get_all_series_streams first
+        (get_series with empty category_id — single call, all items).
+        Falls back to flattening preloaded M3U groups filtered by series type."""
+        if self._xtream_client:
+            try:
+                result = await self._xtream_client.get_all_series_streams()
+                if result:
+                    return result
+            except Exception:
+                pass
+        type_filter = self._type_filter("series")
+        out = []
+        for items in self._all_groups.values():
+            for it in items:
+                if it.get("tvg_type", "") in type_filter:
                     out.append(it)
         return out
 
