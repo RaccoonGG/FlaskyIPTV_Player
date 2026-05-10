@@ -1008,7 +1008,78 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                     _arch_days = 7  # safe default when not reported
                 _arch_cutoff = now_ts - _arch_days * 86400  # programmes older = greyed out
 
-                results = []
+                def _match_xmltv(epg_dict, chan_names, lookup_id, tag="XMLTV"):
+                    """Match lookup_id against a parsed XMLTV index and return catchup result dicts.
+                    Closes over: sid, _arch_cutoff, now_ts (from _resolve scope).
+                    Tries: exact channel-id, display-name substring, noise-stripped normalization.
+                    Returns a list sorted newest-first; empty list when no match found.
+                    """
+                    if not epg_dict or not lookup_id:
+                        return []
+                    lookup_lower = lookup_id.strip().lower()
+                    entries = epg_dict.get(lookup_lower)
+
+                    # Tier 1: display-name substring match
+                    if not entries:
+                        for cid, names in chan_names.items():
+                            name_strs = [t[0] for t in names]
+                            if (lookup_lower in name_strs or
+                                    any(lookup_lower in n or n in lookup_lower
+                                        for n in name_strs)):
+                                entries = epg_dict.get(cid)
+                                if entries:
+                                    state.log(f"[CatchUp] {tag} name match: "
+                                              f"{lookup_id!r} → {cid!r}")
+                                    break
+
+                    # Tier 2: noise-stripped normalised name
+                    if not entries:
+                        lookup_norm = _normalize_ch_name(lookup_id)
+                        if lookup_norm and lookup_norm != lookup_lower:
+                            entries = epg_dict.get(lookup_norm)
+                            if not entries:
+                                for cid, names in chan_names.items():
+                                    cid_norm   = _normalize_ch_name(cid)
+                                    names_norm = [_normalize_ch_name(t[0]) for t in names]
+                                    if (lookup_norm == cid_norm
+                                            or lookup_norm in names_norm
+                                            or any(lookup_norm in nn or nn in lookup_norm
+                                                   for nn in names_norm if nn)):
+                                        entries = epg_dict.get(cid)
+                                        if entries:
+                                            state.log(
+                                                f"[CatchUp] {tag} normalized match: "
+                                                f"{lookup_id!r} → {cid!r}")
+                                            break
+
+                    if not entries:
+                        return []
+
+                    matched = []
+                    for ep in entries:
+                        if isinstance(ep, tuple):
+                            ep_title, ep_start, ep_end = ep[0], ep[1], ep[2]
+                        else:
+                            ep_title = ep.get("title") or "Unknown"
+                            ep_start = ep.get("start", 0)
+                            ep_end   = ep.get("end",   0)
+                        # Include entries back to archive window (+1 day tolerance);
+                        # mark entries older than cutoff greyed (mark_archive=0).
+                        if ep_start and ep_end and (_arch_cutoff - 86400) <= ep_start < now_ts:
+                            _ma = "1" if ep_start >= _arch_cutoff else "0"
+                            matched.append({
+                                "title":        ep_title or "Unknown",
+                                "start":        ep_start,
+                                "stop":         ep_end,
+                                "cmd":          sid,
+                                "live_cmd":     sid,
+                                "mark_archive": _ma,
+                                "epg_id":       "",
+                                "id":           "",
+                                "ch_id":        "",
+                            })
+                    matched.sort(key=lambda x: x.get("start", 0), reverse=True)
+                    return matched
 
                 # ── Step 1: get_epg ──────────────────────────────────────────────
                 epg_api_url = (f"{base_norm}/player_api.php"
@@ -1183,70 +1254,111 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                 finally:
                                     state._xmltv_catchup_downloading.discard(ck)
                             if epg_dict:
-                                lookup_lower = lookup_id.strip().lower()
-                                entries = epg_dict.get(lookup_lower)
-                                # Fallback 1: display-name match (names are (name, lang) tuples)
-                                if not entries:
-                                    for cid, names in chan_names.items():
-                                        name_strs = [t[0] for t in names]
-                                        if (lookup_lower in name_strs or
-                                                any(lookup_lower in n or n in lookup_lower for n in name_strs)):
-                                            entries = epg_dict.get(cid)
-                                            if entries:
-                                                state.log(f"[CatchUp] XMLTV name match: {lookup_id!r} → {cid!r}")
-                                                break
-                                # Fallback 2: noise-stripped matching (HD/SD/FHD/channel/tv…)
-                                if not entries:
-                                    lookup_norm = _normalize_ch_name(lookup_id)
-                                    if lookup_norm and lookup_norm != lookup_lower:
-                                        entries = epg_dict.get(lookup_norm)
-                                        if not entries:
-                                            for cid, names in chan_names.items():
-                                                cid_norm   = _normalize_ch_name(cid)
-                                                names_norm = [_normalize_ch_name(t[0]) for t in names]
-                                                if (lookup_norm == cid_norm or lookup_norm in names_norm
-                                                        or any(lookup_norm in nn or nn in lookup_norm
-                                                               for nn in names_norm if nn)):
-                                                    entries = epg_dict.get(cid)
-                                                    if entries:
-                                                        state.log(f"[CatchUp] XMLTV normalized match: {lookup_id!r} → {cid!r}")
-                                                        break
-
-                                if entries:
-                                    # cutoff = full archive window (not hardcoded 3 days)
-                                    cutoff = _arch_cutoff
-                                    for ep in entries:
-                                        if isinstance(ep, tuple):
-                                            ep_title, ep_start, ep_end = ep[0], ep[1], ep[2]
-                                        else:
-                                            ep_title = ep.get("title") or "Unknown"
-                                            ep_start = ep.get("start", 0)
-                                            ep_end   = ep.get("end",   0)
-                                        # Include all entries back to archive window,
-                                        # mark older ones greyed (mark_archive=0).
-                                        # Look back one extra day for partial entries near the edge.
-                                        if ep_start and ep_end and (cutoff - 86400) <= ep_start < now_ts:
-                                            _ma3 = "1" if ep_start >= _arch_cutoff else "0"
-                                            results.append({
-                                                "title":        ep_title or "Unknown",
-                                                "start":        ep_start,
-                                                "stop":         ep_end,
-                                                "cmd":          sid,
-                                                "live_cmd":     sid,
-                                                "mark_archive": _ma3,
-                                                "epg_id":       "",
-                                                "id":           "",
-                                                "ch_id":        "",
-                                            })
-                                    results.sort(key=lambda x: x.get("start", 0), reverse=True)
-                                    state.log(f"[CatchUp] XMLTV gave {len(results)} past entries "
-                                              f"({sum(1 for r in results if r['mark_archive']=='1')} active, "
-                                              f"{sum(1 for r in results if r['mark_archive']=='0')} greyed)")
+                                results = _match_xmltv(epg_dict, chan_names,
+                                                       lookup_id, tag="PortalXMLTV")
+                                if results:
+                                    state.log(
+                                        f"[CatchUp] Portal XMLTV gave {len(results)} past entries "
+                                        f"({sum(1 for r in results if r['mark_archive']=='1')} active, "
+                                        f"{sum(1 for r in results if r['mark_archive']=='0')} greyed)"
+                                    )
                         except Exception as e:
                             state.log(f"[CatchUp] Xtream XMLTV fallback error: {e}")
 
+                # ── Step 3: External EPG URLs (−18h window) ──────────────────────
+                # If the user supplied external XMLTV URL(s) in the connection panel,
+                # try them with a separate 18-hour-back fetch dedicated to catchup.
+                # The live-EPG cache keeps only ±2-14h and is intentionally left
+                # untouched; this is a separate download (win_back_h=18, win_fwd_h=0)
+                # cached under "ext_cu:<url_blob>" so the two windows never collide.
+                if not results and (state.ext_epg_url or "").strip():
+                    ext_url_blob = state.ext_epg_url.strip()
+                    ck_ext = f"ext_cu:{ext_url_blob}"
+                    if not lookup_id:
+                        _epg_ch_id2 = str(item.get("epg_channel_id") or "").strip()
+                        _tvg_name2  = str(item.get("name") or "").strip()
+                        lookup_id   = _epg_ch_id2 or _tvg_name2
+                    state.log(f"[CatchUp] Trying external EPG (lookup={lookup_id!r})")
+                    try:
+                        cached_ext = state._xmltv_catchup_cache.get(ck_ext)
+                        if cached_ext:
+                            _cu_ts, _ext_d, _ext_n, _cu_win = cached_ext
+                            if time.time() - _cu_ts > state._xmltv_cache_ttl:
+                                cached_ext = None
+                        ext_dict = ext_names = None
+                        if cached_ext:
+                            _, ext_dict, ext_names, _ = cached_ext
+                        elif ck_ext in state._xmltv_catchup_downloading:
+                            state.log("[CatchUp] External EPG download already running — waiting…")
+                            for _w in range(120):
+                                await asyncio.sleep(1)
+                                if ck_ext not in state._xmltv_catchup_downloading:
+                                    break
+                            cached_ext = state._xmltv_catchup_cache.get(ck_ext)
+                            if cached_ext:
+                                _, ext_dict, ext_names, _ = cached_ext
+                            else:
+                                state.log("[CatchUp] External EPG wait timed out")
+                                ext_dict, ext_names = {}, {}
+                        else:
+                            state._xmltv_catchup_downloading.add(ck_ext)
+                            state.log(
+                                "[CatchUp] Downloading external EPG (−18h window for catchup fallback)")
+                            try:
+                                ext_dict, ext_names = await _build_xmltv_index(
+                                    ext_url_blob, state.log,
+                                    win_back_h=18, win_fwd_h=0)
+                                state._xmltv_catchup_cache[ck_ext] = (
+                                    time.time(), ext_dict, ext_names, _arch_days)
+                            finally:
+                                state._xmltv_catchup_downloading.discard(ck_ext)
+
+                        if ext_dict:
+                            matched_ext = _match_xmltv(ext_dict, ext_names,
+                                                       lookup_id, tag="ExtEPG")
+                            if matched_ext:
+                                results = matched_ext
+                                state.log(
+                                    f"[CatchUp] External EPG gave {len(results)} past entries "
+                                    f"({sum(1 for r in results if r['mark_archive']=='1')} active)")
+                    except Exception as e:
+                        state.log(f"[CatchUp] External EPG error: {e}")
+
+                # ── Step 4: Synthetic time-slot grid ─────────────────────────────
+                # Last resort: when ALL EPG sources fail but tv_archive=1 confirms
+                # the portal does serve catch-up, generate hourly time blocks over
+                # the full archive window.  The user gets clickable slots rather
+                # than having to type times manually.
+                # Each entry carries synthetic=True so the frontend can display
+                # a "no programme data" notice instead of showing "Unknown" titles.
+                if not results and int(item.get("tv_archive") or 0) == 1:
+                    state.log(
+                        f"[CatchUp] Generating synthetic time grid "
+                        f"({_arch_days}d × 60-min slots — no EPG data available)")
+                    _slot_sec = 3600  # 60-minute blocks
+                    _now_slot  = (int(now_ts) // _slot_sec) * _slot_sec
+                    # Exclude the currently-airing (incomplete) slot
+                    _t = _now_slot - _slot_sec
+                    _cut_slot  = (int(_arch_cutoff) // _slot_sec) * _slot_sec
+                    while _t >= _cut_slot:
+                        results.append({
+                            "title":        "",        # no programme title
+                            "start":        _t,
+                            "stop":         _t + _slot_sec,
+                            "cmd":          sid,
+                            "live_cmd":     sid,
+                            "mark_archive": "1",       # portal has catchup; all slots active
+                            "synthetic":    True,      # frontend notice flag
+                            "epg_id":       "",
+                            "id":           "",
+                            "ch_id":        "",
+                        })
+                        _t -= _slot_sec
+                    # Already sorted newest-first by construction
+                    state.log(f"[CatchUp] Synthetic grid: {len(results)} slots")
+
                 if not results:
-                    return {"error": "No past EPG data found. Use the manual time picker below."}
+                    return {"error": "No catchup data found — this channel may not support catch-up."}
 
                 return {"archive_listings": results, "label": item.get("name", "")}
 
@@ -3373,6 +3485,7 @@ async function _loadCatchupEPG(){
 let _cuListings = [];
 function _renderArchiveListings(listings){
   _cuListings = listings;
+  const isSynthetic = listings.length > 0 && listings.every(p => p.synthetic);
   // Show all programmes; highlight archived ones. Non-archived are dimmed.
   let lastDate='';
   const rows=listings.map(p=>{
@@ -3387,7 +3500,8 @@ function _renderArchiveListings(listings){
     const cmdSafe=encodeURIComponent(p.cmd||'');
     const liveCmdSafe=encodeURIComponent(p.live_cmd||'');
     const realIdSafe=encodeURIComponent(p.epg_id||p.id||'');
-    const titleSafe=(p.title||'').replace(/'/g,"\\'");
+    const titleDisplay=p.title||(p.synthetic?'—':'Unknown');
+    const titleSafe=titleDisplay.replace(/'/g,"\\'");
     // start_str is the portal's own server-local datetime string ("YYYY-MM-DD HH:MM").
     // Passing it bypasses the DST-sensitive epoch+offset conversion in api_catchup_play
     // so the timeshift URL always uses the portal's stored time directly.
@@ -3401,19 +3515,26 @@ function _renderArchiveListings(listings){
       :'';
     const cursor=hasArchive?'pointer':'default';
     const archIcon=hasArchive?'<span style="font-size:14px;color:var(--acc)">▶</span>':'';
+    const titleColor=p.synthetic?'var(--txt3)':'var(--txt1)';
     return dateHdr+`<div ${click}
       style="display:flex;align-items:center;gap:10px;padding:10px 8px;border-radius:var(--rsm);cursor:${cursor};
              border-left:3px solid var(--s4);margin-bottom:4px;background:var(--s3);
              transition:background .15s;opacity:${opacity}"
       ${hasArchive?'onmouseover="this.style.background=\'var(--s4)\'" onmouseout="this.style.background=\'var(--s3)\'"':''}>
       <span style="font-size:11px;color:var(--txt3);white-space:nowrap;min-width:90px">${t}</span>
-      <span style="flex:1;font-size:12px;font-weight:600;color:var(--txt1)">${p.title||'Unknown'}</span>
+      <span style="flex:1;font-size:12px;font-weight:600;color:${titleColor}">${titleDisplay}</span>
       ${extBtn}
       ${archIcon}
     </div>`;
   }).join('');
+  const syntheticNotice = isSynthetic
+    ? `<div style="font-size:11px;color:var(--txt3);background:var(--s3);border-radius:var(--rsm);
+                  padding:8px 10px;margin-bottom:10px;text-align:center;border-left:3px solid var(--bdr2)">
+        ⚠ No programme data — showing 1-hour time slots. Click any slot to watch from that time.
+       </div>`
+    : '';
   document.getElementById('catchup-body').innerHTML=
-    rows+'<div style="padding-top:8px;border-top:1px solid var(--bdr)">'+_cuManualForm()+'</div>';
+    syntheticNotice+rows+'<div style="padding-top:8px;border-top:1px solid var(--bdr)">'+_cuManualForm()+'</div>';
 }
 
 function doPlayArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, encodedRealId, encodedStartStr){
