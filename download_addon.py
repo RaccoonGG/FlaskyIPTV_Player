@@ -2402,15 +2402,14 @@ const _outFbLsKey = {m3u:'m3u_path', dir:'mkv_folder', dvr:'dvr_folder'};
 
 // ── State synchronisation ──────────────────────────────────────────────────
 function _outFbSyncReadouts(){
-  // Read from localStorage — never from display:none inputs which can return ''
-  const spanMap = {m3u:'out-mob-m3u', dir:'out-mob-dir', dvr:'out-mob-dvr'};
-  for(const [k, lsKey] of Object.entries(_outFbLsKey)){
-    const span = document.getElementById(spanMap[k]);
-    if(span){
-      const v = localStorage.getItem(lsKey) || '';
-      span.textContent = v || '(not set)';
-    }
-  }
+  // Show only the active target's path in the single readout row
+  const lbl = document.getElementById('out-mob-path-lbl');
+  const val = document.getElementById('out-mob-path-val');
+  if(!lbl || !val) return;
+  const lblMap = {m3u:'M3U:', dir:'Download:', dvr:'DVR:'};
+  const lsKey  = _outFbLsKey[_outFbTarget];
+  lbl.textContent = lblMap[_outFbTarget] || '';
+  val.textContent = (lsKey && localStorage.getItem(lsKey)) || '(not set)';
 }
 
 function _outFbApplyState(){
@@ -2452,11 +2451,12 @@ function outFbSetTarget(t){
   // Filename row — only for M3U
   const fnRow = document.getElementById('out-fb-fname-row');
   if(fnRow) fnRow.style.display = (t==='m3u') ? 'flex' : 'none';
-  // Show only the correct preset group, hide the others
-  ['m3u','dir','dvr'].forEach(k=>{
-    const el = document.getElementById('out-fb-'+k+'-presets');
-    if(el) el.style.display = (k===t) ? 'flex' : 'none';
-  });
+  // Update the single path readout label + value for the new tab
+  const lblMap = {m3u:'M3U:', dir:'Download:', dvr:'DVR:'};
+  const lbl = document.getElementById('out-mob-path-lbl');
+  const val = document.getElementById('out-mob-path-val');
+  if(lbl) lbl.textContent = lblMap[t] || '';
+  if(val) val.textContent = (localStorage.getItem(_outFbLsKey[t])) || '(not set)';
   if(t==='m3u'){
     // Pre-fill filename from localStorage
     const cur  = localStorage.getItem('m3u_path') || '';
@@ -2531,15 +2531,14 @@ function outFbPickFile(fp){ outFbApply(fp); }
 function outFbApply(val){
   const lsKey = _outFbLsKey[_outFbTarget];
   const idMap  = {m3u:'o-m3u', dir:'o-dir', dvr:'o-dvr'};
-  const spanMap= {m3u:'out-mob-m3u', dir:'out-mob-dir', dvr:'out-mob-dvr'};
-  // 1. Write to localStorage — primary storage, bypasses all hidden-input issues
+  // 1. Write to localStorage — primary storage
   try{ localStorage.setItem(lsKey, val); }catch(e){}
-  // 2. Update the hidden desktop input so desktop view and saveFP() stay in sync
+  // 2. Update the hidden desktop input so saveFP() stays in sync
   const inp = document.getElementById(idMap[_outFbTarget]);
   if(inp) inp.value = val;
-  // 3. Update the visible readout span directly — do NOT re-read inp.value
-  const span = document.getElementById(spanMap[_outFbTarget]);
-  if(span) span.textContent = val;
+  // 3. Update the single visible readout
+  const pathVal = document.getElementById('out-mob-path-val');
+  if(pathVal) pathVal.textContent = val;
   toast('Path set \u2014 ' + (val.split('/').filter(Boolean).pop()||val), 'ok');
 }
 
