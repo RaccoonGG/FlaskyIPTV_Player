@@ -151,7 +151,8 @@ class AppState:
         self.portal_ua_custom: str = ""
         self.cats_cache: dict = {}
         self._items_cache: dict = {}  # (mode, cat_id) → list of items, session-wide
-        self._prefetch_running: bool = False  # True while bg channel prefetch is in-flight
+        self._prefetch_running: bool = False     # True while bg live-channel prefetch is in-flight
+        self._prefetch_running_vs: bool = False  # True while bg VOD/Series prefetch is in-flight
         self.m3u_cache = None
         self.m3u_is_local = False
         self.m3u_xtream_override = None
@@ -318,18 +319,30 @@ def _resolve_custom_ua() -> str:
 @contextlib.asynccontextmanager
 async def _make_client(do_handshake=True):
     conn = state.conn_type
+
+    def _preseed_xtream_caches(client):
+        """Pre-seed all three __all__ caches from state._items_cache.
+
+        Called after constructing any XtreamClient instance so that if the
+        connect-time background prefetch already populated the shared cache,
+        this request's client instance gets an immediate cache hit on the first
+        call to get_all_channels / get_all_vod_streams / get_all_series_streams
+        instead of issuing a redundant HTTP call."""
+        for attr, key in (("_all_channels_raw", ("live",   "__all__")),
+                          ("_all_vod_raw",      ("vod",    "__all__")),
+                          ("_all_series_raw",   ("series", "__all__"))):
+            if getattr(client, attr, None) is None:
+                pool = state._items_cache.get(key)
+                if pool:
+                    setattr(client, attr, pool)
+
     if conn == "xtream":
         client = XtreamClient(state.url, state.username, state.password, state.log,
                               custom_ua=_resolve_custom_ua())
         # _logo_cache is a plain dict — share the same object so mutations
         # (new entries added during this request) survive after the client exits.
         client._logo_cache = state._logo_cache_vod
-        # Pre-seed live channel pool so get_all_channels() returns from cache
-        # immediately if the connect-time prefetch already populated it.
-        if client._all_channels_raw is None:
-            _xt_pool = state._items_cache.get(("live", "__all__"))
-            if _xt_pool:
-                client._all_channels_raw = _xt_pool
+        _preseed_xtream_caches(client)
         async with client:
             if do_handshake:
                 await client.handshake()
@@ -341,11 +354,7 @@ async def _make_client(do_handshake=True):
             client = XtreamClient(creds["base"], creds["username"], creds["password"],
                                   state.log, custom_ua=_resolve_custom_ua())
             client._logo_cache = state._logo_cache_vod
-            # Pre-seed live channel pool from connect-time prefetch if available.
-            if client._all_channels_raw is None:
-                _xt_pool = state._items_cache.get(("live", "__all__"))
-                if _xt_pool:
-                    client._all_channels_raw = _xt_pool
+            _preseed_xtream_caches(client)
             async with client:
                 if do_handshake:
                     await client.handshake()
@@ -383,7 +392,7 @@ async def _make_client(do_handshake=True):
         # on it instead of firing a concurrent get_all_channels HTTP call when
         # state._logo_cache_live is an empty dict (prefetch in progress).
         client._all_channels_ready_event = state._all_channels_ready
-        
+
         # Inject a reference to the shared items cache so that the items-page
         # fallback can seed _all_channels_raw from it after waiting on the
         # prefetch event.  Without this the browsing client's _all_channels_raw
@@ -392,13 +401,19 @@ async def _make_client(do_handshake=True):
         # completed successfully.
         client._shared_items_cache = state._items_cache
 
-        # Pre-seed _all_channels_raw from the __all__ pool if already fetched.
-        # Prevents _fetch_ch_logo_cache() from issuing a redundant get_all_channels
-        # call on any code path (api_items, api_global_search, etc.).
-        if hasattr(client, "_all_channels_raw") and client._all_channels_raw is None:
-            cached_pool = state._items_cache.get(("live", "__all__"))
-            if cached_pool:
-                client._all_channels_raw = cached_pool
+        # Pre-seed all three __all__ caches from state._items_cache.
+        # Live: prevents _fetch_ch_logo_cache() from issuing a redundant call.
+        # VOD/Series: allows api_items() to serve "All VOD"/"All Series" from
+        # cache on MAC/Stalker portals if a prior request already populated them
+        # (e.g. user browsed "All VOD" → pagination result stored → next visit free).
+        for _attr, _key in (("_all_channels_raw", ("live",   "__all__")),
+                             ("_all_vod_raw",      ("vod",    "__all__")),
+                             ("_all_series_raw",   ("series", "__all__"))):
+            if getattr(client, _attr, None) is None:
+                _pool = state._items_cache.get(_key)
+                if _pool:
+                    setattr(client, _attr, _pool)
+
         async with client:
             if do_handshake:
                 await client.handshake()
@@ -764,40 +779,52 @@ def api_connect():
 
     try:
         result = run_async(_connect_async())
-        # Ensure "All Channels" appears at the top of the live category list
-        # with id="__all__" so api_items() always routes it through the fast path.
+        # Ensure "All Channels / All VOD / All Series" appears at the top of
+        # each mode's category list with id="__all__" so api_items() always
+        # routes it through the correct fast path instead of paginating with a
+        # garbage cat_id.
         #
-        # Strategy: if the portal already returned its own "all genres" entry
-        # (MAC portals use id="*", title="All"; others vary), replace its id
-        # with "__all__" in-place rather than prepending a duplicate entry.
-        # If no such entry exists, prepend one.
-        _ALL_TITLES = {"all", "all channels", "all streams", "all live", "all genres"}
+        # Strategy: if the portal already returned its own "all" entry
+        # (MAC portals use id="*", title="All"), replace its id with "__all__"
+        # in-place.  If no such entry exists, prepend one.
+        #
+        # Applied to all three modes so the normal view shows "All VOD" /
+        # "All Series" buttons at the top alongside "All Channels".
+        _ALL_TITLES = {"all", "all channels", "all streams", "all live",
+                       "all genres", "all movies", "all vod", "all series"}
         _ALL_IDS    = {"*", "0", "all", ""}   # portal-specific "all" sentinel ids
+        _MODE_LABELS = {"live": "All Channels", "vod": "All VOD", "series": "All Series"}
+
+        def _inject_all_cat(mode_key):
+            _cats = state.cats_cache.get(mode_key, [])
+            if not _cats:
+                return
+            _label = _MODE_LABELS[mode_key]
+            _native_idx = next(
+                (i for i, c in enumerate(_cats)
+                 if str(c.get("id", "")).strip() in _ALL_IDS
+                 or str(c.get("title", "")).strip().lower() in _ALL_TITLES),
+                None
+            )
+            if _native_idx is not None:
+                _entry = dict(_cats[_native_idx])
+                _old_id = _entry.get("id")
+                _entry["id"] = "__all__"
+                _entry["title"] = _label
+                state.cats_cache[mode_key] = [_entry] + [
+                    c for i, c in enumerate(_cats) if i != _native_idx
+                ]
+                _extra = f" ({len(_cats)-1} other categories)" if mode_key == "live" else ""
+                state.log(f"[CONNECT] Mapped portal 'All' (id={_old_id!r}) → '__all__' for {mode_key.upper()}{_extra}")
+            elif _cats[0].get("id") != "__all__":
+                state.cats_cache[mode_key] = [{"id": "__all__", "title": _label}] + _cats
+                state.log(f"[CONNECT] Injected '{_label}' category ({len(_cats)} real categories)")
+
         if result.get("success"):
-            live = state.cats_cache.get("live", [])
-            if live:
-                # Check if there's already a native "all" category from the portal
-                native_all_idx = next(
-                    (i for i, c in enumerate(live)
-                     if str(c.get("id","")).strip() in _ALL_IDS
-                     or str(c.get("title","")).strip().lower() in _ALL_TITLES),
-                    None
-                )
-                if native_all_idx is not None:
-                    # Re-use the portal's entry but fix its id so the fast path works
-                    entry = dict(live[native_all_idx])
-                    old_id = entry.get("id")
-                    entry["id"] = "__all__"
-                    entry["title"] = "All Channels"
-                    # Move it to the front
-                    live = [entry] + [c for i,c in enumerate(live) if i != native_all_idx]
-                    state.cats_cache["live"] = live
-                    state.log(f"[CONNECT] Mapped portal 'All' (id={old_id!r}) → '__all__' ({len(live)-1} other categories)")
-                elif live[0].get("id") != "__all__":
-                    # No native "all" entry — inject our own at the top
-                    state.cats_cache["live"] = [{"id": "__all__", "title": "All Channels"}] + live
-                    state.log(f"[CONNECT] Injected 'All Channels' category ({len(live)} real categories)")
-                result["categories"] = state.cats_cache
+            _inject_all_cat("live")
+            _inject_all_cat("vod")
+            _inject_all_cat("series")
+            result["categories"] = state.cats_cache
 
         # ── Background: prefetch full live channel list for logo cache + EPG ──
         # Only for MAC/Stalker portals — get_all_channels is a dedicated endpoint
@@ -821,7 +848,7 @@ def api_connect():
 
         if _is_mac or _is_xtream:
             _pf_portal_key = (f"{state.conn_type}:{state.url}"
-                              f":{getattr(state, 'mac', '')}:{getattr(state, 'username', '')}")
+                              f":{getattr(state, 'mac', '')}:{getattr(state, 'username', '')}") 
 
             # MAC only: pre-initialise the shared logo dict to {} (not None) so
             # any concurrent _make_client call gets the empty dict injected and
@@ -842,7 +869,7 @@ def api_connect():
                         if not state.connected:
                             return
                         _ck = (f"{state.conn_type}:{state.url}"
-                               f":{getattr(state, 'mac', '')}:{getattr(state, 'username', '')}")
+                               f":{getattr(state, 'mac', '')}:{getattr(state, 'username', '')}") 
                         if _ck != _pf_portal_key:
                             return   # portal changed since connect
                         if ("live", "__all__") in state._items_cache:
@@ -898,6 +925,93 @@ def api_connect():
             threading.Thread(target=_bg_prefetch_channels,
                              daemon=True, name="ch-prefetch").start()
 
+        # ── Background: prefetch full VOD and Series lists ───────────────────
+        # For Xtream: get_vod_streams / get_series with empty category_id returns
+        # everything in a single HTTP call — identical to get_live_streams for live.
+        #
+        # For MAC/Stalker: we probe for Xtream credentials embedded in VOD item
+        # cmd URLs (via _extract_xtream_creds()).  If the portal runs on Xtream
+        # Codes software it will expose player_api.php and we call get_vod_streams
+        # / get_series there.  If creds cannot be extracted the methods return []
+        # and api_items() falls back to per-category pagination automatically.
+        #
+        # Results land in state._items_cache[("vod","__all__")] and
+        # state._items_cache[("series","__all__")] so any subsequent api_items()
+        # call for those views is an instant cache hit via _make_client pre-seeding.
+        if _is_xtream or _is_mac:
+            # Key includes both mac AND username so that switching between two
+            # MAC portals at the same URL but different MAC addresses is caught.
+            # Mirrors the construction used by the live-channel prefetch guard
+            # (see _pf_portal_key above) to ensure consistency.
+            _pf_portal_key_vs = (f"{state.conn_type}:{state.url}"
+                                 f":{state.mac}:{state.username}")
+
+            def _bg_prefetch_vod_series():
+                try:
+                    _pf_loop2 = asyncio.new_event_loop()
+                    asyncio.set_event_loop(_pf_loop2)
+
+                    async def _prefetch_vs():
+                        if not state.connected:
+                            return
+                        # Build key the same way as at creation time so the
+                        # comparison is symmetric (bug fix: old code used
+                        # getattr(state,'username','') which silently dropped
+                        # state.mac for MAC portals).
+                        _ck = f"{state.conn_type}:{state.url}:{state.mac}:{state.username}"
+                        if _ck != _pf_portal_key_vs:
+                            state.log("[PREFETCH] Portal changed before VOD/Series fetch — aborting")
+                            return  # portal changed since connect
+                        state._prefetch_running_vs = True
+                        async with _make_client() as client:
+                            # ── VOD ────────────────────────────────────────────────
+                            if ("vod", "__all__") not in state._items_cache \
+                                    and hasattr(client, "get_all_vod_streams"):
+                                state.log("[PREFETCH] Background: fetching full VOD list…")
+                                try:
+                                    vods = await client.get_all_vod_streams()
+                                    # Re-verify portal hasn't changed during the slow
+                                    # network call — this is the main race condition
+                                    # window where old portal data could contaminate
+                                    # a freshly connected portal's cache.
+                                    _ck2 = f"{state.conn_type}:{state.url}:{state.mac}:{state.username}"
+                                    if _ck2 != _pf_portal_key_vs:
+                                        state.log("[PREFETCH] Portal changed during VOD fetch — discarding stale data")
+                                    elif vods:
+                                        state._items_cache[("vod", "__all__")] = vods
+                                        state.log(f"[PREFETCH] {len(vods)} VOD streams cached")
+                                    else:
+                                        state.log("[PREFETCH] get_vod_streams returned empty")
+                                except Exception as _ve:
+                                    state.log(f"[PREFETCH] VOD prefetch error: {_ve}")
+                            # ── Series ───────────────────────────────────────────────
+                            if ("series", "__all__") not in state._items_cache \
+                                    and hasattr(client, "get_all_series_streams"):
+                                state.log("[PREFETCH] Background: fetching full series list…")
+                                try:
+                                    series = await client.get_all_series_streams()
+                                    # Same post-fetch guard as VOD above.
+                                    _ck3 = f"{state.conn_type}:{state.url}:{state.mac}:{state.username}"
+                                    if _ck3 != _pf_portal_key_vs:
+                                        state.log("[PREFETCH] Portal changed during Series fetch — discarding stale data")
+                                    elif series:
+                                        state._items_cache[("series", "__all__")] = series
+                                        state.log(f"[PREFETCH] {len(series)} series cached")
+                                    else:
+                                        state.log("[PREFETCH] get_series returned empty")
+                                except Exception as _se:
+                                    state.log(f"[PREFETCH] Series prefetch error: {_se}")
+
+                    _pf_loop2.run_until_complete(_prefetch_vs())
+                    _pf_loop2.close()
+                except Exception as _pfe2:
+                    state.log(f"[PREFETCH] VOD/Series prefetch error: {_pfe2}")
+                finally:
+                    state._prefetch_running_vs = False
+
+            threading.Thread(target=_bg_prefetch_vod_series,
+                             daemon=True, name="vod-series-prefetch").start()
+
         # ── Background: prefetch external EPG (if configured) ──────────────────
         # Runs parallel to the channel prefetch. Builds ek_combined the same way
         # api_whats_on does, registers all relevant keys in _xmltv_downloading so
@@ -925,7 +1039,8 @@ def api_categories():
     if not state.connected:
         return jsonify({"error": "Not connected", "categories": []})
     cats = state.cats_cache.get(mode, [])
-    return jsonify({"categories": cats, "mode": mode})
+    all_cached = (mode, "__all__") in state._items_cache
+    return jsonify({"categories": cats, "mode": mode, "all_cached": all_cached})
 
 
 @flask_app.route("/api/clear_cache", methods=["POST"])
@@ -970,14 +1085,15 @@ def api_items():
     if not state.connected:
         return jsonify({"error": "Not connected", "items": []})
 
-    # Safety-net alias: if the __all__ pool is cached and this cat_id is a
-    # known portal-native "all channels" sentinel, treat it as __all__ so it
-    # serves from cache instantly instead of paginating tens of thousands of items.
+    # Safety-net alias: if the __all__ pool is already cached for this mode
+    # and this cat_id is a known portal-native "all" sentinel (id="*", "0",
+    # "all", or ""), alias it to "__all__" so api_items() serves from cache
+    # instantly for any mode — not just live — instead of paginating with a
+    # garbage cat_id that most servers would reject or return [] for.
     _ALL_SENTINELS = {"*", "0", "all", ""}
-    if (mode == "live"
-            and cat_id in _ALL_SENTINELS
-            and ("live", "__all__") in state._items_cache):
-        state.log(f"[ITEMS] Aliasing cat_id={cat_id!r} → '__all__' (pool cached)")
+    if (cat_id in _ALL_SENTINELS
+            and (mode, "__all__") in state._items_cache):
+        state.log(f"[ITEMS] Aliasing cat_id={cat_id!r} → '__all__' ({mode}, pool cached)")
         cat_id = "__all__"
 
     # ── Session-wide items cache — keyed by (mode, cat_id) ───────────────────
@@ -997,6 +1113,31 @@ def api_items():
         state.log(f"[ITEMS] All Channels: cache hit from global search ({len(items)} items)")
         state._items_cache[_cache_key] = items
         return jsonify({"items": items, "count": len(items), "has_more": False})
+
+    # ── Request deduplication: prevent concurrent fetches for same key ──
+    # Multiple rapid requests (mode switches) each started their own 1080-page
+    # pagination loop, hammering the MAC portal into WinError 64. Secondary
+    # requesters now wait for the primary to finish and serve from cache.
+    import threading as _threading
+    if not hasattr(state, '_fetch_events'):
+        state._fetch_events = {}
+        state._fetch_events_mu = _threading.Lock()
+    with state._fetch_events_mu:
+        if _cache_key in state._fetch_events:
+            _wait_evt = state._fetch_events[_cache_key]
+            _is_primary = False
+        else:
+            _wait_evt = _threading.Event()
+            state._fetch_events[_cache_key] = _wait_evt
+            _is_primary = True
+    if not _is_primary:
+        state.log(f"[ITEMS] Dedup: waiting for concurrent fetch of {mode} cat={cat_id}…")
+        _wait_evt.wait(timeout=600)
+        if _cache_key in state._items_cache:
+            _cached = state._items_cache[_cache_key]
+            state.log(f"[ITEMS] Dedup resolved: {len(_cached)} items for {mode} cat={cat_id}")
+            return jsonify({"items": _cached, "count": len(_cached), "has_more": False})
+        return jsonify({"items": [], "count": 0, "has_more": False})
 
     try:
         # Snapshot prefetch state BEFORE the async fetch begins.
@@ -1020,33 +1161,55 @@ def api_items():
                         client._all_channels_raw = state._items_cache[_all_key]
                         state.log(f"[ITEMS] Pre-seeded client logo cache from __all__ pool ({len(client._all_channels_raw)} entries)")
 
-                # ── "All Channels" fast path via get_all_channels ─────────────
-                if cat_id == "__all__" and mode == "live":
-                    if hasattr(client, "get_all_channels"):
-                        try:
-                            channels = await client.get_all_channels("live")
-                            if channels:
-                                state.log(f"[ITEMS] All Channels via get_all_channels: {len(channels)} items")
-                                return {"items": channels, "has_more": False}
-                            state.log("[ITEMS] get_all_channels returned empty — falling back to full pagination")
-                        except Exception as e:
-                            state.log(f"[ITEMS] get_all_channels failed ({e}) — falling back to full pagination")
-                    # Fallback: paginate every real category
-                    real_cats = [c for c in state.cats_cache.get("live", [])
+                # ── "__all__" fast path — mode-specific single-call fetchers ─────────
+                #
+                # Dispatch table:
+                #   live   → client.get_all_channels("live")
+                #            MAC/Stalker: type=itv&action=get_all_channels
+                #            Xtream:      get_live_streams with empty category_id
+                #
+                #   vod    → client.get_all_vod_streams()
+                #            Xtream:      get_vod_streams with empty category_id
+                #            MAC/Stalker: returns [] → falls through to pagination
+                #
+                #   series → client.get_all_series_streams()
+                #            Xtream:      get_series with empty category_id
+                #            MAC/Stalker: returns [] → falls through to pagination
+                if cat_id == "__all__":
+                    _mode_label = {"live": "All Channels", "vod": "All VOD",
+                                   "series": "All Series"}.get(mode, "All")
+                    _fetched = []
+                    try:
+                        if mode == "live" and hasattr(client, "get_all_channels"):
+                            _fetched = await client.get_all_channels("live")
+                        elif mode == "vod" and hasattr(client, "get_all_vod_streams"):
+                            _fetched = await client.get_all_vod_streams()
+                        elif mode == "series" and hasattr(client, "get_all_series_streams"):
+                            _fetched = await client.get_all_series_streams()
+                    except Exception as e:
+                        state.log(f"[ITEMS] {_mode_label} single-call error ({e}) — falling back to pagination")
+                    if _fetched:
+                        state.log(f"[ITEMS] {_mode_label}: {len(_fetched)} items (single call)")
+                        return {"items": _fetched, "has_more": False}
+                    # Fallback: paginate every real category for this mode.
+                    # Used by MAC/Stalker for VOD/Series (no single-shot endpoint)
+                    # and as a safety net when the single-call method returns [].
+                    state.log(f"[ITEMS] {_mode_label}: no single-call result — paginating all categories")
+                    real_cats = [c for c in state.cats_cache.get(mode, [])
                                  if c.get("id") != "__all__"]
                     all_items = []
                     for cat_obj in real_cats:
                         page = 1
                         while True:
                             pg_items = await client.fetch_items_page(
-                                "live", str(cat_obj.get("id", "")), page)
+                                mode, str(cat_obj.get("id", "")), page)
                             if not pg_items:
                                 break
                             all_items.extend(pg_items)
                             page += 1
                             if len(pg_items) < 5:
                                 break
-                    state.log(f"[ITEMS] All Channels via full pagination: {len(all_items)} items")
+                    state.log(f"[ITEMS] {_mode_label}: {len(all_items)} items (full category pagination)")
                     return {"items": all_items, "has_more": False}
 
                 # ── Normal single-category pagination ─────────────────────────
@@ -1054,10 +1217,18 @@ def api_items():
                 page = 1
                 items = []
                 while page <= max_pages:
-                    items = await client.fetch_items_page(mode, cat_id, page)
+                    try:
+                        items = await client.fetch_items_page(mode, cat_id, page)
+                    except Exception as _pg_err:
+                        state.log(f"[ITEMS] Page {page} error ({mode} cat={cat_id}): {_pg_err}")
+                        if all_items:
+                            state.log(f"[ITEMS] Partial result: {len(all_items)} items (stopped page {page})")
+                        break
                     if not items:
                         break
                     all_items.extend(items)
+                    if page % 10 == 0:
+                        state.log(f"[ITEMS] {mode.upper()} cat={cat_id}: page {page}, {len(all_items)} items so far…")
                     if not browse:
                         state.log(f"  Page {page}: {len(items)} items (total: {len(all_items)})")
                     page += 1
@@ -1088,6 +1259,11 @@ def api_items():
     except Exception as e:
         state.log(f"[ITEMS] Error: {e}")
         return jsonify({"error": str(e), "items": []})
+    finally:
+        if _is_primary:
+            with state._fetch_events_mu:
+                state._fetch_events.pop(_cache_key, None)
+            _wait_evt.set()
 
 
 @flask_app.route("/api/global_search", methods=["POST"])
@@ -2122,6 +2298,161 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 
 
 .mv-confirm-btns button{height:32px;padding:0 14px;font-size:12px}
+
+/* ── VOD / Series Expanded Browse Overlay ──────────────────────────────── */
+#vod-expand-overlay{position:fixed;inset:0;z-index:650;background:rgba(0,0,0,.72);
+  display:none;align-items:stretch;justify-content:center}
+#vod-expand-overlay.open{display:flex}
+#vod-expand-modal{background:var(--s1);width:100%;height:100%;
+  display:flex;flex-direction:column;overflow:hidden;animation:pop-in .18s ease}
+/* Three-zone header: left(title) | center(mode tabs) | right(controls) */
+#vod-expand-hdr{display:flex;align-items:center;padding:8px 12px;
+  border-bottom:1px solid var(--s4);flex-shrink:0;background:var(--s2);gap:0}
+.xp-hdr-left{flex:1;min-width:0;display:flex;align-items:center}
+.xp-hdr-left h3{margin:0;font-size:13px;font-weight:700;color:var(--txt3);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.xp-hdr-center{flex:0;display:flex;justify-content:center;padding:0 12px}
+.xp-hdr-right{flex:1;display:flex;align-items:center;justify-content:flex-end;gap:8px}
+/* Mode tab pills */
+.xp-mode-tabs{display:flex;gap:2px;background:var(--s3);padding:3px;
+  border-radius:var(--rsm);border:1px solid var(--bdr)}
+.xp-mode-tab{height:28px;padding:0 16px;font-size:12px;font-weight:600;
+  border-radius:calc(var(--rsm) - 2px);background:transparent;border:none;
+  color:var(--txt2);cursor:pointer;transition:background .15s,color .15s;white-space:nowrap}
+.xp-mode-tab.active{background:var(--acc);color:#fff}
+.xp-mode-tab:hover:not(.active){background:var(--s4);color:var(--txt)}
+#vod-expand-hdr-search{position:relative;width:200px}
+#vod-expand-hdr-search input{height:32px;padding:0 10px 0 30px;font-size:12px;border-radius:var(--rss);width:100%}
+#vod-expand-hdr-search .sico{position:absolute;left:9px;top:50%;transform:translateY(-50%);
+  font-size:12px;pointer-events:none;color:var(--txt3)}
+#vod-expand-sort{height:32px;padding:0 8px;font-size:12px;width:auto;border-radius:var(--rss)}
+#vod-expand-body{flex:1;display:flex;min-height:0;overflow:hidden}
+#vod-expand-sidebar{width:200px;flex-shrink:0;overflow-y:auto;border-right:1px solid var(--s4);
+  padding:8px 0;background:var(--s2)}
+#vod-expand-sidebar .xp-cat-item{padding:8px 14px;font-size:12px;cursor:pointer;
+  color:var(--txt2);transition:background .15s,color .15s;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;border-radius:0}
+#vod-expand-sidebar .xp-cat-item:hover{background:rgba(124,58,237,.1);color:var(--txt)}
+#vod-expand-sidebar .xp-cat-item.active{background:rgba(124,58,237,.18);
+  color:var(--acc);font-weight:600}
+/* Fix: min-height:0 + height:0 force flex height propagation so grid gets
+   a definite height and overflow-y:auto works correctly on first render */
+#vod-expand-center{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden}
+/* grid-auto-rows:220px gives every row a definite height so overflow-y
+   activates correctly; avoids aspect-ratio circular-dependency in Chrome */
+#vod-expand-grid-view{flex:1;min-height:0;overflow-y:auto;padding:14px;
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
+  grid-auto-rows:220px;gap:14px}
+#vod-expand-grid-view.wide{grid-template-columns:repeat(auto-fill,minmax(170px,1fr))}
+/* align-self:start prevents grid from stretching card height beyond aspect-ratio */
+.xp-card{position:relative;background:var(--s3);border-radius:var(--rsm);
+  overflow:hidden;cursor:pointer;transition:transform .15s,box-shadow .15s;
+  border:1px solid var(--bdr);display:flex;flex-direction:column}
+.xp-card:hover{transform:translateY(-3px) scale(1.02);
+  box-shadow:0 8px 30px rgba(0,0,0,.5),0 0 0 1px rgba(124,58,237,.4)}
+.xp-card.active{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc)}
+.xp-card-img{width:100%;flex:1;object-fit:cover;display:block;min-height:0}
+.xp-card-img-ph{width:100%;flex:1;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:4px;
+  background:linear-gradient(160deg,rgba(255,255,255,.06) 0%,rgba(255,255,255,.02) 100%);
+  color:rgba(255,255,255,.22);min-height:0;
+  border-bottom:1px solid rgba(255,255,255,.05)}
+.xp-card-img-ph .ph-ico{font-size:28px;display:block}
+.xp-card-img-ph .ph-lbl{font-size:9px;text-transform:uppercase;
+  letter-spacing:.6px;opacity:.45}
+.xp-card-footer{padding:6px 8px;flex-shrink:0;background:linear-gradient(0deg,var(--s3) 60%,transparent)}
+.xp-card-title{font-size:11px;font-weight:600;color:var(--txt);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.3}
+.xp-card-sub{font-size:10px;color:var(--txt3);margin-top:1px}
+.xp-card-badge{position:absolute;top:6px;right:6px;background:rgba(0,0,0,.88);
+  color:#f5c518;font-size:11px;font-weight:700;padding:3px 7px;
+  border-radius:4px;display:flex;align-items:center;gap:3px;
+  z-index:3;box-shadow:0 1px 4px rgba(0,0,0,.6)}
+.xp-card-fav{position:absolute;top:6px;left:6px;background:rgba(0,0,0,.65);
+  border-radius:50%;width:22px;height:22px;display:flex;align-items:center;
+  justify-content:center;font-size:13px;cursor:pointer;transition:background .15s;
+  backdrop-filter:blur(4px)}
+.xp-card-fav:hover{background:rgba(0,0,0,.85)}
+/* Detail view */
+#vod-expand-detail{width:420px;flex-shrink:0;overflow-y:auto;
+  border-left:1px solid var(--s4);background:var(--s2);display:none;flex-direction:column}
+#vod-expand-detail.visible{display:flex}
+#vod-expand-detail-inner{padding:0 0 20px 0;flex:1}
+.xp-detail-backdrop{width:100%;height:200px;object-fit:cover;display:block;flex-shrink:0}
+.xp-detail-backdrop-ph{width:100%;height:160px;display:flex;align-items:center;
+  justify-content:center;font-size:60px;background:var(--s4);color:var(--txt3);flex-shrink:0}
+.xp-detail-poster-row{display:flex;gap:14px;padding:14px 16px;align-items:flex-start}
+.xp-detail-poster{width:90px;height:130px;object-fit:cover;border-radius:var(--rsm);
+  flex-shrink:0;border:1px solid var(--bdr);margin-top:-50px;position:relative;z-index:2;
+  box-shadow:0 4px 20px rgba(0,0,0,.6)}
+.xp-detail-poster-ph{width:90px;height:130px;border-radius:var(--rsm);flex-shrink:0;
+  border:1px solid var(--bdr);margin-top:-50px;position:relative;z-index:2;
+  background:var(--s4);display:flex;align-items:center;justify-content:center;
+  font-size:30px;color:var(--txt3)}
+.xp-detail-title-block{flex:1;padding-top:4px;min-width:0}
+.xp-detail-title{font-size:18px;font-weight:700;color:var(--txt);
+  line-height:1.2;margin-bottom:8px;word-break:break-word}
+.xp-detail-badges{display:flex;flex-wrap:wrap;gap:5px}
+.xp-badge{display:inline-flex;align-items:center;gap:3px;padding:3px 8px;
+  border-radius:20px;font-size:11px;font-weight:600;border:1px solid}
+.xp-badge-rating{background:rgba(245,197,24,.1);color:#f5c518;border-color:rgba(245,197,24,.3)}
+.xp-badge-year{background:rgba(99,179,237,.08);color:#63b3ed;border-color:rgba(99,179,237,.25)}
+.xp-badge-dur{background:rgba(72,187,120,.08);color:#68d391;border-color:rgba(72,187,120,.25)}
+.xp-badge-genre{background:rgba(124,58,237,.12);color:#a78bfa;border-color:rgba(124,58,237,.3)}
+.xp-badge-age{background:rgba(239,68,68,.1);color:#f87171;border-color:rgba(239,68,68,.3)}
+.xp-detail-body{padding:0 16px}
+.xp-detail-plot{font-size:12px;color:var(--txt2);line-height:1.6;
+  margin-bottom:12px;display:-webkit-box;-webkit-line-clamp:5;
+  -webkit-box-orient:vertical;overflow:hidden}
+.xp-detail-plot.expanded{-webkit-line-clamp:unset;overflow:visible}
+.xp-detail-meta-row{display:flex;gap:12px;margin-bottom:10px;flex-wrap:wrap}
+.xp-detail-meta-col{flex:1;min-width:120px}
+.xp-detail-meta-label{font-size:10px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.8px;color:var(--txt3);margin-bottom:4px}
+.xp-detail-meta-val{font-size:12px;color:var(--txt2);line-height:1.5}
+.xp-detail-actions{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;padding:0 16px}
+.xp-detail-ext-links{display:flex;gap:6px;padding:0 16px;margin-bottom:12px;flex-wrap:wrap}
+.xp-ext-btn{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;
+  border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;
+  border:1px solid rgba(139,92,246,.3);background:rgba(139,92,246,.12);
+  color:#a78bfa;transition:background .15s;text-decoration:none}
+.xp-ext-btn:hover{background:rgba(139,92,246,.25)}
+/* Episodes section */
+.xp-seasons{padding:0 16px}
+.xp-season-hdr{display:flex;align-items:center;gap:8px;padding:8px 10px;
+  background:var(--s3);border-radius:var(--rsm);cursor:pointer;
+  border:1px solid var(--bdr);margin-bottom:4px;transition:background .15s}
+.xp-season-hdr:hover{background:var(--s4)}
+.xp-season-title{font-size:12px;font-weight:700;flex:1;color:var(--txt)}
+.xp-season-count{font-size:11px;color:var(--txt3)}
+.xp-season-arrow{font-size:10px;color:var(--txt3);transition:transform .2s}
+.xp-season-body{overflow:hidden;margin-bottom:8px}
+.xp-ep-row{display:flex;align-items:center;gap:10px;padding:8px 10px;
+  border-radius:var(--rsm);transition:background .12s;border:1px solid transparent}
+.xp-ep-row:hover{background:var(--s4);border-color:var(--bdr)}
+.xp-ep-thumb{width:60px;height:40px;object-fit:cover;border-radius:4px;
+  flex-shrink:0;border:1px solid var(--bdr)}
+.xp-ep-thumb-ph{width:60px;height:40px;border-radius:4px;flex-shrink:0;
+  background:var(--s4);display:flex;align-items:center;justify-content:center;
+  font-size:18px;color:var(--txt3);border:1px solid var(--bdr)}
+.xp-ep-info{flex:1;min-width:0}
+.xp-ep-num{font-size:10px;color:var(--acc);font-weight:700;margin-bottom:2px}
+.xp-ep-name{font-size:11px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.xp-ep-desc{font-size:10px;color:var(--txt3);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;margin-top:2px}
+.xp-ep-play{flex-shrink:0;height:28px;padding:0 10px;font-size:12px}
+/* Grid loading / empty states */
+.xp-grid-msg{grid-column:1/-1;text-align:center;padding:48px 20px;
+  color:var(--txt3);font-size:13px}
+.xp-grid-msg .xp-msg-ico{font-size:40px;display:block;margin-bottom:10px;opacity:.3}
+/* Responsive: narrow screens collapse sidebar */
+@media(max-width:700px){
+  #vod-expand-sidebar{width:140px}
+  #vod-expand-grid-view{grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px;padding:10px}
+  #vod-expand-detail{width:100%;border-left:none;border-top:1px solid var(--s4)}
+  #vod-expand-body{flex-direction:column}
+}
 </style>
 </head>
 <body>
@@ -2298,20 +2629,10 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         </div>
         <!-- MOBILE: inline browser — inputs stay in desktop div (hidden), IDs still accessible -->
         <div id="out-paths-mobile" style="display:none;flex-direction:column;gap:0">
-        <!-- Path value readouts (read-only display, actual inputs live in desktop div) -->
-        <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:6px">
-          <div style="display:flex;align-items:center;gap:6px">
-            <span class="plbl">M3U:</span>
-            <span id="out-mob-m3u" style="font-size:11px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
-          </div>
-          <div style="display:flex;align-items:center;gap:6px">
-            <span class="plbl">Download:</span>
-            <span id="out-mob-dir" style="font-size:11px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
-          </div>
-          <div style="display:flex;align-items:center;gap:6px">
-            <span class="plbl">DVR:</span>
-            <span id="out-mob-dvr" style="font-size:11px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
-          </div>
+        <!-- Single path readout — updates to show only the active tab's path -->
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+          <span id="out-mob-path-lbl" class="plbl">M3U:</span>
+          <span id="out-mob-path-val" style="font-size:11px;color:var(--txt2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">(not set)</span>
         </div>
         <div id="out-fb-wrap">
           <!-- Target selector -->
@@ -2332,51 +2653,13 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
               style="height:26px;padding:0 8px;font-size:10px;color:#4ade80;border-color:rgba(34,197,94,.3);flex-shrink:0">&#x2713; Select</button>
             <button class="btn-ghost" onclick="outFbClose()" style="height:26px;padding:0 8px;font-size:11px;flex-shrink:0">&#x2715;</button>
           </div>
-          <!-- Quick paths (nav shortcuts — always visible) -->
-          <div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:5px">
-            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/sdcard/Download')">&#x1F4E5; Download</button>
-            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/storage/emulated/0/Download')">&#x1F4E5; /0/DL</button>
-            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/sdcard/Download/DVR')">&#x1F4FC; DVR</button>
-            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/sdcard')">&#x1F4F1; /sdcard</button>
-            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/storage/emulated/0')">&#x1F4F1; /storage/0</button>
-            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/data/data/com.termux/files/home')">&#x1F5A5; Termux</button>
-          </div>
-          <!-- M3U: filename input + quick presets -->
+          <!-- M3U: filename input -->
           <div id="out-fb-fname-row" style="display:none;align-items:center;gap:6px;margin-bottom:5px">
             <span style="font-size:10px;color:var(--txt3);white-space:nowrap">Filename:</span>
             <input id="out-fb-fname" type="text" placeholder="playlist.m3u"
               style="flex:1;height:24px;font-size:11px;padding:0 7px;border-radius:var(--rss);
                      border:1px solid var(--bdr2);background:var(--s3);color:var(--txt)"
               autocomplete="off" autocorrect="off" spellcheck="false">
-          </div>
-          <div id="out-fb-m3u-presets" style="display:none;flex-wrap:wrap;gap:3px;margin-bottom:5px">
-            <span style="font-size:10px;color:var(--txt3);width:100%;margin-bottom:2px">&#x26A1; Quick set M3U path:</span>
-            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
-              onclick="outFbQuickApply('/sdcard/Download/playlist.m3u')">/sdcard/DL/playlist.m3u</button>
-            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
-              onclick="outFbQuickApply('/storage/emulated/0/Download/playlist.m3u')">/0/DL/playlist.m3u</button>
-            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
-              onclick="outFbQuickApply('/data/data/com.termux/files/home/playlist.m3u')">Termux ~/playlist.m3u</button>
-          </div>
-          <!-- Download dir: quick presets -->
-          <div id="out-fb-dir-presets" style="display:none;flex-wrap:wrap;gap:3px;margin-bottom:5px">
-            <span style="font-size:10px;color:var(--txt3);width:100%;margin-bottom:2px">&#x26A1; Quick set Download folder:</span>
-            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
-              onclick="outFbQuickApply('/sdcard/Download/')">/sdcard/Download/</button>
-            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
-              onclick="outFbQuickApply('/storage/emulated/0/Download/')">/0/Download/</button>
-            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
-              onclick="outFbQuickApply('/data/data/com.termux/files/home/')">Termux ~/</button>
-          </div>
-          <!-- DVR dir: quick presets -->
-          <div id="out-fb-dvr-presets" style="display:none;flex-wrap:wrap;gap:3px;margin-bottom:5px">
-            <span style="font-size:10px;color:var(--txt3);width:100%;margin-bottom:2px">&#x26A1; Quick set DVR folder:</span>
-            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
-              onclick="outFbQuickApply('/sdcard/Download/DVR/')">/sdcard/Download/DVR/</button>
-            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
-              onclick="outFbQuickApply('/storage/emulated/0/Download/DVR/')">/0/Download/DVR/</button>
-            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
-              onclick="outFbQuickApply('/data/data/com.termux/files/home/DVR/')">Termux ~/DVR/</button>
           </div>
           <!-- File/folder list -->
           <div id="out-fb-list" style="max-height:90px;overflow-y:auto;border:1px solid var(--bdr);border-radius:var(--rss);background:var(--s4)">
@@ -2446,13 +2729,15 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
     <button id="items-collapse-btn" onclick="event.stopPropagation();document.getElementById('main').classList.remove('items-open')" title="Collapse">‹</button>
     <div class="ph">
       <h3 id="ittitle">Browse</h3>
-      <button class="btn-ghost btn-sm" id="backbtn" onclick="goBack()" disabled>◀ Back</button>
+      <button class="btn-ghost btn-sm" id="backbtn" onclick="goBack()" style="display:none">◀ Back</button>
     </div>
     <div style="padding:10px 10px 0;display:flex;flex-direction:column;gap:6px;flex-shrink:0">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
         <div class="bcrum" id="bcrum" style="flex:1;min-width:0"><span class="bc-s">Categories</span></div>
         <button class="epg-layout-btn" id="epg-grid-btn" onclick="toggleEpgGrid()" title="EPG Grid view" style="display:none">📅 EPG</button>
         <button class="epg-layout-btn" id="epg-expand-btn" onclick="openEpgExpandOverlay()" title="Expand EPG" style="display:none">⤢</button>
+        <button class="epg-layout-btn" id="vod-expand-btn" onclick="openVodExpandOverlay()" title="Expanded Movies view" style="display:none">⤢</button>
+        <button class="epg-layout-btn" id="series-expand-btn" onclick="openSeriesExpandOverlay()" title="Expanded Series view" style="display:none">⤢</button>
       </div>
       <div class="sbar" id="items-sbar"><span class="sico">🔍</span>
         <input id="isrch" type="search" placeholder="Search items…" oninput="filterItems()">
@@ -2684,6 +2969,54 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   </button>
 
 </nav>
+
+<!-- VOD / SERIES EXPANDED BROWSE OVERLAY -->
+<div id="vod-expand-overlay">
+  <div id="vod-expand-modal">
+    <!-- Header: left(title) | center(mode tabs) | right(search+sort+close) -->
+    <div id="vod-expand-hdr">
+      <div class="xp-hdr-left">
+        <h3 id="vod-expand-title">🎬 Movies</h3>
+      </div>
+      <div class="xp-hdr-center">
+        <div class="xp-mode-tabs">
+          <button class="xp-mode-tab active" data-xm="vod"
+            onclick="_xpSwitchMode('vod')">🎬 Movies</button>
+          <button class="xp-mode-tab" data-xm="series"
+            onclick="_xpSwitchMode('series')">📺 Series</button>
+        </div>
+      </div>
+      <div class="xp-hdr-right">
+        <div id="vod-expand-hdr-search">
+          <span class="sico">🔍</span>
+          <input id="vod-expand-srch" type="search" placeholder="Search…"
+            oninput="_xpSearch()" autocomplete="new-password" spellcheck="false">
+        </div>
+        <select id="vod-expand-sort" onchange="_xpSortChange()">
+          <option value="default">Default order</option>
+          <option value="az">A → Z</option>
+          <option value="za">Z → A</option>
+          <option value="rating">Top rated</option>
+        </select>
+        <button class="btn-ghost" onclick="closeVodExpandOverlay()"
+          style="height:32px;padding:0 14px;font-size:12px;flex-shrink:0">✕ Close</button>
+      </div>
+    </div>
+    <!-- Body: sidebar + grid + detail -->
+    <div id="vod-expand-body">
+      <!-- Category sidebar (populated by JS) -->
+      <div id="vod-expand-sidebar"></div>
+      <!-- Grid center -->
+      <div id="vod-expand-center">
+        <div id="vod-expand-grid-view"></div>
+      </div>
+      <!-- Detail panel (hidden until card selected) -->
+      <div id="vod-expand-detail">
+        <div id="vod-expand-detail-inner"></div>
+      </div>
+    </div>
+  </div>
+</div>
 
 <!-- ACTION DRAWER -->
 <div id="pl-overlay" onclick="if(event.target===this)closePL()">
@@ -3144,6 +3477,7 @@ function setMode(m){
   selSet.clear(); selCats.clear(); refreshCatBtns();
   if(_epgGridActive) _closeEpgGrid();
   document.getElementById('epg-grid-btn').style.display='none';
+  _updateVodSeriesExpandBtn();
   switchMode(m, catsCache[m]||[]);
   document.getElementById('main').classList.remove('items-open');
   showT('p-cats','t-cats');
@@ -4407,6 +4741,8 @@ function selAllCats(v){
   filterCats(); refreshCatBtns();
 }
 function refreshBtns(){
+  const bb=document.getElementById('backbtn');
+  if(bb) bb.style.display=navStack.length?'':'none';
   const n=selSet.size, nc=selCats.size;
   const icnt=document.getElementById('adr-item-count');
   if(icnt) icnt.textContent=n+' selected';
@@ -4598,7 +4934,8 @@ function renderItems(items){
       ?(ep0.logo||ep0.stream_icon||ep0.cover||ep0.screenshot_uri||ep0.pic||''):'';
     const logo=it.logo||it.stream_icon||it.cover||it.screenshot_uri||it.pic||epLogo||'';
     const logoSrc = logo && (logo.startsWith('http://') || logo.startsWith('https://'))
-      ? '/api/proxy?url='+encodeURIComponent(logo) : logo;
+      ? (logo.includes('image.tmdb.org')||logo.includes('themoviedb.org')
+         ? logo : '/api/proxy?url='+encodeURIComponent(logo)) : logo;
     const hasCatchup = mode==='live' && playable && _channelSupportsCatchup(it);
     return '<div class="irow'+(playing?' now':'')+'" style="--d:'+(Math.min(i,20)*.016)+'s" data-key="'+esc(name)+'">'
       +'<input class="ichk" type="checkbox" data-i="'+i+'" onchange="onChk('+i+',this.checked)">'
@@ -4618,6 +4955,7 @@ function renderItems(items){
   el.innerHTML = items.slice(0, _ITEMS_BATCH).map(buildRow).join('');
   refreshBtns();
   _updateEpgGridBtn();
+  _updateVodSeriesExpandBtn();
 
   // Init drag-sort on the container (event-delegated, handles lazy-appended rows too)
   _initDragSort(el, '.irow', document.getElementById('isrch'), (orderedRows)=>{
@@ -6244,6 +6582,729 @@ function _mvSelOpen(callback, forcedMode){
   const tabsEl2 = document.getElementById('mv-sel-tabs');
   if(tabsEl2) tabsEl2.style.display = forcedMode ? 'none' : '';
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VOD / SERIES EXPANDED BROWSE OVERLAY
+// ═══════════════════════════════════════════════════════════════════════════
+(function(){ /* jshint esversion:9 */
+
+'use strict';
+
+// ── Constants ─────────────────────────────────────────────────────────────
+const _XP_BATCH = 60;
+
+// ── State ─────────────────────────────────────────────────────────────────
+let _xpOpen       = false;
+let _xpMode       = 'vod';
+let _xpAllCats    = [];
+let _xpAllCached  = false;          // true when server-side __all__ cache is warm for current mode
+let _xpActiveCat  = '__all__';
+let _xpAllItems   = [];
+let _xpFiltItems  = [];
+let _xpActiveIdx  = -1;
+let _xpEpCache    = {};
+let _xpEpReg      = [];
+let _xpRenderTok  = 0;
+let _xpDetailItem = null;
+let _xpDetailIdx  = -1;
+let _xpSeasonOpen = {};
+let _xpItemsCache = {};          // 'mode:catId' -> items[] (session cache)
+let _xpFetchCtrl  = null;        // AbortController for active /api/items fetch
+let _xpSearchTmr  = null;        // debounce timer for search input
+
+// ── Button visibility (called by setMode + renderItems) ───────────────────
+function _updateVodSeriesExpandBtn(){
+  const vBtn = document.getElementById('vod-expand-btn');
+  const sBtn = document.getElementById('series-expand-btn');
+  if(!vBtn || !sBtn) return;
+  vBtn.style.display = (mode === 'vod'    && filtItems.length > 0) ? '' : 'none';
+  sBtn.style.display = (mode === 'series' && filtItems.length > 0) ? '' : 'none';
+}
+window._updateVodSeriesExpandBtn = _updateVodSeriesExpandBtn;
+
+// ── Open ──────────────────────────────────────────────────────────────────
+function _xpOpen_(m){
+  _xpMode       = m;
+  _xpActiveIdx  = -1;
+  _xpDetailItem = null;
+  _xpDetailIdx  = -1;
+  _xpSeasonOpen = {};
+  _xpEpReg      = [];
+
+  // Detect current category from main app so we pre-select it
+  let initialCat = '__all__';
+  if(typeof mode !== 'undefined' && mode === m &&
+     typeof curCat !== 'undefined' && curCat){
+    initialCat = String(curCat.id != null ? curCat.id : '__all__');
+  }
+  _xpActiveCat = initialCat;
+
+  // Sync mode tab buttons
+  document.querySelectorAll('.xp-mode-tab').forEach(b =>
+    b.classList.toggle('active', b.dataset.xm === m)
+  );
+  document.getElementById('vod-expand-title').textContent =
+    m === 'vod' ? '\u{1F3AC} Movies' : '\u{1F4FA} Series';
+
+  document.getElementById('vod-expand-srch').value  = '';
+  document.getElementById('vod-expand-sort').value  = 'default';
+  document.getElementById('vod-expand-detail').classList.remove('visible');
+  document.getElementById('vod-expand-detail-inner').innerHTML = '';
+
+  document.getElementById('vod-expand-overlay').classList.add('open');
+  _xpOpen = true;
+  document.addEventListener('keydown', _xpKeyDown);
+  console.log('[XP] Overlay opened mode=' + m
+    + ' | lazy: native(loading=lazy) + IO-batch(' + _XP_BATCH + ' cards/render)'
+    + ' | initial-cat=' + initialCat);
+
+  _xpLoadCats(initialCat);
+}
+window.openVodExpandOverlay    = () => _xpOpen_('vod');
+window.openSeriesExpandOverlay = () => _xpOpen_('series');
+
+// ── Close ─────────────────────────────────────────────────────────────────
+function _xpClose(){
+  if(!_xpOpen) return;
+  document.getElementById('vod-expand-overlay').classList.remove('open');
+  document.removeEventListener('keydown', _xpKeyDown);
+  _xpOpen = false;
+}
+window.closeVodExpandOverlay = _xpClose;
+
+function _xpKeyDown(e){ if(e.key === 'Escape') _xpClose(); }
+
+// ── Mode switch (from header tabs) ────────────────────────────────────────
+window._xpSwitchMode = function(m){
+  if(m === _xpMode) return;
+  _xpMode       = m;
+  _xpActiveCat  = '__all__';
+  _xpAllItems   = [];
+  _xpFiltItems  = [];
+  _xpActiveIdx  = -1;
+  _xpDetailItem = null;
+  _xpDetailIdx  = -1;
+  _xpSeasonOpen = {};
+  _xpEpReg      = [];
+  _xpAllCached  = false;
+  // _xpItemsCache NOT cleared: keys are 'mode:catId' so modes never
+  // collide; clearing would force full re-pagination on mode switch-back.
+
+  document.querySelectorAll('.xp-mode-tab').forEach(b =>
+    b.classList.toggle('active', b.dataset.xm === m)
+  );
+  document.getElementById('vod-expand-title').textContent =
+    m === 'vod' ? '\u{1F3AC} Movies' : '\u{1F4FA} Series';
+  document.getElementById('vod-expand-srch').value = '';
+  document.getElementById('vod-expand-sort').value = 'default';
+  document.getElementById('vod-expand-detail').classList.remove('visible');
+  document.getElementById('vod-expand-detail-inner').innerHTML = '';
+
+  _xpLoadCats('__all__');
+};
+
+// ── HTML escape helper ────────────────────────────────────────────────────
+function _xpe(s){
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// ── Image proxy helper ────────────────────────────────────────────────────
+function _xpImgSrc(url){
+  if(!url) return '';
+  // MAC/Stalker portals may return backdrop_path as an array of relative paths
+  if(Array.isArray(url)) url = url[0] || '';
+  if(!url) return '';
+  // Coerce any remaining non-string (number, object) to empty
+  if(typeof url !== 'string') return '';
+  if(url.startsWith('http://') || url.startsWith('https://')){
+    if(url.includes('image.tmdb.org') || url.includes('themoviedb.org')) return url;
+    return '/api/proxy?url=' + encodeURIComponent(url);
+  }
+  return url;
+}
+
+// ── Extract item logo from all known field names ──────────────────────────
+// Returns the first field that looks like a real image URL.
+// Bare TMDB base-URLs (e.g. "http://image.tmdb.org/t/p/w600_and_h900_bestv2"
+// with no filename after the size prefix) are silently skipped — they produce
+// broken images and are meant to be combined with backdrop_path, not used alone.
+function _xpLogo(it){
+  const _isBareBase = function(u){
+    if(!u || typeof u !== 'string') return false;
+    if(!u.includes('image.tmdb.org') && !u.includes('themoviedb.org')) return false;
+    // A complete URL has an actual filename after the size token, e.g. /abc123.jpg
+    return !/\/[^\/]+\.[a-z]{3,4}(\?|$)/i.test(u);
+  };
+  const candidates = [it.logo, it.stream_icon, it.cover, it.screenshot_uri, it.pic];
+  for(const c of candidates){
+    if(!c || typeof c !== 'string') continue;
+    if(_isBareBase(c)) continue;          // skip bare TMDB base URL
+    return c;
+  }
+  return '';
+}
+
+// ── Rating normalisation (rating_5based is /5 → scale to /10) ────────────
+function _xpRating(it){
+  // MAC: rating_imdb/rating_kinopoisk (/10); Xtream: rating, rating_5based(/5->x2), movie_rating
+  const raw = it.rating_imdb || it.rating_kinopoisk ||
+              it.rating || it.rating_5based || it.movie_rating || 0;
+  const r = parseFloat(raw) || 0;
+  if(!r) return '';
+  const is5 = !it.rating_imdb && !it.rating_kinopoisk && !it.rating
+           && !!it.rating_5based && r <= 5;
+  const v = is5 ? (r * 2).toFixed(1) : r.toFixed(1);
+  return v === '0.0' ? '' : v;
+}
+function _xpRatingSort(it){
+  const raw = it.rating_imdb || it.rating_kinopoisk ||
+              it.rating || it.rating_5based || it.movie_rating || 0;
+  const r = parseFloat(raw) || 0;
+  const is5 = !it.rating_imdb && !it.rating_kinopoisk && !it.rating
+           && !!it.rating_5based && r <= 5;
+  return is5 ? r * 2 : r;
+}
+
+// ── Duration formatter (handles both seconds and minutes) ─────────────────
+function _xpFmtDur(raw){
+  if(!raw) return '';
+  const n = parseInt(raw);
+  if(isNaN(n) || n <= 0) return '';
+  const mins = n > 300 ? Math.round(n / 60) : n;
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return h ? h + 'h ' + m + 'm' : m + 'm';
+}
+
+// ── Detect "All" sentinel categories that some portals inject ─────────────
+// These should be filtered out to avoid a duplicate of our own "All" entry.
+function _xpIsAllSentinel(id, name){
+  const nid  = String(id   || '').toLowerCase().trim();
+  const nnam = String(name || '').toLowerCase().trim();
+  const ids  = ['0','00','','*','**','__all__','all'];
+  const nams = ['all','all channels','all categories','all series',
+                'all movies','alle','\u0432\u0441\u0435','\u0432\u0441\u0435 \u043a\u0430\u043d\u0430\u043b\u044b'];
+  return ids.includes(nid) || nams.includes(nnam);
+}
+
+// ── Load categories ───────────────────────────────────────────────────────
+async function _xpLoadCats(initialCat){
+  const sb = document.getElementById('vod-expand-sidebar');
+  sb.innerHTML = '<div style="color:var(--txt3);font-size:11px;padding:12px 14px">\u23F3 Loading\u2026</div>';
+  _xpGridMsg('\u23F3', 'Loading\u2026');
+
+  try {
+    let cats = (typeof catsCache !== 'undefined' && catsCache[_xpMode]) || [];
+    // Always fetch to get authoritative all_cached status before _xpLoadItems gate runs
+    const r = await fetch('/api/categories?mode=' + _xpMode);
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    _xpAllCached = !!d.all_cached;
+    if(!cats || !cats.length) cats = d.categories || [];
+    _xpAllCats = cats;
+    _xpBuildSidebar(cats, initialCat || '__all__');
+    await _xpLoadItems(initialCat || '__all__');
+  } catch(e){
+    sb.innerHTML = '<div style="color:var(--red);font-size:11px;padding:12px 14px">Error loading</div>';
+    _xpGridMsg('\u26A0\uFE0F', 'Failed to load: ' + e.message);
+  }
+}
+
+// ── Build sidebar, pre-selecting the given cat id ─────────────────────────
+function _xpBuildSidebar(cats, activeCatId){
+  const sb       = document.getElementById('vod-expand-sidebar');
+  const allActive = !activeCatId || activeCatId === '__all__';
+  let html = '<div class="xp-cat-item' + (allActive ? ' active' : '')
+    + '" data-cid="__all__" onclick="_xpSelCat(this,\'__all__\')">All</div>';
+
+  for(const c of cats){
+    const id   = String(c.id != null ? c.id : (c.category_id != null ? c.category_id : ''));
+    const name = c.title || c.name || c.category_name || '?';
+    // Skip portals' own "All" sentinel entries to avoid duplication
+    if(_xpIsAllSentinel(id, name)) continue;
+    const isActive = String(activeCatId) === id;
+    const eid = _xpe(id), ename = _xpe(name);
+    html += '<div class="xp-cat-item' + (isActive ? ' active' : '')
+      + '" data-cid="' + eid + '" onclick="_xpSelCat(this,\'' + eid + '\')">' + ename + '</div>';
+  }
+  sb.innerHTML = html;
+}
+
+window._xpSelCat = function(el, catId){
+  document.querySelectorAll('#vod-expand-sidebar .xp-cat-item')
+    .forEach(x => x.classList.remove('active'));
+  el.classList.add('active');
+  _xpActiveCat  = catId;
+  _xpActiveIdx  = -1;
+  _xpDetailItem = null;
+  _xpDetailIdx  = -1;
+  document.getElementById('vod-expand-detail').classList.remove('visible');
+  _xpLoadItems(catId);
+};
+
+// ── Load items for a category ─────────────────────────────────────────────
+async function _xpLoadItems(catId, _forceAll){
+  _xpGridMsg('\u23F3', 'Loading\u2026');
+  const cacheKey = _xpMode + ':' + catId;
+  try {
+    let items = [];
+    if(_xpItemsCache[cacheKey]){
+      items = _xpItemsCache[cacheKey];
+      console.log('[XP] Cache hit: ' + cacheKey + ' (' + items.length + ' items)');
+    } else if(catId !== '__all__'
+        && typeof mode !== 'undefined' && mode === _xpMode
+        && typeof curCat !== 'undefined' && curCat
+        && String(curCat.id != null ? curCat.id : '') === catId
+        && typeof allItems !== 'undefined' && allItems.length
+        && typeof navStack !== 'undefined' && navStack.length === 0){
+      // Fast path: main app's allItems matches exactly — use it (never for __all__,
+      // never when drilled in since allItems would contain episodes not shows)
+      items = [...allItems];
+      _xpItemsCache[cacheKey] = items;
+    } else if(catId === '__all__' && !_forceAll && !_xpAllCached){
+      // Prefetch didn't run — show a prompt instead of auto-fetching a huge list
+      const lbl = _xpMode === 'series' ? 'Load Series' : 'Load Movies';
+      const ico = _xpMode === 'series' ? '\u{1F4FA}' : '\u{1F3AC}';
+      document.getElementById('vod-expand-grid-view').innerHTML =
+        '<div style="grid-column:1/-1;display:flex;flex-direction:column;align-items:center;'
+        + 'justify-content:center;min-height:220px;gap:14px;text-align:center">'
+        + '<span style="font-size:48px;opacity:.4">' + ico + '</span>'
+        + '<span style="color:var(--txt3);font-size:13px">Prefetch not available \u2014 load manually</span>'
+        + '<button class="btn-blue" style="height:38px;padding:0 24px;font-size:13px" '
+        +   'onclick="_xpLoadItems(\'__all__\',true)">' + ico + ' ' + lbl + '</button>'
+        + '</div>';
+      return;
+    } else {
+      const cat = catId === '__all__'
+        ? {id: '__all__', title: 'All'}
+        : (_xpAllCats.find(c => String(c.id != null ? c.id : c.category_id) === catId)
+           || {id: catId, title: ''});
+      if(_xpFetchCtrl){ _xpFetchCtrl.abort(); }
+      const _ctrl = new AbortController();
+      _xpFetchCtrl = _ctrl;
+      const r = await fetch('/api/items', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({mode: _xpMode, category: cat}),
+        signal: _ctrl.signal
+      });
+      _xpFetchCtrl = null;
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      items = d.items || [];
+      _xpItemsCache[cacheKey] = items;
+    }
+    _xpAllItems  = items;
+    _xpFiltItems = [...items];
+    _xpApplyFilter();
+  } catch(e){
+    if(e && e.name === 'AbortError') return;
+    _xpGridMsg('⚠️', 'Failed to load: ' + e.message);
+  }
+}
+
+// ── Search + sort ─────────────────────────────────────────────────────────
+window._xpSearch = function(){
+  clearTimeout(_xpSearchTmr);
+  _xpSearchTmr = setTimeout(_xpApplyFilter, 250);
+};
+window._xpSortChange = () => _xpApplyFilter();
+
+function _xpApplyFilter(){
+  const q    = (document.getElementById('vod-expand-srch').value || '').trim().toLowerCase();
+  const sort = document.getElementById('vod-expand-sort').value;
+  let items  = [..._xpAllItems];
+  if(q) items = items.filter(it =>
+    (it.name || it.o_name || it.fname || it.title || '').toLowerCase().includes(q)
+  );
+  if(sort === 'az')       items.sort((a,b) => (a.name||a.o_name||'').localeCompare(b.name||b.o_name||''));
+  else if(sort === 'za')  items.sort((a,b) => (b.name||b.o_name||'').localeCompare(a.name||a.o_name||''));
+  else if(sort === 'rating') items.sort((a,b) => _xpRatingSort(b) - _xpRatingSort(a));
+  _xpFiltItems = items;
+  _xpRenderGrid(items);
+  if(_xpDetailItem){
+    const ni = items.indexOf(_xpDetailItem);
+    _xpActiveIdx = ni >= 0 ? ni : -1;
+  }
+}
+
+// ── Grid rendering ────────────────────────────────────────────────────────
+function _xpGridMsg(ico, txt){
+  document.getElementById('vod-expand-grid-view').innerHTML =
+    '<div class="xp-grid-msg"><span class="xp-msg-ico">' + ico + '</span>' + _xpe(txt) + '</div>';
+}
+
+function _xpCard(it, i){
+  const name   = _xpe(it.name || it.o_name || it.fname || 'Unknown');
+  const lsrc   = _xpImgSrc(_xpLogo(it));
+  const rating = _xpRating(it);
+  const ph     = _xpMode === 'series' ? '\u{1F4FA}' : '\u{1F3AC}';
+  const active = i === _xpActiveIdx ? ' active' : '';
+  const phInner = '<span class="ph-ico">' + ph + '</span>'
+    + '<span class="ph-lbl">No poster</span>';
+  const img    = lsrc
+    ? '<img class="xp-card-img" loading="lazy" src="' + lsrc
+      + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'">'
+      + '<div class="xp-card-img-ph" style="display:none">' + phInner + '</div>'
+    : '<div class="xp-card-img-ph">' + phInner + '</div>';
+  const badge  = rating ? '<div class="xp-card-badge">\u2B50 ' + rating + '</div>' : '';
+  return '<div class="xp-card' + active + '" data-xi="' + i
+    + '" onclick="_xpCardClick(' + i + ')" title="' + name + '">'
+    + img + badge
+    + '<div class="xp-card-footer"><div class="xp-card-title">' + name + '</div></div>'
+    + '</div>';
+}
+
+function _xpRenderGrid(items){
+  const tok = ++_xpRenderTok;
+  const g   = document.getElementById('vod-expand-grid-view');
+  if(!items.length){ _xpGridMsg('\u{1F50D}', 'No items found'); return; }
+  g.innerHTML = items.slice(0, _XP_BATCH).map(_xpCard).join('');
+  if(items.length <= _XP_BATCH) return;
+
+  let offset   = _XP_BATCH;
+  const sentinel = document.createElement('div');
+  sentinel.style.cssText = 'grid-column:1/-1;height:1px';
+  g.appendChild(sentinel);
+  const obs = new IntersectionObserver(entries => {
+    if(_xpRenderTok !== tok){ obs.disconnect(); sentinel.remove(); return; }
+    if(!entries[0].isIntersecting) return;
+    if(offset >= items.length){ obs.disconnect(); sentinel.remove(); return; }
+    requestAnimationFrame(() => {
+      if(_xpRenderTok !== tok){ obs.disconnect(); sentinel.remove(); return; }
+      const end = Math.min(offset + _XP_BATCH, items.length);
+      const tmp = document.createElement('div');
+      tmp.innerHTML = items.slice(offset, end).map((it,j) => _xpCard(it, offset+j)).join('');
+      while(tmp.firstChild) g.insertBefore(tmp.firstChild, sentinel);
+      offset = end;
+      if(offset >= items.length){ obs.disconnect(); sentinel.remove(); }
+    });
+  }, {root: g, rootMargin: '300px'});
+  obs.observe(sentinel);
+}
+
+// ── Card click ────────────────────────────────────────────────────────────
+window._xpCardClick = function(i){
+  const it = _xpFiltItems[i];
+  if(!it) return;
+  _xpActiveIdx = i; _xpDetailItem = it; _xpDetailIdx = i;
+  document.querySelectorAll('#vod-expand-grid-view .xp-card').forEach(c =>
+    c.classList.toggle('active', parseInt(c.dataset.xi) === i)
+  );
+  document.getElementById('vod-expand-detail').classList.add('visible');
+  _xpRenderDetail(it, i);
+};
+
+// ── Detail panel ──────────────────────────────────────────────────────────
+function _xpRenderDetail(it, idx){
+  // ── Dev: log raw portal item — rating/logo fields inspectable in console ──
+  (function(){
+    const _n = it.name || it.o_name || it.fname || '?';
+    console.group('%c[XP Detail] ' + _n, 'color:#7c3aed;font-weight:700');
+    console.log('RAW item:', Object.assign({}, it));
+    console.log('LOGO fields →',
+      'logo:', it.logo||'\u2014',
+      '| stream_icon:', it.stream_icon||'\u2014',
+      '| cover:', it.cover||'\u2014',
+      '| screenshot_uri:', it.screenshot_uri||'\u2014',
+      '| pic:', it.pic||'\u2014',
+      '| backdrop_path:', it.backdrop_path||'\u2014'
+    );
+    console.log('RATING fields →',
+      'rating_imdb:', it.rating_imdb !== undefined ? JSON.stringify(it.rating_imdb) : '(absent)',
+      '| rating_kp:', it.rating_kinopoisk !== undefined ? JSON.stringify(it.rating_kinopoisk) : '(absent)',
+      '| rating:', it.rating !== undefined ? JSON.stringify(it.rating) : '(absent)',
+      '| rating_5based:', it.rating_5based !== undefined ? JSON.stringify(it.rating_5based) : '(absent)',
+      '| movie_rating:', it.movie_rating !== undefined ? JSON.stringify(it.movie_rating) : '(absent)'
+    );
+    const _plt = it.plot || it.description || '';
+    console.log('META →',
+      'plot/desc:', _plt ? '"'+_plt.substring(0,80)+(_plt.length>80?'…':'')+'"' : '(none)',
+      '| year:', it.year||it.releaseDate||'—',
+      '| genres_str:', it.genres_str||'—',
+      '| age:', it.age||'—',
+      '| director:', it.director||'—',
+      '| tmdb_id:', it.tmdb_id||it.tmdb||'—'
+    );
+    console.groupEnd();
+  })();
+  const inner    = document.getElementById('vod-expand-detail-inner');
+  const isSeries = (_xpMode === 'series');
+  const ph       = isSeries ? '\u{1F4FA}' : '\u{1F3AC}';
+  const name     = it.name || it.o_name || it.fname || 'Unknown';
+  const logo     = _xpLogo(it);
+  const lsrc     = _xpImgSrc(logo);
+  const plot     = it.plot || it.description || it.desc || it.info || '';
+  const director = it.director || it.Director || '';
+  const cast     = it.cast || it.actors || it.Cast || it.cast_actors || '';
+  const rating   = _xpRating(it);
+  const year     = String(it.year || it.releaseDate || it.release_date || it.added || '').substring(0,4);
+  const duration = _xpFmtDur(it.duration || it.runtime_secs || '');
+  const genres   = String(it.genres_str || it.genre || it.genres || '');
+  const ageRat   = it.age || '';
+  // ── Backdrop image resolution ──────────────────────────────────────────────
+  // MAC/Stalker portals split the image URL: cover holds the TMDB size-prefix
+  // base URL (e.g. "http://image.tmdb.org/t/p/w600_and_h900_bestv2") and
+  // backdrop_path holds an array of relative paths (e.g. ["/abc123.jpg"]).
+  // Neither alone is a valid image; combine them when both are present.
+  let bdRaw;
+  (function(){
+    const bdArr  = it.backdrop_path;
+    const bdElem = Array.isArray(bdArr) ? (bdArr[0] || '') : (typeof bdArr === 'string' ? bdArr : '');
+    if(bdElem && typeof bdElem === 'string' && bdElem.startsWith('/')){
+      // Relative TMDB path — find a base URL to prepend.
+      const coverBase = (it.cover && typeof it.cover === 'string' && it.cover.startsWith('http'))
+        ? it.cover.replace(/\/+$/, '')   // strip any trailing slash
+        : 'https://image.tmdb.org/t/p/w1280';
+      bdRaw = coverBase + bdElem;
+    } else if(bdElem){
+      bdRaw = bdElem;
+    } else {
+      // No usable backdrop_path — fall back through the usual chain
+      bdRaw = it.backdrop || it.cover || logo;
+    }
+  })();
+  const bdsrc    = _xpImgSrc(bdRaw);
+
+  let badges = '';
+  if(rating)   badges += '<span class="xp-badge xp-badge-rating">\u2B50 ' + _xpe(rating) + '</span>';
+  if(year)     badges += '<span class="xp-badge xp-badge-year">\u{1F4C5} ' + _xpe(year)  + '</span>';
+  if(duration) badges += '<span class="xp-badge xp-badge-dur">\u23F1 '   + _xpe(duration) + '</span>';
+  if(ageRat)  badges += '<span class="xp-badge xp-badge-age">' + _xpe(ageRat) + '</span>';
+  if(genres) genres.split(/[,;\/]/).map(g=>g.trim()).filter(Boolean).slice(0,3)
+    .forEach(g => { badges += '<span class="xp-badge xp-badge-genre">' + _xpe(g) + '</span>'; });
+
+  const isGroup = !!it._is_series_group;
+  const hasUrl  = !!(it.url || it.stream_url || it.direct_url || it.direct);
+  let actionBtn;
+  if(isGroup){
+    const ec = (it._episodes || []).length;
+    actionBtn = '<button class="btn-blue" style="height:38px;padding:0 18px;font-size:13px"'
+      + ' onclick="_xpExpandGroup(' + idx + ')">&#x1F4CB; Episodes'
+      + (ec ? ' (' + ec + ')' : '') + '</button>';
+  } else if(isSeries && !hasUrl){
+    actionBtn = ''; // episodes auto-load on card open — no manual button needed
+  } else {
+    actionBtn = '<button class="btn-blue" style="height:38px;padding:0 18px;font-size:13px"'
+      + ' onclick="_xpPlayDirect(' + idx + ')">\u25B6 Play</button>';
+  }
+
+  const plotHtml = plot
+    ? '<div class="xp-detail-plot" id="xp-plot-txt">' + _xpe(plot) + '</div>'
+      + '<div style="margin-bottom:12px"><a href="javascript:void(0)"'
+      + ' style="font-size:11px;color:var(--acc)" onclick="_xpTogglePlot()">Show more \u25BE</a></div>'
+    : '';
+  const dirHtml = director
+    ? '<div class="xp-detail-meta-col"><div class="xp-detail-meta-label">Director</div>'
+      + '<div class="xp-detail-meta-val">' + _xpe(director) + '</div></div>' : '';
+  const castHtml = cast
+    ? '<div class="xp-detail-meta-col"><div class="xp-detail-meta-label">Cast</div>'
+      + '<div class="xp-detail-meta-val">'
+      + _xpe(cast.length > 220 ? cast.substring(0,220) + '\u2026' : cast)
+      + '</div></div>' : '';
+  const bdHtml = bdsrc
+    ? '<img class="xp-detail-backdrop" src="' + bdsrc
+      + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'">'
+      + '<div class="xp-detail-backdrop-ph" style="display:none">' + ph + '</div>'
+    : '<div class="xp-detail-backdrop-ph">' + ph + '</div>';
+  const posterHtml = lsrc
+    ? '<img class="xp-detail-poster" src="' + lsrc
+      + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'">'
+      + '<div class="xp-detail-poster-ph" style="display:none">' + ph + '</div>'
+    : '<div class="xp-detail-poster-ph">' + ph + '</div>';
+
+  inner.innerHTML =
+    '<div>' + bdHtml + '</div>'
+    + '<div class="xp-detail-poster-row">' + posterHtml
+    +   '<div class="xp-detail-title-block">'
+    +     '<div class="xp-detail-title">' + _xpe(name) + '</div>'
+    +     '<div class="xp-detail-badges">' + badges + '</div>'
+    +   '</div></div>'
+    + '<div class="xp-detail-actions">' + actionBtn + '</div>'
+    + '<div class="xp-detail-ext-links">'
+    +   '<a class="xp-ext-btn" href="javascript:void(0)" onclick="_xpOpenIMDB(' + idx + ')">'
+    +   '\u{1F517} IMDB / TMDB</a></div>'
+    + '<div class="xp-detail-body">'
+    +   plotHtml
+    +   ((dirHtml || castHtml)
+       ? '<div class="xp-detail-meta-row">' + dirHtml + castHtml + '</div>' : '')
+    + '</div>'
+    + '<div class="xp-seasons" id="xp-seasons-wrap"></div>';
+
+  if(isGroup && it._episodes && it._episodes.length){
+    _xpSeasonOpen = {};
+    _xpRenderSeasons(it._episodes, logo);
+  } else if(isSeries && !hasUrl){
+    // Auto-preload — triggers immediately after innerHTML is set
+    _xpLoadEpisodes(idx);
+  }
+}
+
+// ── Plot toggle ───────────────────────────────────────────────────────────
+window._xpTogglePlot = function(){
+  const el = document.getElementById('xp-plot-txt');
+  if(!el) return;
+  const link = el.nextElementSibling && el.nextElementSibling.querySelector('a');
+  const exp  = el.classList.toggle('expanded');
+  if(link) link.textContent = exp ? 'Show less \u25B4' : 'Show more \u25BE';
+};
+
+// ── Expand group (pre-loaded _episodes array) ─────────────────────────────
+window._xpExpandGroup = function(idx){
+  const it = _xpFiltItems[idx];
+  if(!it) return;
+  _xpSeasonOpen = {};
+  _xpRenderSeasons(it._episodes || [], _xpLogo(it));
+};
+
+// ── Load episodes via /api/episodes ───────────────────────────────────────
+window._xpLoadEpisodes = function(idx, btn){
+  const it = _xpFiltItems[idx];
+  if(!it) return;
+  const key = String(it.series_id || it.id || it.name || '') + '_' + idx;
+  if(_xpEpCache[key]){
+    _xpSeasonOpen = {};
+    _xpRenderSeasons(_xpEpCache[key], _xpLogo(it));
+    return;
+  }
+  if(btn){ btn.disabled = true; btn.textContent = '\u23F3 Loading\u2026'; }
+  const wrap = document.getElementById('xp-seasons-wrap');
+  const pLogo = _xpLogo(it);
+  if(wrap) wrap.innerHTML = '<div style="color:var(--txt3);font-size:12px;padding:14px 0">Fetching\u2026</div>';
+  const catId    = (typeof curCat !== 'undefined' && curCat) ? String(curCat.id || '') : '';
+  const catTitle = (typeof curCat !== 'undefined' && curCat) ? String(curCat.title || '') : '';
+  fetch('/api/episodes', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({item:it, mode:_xpMode, cat_id:catId, cat_title:catTitle, parent_logo:pLogo})
+  })
+  .then(r => { if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+  .then(d => {
+    if(btn){ btn.disabled = false; btn.textContent = '\u{1F4FA} Load Episodes'; }
+    const eps = d.episodes || [];
+    if(!eps.length){
+      if(wrap) wrap.innerHTML = '<div style="color:var(--txt3);font-size:12px;padding:14px 0">No episodes found</div>';
+      return;
+    }
+    if(pLogo) eps.forEach(ep => { if(!_xpLogo(ep)) ep.logo = pLogo; });
+    _xpEpCache[key] = eps;
+    _xpSeasonOpen = {};
+    _xpRenderSeasons(eps, pLogo);
+  })
+  .catch(e => {
+    if(btn){ btn.disabled = false; btn.textContent = '\u{1F4FA} Load Episodes'; }
+    if(wrap) wrap.innerHTML = '<div style="color:var(--red);font-size:12px;padding:14px 0">Error: ' + _xpe(e.message) + '</div>';
+  });
+};
+
+// ── Season grouping ───────────────────────────────────────────────────────
+function _xpGroupSeasons(episodes){
+  const map = new Map();
+  for(const ep of episodes){
+    let sn = ep.season_number || ep.season_num || ep.season || ep._season || '';
+    if(!sn){
+      const m = String(ep.name || '').match(/[Ss]0*(\d+)[Ee]/);
+      sn = m ? m[1] : '1';
+    }
+    sn = String(parseInt(sn) || 1);
+    if(!map.has(sn)) map.set(sn, []);
+    map.get(sn).push(ep);
+  }
+  return [...map.entries()].sort((a,b) => (parseInt(a[0])||0) - (parseInt(b[0])||0));
+}
+
+function _xpRenderSeasons(episodes, showLogo){
+  const wrap = document.getElementById('xp-seasons-wrap');
+  if(!wrap || !episodes.length) return;
+
+  _xpEpReg = [];
+  _xpEpReg.push(...episodes);
+  const epIdxMap = new Map();
+  episodes.forEach((ep,i) => epIdxMap.set(ep, i));
+
+  const seasons = _xpGroupSeasons(episodes);
+  const multi   = seasons.length > 1;
+  let html = '';
+
+  for(let si = 0; si < seasons.length; si++){
+    const [sNum, eps] = seasons[si];
+    const openKey = 's' + sNum;
+    const isOpen  = _xpSeasonOpen.hasOwnProperty(openKey) ? _xpSeasonOpen[openKey] : (si === 0);
+    let epHtml = '';
+    for(const ep of eps) epHtml += _xpEpRow(ep, epIdxMap.get(ep), showLogo);
+
+    if(multi){
+      const rot = isOpen ? 'rotate(0deg)' : 'rotate(-90deg)';
+      html += '<div class="xp-season-section">'
+        + '<div class="xp-season-hdr" onclick="_xpToggleSeason(this,\'' + sNum + '\')">'
+        +   '<span class="xp-season-title">Season ' + _xpe(sNum) + '</span>'
+        +   '<span class="xp-season-count">' + eps.length + ' ep' + (eps.length!==1?'s':'') + '</span>'
+        +   '<span class="xp-season-arrow" style="transform:' + rot + '">\u25BC</span>'
+        + '</div>'
+        + '<div class="xp-season-body"' + (isOpen ? '' : ' style="display:none"') + '>' + epHtml + '</div>'
+        + '</div>';
+    } else {
+      html += epHtml;
+    }
+  }
+  wrap.innerHTML = html || '<div style="color:var(--txt3);font-size:12px;padding:14px 0">No episodes</div>';
+}
+
+function _xpEpRow(ep, regIdx, showLogo){
+  const raw   = ep.name || ep.o_name || ep.fname || '';
+  const lsrc  = _xpImgSrc(_xpLogo(ep) || showLogo);
+  const epM   = raw.match(/[Ee]0*(\d+)/);
+  const epNum = epM ? 'E' + parseInt(epM[1]) : '';
+  const titM  = raw.match(/[Ss]\d+[Ee]\d+\s*[^\w\s]\s*(.+)/);
+  const title = (titM && titM[1].trim()) || ep.title || ep.ep_title || raw;
+  const img   = lsrc
+    ? '<img class="xp-ep-thumb" loading="lazy" src="' + lsrc
+      + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'">'
+      + '<div class="xp-ep-thumb-ph" style="display:none">\u{1F4FA}</div>'
+    : '<div class="xp-ep-thumb-ph">\u{1F4FA}</div>';
+  return '<div class="xp-ep-row">' + img
+    + '<div class="xp-ep-info">'
+    + (epNum ? '<div class="xp-ep-num">' + _xpe(epNum) + '</div>' : '')
+    + '<div class="xp-ep-name">' + _xpe(title) + '</div>'
+    + '</div>'
+    + '<button class="btn-blue xp-ep-play" onclick="_xpPlayEp(' + regIdx + ')">\u25B6</button>'
+    + '</div>';
+}
+
+// ── Toggle season ─────────────────────────────────────────────────────────
+window._xpToggleSeason = function(hdr, sNum){
+  const body  = hdr.nextElementSibling;
+  const arrow = hdr.querySelector('.xp-season-arrow');
+  const open  = body.style.display !== 'none';
+  body.style.display    = open ? 'none' : '';
+  arrow.style.transform = open ? 'rotate(-90deg)' : 'rotate(0deg)';
+  _xpSeasonOpen['s' + sNum] = !open;
+};
+
+// ── Play ──────────────────────────────────────────────────────────────────
+window._xpPlayDirect = function(idx){
+  const it = _xpFiltItems[idx];
+  if(!it) return;
+  _xpClose();
+  window.mode = _xpMode; window.filtItems = _xpFiltItems; window.allItems = _xpAllItems;
+  playItem(idx);
+};
+window._xpPlayEp = function(regIdx){
+  const ep = _xpEpReg[regIdx];
+  if(!ep) return;
+  _xpClose();
+  window.mode = _xpMode; window.filtItems = [ep]; window.allItems = [ep];
+  playItem(0);
+};
+
+// ── IMDB / TMDB ───────────────────────────────────────────────────────────
+window._xpOpenIMDB = function(idx){
+  const it = _xpFiltItems[idx];
+  if(!it || typeof _iMenuIMDBOpen !== 'function') return;
+  _iMenuIMDBOpen(it, _xpMode);
+};
+
+})(); // end IIFE
 </script>
 <script src="/api/dl/ui.js"></script>
 <script src="/api/mv/ui.js"></script>
