@@ -2655,13 +2655,51 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
               style="height:26px;padding:0 8px;font-size:10px;color:#4ade80;border-color:rgba(34,197,94,.3);flex-shrink:0">&#x2713; Select</button>
             <button class="btn-ghost" onclick="outFbClose()" style="height:26px;padding:0 8px;font-size:11px;flex-shrink:0">&#x2715;</button>
           </div>
-          <!-- M3U: filename input -->
+          <!-- Quick paths (nav shortcuts — always visible) -->
+          <div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:5px">
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/sdcard/Download')">&#x1F4E5; Download</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/storage/emulated/0/Download')">&#x1F4E5; /0/DL</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/sdcard/Download/DVR')">&#x1F4FC; DVR</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/sdcard')">&#x1F4F1; /sdcard</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/storage/emulated/0')">&#x1F4F1; /storage/0</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/data/data/com.termux/files/home')">&#x1F5A5; Termux</button>
+          </div>
+          <!-- M3U: filename input + quick presets -->          <!-- M3U: filename input + quick presets -->
           <div id="out-fb-fname-row" style="display:none;align-items:center;gap:6px;margin-bottom:5px">
             <span style="font-size:10px;color:var(--txt3);white-space:nowrap">Filename:</span>
             <input id="out-fb-fname" type="text" placeholder="playlist.m3u"
               style="flex:1;height:24px;font-size:11px;padding:0 7px;border-radius:var(--rss);
                      border:1px solid var(--bdr2);background:var(--s3);color:var(--txt)"
               autocomplete="off" autocorrect="off" spellcheck="false">
+          </div>
+                    <div id="out-fb-m3u-presets" style="display:none;flex-wrap:wrap;gap:3px;margin-bottom:5px">
+            <span style="font-size:10px;color:var(--txt3);width:100%;margin-bottom:2px">&#x26A1; Quick set M3U path:</span>            <span style="font-size:10px;color:var(--txt3);width:100%;margin-bottom:2px">&#x26A1; Quick set M3U path:</span>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/sdcard/Download/playlist.m3u')">/sdcard/DL/playlist.m3u</button>              onclick="outFbQuickApply('/sdcard/Download/playlist.m3u')">/sdcard/DL/playlist.m3u</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/storage/emulated/0/Download/playlist.m3u')">/0/DL/playlist.m3u</button>              onclick="outFbQuickApply('/storage/emulated/0/Download/playlist.m3u')">/0/DL/playlist.m3u</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/data/data/com.termux/files/home/playlist.m3u')">Termux ~/playlist.m3u</button>              onclick="outFbQuickApply('/data/data/com.termux/files/home/playlist.m3u')">Termux ~/playlist.m3u</button>
+          </div>
+          <!-- Download dir: quick presets -->          <!-- Download dir: quick presets -->
+          <div id="out-fb-dir-presets" style="display:none;flex-wrap:wrap;gap:3px;margin-bottom:5px">
+            <span style="font-size:10px;color:var(--txt3);width:100%;margin-bottom:2px">&#x26A1; Quick set Download folder:</span>            <span style="font-size:10px;color:var(--txt3);width:100%;margin-bottom:2px">&#x26A1; Quick set Download folder:</span>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/sdcard/Download/')">/sdcard/Download/</button>              onclick="outFbQuickApply('/sdcard/Download/')">/sdcard/Download/</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/storage/emulated/0/Download/')">/0/Download/</button>              onclick="outFbQuickApply('/storage/emulated/0/Download/')">/0/Download/</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/data/data/com.termux/files/home/')">Termux ~/</button>              onclick="outFbQuickApply('/data/data/com.termux/files/home/')">Termux ~/</button>
+          </div>
+          <!-- DVR dir: quick presets -->          <!-- DVR dir: quick presets -->
+          <div id="out-fb-dvr-presets" style="display:none;flex-wrap:wrap;gap:3px;margin-bottom:5px">
+            <span style="font-size:10px;color:var(--txt3);width:100%;margin-bottom:2px">&#x26A1; Quick set DVR folder:</span>            <span style="font-size:10px;color:var(--txt3);width:100%;margin-bottom:2px">&#x26A1; Quick set DVR folder:</span>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/sdcard/Download/DVR/')">/sdcard/Download/DVR/</button>              onclick="outFbQuickApply('/sdcard/Download/DVR/')">/sdcard/Download/DVR/</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/storage/emulated/0/Download/DVR/')">/0/Download/DVR/</button>              onclick="outFbQuickApply('/storage/emulated/0/Download/DVR/')">/0/Download/DVR/</button>
+            <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
+              onclick="outFbQuickApply('/data/data/com.termux/files/home/DVR/')">Termux ~/DVR/</button>              onclick="outFbQuickApply('/data/data/com.termux/files/home/DVR/')">Termux ~/DVR/</button>
           </div>
           <!-- File/folder list -->
           <div id="out-fb-list" style="max-height:90px;overflow-y:auto;border:1px solid var(--bdr);border-radius:var(--rss);background:var(--s4)">
