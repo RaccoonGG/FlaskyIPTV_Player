@@ -177,7 +177,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                             state.log(f"[EPG] get_short_epg first entry: {listings[0]}")
                             result = _parse_xtream_short_epg(payload)
                             if result.get("current") or result.get("next"):
-                                state.log(f"[EPG] get_short_epg OK — current={result.get('current',{}).get('title','?')!r}")
+                                state.log(f"[EPG] get_short_epg OK — current={(result.get('current') or {}).get('title','?')!r}")
                                 return result
                             state.log(f"[EPG] get_short_epg has entries but none current/next — falling through")
                         else:
@@ -3890,5 +3890,328 @@ function wonFindChannel(btn, idx){
     res.textContent = '✗ Request failed: ' + e;
   });
 }
+	
+/* ── EPG Now-Playing overlay ─────────────────────────────────────────────────
+   Mirrors the probe stats overlay architecture exactly:
+   - Same IIFE, same vwrap-appended button+panel, same hover/touch/sticky logic
+   - Intercepts /api/resolve to detect channel switches (live only)
+   - Fetches /api/epg once per channel, refreshes at programme boundary
+   - Position: top-left (probe owns top-right)
+   ─────────────────────────────────────────────────────────────────────────── */
+(function(){
+  /* ── CSS ─────────────────────────────────────────────────────────────── */
+  (function(){
+    const s = document.createElement('style');
+    s.textContent = `
+#epg-now-btn{
+  position:absolute;bottom:94px;right:8px;
+  display:flex;align-items:center;gap:5px;
+  background:rgba(10,12,20,.68);
+  border:1px solid rgba(255,255,255,.13);
+  border-radius:4px;
+  padding:3px 8px 3px 7px;
+  cursor:pointer;z-index:31;
+  font-size:11px;font-weight:600;
+  color:#c4b5fd;
+  user-select:none;white-space:nowrap;
+  backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);
+  max-width:240px;overflow:hidden;text-overflow:ellipsis;
+  opacity:0;pointer-events:none;
+  transition:opacity .2s ease,background .15s,border-color .15s;
+}
+#epg-now-btn.en-hover  { opacity:1;pointer-events:auto; }
+#epg-now-btn.en-sticky { opacity:1;pointer-events:auto; }
+#epg-now-btn:hover     { background:rgba(30,35,55,.82);border-color:rgba(255,255,255,.25); }
+#epg-now-btn.en-open   { background:rgba(30,35,55,.88);border-color:rgba(196,181,253,.35); }
+#epg-now-panel{
+  position:absolute;bottom:120px;right:8px;
+  display:none;flex-direction:column;gap:0;
+  background:rgba(10,12,20,.85);
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:5px;
+  padding:9px 12px 8px;
+  z-index:30;
+  max-width:320px;
+  font-size:11.5px;line-height:1.55;
+  color:#dde4f0;
+  backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);
+  pointer-events:auto;
+  animation:en-rise .15s ease;
+}
+#epg-now-panel.en-open{ display:flex; }
+@keyframes en-rise{
+  from{opacity:0;transform:translateY(4px);}
+  to{opacity:1;transform:translateY(0);}
+}
+@media(hover:none){
+  #epg-now-btn.en-touch-visible{ opacity:1;pointer-events:auto; }
+  #epg-now-btn  { bottom:61px; }
+  #epg-now-panel{ bottom:87px; }
+}
+.en-time { color:#6ee7b7;font-size:10px;font-weight:700;letter-spacing:.4px;margin-bottom:3px; }
+.en-title{ color:#f1f5f9;font-size:12.5px;font-weight:700;margin-bottom:4px;line-height:1.35; }
+.en-desc { color:#94a3b8;font-size:10.5px;line-height:1.5;max-width:300px; }
+.en-divider{ height:1px;background:rgba(255,255,255,.07);margin:6px 0; }
+.en-next-lbl{ color:#4a5a78;font-size:9px;text-transform:uppercase;letter-spacing:.7px;margin-bottom:2px; }
+.en-next-title{ color:#7c8fa8;font-size:10.5px; }
+.en-next-time { color:#4a5a78;font-size:10px;margin-right:5px; }
+`;
+    document.head.appendChild(s);
+  })();
+  /* ── State ──────────────────────────────────────────────────────────── */
+  let _btn        = null;
+  let _panel      = null;
+  let _open       = false;
+  let _sticky     = false;
+  let _hasData    = false;
+  let _curItem    = null;   // last resolved live item
+  let _curData    = null;   // last EPG response {current, next}
+  let _refreshTmr = null;   // setTimeout to refresh at programme boundary
+  let _revealTmr  = null;
+  const _isTouch  = window.matchMedia('(hover:none)').matches;
+  /* ── Touch reveal ───────────────────────────────────────────────────── */
+  function _reveal(ms){
+    if(!_btn || !_hasData) return;
+    if(_revealTmr){ clearTimeout(_revealTmr); _revealTmr = null; }
+    _btn.classList.add('en-touch-visible');
+    if(_sticky) return;
+    _revealTmr = setTimeout(function(){
+      _revealTmr = null;
+      if(!_sticky) _btn.classList.remove('en-touch-visible');
+    }, ms);
+  }
+  function _cancelReveal(){
+    if(_revealTmr){ clearTimeout(_revealTmr); _revealTmr = null; }
+    if(_btn) _btn.classList.remove('en-touch-visible');
+  }
+  /* ── DOM setup ──────────────────────────────────────────────────────── */
+  function _ensureEls(){
+    if(_btn) return true;
+    const vwrap = document.getElementById('vwrap');
+    if(!vwrap) return false;
+    _btn = document.createElement('div');
+    _btn.id = 'epg-now-btn';
+    _btn.textContent = '📺';
+    vwrap.appendChild(_btn);
+    _panel = document.createElement('div');
+    _panel.id = 'epg-now-panel';
+    vwrap.appendChild(_panel);
+    /* Desktop: hover shows/hides button */
+    if(!_isTouch){
+      vwrap.addEventListener('mouseenter', function(){
+        if(!_hasData) return;
+        _btn.classList.add('en-hover');
+      });
+      vwrap.addEventListener('mouseleave', function(){
+        _btn.classList.remove('en-hover');
+        if(!_sticky && _open){
+          _btn.classList.remove('en-open');
+          _panel.classList.remove('en-open');
+          _open = false;
+        }
+      });
+    }
+    /* Mobile: tap on player area reveals button */
+    if(_isTouch){
+      vwrap.addEventListener('touchstart', function(e){
+        if(!_hasData) return;
+        if(!_btn.contains(e.target) && !_panel.contains(e.target)) _reveal(4000);
+      }, {passive:true});
+      document.addEventListener('touchstart', function(e){
+        if(_open && _panel && !_panel.contains(e.target) && !_btn.contains(e.target)){
+          _btn.classList.remove('en-open','en-sticky');
+          _panel.classList.remove('en-open');
+          _open = false; _sticky = false;
+          _reveal(2000);
+        }
+      }, {passive:true});
+    }
+    /* Button click: toggle panel */
+    _btn.addEventListener('click', function(e){
+      e.stopPropagation();
+      if(_open){
+        _btn.classList.remove('en-open','en-sticky');
+        _panel.classList.remove('en-open');
+        _open = false; _sticky = false;
+        if(_isTouch) _reveal(2000);
+      } else {
+        _btn.classList.add('en-open','en-sticky');
+        _panel.classList.add('en-open');
+        _open = true; _sticky = true;
+        if(_isTouch) _reveal(0);
+        // Silently refresh if data is stale (>10 min old)
+        if(_curItem && _fetchedAt && Date.now() - _fetchedAt > 10 * 60 * 1000){
+          _fetchAndShow(_curItem);
+        }
+      }
+    });
+    return true;
+  }
+  /* ── Helpers ────────────────────────────────────────────────────────── */
+  function _fmtTime(iso){
+    if(!iso) return '';
+    try{
+      const d = new Date(iso);
+      return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',hour12:false});
+    }catch(e){ return ''; }
+  }
+  function _truncate(s, n){
+    if(!s) return '';
+    return s.length > n ? s.slice(0, n-1) + '\u2026' : s;
+  }
+  function _secsUntil(iso){
+    if(!iso) return null;
+    try{
+      const ms = new Date(iso).getTime() - Date.now();
+      return ms > 0 ? Math.ceil(ms/1000) : null;
+    }catch(e){ return null; }
+  }
+  /* ── Schedule auto-refresh at programme boundary ─────────────────────── */
+  function _scheduleRefresh(endIso, nextStartIso){
+    if(_refreshTmr){ clearTimeout(_refreshTmr); _refreshTmr = null; }
+    // Priority: 5s after current ends → 5s after next starts → 15-min poll
+    let secs = null;
+    if(endIso){
+      const s = _secsUntil(endIso);
+      if(s !== null && s > 0 && s <= 7200) secs = s + 5;
+    }
+    if(secs === null && nextStartIso){
+      const s = _secsUntil(nextStartIso);
+      if(s !== null && s > 0 && s <= 7200) secs = s + 5;
+    }
+    if(secs === null) secs = 15 * 60;   // fallback: 15-min poll
+    _refreshTmr = setTimeout(function(){
+      _refreshTmr = null;
+      if(_curItem) _fetchAndShow(_curItem);
+    }, secs * 1000);
+  }
+  /* ── Render panel ────────────────────────────────────────────────────── */
+  let _fetchedAt = 0;
+  function _render(data){
+    if(!_ensureEls()) return;
+    const cur  = data.current  || {};
+    const next = data.next     || {};
+    if(!cur.title && !next.title){ _hide(); return; }
+    /* Button shows current title ONLY — never next.title, which would make
+       an upcoming programme look like it's already playing.              */
+    _btn.textContent = cur.title ? _truncate(cur.title, 26) : '\u{1F4FA}';
+    /* Panel HTML */
+    let html = '';
+    if(cur.title){
+      const t1 = _fmtTime(cur.start), t2 = _fmtTime(cur.end);
+      const timeStr = (t1 && t2) ? (t1 + ' \u2013 ' + t2) : (t1 || '');
+      if(timeStr) html += '<div class="en-time">' + timeStr + '</div>';
+      html += '<div class="en-title">' + _esc(cur.title) + '</div>';
+      if(cur.desc) html += '<div class="en-desc">' + _esc(cur.desc) + '</div>';
+    } else {
+      html += '<div class="en-desc" style="opacity:.5;font-style:italic">No programme info right now</div>';
+    }
+    if(next.title){
+      html += '<div class="en-divider"></div>';
+      html += '<div class="en-next-lbl">Up next</div>';
+      const nt = _fmtTime(next.start);
+      html += '<div class="en-next-title">'
+            + (nt ? '<span class="en-next-time">' + nt + '</span>' : '')
+            + _esc(next.title) + '</div>';
+    }
+    _panel.innerHTML = html;
+    _hasData = true;
+    _curData = data;
+    _fetchedAt = Date.now();
+    /* Show button + auto-open panel for 8s then collapse */
+    if(_isTouch){
+      _reveal(8000);
+    } else {
+      _btn.classList.add('en-hover');
+    }
+    _btn.classList.add('en-open');
+    _panel.classList.add('en-open');
+    _open = true;
+    const snap = data;
+    setTimeout(function(){
+      if(!_sticky && _open && _curData === snap){
+        _btn.classList.remove('en-open');
+        _panel.classList.remove('en-open');
+        _open = false;
+        if(!_isTouch){
+          const vwrap = document.getElementById('vwrap');
+          if(vwrap && !vwrap.matches(':hover')) _btn.classList.remove('en-hover');
+        }
+      }
+    }, 8000);
+    /* Schedule next refresh — at current end, at next start, or 15-min poll */
+    _scheduleRefresh(cur.end, next.start);
+  }
+  function _esc(s){
+    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+  /* ── Fetch EPG and render ────────────────────────────────────────────── */
+  function _fetchAndShow(item){
+    fetch('/api/epg', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({item: item})
+    }).then(function(r){ return r.json(); }).then(function(d){
+      if(d && (d.current || d.next)) _render(d);
+    }).catch(function(){});
+  }
+  /* ── Hide (on stop / channel switch) ────────────────────────────────── */
+  function _hide(){
+    if(_refreshTmr){ clearTimeout(_refreshTmr); _refreshTmr = null; }
+    _open = false; _sticky = false; _hasData = false;
+    _curItem = null; _curData = null;
+    if(_isTouch && _btn) _cancelReveal();
+    if(_btn){ _btn.classList.remove('en-hover','en-open','en-sticky'); _btn.textContent = '📺'; }
+    if(_panel){ _panel.classList.remove('en-open'); _panel.innerHTML = ''; }
+  }
+  /* ── Intercept /api/resolve — same pattern as probe overlay ─────────── */
+  // We chain onto the existing window.fetch which may already be wrapped by
+  // probe_addon. We do NOT re-assign window.fetch here to avoid overwriting
+  // probe's wrapper; instead we hook into window._streamInfoShow being called
+  // (probe exports it) and use it as a trigger. This is the cleanest option
+  // when both overlays coexist. Additionally, we check the resolve response
+  // independently so EPG overlay works even without probe_addon.
+  const _origFetch2 = window.fetch;
+  window.fetch = async function(resource, opts){
+    const res = await _origFetch2.apply(this, arguments);
+    const url = (typeof resource === 'string') ? resource : (resource && resource.url || '');
+    if(url.includes('/api/resolve') && !url.includes('/api/resolve_url')){
+      const clone = res.clone();
+      clone.json().then(function(d){
+        if(!d || !d.url) return;
+        // Only show EPG overlay for live streams
+        try{
+          const body = opts && opts.body ? JSON.parse(opts.body) : null;
+          const isLive = body && (body.mode === 'live' || !body.mode);
+          if(!isLive) { _hide(); return; }
+          const item = body && body.item;
+          if(!item) return;
+          _hide();         // clear previous channel immediately
+          _curItem = item; // set AFTER _hide() so refresh timer reference survives
+          _fetchAndShow(item);
+        } catch(e){}
+      }).catch(function(){});
+    }
+    return res;
+  };
+  /* ── Hook playerStop only ────────────────────────────────────────────
+     We intentionally do NOT patch _destroyPlayers here. doPlay() calls
+     _destroyPlayers() synchronously before the new player is ready, which
+     races with the incoming /api/epg response and wipes the overlay on the
+     first channel play. The resolve interceptor's own _hide() call already
+     handles channel-switch clearing correctly.                           */
+  function _patchStop(name){
+    const orig = window[name];
+    if(typeof orig !== 'function') return;
+    window[name] = function(){ _hide(); return orig.apply(this, arguments); };
+  }
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', function(){
+      _patchStop('playerStop');
+    });
+  } else {
+    _patchStop('playerStop');
+  }
+})();
 """ # end _EPG_UI_JS
  # end _EPG_UI_JS
