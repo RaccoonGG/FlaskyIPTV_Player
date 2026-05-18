@@ -204,6 +204,10 @@ class StreamBroadcaster:
             ).start()
             LOG.info('[MV] Broadcaster started  key=%s  pid=%s',
                      stream_key, self.process.pid)
+            if _mv_state:
+                _mv_state.log(
+                    f'[MV] ✓ Broadcaster started  key={stream_key[:20]}'
+                    f'  pid={self.process.pid}')
         else:
             LOG.error('[MV] Broadcaster failed to spawn ffmpeg  key=%s', stream_key)
 
@@ -616,7 +620,14 @@ def _save_layouts(layouts: List[dict]) -> None:
 # SECTION 7 — ROUTE REGISTRATION
 # ═════════════════════════════════════════════════════════════════════════════
 
-def register_multiview_routes(app) -> None:
+# Portal state reference — set by register_multiview_routes so MvBroadcaster
+# can write to the activity log without needing state in its constructor.
+_mv_state = None
+
+
+def register_multiview_routes(app, state=None) -> None:
+    global _mv_state
+    _mv_state = state
     """
     Register all multiview API routes on the Flask app instance.
 
@@ -1030,6 +1041,10 @@ def register_multiview_routes(app) -> None:
     _register_mv_ui_route(app)
     LOG.info('[MV] Multiview routes registered  '
              '(layouts_file=%s, ui.js=yes)', LAYOUTS_FILE)
+    if state:
+        state.log('[MV] Routes registered: /api/multiview/stream  '
+                  '/api/multiview/stream/stop  /api/multiview/layouts  '
+                  '/api/multiview/status  /api/mv/ui.js')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1650,7 +1665,7 @@ function _mvNeedsResolve(url){
 // first to get a streamable direct URL, then feed it through the normal
 // mpegts.js + ffmpeg proxy pipeline.
 async function _mvPlayFromUrl(wid, rawUrl, cEl){
-  if(!cEl){ console.warn('[MV] _mvPlayFromUrl: cEl is null for wid='+wid); return; }
+  if(!cEl){ toast('Multiview: slot not found (wid='+wid+')', 'err'); return; }
   rawUrl = (rawUrl||'').trim();
   if(!rawUrl){ toast('Enter a URL first', 'wrn'); return; }
 
@@ -2530,7 +2545,6 @@ async function _mvPlayChannel(wid, channel, cEl){
       liveBufferLatencyMinRemain:  _hlsIsLive ? 2 : undefined,
     });
     player.on(mpegts.Events.ERROR, (errType, errDetail)=>{
-      console.error('[MV/transcode] mpegts error wid='+wid, errType, errDetail);
       if(document.getElementById('p-mv').classList.contains('mv-active'))
         toast('Stream error: '+(channel.name||wid),'err');
       _mvStopCleanup(wid, true);
@@ -2543,7 +2557,7 @@ async function _mvPlayChannel(wid, channel, cEl){
       const muteBtn = cEl.querySelector('.mv-mute-btn');
       if(mvPlayers.size === 1){ videoEl.muted=false; if(muteBtn) muteBtn.textContent='🔊'; }
       else if(muteBtn) muteBtn.textContent = videoEl.muted?'🔇':'🔊';
-    } catch(e){ console.warn('[MV/transcode] play() error', e); }
+    } catch(e){ if(e && e.name !== 'AbortError') toast('Playback error: '+(e.message||e), 'err'); }
     // For VOD: show seek bar once duration is known
     if(!_hlsIsLive){
       const seekWrap2 = cEl.querySelector('.mv-seek-wrap');
@@ -2590,7 +2604,6 @@ async function _mvPlayChannel(wid, channel, cEl){
 
   // mirrors multiview.js player.on(mpegts.Events.ERROR ...)
   player.on(mpegts.Events.ERROR, (errType, errDetail)=>{
-    console.error('[MV] mpegts error wid=' + wid, errType, errDetail);
     // Only toast if the panel is still open (don't spam after mvClose)
     if(document.getElementById('p-mv').classList.contains('mv-active'))
       toast('Stream error: ' + (channel.name||wid), 'err');
@@ -2625,7 +2638,6 @@ async function _mvPlayChannel(wid, channel, cEl){
   } catch(e){
     // mirrors multiview.js: if(err.name !== 'AbortError')
     if(e && e.name !== 'AbortError'){
-      console.error('[MV] play() error wid=' + wid, e);
       if(document.getElementById('p-mv').classList.contains('mv-active'))
         toast('Could not play: ' + (channel.name||wid), 'err');
       _mvStopCleanup(wid, true);
@@ -3438,7 +3450,7 @@ async function _mvLoadLayouts(){
     });
     // Store on window for load callback
     window._mvLayouts = layouts;
-  } catch(e){ console.warn('[MV] loadLayouts error', e); }
+  } catch(e){ setStatus('Could not load layouts: ' + (e.message||e)); }
 }
 
 // Auto-restore the last grid layout after re-opening multiview.
@@ -3475,7 +3487,7 @@ async function _mvAutoRestoreLayout(){
     const sel = document.getElementById('mv-layouts-sel');
     if(sel) sel.value = lastId;
     _mvTbCollapseIfMobile();
-  } catch(e){ console.warn('[MV] autoRestoreLayout error', e); }
+  } catch(e){ setStatus('Could not restore multiview layout'); }
 }
 
 // mirrors multiview.js saveLayout()
