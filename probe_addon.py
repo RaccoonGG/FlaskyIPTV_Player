@@ -737,7 +737,6 @@ _PROBE_UI_JS = r"""
       e.stopPropagation();
       const idx = parseInt(btn.getAttribute('data-track-idx'), 10);
       if(!isNaN(idx)){
-        console.log('[probe] track row clicked → _switchAudio(' + idx + ')');
         _switchAudio(idx);
       }
     });
@@ -798,11 +797,7 @@ _PROBE_UI_JS = r"""
   //      transcode so ffmpeg applies -map 0:a:<N>.  Stream restarts through hls_proxy.
   //      Works identically for already-transcoded and previously-direct streams.
   function _switchAudio(trackIdx){
-    console.log('[probe] _switchAudio called — trackIdx:', trackIdx,
-                'curInfo.transcode:', _curInfo && _curInfo.transcode,
-                'hlsAudioTracks:', _hlsAudioTracks.length,
-                'curStreamUrl:', _curStreamUrl ? _curStreamUrl.substring(0,60)+'…' : '(none)');
-    if(!_curInfo){ console.warn('[probe] _switchAudio: no _curInfo, abort'); return; }
+    if(!_curInfo){ setStatus('[probe] No stream info — try replaying'); return; }
 
     // ── Case 1: live HLS with native multi-audio renditions ──────────────
     // HLS.js tracks the renditions; switch directly with zero restart.
@@ -811,7 +806,7 @@ _PROBE_UI_JS = r"""
     const _isTranscoded = !!(_curInfo && _curInfo.transcode);
     if(!_isTranscoded && typeof hlsObj !== 'undefined' && hlsObj
        && typeof hlsObj.audioTrack === 'number' && _hlsAudioTracks.length > 0){
-      console.log('[probe] Case 1: HLS.js direct switch to track', trackIdx);
+      setStatus('[probe] Switching audio track ' + trackIdx + '…');
       hlsObj.audioTrack = trackIdx;
       _activeAudio = trackIdx;
       _rebuildTracks();
@@ -847,8 +842,7 @@ _PROBE_UI_JS = r"""
         .replace(/[&?]audio_track=\d+/g, '')
         .replace(/[&?]$/, '');
       newUrl += (newUrl.includes('?') ? '&' : '?') + 'audio_track=' + trackIdx;
-      console.log('[probe] fast-path: audio_track=' + trackIdx + ' (' + _trackLang + ')',
-                  '→', newUrl.substring(0, 80) + '…');
+      setStatus('[probe] Audio: ' + _trackLang + ' (track ' + trackIdx + ')');
       _activeAudio = trackIdx;
       _rebuildTracks();
 
@@ -874,11 +868,11 @@ _PROBE_UI_JS = r"""
     // ── Case 2 fallback: no cached URL — re-resolve via /api/resolve ─────
     // Reached only if _curStreamUrl wasn't captured (edge-case race).
     // Use filtItems[pIdx] (both are true globals set by playItem).
-    console.warn('[probe] Case 2 fallback: no cached URL, falling back to re-resolve');
+    setStatus('[probe] Re-resolving stream for audio track…');
     const _curIt = (typeof filtItems !== 'undefined' && typeof pIdx !== 'undefined')
                    ? filtItems[pIdx] : null;
     if(!_curIt){
-      console.error('[probe] _switchAudio: no current item (filtItems[' + pIdx + '] is null)');
+      toast('Cannot switch audio track — no current item', 'err');
       return;
     }
     _activeAudio = trackIdx;
@@ -893,12 +887,11 @@ _PROBE_UI_JS = r"""
         audio_track: trackIdx,
       })
     }).then(function(r){ return r.json(); }).then(function(d){
-      console.log('[probe] fallback re-resolve response url:', d.url ? d.url.substring(0,80)+'…' : '(none)');
       if(d.url && typeof doPlay === 'function'){
         doPlay(d.url, name, {isLive: isLive});
       }
     }).catch(function(e){
-      console.error('[probe] re-resolve for audio track failed:', e);
+      toast('Audio track switch failed: ' + (e.message||e), 'err');
     });
   }
 
@@ -1137,7 +1130,6 @@ _PROBE_UI_JS = r"""
               _curStreamName = (it && (it.name || it.o_name || it.fname)) || '';
               _curStreamLive = (bodyObj && bodyObj.mode) ? bodyObj.mode === 'live' : true;
             } catch(_){ _curStreamName = ''; _curStreamLive = true; }
-            console.log('[probe] cached stream url:', _curStreamUrl.substring(0,80)+'…');
           }
           _siShow(d.stream_info);
           // Restore active track highlight for audio-switch resolves only.
@@ -1273,7 +1265,7 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                         _is_hls_url = '.m3u8' in url_lower or '.m3u8' in url_lower_full
                         if _is_hls_url:
                             # ── ffprobe pass 2: HLS retry ─────────────────────
-                            state.log("[PROBE] ffprobe failed on HLS URL — retrying with HLS args")
+                            state.log("[PROBE] ⚠ ffprobe failed on HLS URL — retrying with HLS args")
                             _hls_probe_args = [
                                 "-user_agent", state.stream_ua,
                                 "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls,applehttp",
@@ -1282,7 +1274,7 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                             codecs = probe_stream_codecs(url, pre_input_args=_hls_probe_args,
                                                          timeout=12, ffprobe_path=_FFPROBE_PATH)
                             if codecs:
-                                state.log("[PROBE] ffprobe HLS retry succeeded")
+                                state.log("[PROBE] ✓ ffprobe HLS retry succeeded")
                                 needs_transcode, transcode_reason, detected_codec = _check_codecs(codecs)
                                 # is_hls=False when transcoding — delivery is MPEG-TS from ffmpeg
                                 stream_info = _build_stream_info(codecs, transcode_reason,
@@ -1305,11 +1297,11 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                                 ts_url = _hls_to_ts_variant(url)
                                 ts_fallback_used = False
                                 if ts_url != url:
-                                    state.log("[PROBE] HLS retry failed — trying .ts variant")
+                                    state.log("[PROBE] ⚠ HLS retry failed — trying .ts variant")
                                     codecs = probe_stream_codecs(ts_url, pre_input_args=_probe_pre_args,
                                                                  timeout=10, ffprobe_path=_FFPROBE_PATH)
                                     if codecs:
-                                        state.log("[PROBE] .ts probe succeeded — using TS URL")
+                                        state.log("[PROBE] ✓ .ts probe succeeded — using TS URL")
                                         url = ts_url
                                         ts_fallback_used = True
                                         url_lower_full = url.lower()
@@ -1320,11 +1312,11 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                                                                          is_hls=False)
                                         _log_stream_info(state, stream_info, ".ts fallback")
                                     else:
-                                        state.log("[PROBE] .ts probe also failed — playing direct")
+                                        state.log("[PROBE] ⚠ .ts probe also failed — playing direct")
                                 else:
-                                    state.log("[PROBE] ffprobe HLS retry also failed — playing direct")
+                                    state.log("[PROBE] ⚠ ffprobe HLS retry also failed — playing direct")
                         else:
-                            state.log("[PROBE] ffprobe failed — falling back to TS byte scan")
+                            state.log("[PROBE] ⚠ ffprobe failed — falling back to TS byte scan")
 
                 # ── TS byte-scan fallback (non-HLS, ffprobe failed) ───────────
                 # When ffprobe failed (codecs is None) we fall back to reading the
@@ -1355,7 +1347,7 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                         else:
                             state.log("[PROBE] TS scan: no issue detected — playing direct")
                     except Exception as pe:
-                        state.log(f"[PROBE] TS scan failed: {pe}")
+                        state.log(f"[PROBE] ✗ TS scan failed: {pe}")
 
                 # ── Fresh token for short-lived Stalker CDN URLs ──────────────
                 # CDNs like lx20.net issue single-use or connection-bound tokens.
@@ -1379,10 +1371,10 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                                 return await client.resolve_item_url(mode, item, cat)
                         fresh_url = run_async(_refetch())
                         if fresh_url and isinstance(fresh_url, str) and fresh_url != url:
-                            state.log("[PROBE] Fresh token obtained (probe consumed previous token)")
+                            state.log("[PROBE] ✓ Fresh token obtained (probe consumed previous token)")
                             url = fresh_url
                     except Exception as _rfe:
-                        state.log(f"[PROBE] Fresh token re-fetch failed ({_rfe}) — using probe URL")
+                        state.log(f"[PROBE] ⚠ Fresh token re-fetch failed ({_rfe}) — using probe URL")
 
                 # ── Route result ──────────────────────────────────────────────
                 # audio_track: optional zero-based audio stream index from the
@@ -1436,5 +1428,7 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
 
             return jsonify({"url": url, "stream_info": stream_info})
         except Exception as e:
-            state.log(f"[PROBE] Error: {type(e).__name__}: {e}")
+            state.log(f"[PROBE] ✗ Error: {type(e).__name__}: {e}")
             return jsonify({"url": "", "error": str(e)})
+
+    state.log("[PROBE] Routes registered: /api/resolve  /api/probe/ui.js")
