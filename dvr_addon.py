@@ -946,6 +946,8 @@ def register_dvr_routes(app, state=None) -> None:
 
     _register_dvr_ui_route(app)
     LOG.info("[DVR] Routes registered  (jobs_file=%s, ui.js=yes)", DVR_JOBS_FILE)
+    if state:
+        state.log("[DVR] Routes registered: /api/dvr/*")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
