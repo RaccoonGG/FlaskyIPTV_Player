@@ -159,6 +159,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
 
                 # ── Method 1: get_short_epg (per-channel, fast) ──────────────────
                 short_epg_skip = base_norm in state._short_epg_broken
+                _short_epg_fallback = None   # holds next-only result if current was absent
                 if stream_id and not short_epg_skip:
                     epg_api_url = (f"{base_norm}/player_api.php"
                                    f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}"
@@ -176,15 +177,23 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                         if listings and isinstance(listings, list):
                             state.log(f"[EPG] get_short_epg first entry: {listings[0]}")
                             result = _parse_xtream_short_epg(payload)
-                            if result.get("current") or result.get("next"):
+                            if result.get("current"):
                                 state.log(f"[EPG] get_short_epg OK — current={(result.get('current') or {}).get('title','?')!r}")
                                 return result
-                            state.log(f"[EPG] get_short_epg has entries but none current/next — falling through")
+                            elif result.get("next"):
+                                # Has upcoming data but no current — programme boundary
+                                # edge case (fetch happened just before start time).
+                                # Continue to XMLTV which may have the correct current;
+                                # keep this as a fallback if XMLTV also has no current.
+                                state.log(f"[EPG] get_short_epg next-only — trying XMLTV for current")
+                                _short_epg_fallback = result
+                            else:
+                                state.log(f"[EPG] get_short_epg has entries but none current/next — falling through")
                         else:
                             state._short_epg_broken.add(base_norm)
                             state.log(f"[EPG] get_short_epg empty — portal flagged, skipping next time")
                     except Exception as e:
-                        state.log(f"[EPG] get_short_epg error: {e}")
+                        state.log(f"[EPG] ✗ get_short_epg error: {e}")
                 elif short_epg_skip:
                     state.log(f"[EPG] Skipping get_short_epg (portal flagged as broken)")
 
@@ -200,6 +209,11 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                                            cache_key=base_norm)
                     if portal_result.get("current") or portal_result.get("next"):
                         return portal_result
+                    # Propagate loading signal so client retries rather than caching empty
+                    if "loading" in (portal_result.get("error") or "").lower():
+                        state._xmltv_needs.add(cache_key)
+                        return {"current": None, "next": None,
+                                "error": portal_result.get("error")}
                     state.log(f"[EPG] Portal XMLTV returned no data for this channel")
                 elif not epg_ch_id or epg_ch_id == item.get("name", ""):
                     state.log(f"[EPG] No epg_channel_id — skipping portal XMLTV")
@@ -226,7 +240,11 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                 "error": "Channel not found in external EPG.",
                                 "_xmltv_checked": True}
 
-                # Nothing worked
+                # Nothing worked — if get_short_epg had next-only data, return that
+                # rather than an error so the client at least sees upcoming info.
+                if _short_epg_fallback:
+                    state.log(f"[EPG] XMLTV had no current — using get_short_epg fallback (next only)")
+                    return _short_epg_fallback
                 err = "No EPG data found."
                 if not state.ext_epg_url:
                     err += " Try adding an external EPG URL in settings."
@@ -303,7 +321,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                     str(payload.get("text", "") if isinstance(payload, dict) else "").lower())
                             )
                             if _auth_failed:
-                                state.log("[EPG] Portal token rejected (auth failed) — re-handshaking")
+                                state.log("[EPG] ⚠ Portal token rejected (auth failed) — re-handshaking")
                                 # For plain MAC portals, clear the cached token so
                                 # _ensure_token() acquires a fresh one.
                                 # Stalker portals never cache a token, so this is a no-op for them.
@@ -316,7 +334,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                 return r.status, payload
                         # Retry with fresh token
                         async with sess.get(epg_url, headers=headers) as r2:
-                            state.log(f"[EPG] HTTP {r2.status} (retry)")
+                            state.log(f"[EPG] ⚠ HTTP {r2.status} (retry)")
                             return r2.status, await safe_json(r2)
 
                 if not ch_id:
@@ -337,7 +355,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                   else "/stalker_portal/server/load.php"
                     else:
                         alt_php = "/server/load.php"
-                    state.log(f"[EPG] Retrying via alt path ({alt_php})")
+                    state.log(f"[EPG] ⚠ Retrying via alt path ({alt_php})")
                     try:
                         _status2, payload2 = await _mac_epg_request(ch_id, alt_php)
                         state.log(f"[EPG] Alt HTTP {_status2}")
@@ -347,7 +365,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                             return result2
                         state.log(f"[EPG] Alt path also returned no EPG data")
                     except Exception as _e2:
-                        state.log(f"[EPG] Alt path error: {_e2}")
+                        state.log(f"[EPG] ✗ Alt path error: {_e2}")
 
                 # External EPG fallback for MAC/Stalker
                 if state.ext_epg_url:
@@ -408,7 +426,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 # Don't retry if EPG is loading in background — just return the loading msg
                 if "loading" in (result.get("error") or "").lower():
                     break
-                state.log(f"[EPG] Attempt {_retry + 1} returned no data — retrying ({_retry + 2}/3)")
+                state.log(f"[EPG] ⚠ Attempt {_retry + 1} returned no data — retrying ({_retry + 2}/3)")
                 result = run_async(fetch_epg())
 
             if result.get("current") or result.get("next") or result.get("schedule"):
@@ -426,7 +444,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
             # Other transient failures not cached so they get a fresh try on next load.
             return jsonify({k: v for k, v in result.items() if k != "_xmltv_checked"})
         except Exception as e:
-            state.log(f"[EPG] Error: {type(e).__name__}: {e}")
+            state.log(f"[EPG] ✗ Error: {type(e).__name__}: {e}")
             # If ext EPG is configured, this portal failure (429, 502, handshake error)
             # is recoverable — the channel may well be in the XMLTV feed.
             # Trigger XMLTV download if not already running/cached, mark channel as
@@ -437,26 +455,47 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 state._xmltv_needs.add(cache_key)
                 if _ext not in state._xmltv_downloading:
                     state._xmltv_downloading.add(_ext)
-                    state.log(f"[EPG] Portal error — launching XMLTV download for {_ext}")
+                    state.log(f"[EPG] ⚠ Portal error — launching XMLTV download for {_ext}")
+                    # Capture portal identity and object references before thread starts —
+                    # same pattern as start_epg_prefetch and _bg_download.
+                    _exc_pf_key      = (f"{state.conn_type}:{state.url}"
+                                        f":{getattr(state,'mac','')}:{getattr(state,'username','')}")
+                    _exc_cache_ref   = state._xmltv_cache
+                    _exc_no_data_ref = state._xmltv_no_data
+                    _exc_dl_ref      = state._xmltv_downloading
+                    _exc_needs_ref   = state._xmltv_needs
+                    _exc_epg_ref     = state._epg_cache
                     def _exc_bg(_url=_ext):
                         try:
                             _loop = asyncio.new_event_loop()
                             asyncio.set_event_loop(_loop)
+                            # Pre-download portal key check
+                            _cur = (f"{state.conn_type}:{state.url}"
+                                    f":{getattr(state,'mac','')}:{getattr(state,'username','')}")
+                            if _cur != _exc_pf_key:
+                                state.log(f"[EPG] Portal changed before exc-bg XMLTV download — aborting")
+                                return
                             _ed, _cn = _loop.run_until_complete(_build_xmltv_index(_url, state.log))
                             _loop.close()
-                            state._xmltv_cache[_url] = (time.time(), _ed, _cn)
+                            # Post-download portal key check
+                            _cur2 = (f"{state.conn_type}:{state.url}"
+                                     f":{getattr(state,'mac','')}:{getattr(state,'username','')}")
+                            if _cur2 != _exc_pf_key:
+                                state.log(f"[EPG] Portal changed during exc-bg XMLTV download — discarding")
+                                return
+                            _exc_cache_ref[_url] = (time.time(), _ed, _cn)
                             if not _ed:
-                                state._xmltv_no_data.add(_url)
+                                _exc_no_data_ref.add(_url)
                         except Exception as _e2:
-                            state.log(f"[EPG] Background XMLTV error: {_e2}")
+                            state.log(f"[EPG] ✗ Background XMLTV error: {_e2}")
                         finally:
-                            state._xmltv_downloading.discard(_url)
-                            state._xmltv_needs.clear()
-                            stale = [k for k, v in list(state._epg_cache.items())
+                            _exc_dl_ref.discard(_url)
+                            _exc_needs_ref.clear()
+                            stale = [k for k, v in list(_exc_epg_ref.items())
                                      if not v[1].get("current") and not v[1].get("next")
                                      and not v[1].get("schedule")]
                             for k in stale:
-                                state._epg_cache.pop(k, None)
+                                _exc_epg_ref.pop(k, None)
                     threading.Thread(target=_exc_bg, daemon=True, name="xmltv-exc-bg").start()
                 _loading_err = {"current": None, "next": None,
                                 "error": "EPG loading… please try again in a moment"}
@@ -531,27 +570,49 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 else:
                     state.log(f"[WHATS_ON] Launching background EPG download from {ek_combined}")
 
+                # Capture portal identity and object references before thread starts —
+                # same pattern as start_epg_prefetch and the other EPG threads.
+                _won_pf_key      = (f"{state.conn_type}:{state.url}"
+                                    f":{getattr(state,'mac','')}:{getattr(state,'username','')}")
+                _won_cache_ref   = state._xmltv_cache
+                _won_no_data_ref = state._xmltv_no_data
+                _won_dl_ref      = state._xmltv_downloading
+                _won_needs_ref   = state._xmltv_needs
+                _won_epg_ref     = state._epg_cache
+
                 def _bg():
                     try:
                         bg_loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(bg_loop)
+                        # Pre-download portal key check
+                        _cur = (f"{state.conn_type}:{state.url}"
+                                f":{getattr(state,'mac','')}:{getattr(state,'username','')}")
+                        if _cur != _won_pf_key:
+                            state.log(f"[WHATS_ON] Portal changed before EPG download — aborting")
+                            return
                         epg_d, ch_n = bg_loop.run_until_complete(
                             _build_xmltv_index(ek_combined, state.log))
                         bg_loop.close()
-                        state._xmltv_cache[ek_combined] = (time.time(), epg_d, ch_n)
+                        # Post-download portal key check
+                        _cur2 = (f"{state.conn_type}:{state.url}"
+                                 f":{getattr(state,'mac','')}:{getattr(state,'username','')}")
+                        if _cur2 != _won_pf_key:
+                            state.log(f"[WHATS_ON] Portal changed during EPG download — discarding")
+                            return
+                        _won_cache_ref[ek_combined] = (time.time(), epg_d, ch_n)
                         if not epg_d:
-                            state._xmltv_no_data.add(ek_combined)
-                        state.log(f"[WHATS_ON] Background EPG download complete")
+                            _won_no_data_ref.add(ek_combined)
+                        state.log(f"[WHATS_ON] ✓ Background EPG download complete")
                     except Exception as e:
-                        state.log(f"[WHATS_ON] EPG load failed: {e}")
+                        state.log(f"[WHATS_ON] ✗ EPG load failed: {e}")
                     finally:
-                        state._xmltv_downloading.discard(ek_combined)
-                        state._xmltv_needs.clear()
-                        stale = [k for k, v in list(state._epg_cache.items())
+                        _won_dl_ref.discard(ek_combined)
+                        _won_needs_ref.clear()
+                        stale = [k for k, v in list(_won_epg_ref.items())
                                  if not v[1].get("current") and not v[1].get("next")
                                  and not v[1].get("schedule")]
                         for k in stale:
-                            state._epg_cache.pop(k, None)
+                            _won_epg_ref.pop(k, None)
 
                 threading.Thread(target=_bg, daemon=True, name="xmltv-whats-on").start()
 
@@ -757,7 +818,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                 if _try < 2:
                                     await asyncio.sleep(1.5)
                             except Exception as e:
-                                state.log(f"[FIND_CH] Attempt 1.{_try} error: {e}")
+                                state.log(f"[FIND_CH] ⚠ Attempt 1.{_try} error: {e}")
                                 chans = []
                                 if _try < 2:
                                     await asyncio.sleep(1.5)
@@ -781,7 +842,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                 chans = normalize_js(payload2)
                                 state.log(f"[FIND_CH] Attempt 2 → {len(chans)} channels")
                             except Exception as e2:
-                                state.log(f"[FIND_CH] Attempt 2 error: {e2}")
+                                state.log(f"[FIND_CH] ⚠ Attempt 2 error: {e2}")
                                 chans = []
 
                         # ── Attempt 3: walk all live categories page-by-page (always works) ──
@@ -832,7 +893,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                     state._items_cache[("live", "__all__")] = channels
                 state.log(f"[FIND_CH] Fetched {len(channels)} live channels — cached for session")
             except Exception as e:
-                state.log(f"[FIND_CH] Fetch error: {e}")
+                state.log(f"[FIND_CH] ✗ Fetch error: {e}")
                 return jsonify({"found": False, "error": str(e)})
 
         if not channels:
@@ -1028,7 +1089,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                         for n in name_strs)):
                                 entries = epg_dict.get(cid)
                                 if entries:
-                                    state.log(f"[CatchUp] {tag} name match: "
+                                    state.log(f"[CATCHUP] {tag} name match: "
                                               f"{lookup_id!r} → {cid!r}")
                                     break
 
@@ -1048,7 +1109,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                         entries = epg_dict.get(cid)
                                         if entries:
                                             state.log(
-                                                f"[CatchUp] {tag} normalized match: "
+                                                f"[CATCHUP] {tag} normalized match: "
                                                 f"{lookup_id!r} → {cid!r}")
                                             break
 
@@ -1085,7 +1146,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 epg_api_url = (f"{base_norm}/player_api.php"
                                f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}"
                                f"&action=get_epg&stream_id={sid}")
-                state.log(f"[CatchUp] Xtream get_epg stream_id={sid}")
+                state.log(f"[CATCHUP] Xtream get_epg stream_id={sid}")
                 results = []
                 try:
                     async with aiohttp.ClientSession() as sess:
@@ -1095,7 +1156,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
 
                     parsed = _parse_xtream_short_epg(payload)
                     all_entries = parsed.get("schedule", [])
-                    state.log(f"[CatchUp] Xtream EPG entries: {len(all_entries)} total")
+                    state.log(f"[CATCHUP] Xtream EPG entries: {len(all_entries)} total")
 
                     if len(all_entries) == 0 and isinstance(payload, dict):
                         raw = (payload.get("epg_listings") or
@@ -1103,10 +1164,10 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                (payload.get("js") or {}).get("epg_listings") or [])
                         if isinstance(raw, list) and len(raw) > 0:
                             s = raw[0]
-                            state.log(f"[CatchUp] get_epg raw={len(raw)} parsed to 0 "
+                            state.log(f"[CATCHUP] get_epg raw={len(raw)} parsed to 0 "
                                       f"— sample keys: {list(s.keys()) if isinstance(s, dict) else s}")
                         else:
-                            state.log("[CatchUp] get_epg returned empty — portal may not support this endpoint")
+                            state.log("[CATCHUP] get_epg returned empty — portal may not support this endpoint")
 
                     for ep in all_entries:
                         ep_end   = ep.get("end", 0)
@@ -1131,7 +1192,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                     results.sort(key=lambda x: x.get("start", 0), reverse=True)
 
                 except Exception as e:
-                    state.log(f"[CatchUp] Xtream EPG fetch error: {e}")
+                    state.log(f"[CATCHUP] ✗ Xtream EPG fetch error: {e}")
 
                 # ── Step 1.5: get_simple_data_table fallback ─────────────────────
                 # Same endpoint used by playlist.py / MainWindow reference impl.
@@ -1140,7 +1201,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                     simple_url = (f"{base_norm}/player_api.php"
                                   f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}"
                                   f"&action=get_simple_data_table&stream_id={sid}")
-                    state.log(f"[CatchUp] Trying get_simple_data_table stream_id={sid}")
+                    state.log(f"[CATCHUP] Trying get_simple_data_table stream_id={sid}")
                     try:
                         async with aiohttp.ClientSession() as sess:
                             async with sess.get(simple_url,
@@ -1148,7 +1209,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                 payload2 = await safe_json(r2)
                         if isinstance(payload2, dict):
                             listings2 = payload2.get("epg_listings") or []
-                            state.log(f"[CatchUp] get_simple_data_table entries: {len(listings2)} total")
+                            state.log(f"[CATCHUP] get_simple_data_table entries: {len(listings2)} total")
                             for ep in listings2:
                                 if not isinstance(ep, dict):
                                     continue
@@ -1196,11 +1257,11 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                 })
                             if results:
                                 results.sort(key=lambda x: x.get("start", 0), reverse=True)
-                                state.log(f"[CatchUp] get_simple_data_table gave {len(results)} past entries")
+                                state.log(f"[CATCHUP] get_simple_data_table gave {len(results)} past entries")
                             else:
-                                state.log("[CatchUp] get_simple_data_table returned no past entries")
+                                state.log("[CATCHUP] get_simple_data_table returned no past entries")
                     except Exception as e:
-                        state.log(f"[CatchUp] get_simple_data_table error: {e}")
+                        state.log(f"[CATCHUP] ✗ get_simple_data_table error: {e}")
 
                 # ── Step 2: XMLTV fallback — wide-window index ────────────────────
                 # KEY FIX: the live EPG index only keeps ±4-20h of data.  For catchup
@@ -1214,7 +1275,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                     if lookup_id and base_norm not in state._xmltv_no_data:
                         xmltv_url = (f"{base_norm}/xmltv.php"
                                      f"?username={_q(user, safe='')}&password={_q(pwd, safe='')}")
-                        state.log(f"[CatchUp] Xtream XMLTV fallback (lookup={lookup_id!r}, window={_arch_days}d)")
+                        state.log(f"[CATCHUP] Xtream XMLTV fallback (lookup={lookup_id!r}, window={_arch_days}d)")
                         try:
                             ck = base_norm
                             # Use the wide catchup cache; rebuild if window is wider than cached
@@ -1229,7 +1290,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                             if cached_cu:
                                 _, epg_dict, chan_names, _ = cached_cu
                             elif ck in state._xmltv_catchup_downloading:
-                                state.log(f"[CatchUp] Wide XMLTV download already running for {ck} — waiting…")
+                                state.log(f"[CATCHUP] Wide XMLTV download already running for {ck} — waiting…")
                                 for _w in range(120):
                                     await asyncio.sleep(1)
                                     if ck not in state._xmltv_catchup_downloading:
@@ -1238,12 +1299,12 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                 if cached_cu:
                                     _, epg_dict, chan_names, _ = cached_cu
                                 else:
-                                    state.log(f"[CatchUp] Wide XMLTV wait timed out for {ck}")
+                                    state.log(f"[CATCHUP] Wide XMLTV wait timed out for {ck}")
                                     epg_dict, chan_names = {}, {}
                             else:
                                 # Download with full archive window (e.g. 7d back, 1d forward)
                                 state._xmltv_catchup_downloading.add(ck)
-                                state.log(f"[CatchUp] Downloading wide XMLTV (win_back={_arch_days * 24}h)")
+                                state.log(f"[CATCHUP] Downloading wide XMLTV (win_back={_arch_days * 24}h)")
                                 try:
                                     epg_dict, chan_names = await _build_xmltv_index(
                                         xmltv_url, state.log,
@@ -1258,12 +1319,12 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                                        lookup_id, tag="PortalXMLTV")
                                 if results:
                                     state.log(
-                                        f"[CatchUp] Portal XMLTV gave {len(results)} past entries "
+                                        f"[CATCHUP] Portal XMLTV gave {len(results)} past entries "
                                         f"({sum(1 for r in results if r['mark_archive']=='1')} active, "
                                         f"{sum(1 for r in results if r['mark_archive']=='0')} greyed)"
                                     )
                         except Exception as e:
-                            state.log(f"[CatchUp] Xtream XMLTV fallback error: {e}")
+                            state.log(f"[CATCHUP] ✗ Xtream XMLTV fallback error: {e}")
 
                 # ── Step 3: External EPG URLs (−18h window) ──────────────────────
                 # If the user supplied external XMLTV URL(s) in the connection panel,
@@ -1278,7 +1339,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                         _epg_ch_id2 = str(item.get("epg_channel_id") or "").strip()
                         _tvg_name2  = str(item.get("name") or "").strip()
                         lookup_id   = _epg_ch_id2 or _tvg_name2
-                    state.log(f"[CatchUp] Trying external EPG (lookup={lookup_id!r})")
+                    state.log(f"[CATCHUP] Trying external EPG (lookup={lookup_id!r})")
                     try:
                         cached_ext = state._xmltv_catchup_cache.get(ck_ext)
                         if cached_ext:
@@ -1289,7 +1350,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                         if cached_ext:
                             _, ext_dict, ext_names, _ = cached_ext
                         elif ck_ext in state._xmltv_catchup_downloading:
-                            state.log("[CatchUp] External EPG download already running — waiting…")
+                            state.log("[CATCHUP] External EPG download already running — waiting…")
                             for _w in range(120):
                                 await asyncio.sleep(1)
                                 if ck_ext not in state._xmltv_catchup_downloading:
@@ -1298,12 +1359,12 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                             if cached_ext:
                                 _, ext_dict, ext_names, _ = cached_ext
                             else:
-                                state.log("[CatchUp] External EPG wait timed out")
+                                state.log("[CATCHUP] External EPG wait timed out")
                                 ext_dict, ext_names = {}, {}
                         else:
                             state._xmltv_catchup_downloading.add(ck_ext)
                             state.log(
-                                "[CatchUp] Downloading external EPG (−18h window for catchup fallback)")
+                                "[CATCHUP] Downloading external EPG (−18h window for catchup fallback)")
                             try:
                                 ext_dict, ext_names = await _build_xmltv_index(
                                     ext_url_blob, state.log,
@@ -1319,10 +1380,10 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                             if matched_ext:
                                 results = matched_ext
                                 state.log(
-                                    f"[CatchUp] External EPG gave {len(results)} past entries "
+                                    f"[CATCHUP] External EPG gave {len(results)} past entries "
                                     f"({sum(1 for r in results if r['mark_archive']=='1')} active)")
                     except Exception as e:
-                        state.log(f"[CatchUp] External EPG error: {e}")
+                        state.log(f"[CATCHUP] ✗ External EPG error: {e}")
 
                 # ── Step 4: Synthetic time-slot grid ─────────────────────────────
                 # Last resort: when ALL EPG sources fail but tv_archive=1 confirms
@@ -1333,7 +1394,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 # a "no programme data" notice instead of showing "Unknown" titles.
                 if not results and int(item.get("tv_archive") or 0) == 1:
                     state.log(
-                        f"[CatchUp] Generating synthetic time grid "
+                        f"[CATCHUP] Generating synthetic time grid "
                         f"({_arch_days}d × 60-min slots — no EPG data available)")
                     _slot_sec = 3600  # 60-minute blocks
                     _now_slot  = (int(now_ts) // _slot_sec) * _slot_sec
@@ -1355,7 +1416,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                         })
                         _t -= _slot_sec
                     # Already sorted newest-first by construction
-                    state.log(f"[CatchUp] Synthetic grid: {len(results)} slots")
+                    state.log(f"[CATCHUP] Synthetic grid: {len(results)} slots")
 
                 if not results:
                     return {"error": "No catchup data found — this channel may not support catch-up."}
@@ -1372,7 +1433,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 m          = re.search(r'/ch/(\d+)', cmd_field)
                 cmd_ch_id  = m.group(1) if m else None
                 ch_id      = item_ch_id or cmd_ch_id
-                state.log(f"[CatchUp] ch_id={ch_id}")
+                state.log(f"[CATCHUP] ch_id={ch_id}")
                 if not ch_id:
                     return {"error": "No channel ID for catch-up"}
 
@@ -1399,25 +1460,25 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                         while True:
                             epg_url = (f"{base_url}{php}?type=epg&action=get_simple_data_table"
                                        f"&ch_id={ch_id}&date={date_str}&p={page}&JsHttpRequest=1-xml")
-                            state.log(f"[CatchUp] get_simple_data_table ch={ch_id} date={date_str} p={page}")
+                            state.log(f"[CATCHUP] get_simple_data_table ch={ch_id} date={date_str} p={page}")
                             try:
                                 async with client.session.get(epg_url, headers=hdrs,
                                                               timeout=aiohttp.ClientTimeout(total=10)) as r:
                                     payload = await safe_json(r)
                             except Exception as e:
-                                state.log(f"[CatchUp] fetch error: {e}")
+                                state.log(f"[CATCHUP] ✗ fetch error: {e}")
                                 break
                             js   = payload.get("js", {}) if isinstance(payload, dict) else {}
                             rows = (js.get("data") or []) if isinstance(js, dict) else (js if isinstance(js, list) else [])
                             if not rows:
                                 break
-                            state.log(f"[CatchUp] date={date_str} p={page} → {len(rows)} entries")
+                            state.log(f"[CATCHUP] date={date_str} p={page} → {len(rows)} entries")
                             first_logged = False
                             for ep in rows:
                                 if not isinstance(ep, dict):
                                     continue
                                 if not first_logged:
-                                    state.log(f"[CatchUp] fields: {list(ep.keys())}")
+                                    state.log(f"[CATCHUP] fields: {list(ep.keys())}")
                                     first_logged = True
                                 mark_archive = str(ep.get("mark_archive", 0))
                                 archive_cmd  = str(ep.get("cmd") or "").strip()
@@ -1437,7 +1498,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                 if not st:
                                     continue
                                 state.log(
-                                    f"[CatchUp] '{ep.get('name','?')}' mark_archive={mark_archive}"
+                                    f"[CATCHUP] '{ep.get('name','?')}' mark_archive={mark_archive}"
                                     f" id={epg_id!r} real_id={raw_real_id!r}"
                                 )
                                 results.append({
@@ -1468,7 +1529,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
         try:
             return jsonify(run_async(_resolve()))
         except Exception as e:
-            state.log(f"[CatchUp] Error: {e}")
+            state.log(f"[CATCHUP] ✗ Error: {e}")
             return jsonify({"error": str(e)})
 
 
@@ -1546,7 +1607,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                     _srv_local_ts = start_ts + _offset_secs
                     start_fmt = datetime.utcfromtimestamp(_srv_local_ts).strftime("%Y-%m-%d:%H-%M")
 
-                state.log(f"[CatchUp/Play] Server offset={_offset_secs:+d}s  "
+                state.log(f"[CATCHUP/Play] Server offset={_offset_secs:+d}s  "
                           f"start_utc={datetime.utcfromtimestamp(start_ts).strftime('%Y-%m-%d %H:%M')}  "
                           f"start_server={start_fmt}"
                           + (f"  [from start_str]" if len(_start_str_raw) >= 13 else ""))
@@ -1561,8 +1622,8 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                    f"?username={user}&password={pwd}"
                                    f"&stream={sid}&start={start_fmt}&duration={dur}")
 
-                state.log(f"[CatchUp/Play] Xtream timeshift (path/primary)   -> {cu_url}")
-                state.log(f"[CatchUp/Play] Xtream timeshift (query/fallback)  -> {cu_url_fallback}")
+                state.log(f"[CATCHUP/Play] Xtream timeshift (path/primary)   -> {cu_url}")
+                state.log(f"[CATCHUP/Play] Xtream timeshift (query/fallback)  -> {cu_url_fallback}")
                 return {"url": cu_url, "fallback_url": cu_url_fallback, "duration_secs": int(stop_ts - start_ts)}
 
             # ── MAC / Stalker portal ──────────────────────────────────────────────
@@ -1575,7 +1636,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
             start_str    = datetime.utcfromtimestamp(_mac_srv_local_ts).strftime("%Y-%m-%d:%H-%M")
             duration_min = max(1, (stop_ts - start_ts) // 60)
 
-            state.log(f"[CatchUp/Play] cmd={effective_cmd[:50]} archive_cmd={archive_cmd[:50] if archive_cmd else '(none)'} start={start_str} dur={duration_min}m")
+            state.log(f"[CATCHUP/Play] cmd={effective_cmd[:50]} archive_cmd={archive_cmd[:50] if archive_cmd else '(none)'} start={start_str} dur={duration_min}m")
 
             client_cls = StalkerPortalClient if state.is_stalker_portal else PortalClient
             async with client_cls(state.url, state.mac, state.log) as client:
@@ -1585,7 +1646,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 # If tv_archive returned nothing (null storage response), fall back to
                 # type=itv + start/duration which works on Flussonic-backed portals.
                 if not url and archive_cmd:
-                    state.log(f"[CatchUp/Play] tv_archive failed — retrying with type=itv fallback")
+                    state.log(f"[CATCHUP/Play] ⚠ tv_archive failed — retrying with type=itv fallback")
                     url = await client.create_catchup_link(effective_cmd, start_str, duration_min,
                                                            archive_cmd="")
 
@@ -1620,16 +1681,16 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                f"{_stream_base}/archive-{start_ts}-{dur_secs}.m3u8"
                                f"?token={_tok}"
                                + (f"&{_extra_qs}" if _extra_qs else ""))
-                state.log(f"[CatchUp/Play] Flussonic → {archive_url}")
+                state.log(f"[CATCHUP/Play] Flussonic → {archive_url}")
                 return {"url": archive_url}
 
-            state.log(f"[CatchUp/Play] Resolved → {url}")
+            state.log(f"[CATCHUP/Play] Resolved → {url}")
             return {"url": url}
 
         try:
             return jsonify(run_async(_play()))
         except Exception as e:
-            state.log(f"[CatchUp/Play] Error: {e}")
+            state.log(f"[CATCHUP/Play] ✗ Error: {e}")
             return jsonify({"error": str(e)})
 
 
@@ -1723,6 +1784,37 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
 
         entries.sort(key=lambda x: x["start"])
         out["schedule"] = entries
+
+        # ── Detect and correct "local-as-UTC" timestamp bug ──────────────────────
+        # Many Xtream panels compute start_timestamp by converting the server's
+        # LOCAL datetime to a Unix epoch WITHOUT applying the UTC offset (i.e.
+        # they call mktime on the local struct_time without TZ conversion).
+        # This makes every entry appear to start `portal_utc_offset` seconds in
+        # the future relative to true UTC — causing the currently-airing show to
+        # be classified as "next" instead of "current".
+        #
+        # Detection: if NO entry spans `now` as-is, but at least one entry WOULD
+        # span `now` after subtracting portal_utc_offset, the portal is using
+        # local-as-UTC timestamps.  We only correct when we have positive
+        # evidence (a current-after-correction entry exists), so correctly-
+        # configured UTC portals — or genuine dead-air gaps — are unaffected.
+        _utc_offset = getattr(state, "_portal_utc_offset", 0)
+        if _utc_offset and entries:
+            _spans_now = any(e["start"] <= now < e["end"] for e in entries if e["end"])
+            if not _spans_now:
+                _corrected_spans = any(
+                    (e["start"] - _utc_offset) <= now < (e["end"] - _utc_offset)
+                    for e in entries if e["end"]
+                )
+                if _corrected_spans:
+                    state.log(
+                        f"[EPG] Detected local-as-UTC timestamps "
+                        f"(offset={_utc_offset:+d}s) — correcting {len(entries)} entries"
+                    )
+                    for e in entries:
+                        e["start"] -= _utc_offset
+                        if e["end"]:
+                            e["end"] -= _utc_offset
 
         for ep in entries:
             if ep["start"] <= now < ep["end"]:
@@ -2196,32 +2288,61 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
             state._xmltv_downloading.add(ck)
             _log(f"[EPG] Launching background XMLTV download for {ck}")
 
+            # Capture portal identity and live-object references NOW, before the
+            # thread starts — mirrors the proven pattern in start_epg_prefetch.
+            # If api_connect() fires while the download is in-flight:
+            #   _portal_key_bg:  used to detect the switch (pre+post check)
+            #   _cache_ref_bg:   api_connect() replaces state._xmltv_cache with a
+            #                    new dict, so writing to the old ref is harmless
+            #   _downloading_ref_bg / _needs_ref_bg / _epg_ref_bg: same pattern —
+            #                    finally block operates on the OLD objects, not
+            #                    Portal 2's fresh state.
+            _portal_key_bg   = (f"{state.conn_type}:{state.url}"
+                                f":{getattr(state,'mac','')}:{getattr(state,'username','')}")
+            _cache_ref_bg    = state._xmltv_cache
+            _no_data_ref_bg  = state._xmltv_no_data
+            _dl_ref_bg       = state._xmltv_downloading
+            _needs_ref_bg    = state._xmltv_needs
+            _epg_ref_bg      = state._epg_cache
+
             def _bg_download():
                 try:
                     bg_loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(bg_loop)
+                    # Pre-download portal key check
+                    _cur = (f"{state.conn_type}:{state.url}"
+                            f":{getattr(state,'mac','')}:{getattr(state,'username','')}")
+                    if _cur != _portal_key_bg:
+                        _log(f"[EPG] Portal changed before XMLTV download started — aborting")
+                        return
                     epg_d, ch_n = bg_loop.run_until_complete(
                         _build_xmltv_index(xmltv_url, _log))
                     bg_loop.close()
-                    state._xmltv_cache[ck] = (time.time(), epg_d, ch_n)
+                    # Post-download portal key check — download may have taken minutes
+                    _cur2 = (f"{state.conn_type}:{state.url}"
+                             f":{getattr(state,'mac','')}:{getattr(state,'username','')}")
+                    if _cur2 != _portal_key_bg:
+                        _log(f"[EPG] Portal changed during XMLTV download — discarding")
+                        return
+                    _cache_ref_bg[ck] = (time.time(), epg_d, ch_n)
                     if not epg_d:
-                        state._xmltv_no_data.add(ck)
+                        _no_data_ref_bg.add(ck)
                     _log(f"[EPG] Background XMLTV download complete for {ck}")
                 except Exception as e:
                     _log(f"[EPG] Background XMLTV error for {ck}: {e}")
                 finally:
-                    state._xmltv_downloading.discard(ck)
+                    _dl_ref_bg.discard(ck)
                     # Clear the "needs XMLTV" markers so all waiting channels get
                     # a fresh EPG lookup now that the data is available.
-                    state._xmltv_needs.clear()
-                    # Evict ALL no-data per-channel cache entries (both "loading" and
-                    # "confirmed empty") so every channel gets a fresh lookup now that
-                    # the XMLTV index is populated.
-                    stale = [k for k, v in list(state._epg_cache.items())
+                    # Uses captured ref so this targets Portal 1's set, not Portal 2's.
+                    _needs_ref_bg.clear()
+                    # Evict stale empty per-channel EPG cache entries.
+                    # Uses captured ref so Portal 2's fresh cache is never touched.
+                    stale = [k for k, v in list(_epg_ref_bg.items())
                              if not v[1].get("current") and not v[1].get("next")
                              and not v[1].get("schedule")]
                     for k in stale:
-                        state._epg_cache.pop(k, None)
+                        _epg_ref_bg.pop(k, None)
 
             t = threading.Thread(target=_bg_download, daemon=True,
                                  name=f"xmltv-dl-{ck[:30]}")
@@ -2452,6 +2573,8 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
     # call it without being inside this closure.
     import epg_addon as _self
     _self._build_xmltv_index_ref = _build_xmltv_index
+    state.log("[EPG] Routes registered: /api/epg  /api/epg_status  /api/whats_on"
+              "  /api/find_channel  /api/catchup  /api/catchup/play")
 
 
 # ===================== EPG CONNECT-TIME PREFETCH =====================
@@ -2587,12 +2710,12 @@ def start_epg_prefetch(state):
                     _no_data_ref.add(_k)
                 state.log("[EPG] Prefetch: XMLTV has no programme data")
             else:
-                state.log(f"[EPG] Prefetch complete — "
+                state.log(f"[EPG] ✓ Prefetch complete — "
                           f"{len(epg_d)} channels indexed across "
                           f"{len(_keys_list)} cache key(s)")
 
         except Exception as _e:
-            state.log(f"[EPG] Prefetch error: {_e}")
+            state.log(f"[EPG] ✗ Prefetch error: {_e}")
         finally:
             bg_loop.close()
             # Always unblock all registered keys — even on failure — so no
@@ -3455,6 +3578,26 @@ document.getElementById('catchup-overlay').addEventListener('click',function(e){
 
 function _cuFmtTime(ts){const d=new Date(ts*1000);return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
 function _cuFmtDate(ts){const d=new Date(ts*1000);return d.toLocaleDateString([],{weekday:'short',month:'short',day:'numeric'});}
+// Display-only helpers — read directly from start_str ("YYYY-MM-DD HH:MM" server-local)
+// to avoid Unix-timestamp timezone ambiguity. Catchup request values are untouched.
+function _cuDispTime(str){ return str ? str.slice(-5) : ''; }
+function _cuDispDate(str){
+  if(!str) return '';
+  const parts = str.split(' ')[0].split('-').map(Number);
+  if(parts.length < 3) return '';
+  const dt = new Date(Date.UTC(parts[0], parts[1]-1, parts[2]));
+  return dt.toLocaleDateString([], {weekday:'short',month:'short',day:'numeric',timeZone:'UTC'});
+}
+function _cuDispEndTime(startStr, startTs, stopTs){
+  if(!startStr || !startTs || !stopTs) return '';
+  const dur = Math.round((stopTs - startTs) / 60);
+  const hm = startStr.slice(-5).split(':');
+  if(hm.length < 2) return '';
+  const totalMins = parseInt(hm[0]) * 60 + parseInt(hm[1]) + dur;
+  const hEnd = Math.floor(totalMins / 60) % 24;
+  const mEnd = totalMins % 60;
+  return String(hEnd).padStart(2,'0') + ':' + String(mEnd).padStart(2,'0');
+}
 
 async function _loadCatchupEPG(){
   document.getElementById('catchup-body').innerHTML=
@@ -3490,13 +3633,15 @@ function _renderArchiveListings(listings){
   let lastDate='';
   const rows=listings.map(p=>{
     const hasArchive=(p.mark_archive==='1'||p.mark_archive===1);
-    const dateStr=p.start?_cuFmtDate(p.start):'';
+    const dateStr=p.start_str?_cuDispDate(p.start_str):(p.start?_cuFmtDate(p.start):'');
     let dateHdr='';
     if(dateStr&&dateStr!==lastDate){
       lastDate=dateStr;
       dateHdr=`<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--acc);padding:8px 0 4px">${dateStr}</div>`;
     }
-    const t=p.start&&p.stop?`${_cuFmtTime(p.start)}–${_cuFmtTime(p.stop)}`:(p.start?_cuFmtTime(p.start):'');
+    const t=p.start_str
+      ?`${_cuDispTime(p.start_str)}–${_cuDispEndTime(p.start_str,p.start,p.stop)}`
+      :(p.start&&p.stop?`${_cuFmtTime(p.start)}–${_cuFmtTime(p.stop)}`:(p.start?_cuFmtTime(p.start):''));
     const cmdSafe=encodeURIComponent(p.cmd||'');
     const liveCmdSafe=encodeURIComponent(p.live_cmd||'');
     const realIdSafe=encodeURIComponent(p.epg_id||p.id||'');
@@ -3766,13 +3911,11 @@ function wonRender(list){
 
 async function wonPlayFound(idx, resEl, name){
   const ch = _wonMatches[idx];
-  if(!ch){ console.warn('[WON] No cached channel for idx', idx); return; }
+  if(!ch){ return; }
 
   resEl.className = 'won-find-result playing';
   resEl.textContent = '⟳ Resolving ' + name + '…';
   resEl.onclick = null;
-
-  console.log('[WON] Resolving channel:', name, ch);
 
   try {
     const r = await fetch('/api/resolve', {
@@ -3781,8 +3924,6 @@ async function wonPlayFound(idx, resEl, name){
       body: JSON.stringify({item: ch, mode: 'live', category: curCat || {}})
     });
     const d = await r.json();
-    console.log('[WON] resolve result:', d);
-
     if(d.url){
       resEl.textContent = '▶ Playing: ' + name;
       closeWhatsOn();
@@ -3793,7 +3934,6 @@ async function wonPlayFound(idx, resEl, name){
       resEl.onclick = () => wonPlayFound(idx, resEl, name);
     }
   } catch(e) {
-    console.error('[WON] resolve error:', e);
     resEl.className = 'won-find-result fail';
     resEl.textContent = '✗ Error: ' + e;
     resEl.onclick = () => wonPlayFound(idx, resEl, name);
@@ -3845,8 +3985,6 @@ function wonFindChannel(btn, idx){
   const res = document.getElementById('won-res-'+idx);
   if(!res) return;
 
-  console.log('[WON] Find channel:', channelName, '| id:', channelId);
-
   btn.classList.add('loading');
   btn.textContent = '⏳';
   res.className = 'won-find-result';
@@ -3857,12 +3995,8 @@ function wonFindChannel(btn, idx){
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({channel_name: channelName, channel_id: channelId})
   })
-  .then(r => {
-    console.log('[WON] find_channel HTTP', r.status);
-    return r.json();
-  })
+  .then(r => r.json())
   .then(data => {
-    console.log('[WON] find_channel result:', data);
     btn.classList.remove('loading');
     btn.textContent = '🔍';
     if(data.found){
@@ -3883,7 +4017,6 @@ function wonFindChannel(btn, idx){
     }
   })
   .catch(e => {
-    console.error('[WON] find_channel error:', e);
     btn.classList.remove('loading');
     btn.textContent = '🔍';
     res.className = 'won-find-result fail';
@@ -4051,7 +4184,7 @@ function wonFindChannel(btn, idx){
   function _fmtTime(iso){
     if(!iso) return '';
     try{
-      const d = new Date(iso);
+      const d = typeof iso === 'number' ? new Date(iso * 1000) : new Date(iso);
       return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',hour12:false});
     }catch(e){ return ''; }
   }
@@ -4062,7 +4195,7 @@ function wonFindChannel(btn, idx){
   function _secsUntil(iso){
     if(!iso) return null;
     try{
-      const ms = new Date(iso).getTime() - Date.now();
+      const ms = (typeof iso === 'number' ? iso * 1000 : new Date(iso).getTime()) - Date.now();
       return ms > 0 ? Math.ceil(ms/1000) : null;
     }catch(e){ return null; }
   }
@@ -4146,18 +4279,36 @@ function wonFindChannel(btn, idx){
     return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   }
   /* ── Fetch EPG and render ────────────────────────────────────────────── */
+  let _loadingRetryTmr = null;
   function _fetchAndShow(item){
+    if(_loadingRetryTmr){ clearTimeout(_loadingRetryTmr); _loadingRetryTmr = null; }
     fetch('/api/epg', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({item: item})
     }).then(function(r){ return r.json(); }).then(function(d){
-      if(d && (d.current || d.next)) _render(d);
+      if(d && (d.current || d.next)){
+        _render(d);
+      } else if(d && d.error && d.error.toLowerCase().includes('loading')){
+        // XMLTV still downloading — show spinner and retry in 5s
+        if(_ensureEls()){
+          _btn.textContent = '\u23F3 Loading EPG\u2026';
+          _hasData = true;
+          if(_isTouch) _reveal(10000);
+          else _btn.classList.add('en-hover');
+        }
+        const capturedItem = item;
+        _loadingRetryTmr = setTimeout(function(){
+          _loadingRetryTmr = null;
+          if(_curItem === capturedItem) _fetchAndShow(capturedItem);
+        }, 5000);
+      }
     }).catch(function(){});
   }
   /* ── Hide (on stop / channel switch) ────────────────────────────────── */
   function _hide(){
     if(_refreshTmr){ clearTimeout(_refreshTmr); _refreshTmr = null; }
+    if(_loadingRetryTmr){ clearTimeout(_loadingRetryTmr); _loadingRetryTmr = null; }
     _open = false; _sticky = false; _hasData = false;
     _curItem = null; _curData = null;
     if(_isTouch && _btn) _cancelReveal();
