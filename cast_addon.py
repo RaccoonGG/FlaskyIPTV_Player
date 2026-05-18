@@ -2264,7 +2264,7 @@ def register_cast_routes(flask_app, app_state, run_async_fn, make_client_fn):
             app_state.log(f"[CAST] Found {len(devices)} device(s)")
             return jsonify({"devices": [d.to_dict() for d in devices]})
         except Exception as exc:
-            app_state.log(f"[CAST] Discovery error: {exc}")
+            app_state.log(f"[CAST] ✗ Discovery error: {exc}")
             return jsonify({"error": str(exc), "devices": []}), 500
 
     # ── /api/cast/connect ─────────────────────────────────────────────────────
@@ -2296,7 +2296,7 @@ def register_cast_routes(flask_app, app_state, run_async_fn, make_client_fn):
             app_state.log(f"[CAST] ✓ Connected to {device.display_name}")
             return jsonify({"ok": True, "device": device.to_dict()})
         except Exception as exc:
-            app_state.log(f"[CAST] Connect failed: {exc}")
+            app_state.log(f"[CAST] ✗ Connect failed: {exc}")
             return jsonify({"error": str(exc)}), 500
 
     # ── /api/cast/play ────────────────────────────────────────────────────────
@@ -2324,7 +2324,7 @@ def register_cast_routes(flask_app, app_state, run_async_fn, make_client_fn):
                     return await client.resolve_item_url(mode, item, cat)
             raw_url = run_async_fn(_resolve())
         except Exception as exc:
-            app_state.log(f"[CAST] Resolve error: {exc}")
+            app_state.log(f"[CAST] ✗ Resolve error: {exc}")
             return jsonify({"error": f"Could not resolve stream URL: {exc}"}), 500
 
         if not raw_url:
@@ -2379,7 +2379,7 @@ def register_cast_routes(flask_app, app_state, run_async_fn, make_client_fn):
             app_state.log(f"[CAST] ✓ Cast sent — device should start fetching from proxy")
             return jsonify({"ok": True, "proxy_url": proxy_url, "title": title})
         except Exception as exc:
-            app_state.log(f"[CAST] Play error: {exc}")
+            app_state.log(f"[CAST] ✗ Play error: {exc}")
             return jsonify({"error": str(exc)}), 500
 
     # ── /api/cast/play_direct ─────────────────────────────────────────────────
@@ -2541,7 +2541,7 @@ def register_cast_routes(flask_app, app_state, run_async_fn, make_client_fn):
             app_state.log(f"[CAST] ✓ SOAP sent — phone should start fetching from proxy")
             return jsonify({"ok": True, "proxy_url": browser_url})
         except Exception as exc:
-            app_state.log(f"[CAST] Direct play error: {exc}")
+            app_state.log(f"[CAST] ✗ Direct play error: {exc}")
             return jsonify({"error": str(exc)}), 500
 
     # ── /api/cast/control ─────────────────────────────────────────────────────
@@ -2763,7 +2763,6 @@ _CAST_UI_JS = r"""
         // Server returned HTML (likely a 500 error page) — extract a useful message
         return r.text().then(txt => {
           const preview = txt.replace(/<[^>]+>/g, ' ').replace(/[\s]+/g, ' ').trim().slice(0, 120);
-          console.error('[CAST] Non-JSON response from', path, ':', preview);
           return {error: 'Server error: ' + preview};
         });
       }
@@ -2775,7 +2774,7 @@ _CAST_UI_JS = r"""
     if (typeof window.toast === 'function') {
       window.toast(msg, type || 'info');
     } else {
-      console.log('[CAST]', msg);
+      setStatus('[CAST] ' + msg);
     }
   }
 
@@ -3215,7 +3214,7 @@ _CAST_UI_JS = r"""
     // Block re-entrant calls — the browser's error handler may re-resolve and
     // re-call castPlayDirect while a cast is already in flight, causing 429s.
     if (_castInProgress) {
-      console.log('[CAST] castPlayDirect blocked — cast already in progress');
+      setStatus('[CAST] busy — cast already in progress');
       return;
     }
     // Reject relative / local-proxy URLs before they reach the server.
@@ -3223,7 +3222,6 @@ _CAST_UI_JS = r"""
     // are not reachable by cast devices on the network.
     if (!url || !url.match(/^https?:\/\//i)) {
       _toast('Cannot cast: URL is a local proxy path. Play the channel first, then use the ▶ button.', 'wrn');
-      console.warn('[CAST] castPlayDirect blocked — non-absolute URL:', url);
       return;
     }
     _castInProgress = true;
@@ -3272,7 +3270,7 @@ _CAST_UI_JS = r"""
         // For HLS (transcode) URLs: poll until FFmpeg generates the manifest.
         // For HLS (transcode) URLs: poll until FFmpeg generates the manifest.
         if (d.proxy_url) {
-          console.log('[CAST] switching browser to HLS proxy:', d.proxy_url);
+          setStatus('[CAST] Connecting browser to HLS proxy…');
           const _proxyUrl = d.proxy_url;
           let _attempts = 0;
           const _pollManifest = () => {
@@ -3288,15 +3286,15 @@ _CAST_UI_JS = r"""
                     hlsObj.on(Hls.Events.MANIFEST_PARSED, () => {
                       _vid.play().catch(() => {});
                     });
-                    console.log('[CAST] browser attached to HLS proxy after', _attempts, 'polls');
+                    setStatus('[CAST] ✓ HLS proxy ready');
                   } else if (_vid) {
                     _vid.src = _proxyUrl; _vid.play().catch(() => {});
                   }
-                } catch(_e2) { console.warn('[CAST] attach error', _e2); }
+                } catch(_e2) { _toast('[CAST] attach error: ' + (_e2.message||_e2), 'err'); }
               } else if (_attempts++ < 15) {
                 setTimeout(_pollManifest, 1000);
               } else {
-                console.warn('[CAST] proxy manifest never became ready');
+                _toast('[CAST] HLS proxy not ready — cast may have stalled', 'wrn');
               }
             }).catch(() => { if (_attempts++ < 15) setTimeout(_pollManifest, 1000); });
           };
@@ -3528,6 +3526,5 @@ _CAST_UI_JS = r"""
     })
     .catch(() => {});
 
-  console.log('[cast_addon] UI loaded ✓');
 })();
 """
