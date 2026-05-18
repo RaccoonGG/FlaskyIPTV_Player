@@ -76,7 +76,7 @@ def _os_headers(api_key: str = ""):
 
 # ===================== REGISTRATION =====================
 
-def register_subtitles_routes(flask_app):
+def register_subtitles_routes(flask_app, state=None):
     """Register all subtitle-related Flask routes."""
 
     # ── /api/load_subtitle_path ───────────────────────────────────────────────
@@ -175,6 +175,8 @@ def register_subtitles_routes(flask_app):
         if not query:
             return jsonify({"error": "No query provided", "results": []}), 400
         if not api_key:
+            if state:
+                state.log("[SUBS] ✗ No OpenSubtitles API key configured")
             return jsonify({"error": "No OpenSubtitles API key set — add it in ⚙ Settings.", "results": []}), 400
 
         params = {"query": query, "languages": lang, "per_page": min(max_results, 40)}
@@ -231,6 +233,8 @@ def register_subtitles_routes(flask_app):
         if not file_id:
             return jsonify({"error": "No file_id provided"}), 400
         if not api_key:
+            if state:
+                state.log("[SUBS] ✗ No OpenSubtitles API key configured")
             return jsonify({"error": "No OpenSubtitles API key set — add it in ⚙ Settings."}), 400
         try:
             r = _requests_lib.post(
@@ -257,6 +261,8 @@ def register_subtitles_routes(flask_app):
                 }), 429
 
             if r.status_code in (401, 403):
+                if state:
+                    state.log("[SUBS] ✗ Invalid OpenSubtitles API key")
                 return jsonify({"error": "Invalid OpenSubtitles API key — check your key in ⚙ Settings."}), 401
 
             r.raise_for_status()
@@ -307,6 +313,9 @@ def register_subtitles_routes(flask_app):
             content_type="application/javascript; charset=utf-8",
             headers={"Cache-Control": "public, max-age=3600"},
         )
+
+    if state:
+        state.log("[SUBS] Routes registered: /api/subtitles/search  /api/subtitles/download  /api/subtitles/ui.js  /api/browse_dir  /api/load_subtitle_path  /api/browse_subtitle")
 
 
 # ===================== FRONTEND (CSS + HTML + JS) =====================
