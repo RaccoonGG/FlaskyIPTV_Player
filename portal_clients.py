@@ -369,6 +369,13 @@ class PortalClient:
         # None = not yet attempted.  {} = tried and failed (no Xtream API).
         # dict with keys "base", "username", "password" = success.
         self._xtream_creds: dict | None = None
+        # Full JS dict from get_main_info — cached so FlaskyIPTV can read
+        # timezone, comment, ip, storages without an extra round-trip.
+        self._last_account_js: dict | None = None
+        # Full JS dict from get_profile — may carry extra fields absent in
+        # get_main_info: default_timezone, parent_password, settings_password,
+        # ip, storages, comment.  None = not yet attempted.  {} = tried+failed.
+        self._last_profile_js: dict | None = None
 
     async def __aenter__(self):
         _timeout = aiohttp.ClientTimeout(total=15, connect=8)
@@ -415,7 +422,7 @@ class PortalClient:
                     self.log(f"[MAC] Handshake 429 — backing off {_wait}s (attempt {_attempt+1}/4)")
                     await asyncio.sleep(_wait)
                     continue
-                payload = await safe_json(r)
+                payload = await self._read_json(r, "handshake")
                 break
         if not isinstance(payload, dict):
             raise RuntimeError(f"Handshake failed: empty/non-JSON response (HTTP {_status})")
@@ -429,13 +436,48 @@ class PortalClient:
         self.log(f"[MAC] Token acquired: {self.token[:16]}…")
         return self.token
 
+    async def _read_json(self, r: aiohttp.ClientResponse, tag: str = "") -> "dict | list | None":
+        """Read response text, log a raw preview, then parse and return JSON.
+
+        Mirrors StalkerPortalClient._read_json so the Activity Log shows the
+        same raw-response lines for MAC portal calls as for Stalker calls.
+        tag  — label used in the log line, e.g. "account_info", "get_profile".
+              Pass "" to skip logging (silent parse-only path).
+        """
+        try:
+            text = await r.text()
+        except Exception as e:
+            if tag:
+                self.log(f"[MAC] {tag} read error: {e}")
+            return None
+        if tag:
+            preview = repr(text[:800]) if text else "''"
+            self.log(f"[MAC] {tag} raw: {preview}")
+        if not text or not text.strip():
+            return None
+        t = text.lstrip()
+        if not (t.startswith("{") or t.startswith("[")):
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
     async def account_info(self):
         assert self.session is not None
         url = f"{self.base}/portal.php?type=account_info&action=get_main_info&JsHttpRequest=1-xml"
         self.log("[MAC] Fetching account info…")
-        async with self.session.get(url, headers=self.headers) as r:
-            self.log(f"[MAC] Account info HTTP {r.status}")
-            payload = await safe_json(r)
+        payload = None
+        for _attempt in range(4):
+            async with self.session.get(url, headers=self.headers) as r:
+                self.log(f"[MAC] Account info HTTP {r.status}")
+                if r.status == 429:
+                    _wait = 2 ** _attempt
+                    self.log(f"[MAC] Account info 429 — backing off {_wait}s (attempt {_attempt+1}/4)")
+                    await asyncio.sleep(_wait)
+                    continue
+                payload = await self._read_json(r, "account_info")
+                break
         if not isinstance(payload, dict):
             return ("unknown", "unknown")
         js = payload.get("js")
@@ -443,6 +485,7 @@ class PortalClient:
             js = js[0]
         if not isinstance(js, dict):
             return ("unknown", "unknown")
+        self._last_account_js = js  # set immediately so caller always has full dict
         mac = str(js.get("mac") or js.get("device_mac") or self.mac or "unknown")
         phone = str(js.get("phone") or js.get("end_date") or js.get("expire_date")
                     or js.get("expiry") or js.get("expired") or "unknown")
@@ -460,6 +503,48 @@ class PortalClient:
         ident = login or mac
         self.log(f"[MAC] Account: MAC={mac}  login={login}  expiry={phone}")
         return (ident, phone, max_conn, settings_pwd, adult_pwd)
+
+    async def get_profile(self) -> dict:
+        """Fetch portal.php?type=stb&action=get_profile with 429 backoff retry.
+
+        Returns the raw js dict.  Caches in _last_profile_js.  Returns {} on
+        failure so callers can always safely do .get().
+
+        This endpoint carries fields that get_main_info typically omits:
+        default_timezone, parent_password, settings_password, ip, storages.
+        The connect handler merges these into _last_account_js so the rest of
+        the profile-display logic needs no changes.
+        """
+        if self._last_profile_js is not None:
+            return self._last_profile_js
+        assert self.session is not None
+        url = (f"{self.base}/portal.php?type=stb&action=get_profile"
+               f"&hd=1&not_valid_token=0&video_out=hdmi"
+               f"&auth_second_step=0&num_banks=2&JsHttpRequest=1-xml")
+        self.log("[MAC] Fetching get_profile…")
+        payload = None
+        for _attempt in range(4):
+            async with self.session.get(url, headers=self.headers) as r:
+                self.log(f"[MAC] get_profile HTTP {r.status}")
+                if r.status == 429:
+                    _wait = 2 ** _attempt
+                    self.log(f"[MAC] get_profile 429 — backing off {_wait}s (attempt {_attempt+1}/4)")
+                    await asyncio.sleep(_wait)
+                    continue
+                payload = await self._read_json(r, "get_profile")
+                break
+        js: dict = {}
+        if isinstance(payload, dict):
+            raw = payload.get("js", {})
+            if isinstance(raw, list) and raw:
+                raw = raw[0]
+            if isinstance(raw, dict):
+                js = raw
+        self._last_profile_js = js
+        if js:
+            tz = js.get("default_timezone") or js.get("timezone") or ""
+            self.log(f"[MAC] get_profile: timezone={tz!r}  ip={js.get('ip', '')!r}")
+        return js
 
     async def get_all_channels(self, mode: str = "live") -> list:
         """Fetch ALL live channels in one shot via type=itv&action=get_all_channels.
@@ -2029,9 +2114,9 @@ class StalkerPortalClient:
                                           token=tok, prehash=prehash, JsHttpRequest="1-xml")
                     async with self.session.get(url2, headers=headers) as r2:
                         self.log(f"[STALKER] Retry handshake HTTP {r2.status}")
-                        payload = await self._read_json(r2, "Handshake retry")
+                        payload = await self._read_json(r2, "handshake retry")
                 else:
-                    payload = await self._read_json(r, "Handshake")
+                    payload = await self._read_json(r, "handshake")
                 break
 
         if not isinstance(payload, dict) or "js" not in payload:
@@ -2060,6 +2145,7 @@ class StalkerPortalClient:
                 self.log(f"[STALKER] Profile variant {idx+1} rejected (status={status} msg={msg!r}) — trying next")
                 continue
             self._last_profile_js = js  # cache for get_profile() callers
+            self.log(f"[STALKER] ✓ Profile accepted (variant {idx+1}: {stb_type})")
             break
         else:
             # All variants exhausted without a successful profile — portal likely has a strict
@@ -2229,9 +2315,17 @@ class StalkerPortalClient:
         url = f"{self.base}{self.LOAD_PHP}?{urlencode(params)}"
         self.log(f"[STALKER] Profile URL: {url}")
         headers = self._headers(include_auth=True, include_token=False)
-        async with self.session.get(url, headers=headers) as r:
-            self.log(f"[STALKER] Profile HTTP {r.status}")
-            payload = await self._read_json(r, "Profile")
+        payload = None
+        for _attempt in range(4):
+            async with self.session.get(url, headers=headers) as r:
+                self.log(f"[STALKER] Profile HTTP {r.status}")
+                if r.status == 429:
+                    _wait = 2 ** _attempt
+                    self.log(f"[STALKER] Profile 429 — backing off {_wait}s (attempt {_attempt+1}/4)")
+                    await asyncio.sleep(_wait)
+                    continue
+                payload = await self._read_json(r, "get_profile")
+                break
         if isinstance(payload, dict):
             js = payload.get("js", {})
             if isinstance(js, dict):
@@ -3318,12 +3412,39 @@ class XtreamClient:
             url += f"&{k}={v}"
         return url
 
+    async def _read_json(self, r: aiohttp.ClientResponse, tag: str = "") -> "dict | list | None":
+        """Read response text, log a raw preview, then parse and return JSON.
+
+        Mirrors StalkerPortalClient._read_json / PortalClient._read_json so the
+        Activity Log shows consistent raw-response lines across all portal types.
+        tag  — label used in the log line, e.g. "auth", "account_info".
+              Pass "" to skip logging (silent parse-only path).
+        """
+        try:
+            text = await r.text()
+        except Exception as e:
+            if tag:
+                self.log(f"[XTREAM] {tag} read error: {e}")
+            return None
+        if tag:
+            preview = repr(text[:800]) if text else "''"
+            self.log(f"[XTREAM] {tag} raw: {preview}")
+        if not text or not text.strip():
+            return None
+        t = text.lstrip()
+        if not (t.startswith("{") or t.startswith("[")):
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
     async def handshake(self):
         url = f"{self.base}/player_api.php?username={self.username}&password={self.password}"
         self.log(f"[XTREAM] Connecting → {self.base}")
         async with self.session.get(url) as r:
             self.log(f"[XTREAM] Auth HTTP {r.status}")
-            data = await safe_json(r)
+            data = await self._read_json(r, "handshake")
         if not isinstance(data, dict):
             raise RuntimeError(f"Xtream: no JSON response (HTTP {r.status})")
         info = data.get("user_info", {})
@@ -3339,6 +3460,7 @@ class XtreamClient:
         # Example: server=UTC-4, client=UTC+2
         #   .timestamp() → -21600 (wrong: -6h)  calendar.timegm → -14400 (correct: -4h)
         self._server_utc_offset: int = 0
+        self._server_timezone: str = ""   # IANA tz name from server_info, e.g. "Europe/London"
         try:
             import calendar as _cal
             from datetime import datetime as _dt2
@@ -3347,6 +3469,8 @@ class XtreamClient:
                 ts_now = srv.get("timestamp_now") or srv.get("time")
                 t_str  = srv.get("time_now") or srv.get("server_time") or ""
                 tz_nm  = str(srv.get("timezone") or "").strip()
+                if tz_nm:
+                    self._server_timezone = tz_nm
                 if ts_now and t_str:
                     _srv_naive = _dt2.strptime(str(t_str)[:19], "%Y-%m-%d %H:%M:%S")
                     _offset    = _cal.timegm(_srv_naive.timetuple()) - int(float(ts_now))
@@ -3360,9 +3484,9 @@ class XtreamClient:
                         self._server_utc_offset = int(_dm.datetime.now(_z).utcoffset().total_seconds())
                         self.log(f"[XTREAM] Server UTC offset: {self._server_utc_offset:+d}s (from {tz_nm!r})")
                     except Exception:
-                        self.log(f"[XTREAM] Timezone {tz_nm!r} — zoneinfo unavailable, using UTC")
+                        self.log(f"[XTREAM] ⚠ Timezone {tz_nm!r} — zoneinfo unavailable, using UTC")
         except Exception as _tz_e:
-            self.log(f"[XTREAM] Timezone detection failed ({_tz_e}), using UTC")
+            self.log(f"[XTREAM] ⚠ Timezone detection unavailable ({_tz_e}), using UTC")
         self.log(f"[XTREAM] Auth OK — status: {info.get('status','?')}  expiry: {info.get('exp_date','?')}")
         return info
 
@@ -3372,10 +3496,14 @@ class XtreamClient:
         # happened whenever handshake() and account_info() were called in sequence.
         if self._cached_user_info is not None:
             info = self._cached_user_info
+            preview = repr(str(info)[:600]) if info else "''"
+            self.log(f"[XTREAM] account_info raw (cached from handshake): {preview}")
         else:
             url = f"{self.base}/player_api.php?username={self.username}&password={self.password}"
+            self.log("[XTREAM] Fetching account info (no cached user_info)…")
             async with self.session.get(url) as r:
-                data = await safe_json(r)
+                self.log(f"[XTREAM] Account info HTTP {r.status}")
+                data = await self._read_json(r, "account_info")
             if not isinstance(data, dict):
                 return (self.username, "unknown")
             info = data.get("user_info", {})
@@ -3900,9 +4028,11 @@ class M3UClient:
             try:
                 result = await self._xtream_client.account_info()
                 # XtreamClient.account_info() returns (ident, exp, max_conn, password, active_cons) — pass through
+                self.log(f"[M3U] account_info delegated to Xtream client: user={result[0]}  expiry={result[1]}")
                 return result
-            except Exception:
-                pass
+            except Exception as e:
+                self.log(f"[M3U] account_info Xtream delegate failed: {e} — falling back to static")
+        self.log("[M3U] account_info: no Xtream credentials detected — returning static profile (no server data)")
         return ("M3U", "loaded", 0)
 
     async def fetch_categories(self, mode: str):
