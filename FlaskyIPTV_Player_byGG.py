@@ -157,12 +157,15 @@ class AppState:
         self.m3u_is_local = False
         self.m3u_xtream_override = None
         self.stop_flag = threading.Event()
+        self._connect_epoch: int = 0   # monotonic counter — incremented on every api_connect()
         self.log_queue: queue.Queue = queue.Queue(maxsize=2000)
         self.busy = False
         self.status = "Not connected."
         self.worker_thread = None
-        self.active_loop = None
-        self.active_task = None
+        self.active_loop = None   # prefetch/background run_worker() loop
+        self.active_task = None   # prefetch/background run_worker() task
+        self._connect_loop = None  # connect-only: run_async() loop for inter-connect cancellation
+        self._connect_task = None  # connect-only: run_async() task for inter-connect cancellation
         self.mkv_proc = None
         self.mkv_proc_lock = threading.Lock()
         self.recording = False
@@ -233,6 +236,8 @@ class AppState:
         # shared dict empty (prefetch in progress) waits on this instead of
         # issuing a second get_all_channels HTTP request.
         self._all_channels_ready: threading.Event = threading.Event()
+        self._all_channels_epoch: int = 0  # incremented on every api_connect() — prevents
+        #   Portal 1's prefetch finally-block from unblocking Portal 2's logo-cache waiters
         # Cache for all-channels list used by What's on Now → Find Channel.
         # Keyed by portal base URL so the walk only happens ONCE per connected portal
         # for the entire session — not on a TTL. Cleared on disconnect/reconnect.
@@ -425,11 +430,29 @@ async def _make_client(do_handshake=True):
 
 
 def run_async(coro):
-    """Run an async coroutine from sync context."""
+    """Run an async coroutine from sync context (blocking).
+
+    Stores the running loop and task in state._connect_loop/_connect_task so
+    that a concurrent api_connect() call can cancel this in-flight operation
+    immediately, tearing down any pending aiohttp requests without waiting for
+    timeouts.  These fields are separate from state.active_loop/active_task
+    which are owned by run_worker() background prefetch threads — keeping them
+    separate prevents a new api_connect() from accidentally cancelling a
+    prefetch that belongs to an already-successful portal connection.
+    """
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    state._connect_loop = loop
     try:
-        return loop.run_until_complete(coro)
+        task = loop.create_task(coro)
+        state._connect_task = task
+        return loop.run_until_complete(task)
+    except asyncio.CancelledError:
+        state.log("[CONNECT] Previous portal connection cancelled — superseded by new connect.")
+        return {"success": False, "error": "cancelled"}
     finally:
+        state._connect_task = None
+        state._connect_loop = None
         loop.close()
 
 
@@ -464,6 +487,10 @@ def run_worker(coro, on_done=None):
 
 async def _connect_async():
     conn = state.conn_type
+    # Snapshot the current connection epoch synchronously (before any await).
+    # If api_connect() is called again while we're suspended in a long I/O operation,
+    # _connect_epoch will have been incremented and our guard checks will catch it.
+    my_epoch = state._connect_epoch
 
     if conn == "m3u_url":
         m3u_url = state.m3u_url
@@ -495,6 +522,11 @@ async def _connect_async():
                 async with xt:
                     await xt.handshake()
                     ident, exp, max_conn, _pw, active_cons = await xt.account_info()
+                    # Epoch guard: a new api_connect() may have been called while we
+                    # awaited the Xtream handshake.  Discard this result if so.
+                    if state._connect_epoch != my_epoch:
+                        state.log("[CONNECT] Superseded by newer connection attempt — discarding Xtream result.")
+                        return {"success": False, "error": "superseded"}
                     state.m3u_xtream_override = detected
                     state.log(f"[CONNECT] ✓ Xtream API connected: {ident} | {exp}")
                     for m in ("live", "vod", "series"):
@@ -505,9 +537,16 @@ async def _connect_async():
                         except Exception as e:
                             state.log(f"[CONNECT] ✗ {m.upper()} categories: {e}")
                             state.cats_cache[m] = []
+                    # Final epoch guard: covers the fetch_categories() loop above.
+                    # Each category fetch is a real network call (live/VOD/series API
+                    # requests can be slow on large portals); a new api_connect() may
+                    # have arrived during that window.
+                    if state._connect_epoch != my_epoch:
+                        state.log("[CONNECT] Superseded during Xtream category fetch — discarding result.")
+                        return {"success": False, "error": "superseded"}
                     state.connected = True
                     state.set_status(f"Connected (Xtream via M3U): {ident} | {exp}")
-                    state.profile_data = {'type':'xtream','user':ident,'exp':exp,'max_conn':str(max_conn) if max_conn else '','active_cons':active_cons,'portal_url':detected["base"]}
+                    state.profile_data = {'type':'xtream','user':ident,'exp':exp,'max_conn':str(max_conn) if max_conn else '','active_cons':active_cons,'portal_url':detected["base"],'timezone': getattr(xt,'_server_timezone','') or ''}
                     if hasattr(xt, "_server_utc_offset"):
                         state._portal_utc_offset = xt._server_utc_offset
                     return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
@@ -522,6 +561,13 @@ async def _connect_async():
         client = M3UClient(m3u_url, state.log)
         async with client:
             await client.handshake()
+            # Epoch guard: a new api_connect() may have arrived while the M3U
+            # download was in progress (e.g. previous portal timed out and started
+            # downloading only after the user connected to a new portal).
+            # Discard this stale result entirely — do not overwrite state.
+            if state._connect_epoch != my_epoch:
+                state.log("[CONNECT] M3U download from a previous portal completed after reconnect — discarding stale results.")
+                return {"success": False, "error": "superseded"}
             state.m3u_cache = dict(client._all_groups)
             state._tvg_url_cache = client._tvg_url
             _ai3 = await client.account_info()
@@ -547,6 +593,12 @@ async def _connect_async():
         _ai4 = await client.account_info()
         ident, exp = _ai4[0], _ai4[1]
         max_conn = _ai4[2] if len(_ai4) > 2 else 0
+        # Epoch guard: bail immediately if a newer api_connect() arrived while we
+        # were suspended in account_info().  Do this before any state writes so
+        # the new portal's clean state is never overwritten by this stale result.
+        if state._connect_epoch != my_epoch:
+            state.log("[CONNECT] Superseded by newer connection attempt — discarding MAC/Stalker/Xtream result.")
+            return {"success": False, "error": "superseded"}
         # For Stalker: also pull get_profile for richer display data
         if state.is_stalker_portal and hasattr(client, 'get_profile'):
             try:
@@ -580,6 +632,13 @@ async def _connect_async():
                         max_conn = int(raw) if raw else 0
                     except Exception:
                         pass
+                # Collect all storage IPs from storages dict (actual field name is storage_ip)
+                _storage_ips = []
+                _storages_raw = prof.get('storages')
+                if isinstance(_storages_raw, dict):
+                    for _sname, _st in _storages_raw.items():
+                        if isinstance(_st, dict) and _st.get('storage_ip'):
+                            _storage_ips.append(str(_st['storage_ip']))
                 state.profile_data = {
                     'type': 'stalker',
                     'mac': client.mac,
@@ -593,28 +652,76 @@ async def _connect_async():
                     'settings_password': str(prof.get('settings_password', '') or ''),
                     'adult_password': str(prof.get('parent_password', '') or prof.get('adult_password', '') or ''),
                     'portal_url': state.url or state.m3u_url,
+                    'timezone': str(prof.get('default_timezone') or prof.get('timezone') or prof.get('time_zone') or ''),
+                    'storage_ips': _storage_ips,            # list of "host:port" strings
+                    'client_ip': str(prof.get('ip') or ''), # user's IP as seen by server
+                    'comment': str(prof.get('comment') or ''),
                 }
             except Exception as e:
-                state.log(f"[CONNECT] Could not fetch Stalker profile details: {e}")
+                state.log(f"[CONNECT] ✗ Could not fetch Stalker profile details: {e}")
                 state.profile_data = {'type': 'stalker', 'mac': client.mac, 'exp': exp,
                                       'max_conn': str(max_conn) if max_conn else '',
                                       'portal_url': state.url or state.m3u_url}
         elif not state.is_stalker_portal:
             _is_xtream = (state.conn_type == 'xtream' or
                           (state.conn_type == 'm3u_url' and state.m3u_xtream_override))
+            # For MAC portals: _last_account_js holds the full get_main_info JS dict.
+            # It is set immediately after the dict is confirmed valid in account_info(),
+            # so it's always available here if the call succeeded.
+            # We read ALL display fields from it directly — the raw portal response
+            # has every key we need (settings_password, parent_password,
+            # default_timezone, ip, comment, storages) at the top level of js.
+            # For Xtream portals we fall back to _ai4 tuple / _server_timezone.
+            _mac_js = getattr(client, '_last_account_js', None) or {}
+            # For MAC portals: get_main_info often lacks default_timezone,
+            # parent_password, settings_password, ip, and storages.  These fields
+            # are present in portal.php?type=stb&action=get_profile.  Fetch and
+            # merge any missing fields into _mac_js so the display logic below
+            # picks them up without any further changes.
+            if not _is_xtream and hasattr(client, 'get_profile'):
+                try:
+                    _prof_js = await client.get_profile()
+                    if isinstance(_prof_js, dict):
+                        for _pk in ('default_timezone', 'timezone', 'parent_password',
+                                    'settings_password', 'ip', 'storages', 'comment'):
+                            if _pk in _prof_js and not _mac_js.get(_pk):
+                                _mac_js[_pk] = _prof_js[_pk]
+                except Exception as _pe:
+                    state.log(f"[CONNECT] MAC get_profile merge failed: {_pe}")
+            _mac_storage_ips = []
+            if not _is_xtream:
+                _mac_storages = _mac_js.get('storages')
+                if isinstance(_mac_storages, dict):
+                    for _st in _mac_storages.values():
+                        if isinstance(_st, dict) and _st.get('storage_ip'):
+                            _mac_storage_ips.append(str(_st['storage_ip']))
+            # For MAC: read passwords directly from the full js dict (primary source).
+            # Fall back to _ai4 indices only if the js dict doesn't have them.
+            def _str(v): return str(v) if v is not None else ''
+            _mac_settings_pwd = (_str(_mac_js.get('settings_password')) or
+                                 (_ai4[3] if not _is_xtream and len(_ai4) > 3 else ''))
+            _mac_adult_pwd    = (_str(_mac_js.get('parent_password') or _mac_js.get('adult_password')) or
+                                 (_ai4[4] if not _is_xtream and len(_ai4) > 4 else ''))
             state.profile_data = {
                 'type': 'xtream' if _is_xtream else 'mac',
                 'user': ident,
                 'mac': client.mac if hasattr(client, 'mac') else '',
                 'exp': exp,
                 'max_conn': str(max_conn) if max_conn else '',
-                # Xtream returns 5-tuple: (user, exp, max_conn, password, active_cons)
-                # PortalClient returns 5-tuple: (ident, phone, max_conn, settings_pwd, adult_pwd)
-                'active_cons':       _ai4[4] if _is_xtream and len(_ai4) > 4 else '',
-                'password':          _ai4[3] if _is_xtream and len(_ai4) > 3 else '',
-                'settings_password': _ai4[3] if not _is_xtream and len(_ai4) > 3 else '',
-                'adult_password':    _ai4[4] if not _is_xtream and len(_ai4) > 4 else '',
+                # Xtream: _ai4 = (user, exp, max_conn, password, active_cons)
+                'active_cons': _ai4[4] if _is_xtream and len(_ai4) > 4 else '',
+                'password':    _ai4[3] if _is_xtream and len(_ai4) > 3 else '',
+                # MAC: read passwords from raw js dict (always populated by account_info)
+                'settings_password': '' if _is_xtream else _mac_settings_pwd,
+                'adult_password':    '' if _is_xtream else _mac_adult_pwd,
                 'portal_url': state.url or state.m3u_url,
+                # Xtream: timezone from _server_timezone; MAC: from default_timezone in js
+                'timezone': (getattr(client, '_server_timezone', '') or ''
+                             if _is_xtream else
+                             _str(_mac_js.get('default_timezone') or _mac_js.get('timezone') or '')),
+                'storage_ips': [] if _is_xtream else _mac_storage_ips,
+                'client_ip':   '' if _is_xtream else _str(_mac_js.get('ip') or ''),
+                'comment':     '' if _is_xtream else _str(_mac_js.get('comment') or ''),
             }
         state.log(f"[CONNECT] ✓ Connected: {ident} | {exp}")
         for m in ("live", "vod", "series"):
@@ -625,6 +732,12 @@ async def _connect_async():
             except Exception as e:
                 state.log(f"[CONNECT] ✗ Could not load {m.upper()} categories: {e}")
                 state.cats_cache[m] = []
+    # Final epoch guard: covers the fetch_categories() loop above.
+    # If a new api_connect() arrived while we were fetching categories,
+    # discard everything rather than flipping state.connected on stale data.
+    if state._connect_epoch != my_epoch:
+        state.log("[CONNECT] Superseded during category fetch — discarding MAC/Stalker/Xtream result.")
+        return {"success": False, "error": "superseded"}
     state.connected = True
     state.set_status(f"Connected: {ident} | {exp}")
     if state.conn_type == "xtream" and hasattr(client, "_server_utc_offset"):
@@ -641,7 +754,7 @@ flask_app.config["SECRET_KEY"] = os.urandom(24)
 if _CAST_AVAILABLE:
     register_cast_routes(flask_app, state, run_async, _make_client)
 if _MULTIVIEW_AVAILABLE:
-    register_multiview_routes(flask_app)
+    register_multiview_routes(flask_app, state)
 if _DVR_AVAILABLE:
     register_dvr_routes(flask_app, state)
 
@@ -670,7 +783,7 @@ if _DVR_AVAILABLE:
 
     state.dvr_url_resolver = _dvr_resolve_url
 
-register_subtitles_routes(flask_app)
+register_subtitles_routes(flask_app, state)
 register_proxy_routes(flask_app, state)
 
 @flask_app.route('/api/multiview/available')
@@ -737,6 +850,16 @@ def api_connect():
             if state.stalker_device_id: state.log(f"[CONNECT] Device ID override: {state.stalker_device_id}")
             if state.stalker_device_id2:state.log(f"[CONNECT] Device ID2 override: {state.stalker_device_id2}")
             if state.stalker_signature: state.log(f"[CONNECT] Signature override: {state.stalker_signature}")
+        # Cancel any in-flight _connect_async() from a previous api_connect().
+        # Uses _connect_loop/_connect_task (connect-only fields) rather than
+        # active_loop/active_task (owned by run_worker() prefetch threads) to
+        # avoid accidentally killing a prefetch that belongs to an already-
+        # successful portal connection.
+        _prev_loop = state._connect_loop
+        _prev_task = state._connect_task
+        if _prev_task is not None and _prev_loop is not None and not _prev_loop.is_closed():
+            _prev_loop.call_soon_threadsafe(_prev_task.cancel)
+        state._connect_epoch += 1          # invalidates any in-flight _connect_async from a prior attempt
         state.cats_cache = {}
         state._items_cache = {}
         state.m3u_cache = None
@@ -759,6 +882,7 @@ def api_connect():
         # Reset logo caches so a new portal starts fresh
         state._logo_cache_live = None
         state._all_channels_ready.clear()
+        state._all_channels_epoch += 1   # invalidates any Portal 1 prefetch finally-block set()
         state._logo_cache_vod = {}
         state._portal_utc_offset = 0
         state._xmltv_catchup_cache = {}
@@ -859,8 +983,12 @@ def api_connect():
                 state._all_channels_ready.clear()
 
             def _bg_prefetch_channels():
-                # Capture conn_type at thread-creation time; reconnect may change it.
-                _pf_is_mac = _is_mac
+                # Capture conn_type and epoch at thread-creation time; reconnect may
+                # change them.  _my_ch_epoch must live at this (outer) scope so the
+                # finally block below can reference it without a NameError even if
+                # _prefetch() returns early (before the inner assignment would run).
+                _pf_is_mac    = _is_mac
+                _my_ch_epoch  = state._all_channels_epoch
                 try:
                     _pf_loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(_pf_loop)
@@ -877,8 +1005,21 @@ def api_connect():
                             return
                         state.log("[PREFETCH] Background: fetching full live channel list…")
                         state._prefetch_running = True
+                        # epoch already captured in outer scope; no re-assignment needed
                         async with _make_client() as client:
                             channels = await client.get_all_channels()
+                            # Post-fetch portal key guard — mirrors the pattern in
+                            # _bg_prefetch_vod_series (lines 1098, 1115).
+                            # get_all_channels() is a long network call; a new
+                            # api_connect() may have fired and reset state while we
+                            # were suspended. Re-verify the portal key before writing
+                            # anything so Portal 1 channel data never contaminates
+                            # Portal 2's _items_cache or _logo_cache_live.
+                            _ck2 = (f"{state.conn_type}:{state.url}"
+                                    f":{getattr(state, 'mac', '')}:{getattr(state, 'username', '')}")
+                            if _ck2 != _pf_portal_key:
+                                state.log("[PREFETCH] Portal changed during channel fetch — discarding stale data")
+                                return
                             if channels:
                                 state._items_cache[("live", "__all__")] = channels
                                 state._won_ch_cache[_pf_portal_key] = channels
@@ -919,8 +1060,16 @@ def api_connect():
                 finally:
                     state._prefetch_running = False
                     if _pf_is_mac:
-                        # Always unblock MAC logo-cache waiters, even on failure.
-                        state._all_channels_ready.set()
+                        # Only unblock MAC logo-cache waiters if this prefetch still
+                        # belongs to the current portal session.  If api_connect() was
+                        # called again since this thread started, _all_channels_epoch
+                        # will have been incremented and _my_ch_epoch will no longer
+                        # match — in that case Portal 2's prefetch (with the new epoch)
+                        # will fire its own set() once it completes.
+                        if state._all_channels_epoch == _my_ch_epoch:
+                            state._all_channels_ready.set()
+                        else:
+                            state.log("[PREFETCH] Portal changed — skipping _all_channels_ready.set() to avoid unblocking new portal's waiters prematurely")
 
             threading.Thread(target=_bg_prefetch_channels,
                              daemon=True, name="ch-prefetch").start()
@@ -1449,6 +1598,35 @@ def api_status():
 @flask_app.route("/api/profile", methods=["GET"])
 def api_profile():
     return jsonify(state.profile_data if state.connected else {})
+
+
+@flask_app.route("/api/resolve_ip", methods=["GET"])
+def api_resolve_ip():
+    """Resolve a hostname/IP to a numeric IP + basic geo country for profile display.
+    Uses socket for DNS, then ip-api.com for country lookup (5-req/s free tier).
+    Returns: {ip, country, country_code, error?}
+    """
+    import socket as _sock
+    host = request.args.get("host", "").strip()
+    if not host:
+        return jsonify({"error": "No host provided", "ip": "", "country": "", "country_code": ""})
+    # Resolve hostname → IP (no-op if already an IP)
+    ip = host
+    try:
+        ip = _sock.gethostbyname(host)
+    except Exception:
+        pass  # leave as original host string if unresolvable
+    # Geo-lookup via ip-api.com (plain HTTP, no API key needed, 45 req/min)
+    country = ""; country_code = ""
+    try:
+        import urllib.request as _ur, json as _js
+        with _ur.urlopen(f"http://ip-api.com/json/{ip}?fields=country,countryCode", timeout=5) as _r:
+            _geo = _js.loads(_r.read().decode())
+        country      = _geo.get("country", "")
+        country_code = _geo.get("countryCode", "")
+    except Exception:
+        pass
+    return jsonify({"ip": ip, "country": country, "country_code": country_code})
 
 
 @flask_app.route("/api/logs")
@@ -2007,8 +2185,6 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   .mt{padding:5px 10px;font-size:11px}
   .mt[data-m="favs"]{padding:4px 7px}
   .mt-txt{display:inline}
-  /* Expanded view not yet mobile-compatible — hidden until updated */
-  #vod-expand-btn,#series-expand-btn{display:none!important}
 }
 @media(min-width:900px){
   .mtabs{gap:3px}\n  .mt{padding:5px 8px;font-size:11px}\n  .mt[data-m=\"favs\"]{padding:5px 7px}\n}
@@ -2301,6 +2477,62 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 
 .mv-confirm-btns button{height:32px;padding:0 14px;font-size:12px}
 
+/* ── Video Filter Panel ──────────────────────────────────────────── */
+#vf-overlay{position:fixed;inset:0;z-index:600;background:rgba(0,0,0,.55);
+  display:none;align-items:flex-end;justify-content:flex-end;padding:0 0 48px 0}
+@media(min-width:900px){#vf-overlay{align-items:flex-end;justify-content:flex-start;padding:0 0 42px 260px}}
+#vf-overlay.open{display:flex}
+#vf-modal{background:var(--s2);border:1px solid var(--bdr2);
+  border-radius:var(--r) var(--r) 0 0;
+  width:min(420px,100vw);max-height:82dvh;display:flex;flex-direction:column;
+  box-shadow:0 -8px 48px rgba(0,0,0,.7);
+  animation:slide-up .22s cubic-bezier(.34,1.2,.64,1);
+  transform:translateZ(0)}
+@media(min-width:900px){
+  #vf-modal{border-radius:var(--r);margin-bottom:8px;max-height:80dvh}
+}
+.vf-hdr{display:flex;align-items:center;gap:8px;padding:13px 16px 10px;
+  flex-shrink:0}
+.vf-hdr h2{flex:1;font-size:13px;font-weight:800;color:var(--txt);
+  text-transform:uppercase;letter-spacing:1.5px;margin:0}
+/* Tab bar */
+.vf-tabs{display:flex;flex-shrink:0;border-bottom:1px solid var(--bdr);
+  padding:0 16px;gap:0}
+.vf-tab{flex:1;height:34px;font-size:12px;font-weight:600;color:var(--txt3);
+  background:none;border:none;border-bottom:2px solid transparent;
+  cursor:pointer;transition:color .15s,border-color .15s;letter-spacing:.3px;
+  margin-bottom:-1px}
+.vf-tab:hover{color:var(--txt)}
+.vf-tab.active{color:var(--acc);border-bottom-color:var(--acc)}
+/* Tab panels */
+.vf-tabpanel{display:none;flex-direction:column;flex:1;overflow-y:auto;
+  padding:12px 16px 14px}
+.vf-tabpanel.active{display:flex}
+/* Slider rows */
+.vf-row{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.vf-lbl{font-size:11px;color:var(--txt2);width:70px;flex-shrink:0;text-align:right;
+  user-select:none;white-space:nowrap}
+.vf-slider{flex:1;accent-color:var(--acc);cursor:pointer;height:18px}
+.vf-val{font-size:11px;color:var(--acc);width:34px;text-align:right;
+  flex-shrink:0;font-variant-numeric:tabular-nums;font-family:monospace}
+/* Profile list */
+.vf-profile-list{display:flex;flex-direction:column;gap:5px;min-height:32px}
+.vf-pli{display:flex;align-items:center;gap:6px;padding:8px 10px;
+  border-radius:var(--rsm);background:rgba(255,255,255,.025);
+  border:1px solid var(--bdr);transition:var(--tr);cursor:pointer;
+  animation:fade-up .15s ease both}
+.vf-pli:hover{border-color:var(--acc);background:rgba(124,58,237,.08)}
+.vf-pli-name{flex:1;font-size:12px;color:var(--txt);font-weight:600;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.vf-pli-del{font-size:14px;color:var(--txt3);border:none;background:none;
+  cursor:pointer;padding:2px 4px;border-radius:4px;transition:var(--tr)}
+.vf-pli-del:hover{color:#ef4444;background:rgba(239,68,68,.12)}
+/* Toolbar filter button */
+#vf-btn{height:26px;padding:0 10px;font-size:12px;font-weight:700;
+  border-radius:var(--rss);background:var(--s4);color:var(--txt2);
+  border:1px solid var(--bdr2);letter-spacing:.5px;transition:var(--tr)}
+#vf-btn:hover{background:var(--s3);color:var(--txt)}
+
 /* ── VOD / Series Expanded Browse Overlay ──────────────────────────────── */
 #vod-expand-overlay{position:fixed;inset:0;z-index:650;background:rgba(0,0,0,.72);
   display:none;align-items:stretch;justify-content:center}
@@ -2370,30 +2602,54 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   color:#f5c518;font-size:11px;font-weight:700;padding:3px 7px;
   border-radius:4px;display:flex;align-items:center;gap:3px;
   z-index:3;box-shadow:0 1px 4px rgba(0,0,0,.6)}
-.xp-card-fav{position:absolute;top:6px;left:6px;background:rgba(0,0,0,.65);
+.xp-card-fav{position:absolute;top:6px;left:6px;background:rgba(0,0,0,.75);
   border-radius:50%;width:22px;height:22px;display:flex;align-items:center;
-  justify-content:center;font-size:13px;cursor:pointer;transition:background .15s;
-  backdrop-filter:blur(4px)}
+  justify-content:center;font-size:13px;cursor:pointer;transition:background .15s}
 .xp-card-fav:hover{background:rgba(0,0,0,.85)}
-/* Detail view */
-#vod-expand-detail{width:420px;flex-shrink:0;overflow-y:auto;
-  border-left:1px solid var(--s4);background:var(--s2);display:none;flex-direction:column}
-#vod-expand-detail.visible{display:flex}
-#vod-expand-detail-inner{padding:0 0 20px 0;flex:1}
-.xp-detail-backdrop{width:100%;height:200px;object-fit:cover;display:block;flex-shrink:0}
-.xp-detail-backdrop-ph{width:100%;height:160px;display:flex;align-items:center;
-  justify-content:center;font-size:60px;background:var(--s4);color:var(--txt3);flex-shrink:0}
-.xp-detail-poster-row{display:flex;gap:14px;padding:14px 16px;align-items:flex-start}
-.xp-detail-poster{width:90px;height:130px;object-fit:cover;border-radius:var(--rsm);
-  flex-shrink:0;border:1px solid var(--bdr);margin-top:-50px;position:relative;z-index:2;
-  box-shadow:0 4px 20px rgba(0,0,0,.6)}
-.xp-detail-poster-ph{width:90px;height:130px;border-radius:var(--rsm);flex-shrink:0;
-  border:1px solid var(--bdr);margin-top:-50px;position:relative;z-index:2;
-  background:var(--s4);display:flex;align-items:center;justify-content:center;
-  font-size:30px;color:var(--txt3)}
-.xp-detail-title-block{flex:1;padding-top:4px;min-width:0}
-.xp-detail-title{font-size:18px;font-weight:700;color:var(--txt);
-  line-height:1.2;margin-bottom:8px;word-break:break-word}
+/* Detail popup modal – centered overlay replacing the old right-side panel */
+#vod-expand-detail{position:fixed;inset:0;z-index:660;
+  background:rgba(0,0,0,.72);
+  display:none;align-items:center;justify-content:center;padding:20px}
+#vod-expand-detail.visible{display:flex;animation:pop-in .18s ease}
+/* Fixed size: same for every movie and series. Episodes scroll inside.
+   will-change:transform isolates the card into its own GPU compositing layer
+   so background repaints don't invalidate it (and vice-versa). */
+#vod-expand-detail-inner{position:relative;background:var(--s1);
+  border-radius:12px;width:100%;max-width:700px;
+  height:560px;max-height:88vh;
+  overflow:hidden;display:flex;flex-direction:column;
+  will-change:transform;
+  box-shadow:0 28px 90px rgba(0,0,0,.85),0 0 0 1px rgba(255,255,255,.07)}
+/* × close button — solid bg, no backdrop-filter */
+.xp-modal-close{position:absolute;top:10px;right:10px;z-index:20;
+  background:rgba(0,0,0,.7);
+  border:1px solid rgba(255,255,255,.13);border-radius:50%;
+  width:30px;height:30px;display:flex;align-items:center;justify-content:center;
+  cursor:pointer;color:#fff;font-size:13px;line-height:1;
+  transition:background .15s,transform .15s;flex-shrink:0;padding:0}
+.xp-modal-close:hover{background:rgba(60,60,60,.9);transform:scale(1.1)}
+/* Desktop: show ✕, hide ←. Mobile media query inverts this. */
+.xp-close-x{display:inline}
+.xp-close-back{display:none}
+/* Two-column layout fills the fixed card height */
+.xp-modal-layout{display:flex;flex:1;min-height:0;overflow:hidden}
+/* Poster fills full height of the card via flex stretch */
+.xp-modal-poster-col{width:210px;flex-shrink:0;position:relative;
+  background:var(--s3);overflow:hidden}
+.xp-modal-poster-bg{position:absolute;inset:0;background-size:cover;
+  background-position:center;filter:blur(14px) brightness(.3);transform:scale(1.15)}
+.xp-modal-poster-img{position:relative;z-index:2;width:100%;height:100%;
+  object-fit:cover;display:block}
+.xp-modal-poster-ph{position:relative;z-index:2;width:100%;height:100%;
+  display:flex;align-items:center;justify-content:center;
+  font-size:64px;color:rgba(255,255,255,.18)}
+/* Info column scrolls within the fixed card — handles both sparse movies
+   and episode-heavy series without the card ever changing size */
+.xp-modal-info-col{flex:1;min-width:0;overflow-y:auto;padding:22px;
+  display:flex;flex-direction:column;gap:12px}
+.xp-modal-title{font-size:20px;font-weight:700;color:var(--txt);
+  line-height:1.25;word-break:break-word}
+/* Badge pills */
 .xp-detail-badges{display:flex;flex-wrap:wrap;gap:5px}
 .xp-badge{display:inline-flex;align-items:center;gap:3px;padding:3px 8px;
   border-radius:20px;font-size:11px;font-weight:600;border:1px solid}
@@ -2402,25 +2658,26 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .xp-badge-dur{background:rgba(72,187,120,.08);color:#68d391;border-color:rgba(72,187,120,.25)}
 .xp-badge-genre{background:rgba(124,58,237,.12);color:#a78bfa;border-color:rgba(124,58,237,.3)}
 .xp-badge-age{background:rgba(239,68,68,.1);color:#f87171;border-color:rgba(239,68,68,.3)}
-.xp-detail-body{padding:0 16px}
+/* Action buttons row (no legacy padding) */
+.xp-detail-actions{display:flex;gap:8px;flex-wrap:wrap}
+.xp-detail-ext-links{display:flex;gap:6px;flex-wrap:wrap}
+.xp-detail-body{padding:0}
 .xp-detail-plot{font-size:12px;color:var(--txt2);line-height:1.6;
-  margin-bottom:12px;display:-webkit-box;-webkit-line-clamp:5;
+  margin-bottom:0;display:-webkit-box;-webkit-line-clamp:5;
   -webkit-box-orient:vertical;overflow:hidden}
 .xp-detail-plot.expanded{-webkit-line-clamp:unset;overflow:visible}
-.xp-detail-meta-row{display:flex;gap:12px;margin-bottom:10px;flex-wrap:wrap}
+.xp-detail-meta-row{display:flex;gap:12px;flex-wrap:wrap}
 .xp-detail-meta-col{flex:1;min-width:120px}
 .xp-detail-meta-label{font-size:10px;font-weight:700;text-transform:uppercase;
   letter-spacing:.8px;color:var(--txt3);margin-bottom:4px}
 .xp-detail-meta-val{font-size:12px;color:var(--txt2);line-height:1.5}
-.xp-detail-actions{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;padding:0 16px}
-.xp-detail-ext-links{display:flex;gap:6px;padding:0 16px;margin-bottom:12px;flex-wrap:wrap}
 .xp-ext-btn{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;
   border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;
   border:1px solid rgba(139,92,246,.3);background:rgba(139,92,246,.12);
   color:#a78bfa;transition:background .15s;text-decoration:none}
 .xp-ext-btn:hover{background:rgba(139,92,246,.25)}
 /* Episodes section */
-.xp-seasons{padding:0 16px}
+.xp-seasons{padding:0}
 .xp-season-hdr{display:flex;align-items:center;gap:8px;padding:8px 10px;
   background:var(--s3);border-radius:var(--rsm);cursor:pointer;
   border:1px solid var(--bdr);margin-bottom:4px;transition:background .15s}
@@ -2448,12 +2705,134 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .xp-grid-msg{grid-column:1/-1;text-align:center;padding:48px 20px;
   color:var(--txt3);font-size:13px}
 .xp-grid-msg .xp-msg-ico{font-size:40px;display:block;margin-bottom:10px;opacity:.3}
-/* Responsive: narrow screens collapse sidebar */
+/* ══ Mobile (≤700px) ══════════════════════════════════════════════════════
+   Grid: sidebar collapses into a horizontal scrollable category strip.
+   Detail: full-screen sheet — poster fills top hero area, info scrolls below. */
 @media(max-width:700px){
-  #vod-expand-sidebar{width:140px}
-  #vod-expand-grid-view{grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px;padding:10px}
-  #vod-expand-detail{width:100%;border-left:none;border-top:1px solid var(--s4)}
+
+  /* ── Grid header ── */
+  #vod-expand-hdr{padding:8px 10px;gap:8px}
+  #vod-expand-hdr-search{width:160px}
+
+  /* ── Body: stack sidebar above grid ── */
   #vod-expand-body{flex-direction:column}
+
+  /* ── Sidebar → horizontal scrollable category strip ── */
+  #vod-expand-sidebar{
+    width:100% !important;
+    display:flex;          /* was missing — without this flex-direction:row has no effect */
+    flex-direction:row;
+    align-items:center;
+    height:auto;
+    max-height:46px;       /* hard cap so sidebar never grows beyond a single pill row */
+    overflow-x:auto;
+    overflow-y:hidden;
+    border-right:none;
+    border-bottom:1px solid var(--s4);
+    flex-shrink:0;
+    padding:6px 10px;
+    gap:5px;
+    scrollbar-width:none;
+    background:var(--s2)
+  }
+  #vod-expand-sidebar::-webkit-scrollbar{display:none}
+  #vod-expand-sidebar .xp-cat-item{
+    flex-shrink:0;
+    white-space:nowrap;
+    overflow:visible;
+    text-overflow:unset;
+    padding:5px 13px;
+    font-size:12px;
+    border-radius:20px;
+    border:1px solid var(--bdr)
+  }
+  #vod-expand-sidebar .xp-cat-item.active{border-color:var(--acc)}
+
+  /* ── 3-column grid ── */
+  #vod-expand-grid-view{
+    grid-template-columns:repeat(3,1fr);
+    grid-auto-rows:190px;
+    gap:7px;
+    padding:8px
+  }
+  .xp-card-title{font-size:10px}
+
+  /* ══ Detail: full-screen sheet (no margins, no border-radius) ══ */
+  #vod-expand-detail{padding:0;background:rgba(0,0,0,.9);align-items:stretch;justify-content:stretch}
+  #vod-expand-detail-inner{
+    height:100dvh;
+    max-height:100dvh;
+    max-width:100%;
+    border-radius:0;
+    will-change:transform
+  }
+
+  /* Layout: column — poster hero on top, info below, whole thing scrolls */
+  .xp-modal-layout{
+    flex-direction:column;
+    overflow-y:auto;
+    overflow-x:hidden
+  }
+
+  /* ── Poster: full-width hero with gradient bottom fade ── */
+  .xp-modal-poster-col{
+    width:100%;
+    height:45vh;
+    min-height:220px;
+    flex-shrink:0;
+    position:relative
+  }
+  /* Gradient fade from poster into the dark info area */
+  .xp-modal-poster-col::after{
+    content:'';
+    position:absolute;
+    inset:auto 0 0 0;
+    height:55%;
+    background:linear-gradient(to bottom,transparent,var(--s1));
+    z-index:3;
+    pointer-events:none
+  }
+  .xp-modal-poster-img{object-position:center top}
+
+  /* ── Info col: let layout handle scroll, no inner scrollbar ── */
+  .xp-modal-info-col{
+    flex:none;
+    overflow-y:visible;
+    max-height:none;
+    padding:20px 20px 40px;
+    gap:14px
+  }
+
+  /* Large readable title */
+  .xp-modal-title{font-size:24px;font-weight:800;line-height:1.15}
+
+  /* Expanded description (don't clamp on mobile) */
+  .xp-detail-plot{-webkit-line-clamp:unset;overflow:visible}
+
+  /* Full-width prominent play button */
+  .xp-detail-actions{flex-direction:column;gap:10px}
+  .xp-detail-actions .btn,
+  .xp-detail-actions button{
+    padding:13px 20px;
+    font-size:15px;
+    border-radius:50px;
+    width:100%;
+    justify-content:center
+  }
+
+  /* ── Close button → back arrow, top-left ── */
+  .xp-modal-close{
+    left:12px;
+    right:auto;
+    top:12px;
+    width:36px;
+    height:36px;
+    font-size:16px;
+    z-index:20
+  }
+  /* Show ← on mobile, hide ✕ */
+  .xp-close-x{display:none}
+  .xp-close-back{display:inline}
 }
 </style>
 </head>
@@ -2824,6 +3203,12 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <!-- RIGHT BUTTON GROUP -->
           <div style="display:flex;align-items:center;gap:6px">
 
+            <button id="vf-btn"
+              onclick="event.stopPropagation();toggleVfPanel()"
+              title="Video Filters">
+              🎨 Filters
+            </button>
+
             <button id="pctrl-act-btn"
               onclick="event.stopPropagation();openActTab()"
               title="Actions"
@@ -2940,6 +3325,88 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
     </div>
   </div>
 
+  <!-- VIDEO FILTER PANEL -->
+  <div id="vf-overlay" onclick="if(event.target===this)closeVfPanel()">
+    <div id="vf-modal">
+
+      <!-- Header -->
+      <div class="vf-hdr">
+        <h2>🎨 Video Filters</h2>
+        <button class="btn-ghost" onclick="closeVfPanel()"
+          style="height:26px;width:26px;padding:0;font-size:14px">✕</button>
+      </div>
+
+      <!-- Tab bar -->
+      <div class="vf-tabs">
+        <button class="vf-tab active" data-tab="filters" onclick="switchVfTab('filters')">Sliders</button>
+        <button class="vf-tab" data-tab="profiles" onclick="switchVfTab('profiles')">Profiles</button>
+      </div>
+
+      <!-- Sliders tab -->
+      <div class="vf-tabpanel active" id="vf-panel-filters">
+        <div class="vf-row">
+          <span class="vf-lbl">Brightness</span>
+          <input class="vf-slider" type="range" id="vf-brightness" min="0" max="200" step="1" value="100"
+            oninput="onVfSlider('brightness',this.value/100,this)">
+          <span class="vf-val" id="vf-brightness-val">1.00</span>
+        </div>
+        <div class="vf-row">
+          <span class="vf-lbl">Contrast</span>
+          <input class="vf-slider" type="range" id="vf-contrast" min="0" max="200" step="1" value="100"
+            oninput="onVfSlider('contrast',this.value/100,this)">
+          <span class="vf-val" id="vf-contrast-val">1.00</span>
+        </div>
+        <div class="vf-row">
+          <span class="vf-lbl">Saturation</span>
+          <input class="vf-slider" type="range" id="vf-saturate" min="0" max="300" step="1" value="100"
+            oninput="onVfSlider('saturate',this.value/100,this)">
+          <span class="vf-val" id="vf-saturate-val">1.00</span>
+        </div>
+        <div class="vf-row">
+          <span class="vf-lbl">Hue Shift</span>
+          <input class="vf-slider" type="range" id="vf-hue" min="-180" max="180" step="1" value="0"
+            oninput="onVfSlider('hue',parseInt(this.value),this)">
+          <span class="vf-val" id="vf-hue-val">0°</span>
+        </div>
+        <div class="vf-row">
+          <span class="vf-lbl">Greyscale</span>
+          <input class="vf-slider" type="range" id="vf-grayscale" min="0" max="100" step="1" value="0"
+            oninput="onVfSlider('grayscale',this.value/100,this)">
+          <span class="vf-val" id="vf-grayscale-val">0%</span>
+        </div>
+        <div class="vf-row">
+          <span class="vf-lbl">Sepia</span>
+          <input class="vf-slider" type="range" id="vf-sepia" min="0" max="100" step="1" value="0"
+            oninput="onVfSlider('sepia',this.value/100,this)">
+          <span class="vf-val" id="vf-sepia-val">0%</span>
+        </div>
+        <!-- Reset + Save at bottom of sliders tab -->
+        <div style="height:1px;background:var(--bdr);margin:8px 0 10px"></div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="btn-ghost" onclick="resetVfDefaults()"
+            style="height:30px;padding:0 10px;font-size:11px;border-radius:var(--rss);flex-shrink:0">⟳ Reset</button>
+          <input id="vf-profile-name" type="text" placeholder="Save as profile…"
+            style="flex:1;height:30px;font-size:12px;padding:0 8px"
+            onkeydown="if(event.key==='Enter')saveVfProfile()">
+          <button class="btn-acc" onclick="saveVfProfile()"
+            style="height:30px;padding:0 12px;font-size:12px;border-radius:var(--rss);flex-shrink:0">
+            💾 Save
+          </button>
+        </div>
+      </div>
+
+      <!-- Profiles tab -->
+      <div class="vf-tabpanel" id="vf-panel-profiles">
+        <div style="font-size:10px;font-weight:700;text-transform:uppercase;
+          letter-spacing:1.2px;color:var(--txt3);margin-bottom:8px">Saved Profiles</div>
+        <div class="vf-profile-list" id="vf-profile-list">
+          <span style="font-size:11px;color:var(--txt3);padding:4px 0">No saved profiles yet.</span>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
   <!-- EPG OVERLAY -->
   <!-- DVR EPG OVERLAY — programme picker for scheduling -->
 
@@ -3051,7 +3518,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <div id="vod-expand-grid-view"></div>
       </div>
       <!-- Detail panel (hidden until card selected) -->
-      <div id="vod-expand-detail">
+      <div id="vod-expand-detail" onclick="if(event.target===this)_xpCloseDetail()">
         <div id="vod-expand-detail-inner"></div>
       </div>
     </div>
@@ -3152,6 +3619,10 @@ let pUrl='', pName='', pIdx=-1;
 let isStalker=false;  // true when connected to a stalker_portal MAC portal
 let _dlActive=false, _dlTaskType='', _dlItemNames=[];
 let hlsObj=null, mpegtsObj=null, recTmr=null, isRec=false, logEs=null, cpOpen=false;
+// Play-epoch: incremented on every doPlay() call.
+// Each doPlay closure captures its own _ep; callbacks compare _ep === _playEpoch
+// to detect that a newer session has started and bail out early.
+let _playEpoch = 0;
 const vid = document.getElementById('vid');
 
 
@@ -3463,6 +3934,14 @@ async function doConnect(){
         toggleSaveChk(saveBtn);
       }
     } else {
+      // 'cancelled'  → Thread 1 was killed by a newer api_connect() before it
+      //                 completed; the new portal already owns the UI state.
+      // 'superseded' → epoch guard fired after a long I/O operation completed
+      //                 behind a newer connect; same situation.
+      // In both cases this response belongs to a dead attempt — do not touch
+      // the connection dot, status bar, portal label, or credential panel so
+      // Thread 2's successfully-connected UI state is left completely intact.
+      if(d.error === 'cancelled' || d.error === 'superseded') return;
       document.getElementById('cdot').classList.remove('on');
       document.getElementById('conn-btn').classList.remove('connected');
       setStatus('Error: '+(d.error||'Unknown'));
@@ -3485,9 +3964,18 @@ async function refreshPlaylist(){
   const btn = document.getElementById('refresh-btn');
   if(btn){ btn.style.opacity='0.5'; btn.style.pointerEvents='none'; }
   toast('Refreshing playlist…','ok');
+  // First: destroy any running player so all ffmpeg processes are killed before
+  // we hit the server — prevents Flask thread exhaustion blocking /api/clear_cache.
+  _playerStopped = true;
+  _destroyPlayers();
   try {
     // 1. Clear server-side caches (logo cache, proxy image cache, cats cache)
-    await fetch('/api/clear_cache', {method:'POST'});
+    //    — short timeout so a stalled Flask doesn't freeze the UI indefinitely.
+    const _cacheCtrl = new AbortController();
+    const _cacheTmr  = setTimeout(()=>_cacheCtrl.abort(), 8000);
+    try{ await fetch('/api/clear_cache', {method:'POST', signal:_cacheCtrl.signal}); }
+    catch(_e){ /* timeout or network error — proceed with reconnect anyway */ }
+    finally{ clearTimeout(_cacheTmr); }
     // 2. Clear client-side item + category caches
     categoryItemsCache = {};
     catsCache = {};
@@ -5203,8 +5691,6 @@ function iMenuIMDB(){
   const idFields = ['tmdb_id','tmdb','imdb_id','imdb','kinopoisk_id','movie_id','series_id','stream_id','id'];
   const found = {};
   idFields.forEach(k=>{ if(it[k]!==undefined && it[k]!==null && it[k]!=='') found[k]=it[k]; });
-  console.log('[TMDB] item keys:', Object.keys(it));
-  console.log('[TMDB] ID fields:', found);
   alog('🔍 Item ID fields: '+JSON.stringify(found), 'i');
   _iMenuIMDBOpen(it);
 }
@@ -5544,6 +6030,13 @@ function doPlay(url, name, opts={}){
   pUrl=url; pName=name||url;
   const dlb=document.getElementById('dl-now-btn'); if(dlb) dlb.disabled=false;
   const dlbm=document.getElementById('dl-now-btn-mob'); if(dlbm) dlbm.disabled=false;
+  // Capture this invocation's epoch so all async callbacks can detect when a
+  // newer doPlay() has superseded this one.  _playerStopped alone is insufficient
+  // because doPlay() itself resets it to false at the start of every new session.
+  const _ep = ++_playEpoch;
+  // Returns true if this callback belongs to a stale play session (user stopped
+  // playback or started a new stream before this timer fired).
+  const _stale = () => _ep !== _playEpoch || _playerStopped;
   _playerStopped = false;                        // new play — clear stop flag
   window._mseTranscodeFired = false;             // reset MSE transcode guard
   if(window._mpegRetries) window._mpegRetries = {}; // reset general retry counter
@@ -5555,54 +6048,6 @@ function doPlay(url, name, opts={}){
   window._hlsMediaRecoveries = 0;                    // reset HLS media recovery counter
   window._hlsFreshRestarted = false;                  // reset HLS fresh-restart guard
   window._hlsRecoverySuccessHandler = null;           // reset FRAG_BUFFERED success handler
-  // ── Stall watchdog ────────────────────────────────────────────────────────
-  // Neither HLS.js nor mpegts.js fires an error when the stream silently
-  // freezes mid-playback (currentTime stops advancing but no fatal event).
-  // This is the most common symptom on slow portals. The watchdog polls every
-  // 6 s: if currentTime hasn't moved and the video isn't intentionally paused,
-  // it attempts an unload/load recovery cycle. After 3 failed cycles it gives
-  // up so it doesn't loop endlessly on a genuinely offline channel.
-  if(window._stallWatchdog) clearInterval(window._stallWatchdog);
-  window._stallWatchdog = null;
-  window._stallLastTime = -1;
-  window._stallHits = 0;
-  window._stallWatchdog = setInterval(()=>{
-    if(_playerStopped){ clearInterval(window._stallWatchdog); window._stallWatchdog=null; return; }
-    if(vid.paused || vid.ended || vid.readyState < 2) return; // intentionally paused or not loaded yet
-    const ct = vid.currentTime;
-    if(ct === window._stallLastTime && ct > 0){
-      window._stallHits++;
-      alog('[Watchdog] Stall detected ('+window._stallHits+'/3) — currentTime frozen at '+ct.toFixed(2)+'s','w');
-      if(window._stallHits >= 3){
-        // Three consecutive 6 s checks frozen — give up, don't loop endlessly
-        clearInterval(window._stallWatchdog); window._stallWatchdog=null;
-        alog('[Watchdog] Stream appears offline after 3 stall cycles — stopping','e');
-        setNP('✗ Stream stalled — channel may be offline');
-        document.getElementById('ppbtn').textContent='▶';
-        return;
-      }
-      // Attempt a silent recovery: unload then reload without destroying the player.
-      // This re-opens the HTTP connection to the portal without a full page-reload.
-      setNP('⟳ Buffering… '+pName);
-      if(mpegtsObj){ try{ mpegtsObj.unload(); mpegtsObj.load(); vid.play().catch(()=>{}); }catch(e){} }
-      else if(hlsObj){
-        try{
-          hlsObj.stopLoad();
-          // startLoad(-1) jumps to the live edge rather than resuming from the stale position
-          hlsObj.startLoad(-1);
-          const _lp = hlsObj.liveSyncPosition;
-          if(typeof _lp === 'number' && Number.isFinite(_lp) && vid.currentTime < _lp - 2){
-            try{ vid.currentTime = Math.max(0, _lp - 1); }catch(e){}
-          }
-        }catch(e){}
-        vid.play().catch(()=>{});
-      }
-    } else {
-      // Time is advancing — reset hit counter
-      window._stallHits = 0;
-    }
-    window._stallLastTime = ct;
-  }, 6000);
   // ─────────────────────────────────────────────────────────────────────────
   setNP('▶ '+pName);
   document.getElementById('pu').textContent=url;
@@ -5612,11 +6057,120 @@ function doPlay(url, name, opts={}){
 
   _destroyPlayers();
 
+  // ── Stall watchdog — intentionally placed AFTER _destroyPlayers() ─────────
+  // RC1 FIX: Previously the watchdog interval was created ~40 lines above this
+  // point, then immediately killed by _destroyPlayers() → clearInterval() before
+  // a single player was ever created. The watchdog was therefore always dead,
+  // explaining why stalls at minute 5 generated zero watchdog log entries.
+  // Correct position: after the old player is torn down, before the new one starts.
+  if(window._stallWatchdog) clearInterval(window._stallWatchdog);
+  window._stallWatchdog = null;
+  // RC5 FIX: initialize to null, not -1 or 0. The old guard "ct > 0" meant that
+  // a broken player permanently frozen at currentTime=0 never incremented
+  // _stallHits (0===−1 is false on tick 1; 0>0 is always false thereafter).
+  // With null: tick 1 sets the baseline (null check skips the stall test);
+  // tick 2 detects 0===0 and correctly increments the hit counter.
+  window._stallLastTime = null;
+  window._stallHits = 0;
+  window._stallWatchdog = setInterval(()=>{
+    if(_stale()){ clearInterval(window._stallWatchdog); window._stallWatchdog=null; return; }
+    if(vid.paused || vid.ended || vid.readyState < 2) return;
+    const ct = vid.currentTime;
+    // RC5 FIX: null-check replaces ct>0 — detects stalls at currentTime=0
+    if(window._stallLastTime !== null && ct === window._stallLastTime){
+      window._stallHits++;
+      // Catchup/VOD HLS stalls legitimately while waiting for ffmpeg to write
+      // the next segment (realtime generation). Give it 10 cycles (60 s) before
+      // declaring dead; live streams still stop after 3 cycles.
+      const _stallLimit = (!isLiveStream && hlsObj) ? 10 : 3;
+      alog('[Watchdog] Stall detected ('+window._stallHits+'/'+_stallLimit+') — currentTime frozen at '+ct.toFixed(2)+'s','w');
+      if(window._stallHits >= _stallLimit){
+        clearInterval(window._stallWatchdog); window._stallWatchdog=null;
+        alog('[Watchdog] Stream appears offline after '+_stallLimit+' stall cycles — stopping','e');
+        setNP('✗ Stream stalled — channel may be offline');
+        document.getElementById('ppbtn').textContent='▶';
+        return;
+      }
+      // Silent recovery: re-open the HTTP connection without a full restart.
+      setNP('⟳ Buffering… '+pName);
+      if(mpegtsObj){
+        try{
+          // For non-live streams, save currentTime before reload so we can
+          // attempt to restore the position — mpegts.js reload always starts
+          // from byte 0 without this.
+          const _stallPos = !isLiveStream && vid.currentTime > 2 ? vid.currentTime : null;
+          mpegtsObj.unload();
+          mpegtsObj.load();
+          if(_stallPos !== null){
+            vid.addEventListener('loadedmetadata', function _stallResume(){
+              vid.removeEventListener('loadedmetadata', _stallResume);
+              try{ vid.currentTime = _stallPos; }catch(e){}
+              vid.play().catch(()=>{});
+            }, {once:true});
+          } else {
+            vid.play().catch(()=>{});
+          }
+        }catch(e){}
+      }
+      else if(hlsObj){
+        try{
+          hlsObj.stopLoad();
+          if(isLiveStream){
+            // Live: jump to live edge to avoid buffering stale content
+            hlsObj.startLoad(-1);
+            const _lp = hlsObj.liveSyncPosition;
+            if(typeof _lp === 'number' && Number.isFinite(_lp) && vid.currentTime < _lp - 2){
+              try{ vid.currentTime = Math.max(0, _lp - 1); }catch(e){}
+            }
+          } else {
+            // Catchup/VOD: resume from the stalled position; the segment
+            // server will deliver the segment once ffmpeg writes it.
+            hlsObj.startLoad(vid.currentTime);
+          }
+        }catch(e){}
+        vid.play().catch(()=>{});
+      }
+    } else {
+      window._stallHits = 0; // time advancing — reset counter
+    }
+    window._stallLastTime = ct;
+  }, 6000);
+  // ─────────────────────────────────────────────────────────────────────────
+
   // Local /api/ URLs (transcode proxy) must never be wrapped in /api/proxy again
   const px = url.startsWith('/api/') ? url : '/api/proxy?url='+encodeURIComponent(url);
   const u=url.toLowerCase().split('?')[0];
   const qs=url.toLowerCase();
   const fallbackUrl=opts.fallbackUrl||null;
+  // Hoisted to outer scope so ALL branches (HLS, mpegts) and their async
+  // callbacks/closures can reference it.  Previously only declared inside the
+  // else-if(mpegtsOk) block, which made it a ReferenceError in the HLS retry
+  // handler — causing a silent crash with no log and no remux fallback.
+  const isLiveStream = (opts.isLive !== false);
+
+  // ── Catchup MPEG-TS → HLS-VOD proxy (seek bar + sync_byte fix) ──────────
+  // Raw Xtream timeshift .ts streams don't support seeking and suffer from
+  // TSDemuxer sync_byte errors that cause mpegts.js to restart from byte 0.
+  // Route catchup streams (isLive=false, known duration, .ts URL) through
+  // the proxy_addon's HLS-VOD proxy before any player-type detection runs.
+  // The proxy returns a pre-declared VOD m3u8 so HLS.js renders the full
+  // seek bar from the first play; ffmpeg normalises all TS misalignment.
+  if(!isLiveStream && (opts.durationSecs||0) > 0 && !url.includes('/api/catchup/')){
+    const _cqu = url.toLowerCase();
+    const _isCatchupTs = _cqu.endsWith('.ts')
+                       || _cqu.includes('/timeshift/')
+                       || _cqu.includes('timeshift.php');
+    if(_isCatchupTs){
+      const _sid = Math.random().toString(36).slice(2,12);
+      const _chUrl = '/api/catchup/stream?url=' + encodeURIComponent(url)
+                   + '&duration=' + Math.round(opts.durationSecs)
+                   + '&sid=' + _sid;
+      alog('[Catchup] Routing MPEG-TS → HLS-VOD proxy (seek enabled, sync errors suppressed)','k');
+      doPlay(_chUrl, name, {isLive: false, durationSecs: opts.durationSecs});
+      return;
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────
 
   // Stalker storage URLs (stalker_portal/storage/get.php) must NOT go through
   // /api/proxy — the proxy double-encodes their query string (?filename=...&token=...).
@@ -5626,6 +6180,7 @@ function doPlay(url, name, opts={}){
   const isHls  = u.endsWith('.m3u8') || u.endsWith('.m3u')
                || u.includes('/hls/')
                || u.includes('timeshift.php')
+               || u.includes('/api/catchup/stream')   // catchup HLS-VOD proxy
                || qs.includes('extension=m3u8');
 
   // MKV/MP4/AVI etc — browser can play natively, no need for mpegts.js or HLS.js
@@ -5688,7 +6243,7 @@ function doPlay(url, name, opts={}){
 
   } else if(isHls && typeof Hls !== 'undefined' && Hls.isSupported()){
     // ── HLS via HLS.js ────────────────────────────────────────
-    // Shared HLS config — used in every new Hls() call below.
+    // Base config for live streams.
     // enableWorker:true  → parsing/remux runs off the main thread (less UI jank)
     // maxBufferLength:20 → keeps live stream ≤20s behind edge; 45 caused visible lag/drift
     // backBufferLength:10 → evict old segments quickly; frees memory, reduces MSE pressure
@@ -5710,7 +6265,19 @@ function doPlay(url, name, opts={}){
       subtitleStreamController: class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  onAudioTrackSwitching(){}  onSubtitleFragProcessed(){}  onBufferFlushing(){}  on(){}  off(){} },
       subtitleTrackController:  class { startLoad(){}  stopLoad(){}  destroy(){}  onMediaAttached(){}  onMediaDetaching(){}  onManifestLoading(){}  onManifestLoaded(){}  onManifestParsed(){}  onLevelLoaded(){}  on(){}  off(){} },
     };
-    hlsObj=new Hls(_HLS_CFG);
+    // Catchup VOD override — our proxy_addon segment server polls up to 60 s for
+    // ffmpeg to write each segment, so the fragment timeout must exceed 60 s.
+    // Softer retry policy: each retry attempt holds its own 60 s poll slot.
+    // Larger backBuffer: lets users seek backward into already-generated segments.
+    const _isCatchupVOD = !isLiveStream && url.includes('/api/catchup/');
+    const _activeCfg = _isCatchupVOD ? Object.assign({}, _HLS_CFG, {
+      fragLoadingTimeOut:   90000,  // 90 s > segment server's 60 s poll window
+      fragLoadingMaxRetry:  2,      // 2 retries max; each attempt ties up 60 s poll
+      fragLoadingRetryDelay:3000,   // matches Retry-After: 3 from segment server
+      backBufferLength:     60,     // 60 s back-buffer for backward seeking
+    }) : _HLS_CFG;
+
+    hlsObj=new Hls(_activeCfg);
     hlsObj.loadSource(px);
     hlsObj.attachMedia(vid);
     hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>vid.play().catch(()=>{}));
@@ -5739,31 +6306,50 @@ function doPlay(url, name, opts={}){
         if(hlsObj){hlsObj.destroy();hlsObj=null;}
         return;
       }
-      if(hc===503||hc===403||hc===404){
+      // For catchup VOD, 503 = "segment not yet written by ffmpeg, retry later".
+      // Do NOT hard-stop — let HLS.js honour Retry-After and retry automatically.
+      // For live/non-catchup, 503/403/404 are genuine hard failures.
+      if((hc===503||hc===403||hc===404) && !_isCatchupVOD){
         alog('[HLS] Channel unavailable ('+hc+') — stopping','e');
         setNP('✗ Channel unavailable ('+hc+')');
         document.getElementById('ppbtn').textContent='▶';
         if(hlsObj){hlsObj.destroy();hlsObj=null;}
         return;
       }
-      // Fatal error — first try: recreate HLS instance (portal may have hiccuped)
-      if(!_hlsRetryFired && !_playerStopped){
+      // Fatal error — first try: recreate HLS instance (portal may have hiccuped).
+      // For catchup VOD, save the seek position so the retry resumes from the
+      // same point instead of restarting from t=0.
+      if(!_hlsRetryFired && !_stale()){
         _hlsRetryFired = true;
+        const _retrySeekPos = _isCatchupVOD && vid.currentTime > 2 ? vid.currentTime : null;
+        if(_retrySeekPos) alog('[HLS] Saving seek position '+_retrySeekPos.toFixed(1)+'s — will restore after retry','k');
         alog('[HLS] Fatal error — retrying with fresh HLS instance…','w');
         setNP('⟳ Stream hiccup — retrying: '+name+'…');
         if(hlsObj){hlsObj.destroy();hlsObj=null;}
         vid.pause(); vid.removeAttribute('src'); vid.load();
         setTimeout(()=>{
-          if(_playerStopped) return;
-          _playerStopped = false;
-          const _retryHls = new Hls(_HLS_CFG);
+          if(_stale()) return;
+          const _retryHls = new Hls(_activeCfg);   // reuse catchup or live config
           hlsObj = _retryHls;
           _retryHls.loadSource(px);
           _retryHls.attachMedia(vid);
-          _retryHls.on(Hls.Events.MANIFEST_PARSED,()=>vid.play().catch(()=>{}));
+          _retryHls.on(Hls.Events.MANIFEST_PARSED,()=>{
+            alog('[HLS] Retry manifest OK — playing','k');
+            if(_retrySeekPos !== null){
+              // startLoad(pos) tells HLS.js to request segments around the saved
+              // position rather than from the beginning of the playlist.
+              try{ _retryHls.startLoad(_retrySeekPos); }catch(e){}
+              try{ vid.currentTime = _retrySeekPos; }catch(e){}
+              alog('[HLS] Resumed at '+_retrySeekPos.toFixed(1)+'s after retry','k');
+            }
+            vid.play().catch(()=>{});
+          });
           _retryHls.on(Hls.Events.ERROR,(_,d2)=>{
+            const _det2=(d2.details||'').toLowerCase();
+            const _isMani2=_det2.includes('manifest');
+            if(d2.fatal || _isMani2) alog('[HLS] Retry: '+d2.type+': '+d2.details+(d2.fatal?' (fatal)':' (non-fatal)'),'e');
             if(!d2.fatal) return;
-            if(!_playerStopped && !window._remuxFired){
+            if(!_stale() && !window._remuxFired){
               window._remuxFired = true;
               if(hlsObj){hlsObj.destroy();hlsObj=null;}
               // Catchup/VOD: HLS failed (portal doesn't support timeshift.php) —
@@ -5772,16 +6358,28 @@ function doPlay(url, name, opts={}){
               if(!isLiveStream && fallbackUrl){
                 alog('[HLS] Retry also failed — falling back to .ts (catchup fallback)…','w');
                 setTimeout(()=>{
-                  if(_playerStopped) return;
+                  if(_stale()) return;
                   doPlay(fallbackUrl, name, {isLive:false, durationSecs:opts.durationSecs||0});
                 },1000);
+                return;
+              }
+              // RC3 FIX: When isLiveStream=false (catchup) and fallbackUrl=null,
+              // the primary .ts path already failed. Both HLS attempts just failed
+              // on the same timeshift.php URL. Falling through to ffmpeg remux
+              // would open an identical dead URL, hold a Flask thread for the
+              // duration of the connection attempt, and create a zombie mpegts
+              // player with no error handler — repeating the exact failure. Show
+              // a terminal error instead; there is no further fallback to try.
+              if(!isLiveStream && !fallbackUrl){
+                alog('[HLS] Catchup stream unavailable — all attempts exhausted','e');
+                setNP('\u2717 Catchup unavailable: '+name);
+                document.getElementById('ppbtn').textContent='\u25b6';
                 return;
               }
               alog('[HLS] Retry also failed — falling back to ffmpeg remux…','w');
               const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
               setTimeout(()=>{
-                if(_playerStopped) return;
-                _playerStopped = false;
+                if(_stale()) return;
                 setNP('▶ '+name+' [remux]');
                 if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
                   mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{
@@ -5789,6 +6387,14 @@ function doPlay(url, name, opts={}){
                     liveBufferLatencyMaxLatency:12,liveBufferLatencyMinRemain:3,
                   });
                   mpegtsObj.attachMediaElement(vid); mpegtsObj.load(); vid.play().catch(()=>{});
+                  // Error handler so remux failures surface cleanly instead of silently re-entering watchdog
+                  mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
+                    if(!_stale()){
+                      alog('[MPEGTS/remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
+                      setNP('✗ Stream unavailable: '+name);
+                      document.getElementById('ppbtn').textContent='▶';
+                    }
+                  });
                 } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
               },3000);
             }
@@ -5809,7 +6415,7 @@ function doPlay(url, name, opts={}){
 
   } else if(mpegtsOk){
     // ── Raw MPEG-TS via mpegts.js ──────────────────────────────
-    const isLiveStream = (opts.isLive !== false);
+    // isLiveStream is declared in the outer doPlay scope above (hoisted fix).
     // For catchup streams we know the exact duration from start/stop timestamps.
     // Passing it in the mediaDataSource lets mpegts.js set vid.duration via
     // MediaSource so the seek bar shows a real progress range instead of Infinity.
@@ -5858,14 +6464,13 @@ function doPlay(url, name, opts={}){
       // FormatUnsupported: content is not MPEG-TS at all (portal sent HLS/MP4 with play_token URL)
       // → try HLS.js on the original URL first; if that also fails, fall back to ffmpeg remux
       if(isFormatUnsupported){
-        if(!_playerStopped && !window._mseTranscodeFired){
+        if(!_stale() && !window._mseTranscodeFired){
           window._mseTranscodeFired = true;
           alog('[MPEGTS] FormatUnsupported — content may be HLS; retrying with HLS.js…','w');
           setTimeout(()=>{
-            if(_playerStopped) return;
+            if(_stale()) return;
             if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
             vid.pause(); vid.removeAttribute('src'); vid.load();
-            _playerStopped = false;
             const rawUrl = url; // original unproxied URL
             const pxUrl = rawUrl.startsWith('/api/') ? rawUrl : '/api/proxy?url='+encodeURIComponent(rawUrl);
             if(typeof Hls !== 'undefined' && Hls.isSupported()){
@@ -5887,19 +6492,26 @@ function doPlay(url, name, opts={}){
               hlsObj = new Hls(_fbCfg);
               hlsObj.loadSource(pxUrl);
               hlsObj.attachMedia(vid);
-              hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>vid.play().catch(()=>{}));
+              hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>{alog('[HLS fallback] Manifest OK — playing','k');vid.play().catch(()=>{});});
               hlsObj.on(Hls.Events.ERROR,(_,d)=>{
-                if(d.fatal && !_playerStopped && !window._remuxFired){
+                if(d.fatal && !_stale() && !window._remuxFired){
                   window._remuxFired = true;
                   alog('[HLS fallback] Failed — trying ffmpeg remux…','w');
                   if(hlsObj){hlsObj.destroy();hlsObj=null;}
                   const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(rawUrl);
                   setTimeout(()=>{
-                    if(_playerStopped) return;
+                    if(_stale()) return;
                     setNP('▶ '+name+' [remux]');
                     if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
                       mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{enableWorker:false});
                       mpegtsObj.attachMediaElement(vid); mpegtsObj.load(); vid.play().catch(()=>{});
+                      mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
+                        if(!_stale()){
+                          alog('[MPEGTS/remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
+                          setNP('✗ Stream unavailable: '+name);
+                          document.getElementById('ppbtn').textContent='▶';
+                        }
+                      });
                     } else { vid.src=remuxUrl; vid.play().catch(()=>{}); }
                   },3000);  // 3s grace period before ffmpeg connects
                 }
@@ -5914,16 +6526,17 @@ function doPlay(url, name, opts={}){
         return;
       }
       if(isMSEError){
-        if(!_playerStopped && !url.includes('transcode=1') && !window._mseTranscodeFired){
+        if(!_stale() && !url.includes('transcode=1') && !window._mseTranscodeFired){
           window._mseTranscodeFired = true; // guard: only fire once per play session
           alog('[MPEGTS] MSE codec error — re-encoding via ffmpeg (H.264)…','w');
           const transcodeUrl='/api/hls_proxy?transcode=1&url='+encodeURIComponent(url);
           // Defer to next tick — cannot safely destroy mpegts from within its own error callback
           setTimeout(()=>{
+          if(_stale()) return;
           if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
           vid.pause(); vid.removeAttribute('src'); vid.load();
-          _playerStopped = false;
           if(typeof mpegts!=='undefined' && mpegts.isSupported()){
+            alog('[MPEGTS/transcode] Starting HEVC→H.264 transcode…','k');
             setNP('▶ '+name+' [transcoding HEVC→H.264]');
             mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:transcodeUrl,cors:true},{
               enableWorker:false,
@@ -5935,7 +6548,7 @@ function doPlay(url, name, opts={}){
             mpegtsObj.load();
             vid.play().catch(()=>{});
             mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
-              if(!_playerStopped){
+              if(!_stale()){
                 alog('[MPEGTS/transcode] '+et2+': '+(ed2?.msg||JSON.stringify(ed2)),'e');
                 setNP('✗ Transcode failed — ffmpeg may not support this codec');
                 document.getElementById('ppbtn').textContent='▶';
@@ -5977,9 +6590,9 @@ function doPlay(url, name, opts={}){
         if(!window._ptRetries) window._ptRetries = {};
         const _rk = String(pIdx);
         window._ptRetries[_rk] = (window._ptRetries[_rk]||0)+1;
-        if(window._ptRetries[_rk] <= 2 && !_playerStopped){
+        if(window._ptRetries[_rk] <= 2 && !_stale()){
           alog('[MPEGTS] play_token failed (attempt '+window._ptRetries[_rk]+'/2) — re-resolving…','w');
-          if(pIdx>=0) setTimeout(()=>{ if(!_playerStopped) playItem(pIdx); },1000);
+          if(pIdx>=0) setTimeout(()=>{ if(!_stale()) playItem(pIdx); },1000);
         } else {
           alog('[MPEGTS] play_token failed after 2 retries — channel may be offline','e');
           setNP('✗ Stream unavailable: '+name);
@@ -5990,10 +6603,10 @@ function doPlay(url, name, opts={}){
         if(!window._mpegRetries) window._mpegRetries = {};
         const _mk = String(pIdx)+'|'+url.slice(-20);
         window._mpegRetries[_mk] = (window._mpegRetries[_mk]||0)+1;
-        if(window._mpegRetries[_mk] <= 3 && !_playerStopped){
+        if(window._mpegRetries[_mk] <= 3 && !_stale()){
           // Reconnect attempts — unload/load on same instance
-          setTimeout(()=>{ if(mpegtsObj && !_playerStopped){ mpegtsObj.unload(); mpegtsObj.load(); vid.play().catch(()=>{}); }},2000);
-        } else if(window._mpegRetries[_mk] === 4 && !_playerStopped && !window._remuxFired){
+          setTimeout(()=>{ if(mpegtsObj && !_stale()){ mpegtsObj.unload(); mpegtsObj.load(); vid.play().catch(()=>{}); }},2000);
+        } else if(window._mpegRetries[_mk] === 4 && !_stale() && !window._remuxFired){
           // 3 reconnects failed — do one full fresh-instance restart (same as HLS hiccup retry)
           // before giving up and going to ffmpeg remux. Portal may have dropped the session;
           // a brand-new mpegtsObj gets a clean TCP connection with no stale state.
@@ -6002,9 +6615,8 @@ function doPlay(url, name, opts={}){
           if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
           vid.pause(); vid.removeAttribute('src'); vid.load();
           setTimeout(()=>{
-            if(_playerStopped) return;
+            if(_stale()) return;
             alog('[MPEGTS] Fresh restart attempt…','w');
-            _playerStopped = false;
             mpegtsObj=mpegts.createPlayer({
               type:'mse', isLive:true, url:px, cors:true,
             },{
@@ -6018,7 +6630,7 @@ function doPlay(url, name, opts={}){
             vid.play().catch(()=>{});
             // If this also errors, _mpegRetries[_mk] will be 5 → falls to remux below
             mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2,ei2)=>{
-              if(!_playerStopped){
+              if(!_stale()){
                 alog('[MPEGTS] Fresh restart failed — escalating to remux…','w');
                 window._mpegRetries[_mk] = 99; // force past retry threshold on next tick
                 // Trigger the same handler logic by synthesising a network error event
@@ -6028,8 +6640,7 @@ function doPlay(url, name, opts={}){
                   window._remuxFired = true;
                   const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
                   setTimeout(()=>{
-                    if(_playerStopped) return;
-                    _playerStopped=false;
+                    if(_stale()) return;
                     setNP('▶ '+name+' [remux]');
                     mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{
                       enableWorker:false,liveBufferLatencyChasing:true,
@@ -6039,7 +6650,7 @@ function doPlay(url, name, opts={}){
                     mpegtsObj.load();
                     vid.play().catch(()=>{});
                     mpegtsObj.on(mpegts.Events.ERROR,(et3,ed3)=>{
-                      if(!_playerStopped){
+                      if(!_stale()){
                         alog('[MPEGTS/remux] '+(ed3?.msg||JSON.stringify(ed3)),'e');
                         setNP('✗ Stream unavailable: '+name);
                         document.getElementById('ppbtn').textContent='▶';
@@ -6050,7 +6661,7 @@ function doPlay(url, name, opts={}){
               }
             });
           }, 3000);  // 3s for portal to recover before fresh reconnect
-        } else if(!_playerStopped && !url.includes('hls_proxy') && !window._remuxFired){
+        } else if(!_stale() && !url.includes('hls_proxy') && !window._remuxFired){
           // All normal retries exhausted — try ffmpeg -c copy remux as last resort.
           // Handles container/mux issues that mpegts.js can't parse but ffmpeg can.
           // -c copy = no re-encode, near-zero CPU cost.
@@ -6058,10 +6669,9 @@ function doPlay(url, name, opts={}){
           alog('[MPEGTS] Retries exhausted \u2014 trying ffmpeg remux (-c copy)\u2026','w');
           const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
           setTimeout(()=>{
-            if(_playerStopped) return;
+            if(_stale()) return;
             if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
             vid.pause(); vid.removeAttribute('src'); vid.load();
-            _playerStopped=false;
             setNP('\u25b6 '+name+' [remux]');
             mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{
               enableWorker:false,liveBufferLatencyChasing:true,
@@ -6071,18 +6681,22 @@ function doPlay(url, name, opts={}){
             mpegtsObj.load();
             vid.play().catch(()=>{});
             mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
-              if(!_playerStopped){
+              if(!_stale()){
                 alog('[MPEGTS/remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
                 setNP('\u2717 Stream unavailable: '+name);
                 document.getElementById('ppbtn').textContent='\u25b6';
               }
             });
           },3000);  // 3s grace period — lets portal release the connection slot before ffmpeg connects
-        } else if(!_playerStopped){
-          alog('[MPEGTS] Stream failed after retries \u2014 channel may be offline','e');
+        } else if(!_stale()){
+          // ── BUG FIX: This was the infinite-loop branch. Previously it reset
+          // _mpegRetries[_mk]=0 and left mpegtsObj alive with its listener attached,
+          // causing the error event to re-fire → retry counter reset → infinite loop.
+          // Now we explicitly destroy the player and display a terminal error instead.
+          if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
+          alog('[MPEGTS] Stream failed after all retries \u2014 channel may be offline','e');
           setNP('\u2717 Stream unavailable: '+name);
           document.getElementById('ppbtn').textContent='\u25b6';
-          window._mpegRetries[_mk]=0;
         }
       } else if(!isLiveStream && fallbackUrl && et===mpegts.ErrorTypes.NETWORK_ERROR){
         // Catchup path-based .ts failed → try query-string format via HLS.js.
@@ -6100,10 +6714,9 @@ function doPlay(url, name, opts={}){
           alog('[MPEGTS] VOD network error — trying ffmpeg remux…','w');
           const remuxUrl='/api/hls_proxy?url='+encodeURIComponent(url);
           setTimeout(()=>{
-            if(_playerStopped) return;
+            if(_stale()) return;
             if(mpegtsObj){mpegtsObj.destroy();mpegtsObj=null;}
             vid.pause(); vid.removeAttribute('src'); vid.load();
-            _playerStopped=false;
             setNP('▶ '+name+' [remux]');
             if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
               mpegtsObj=mpegts.createPlayer({type:'mse',isLive:false,url:remuxUrl,cors:true},{
@@ -6113,7 +6726,7 @@ function doPlay(url, name, opts={}){
               mpegtsObj.load();
               vid.play().catch(()=>{});
               mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
-                if(!_playerStopped){
+                if(!_stale()){
                   alog('[MPEGTS/VOD remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
                   setNP('✗ Stream unavailable: '+name);
                   document.getElementById('ppbtn').textContent='▶';
@@ -6180,6 +6793,197 @@ function playerStop(){
 function playerPrev(){if(!filtItems.length)return; playItem(pIdx<=0?filtItems.length-1:pIdx-1);}
 function playerNext(){if(!filtItems.length)return; playItem(pIdx<0||pIdx>=filtItems.length-1?0:pIdx+1);}
 function setVol(v){document.getElementById('vlbl').textContent=v; vid.volume=v/100;}
+
+// ══════════════════════════════════════════════════════════════
+// VIDEO FILTERS
+// Applies CSS filter to #vid. Engine-agnostic — survives HLS/
+// mpegts/native-src transitions because vid itself is never
+// replaced, only its src is cleared.
+// ══════════════════════════════════════════════════════════════
+const _VF_DEFAULTS = {brightness:1, contrast:1, saturate:1, hue:0, grayscale:0, sepia:0};
+let _vidFilters = {..._VF_DEFAULTS};
+
+function _vfIsDefault(){
+  const d = _VF_DEFAULTS;
+  const f = _vidFilters;
+  return f.brightness===d.brightness && f.contrast===d.contrast &&
+         f.saturate===d.saturate && f.hue===d.hue &&
+         f.grayscale===d.grayscale && f.sepia===d.sepia;
+}
+
+function applyVidFilter(){
+  const f = _vidFilters;
+  const parts = [];
+  if(f.brightness !== 1)  parts.push('brightness('+f.brightness.toFixed(2)+')');
+  if(f.contrast   !== 1)  parts.push('contrast('+f.contrast.toFixed(2)+')');
+  if(f.saturate   !== 1)  parts.push('saturate('+f.saturate.toFixed(2)+')');
+  if(f.hue        !== 0)  parts.push('hue-rotate('+f.hue+'deg)');
+  if(f.grayscale  !== 0)  parts.push('grayscale('+f.grayscale.toFixed(2)+')');
+  if(f.sepia      !== 0)  parts.push('sepia('+f.sepia.toFixed(2)+')');
+  vid.style.filter = parts.length ? parts.join(' ') : 'none';
+}
+
+function _saveVfState(){
+  try{ localStorage.setItem('vid_filters', JSON.stringify(_vidFilters)); }catch(e){}
+}
+function _loadVfState(){
+  try{
+    const s = localStorage.getItem('vid_filters');
+    if(s) _vidFilters = {..._VF_DEFAULTS, ...JSON.parse(s)};
+  }catch(e){}
+}
+
+// ── Slider callbacks ──────────────────────────────────────────
+function onVfSlider(key, val, el){
+  _vidFilters[key] = val;
+  // Update display value
+  const disp = document.getElementById('vf-'+key+'-val');
+  if(disp){
+    if(key==='hue')             disp.textContent = val+'°';
+    else if(key==='grayscale'||key==='sepia') disp.textContent = Math.round(val*100)+'%';
+    else                        disp.textContent = val.toFixed(2);
+  }
+  applyVidFilter();
+  _saveVfState();
+}
+
+// ── Sync sliders → _vidFilters state (for loading profiles) ──
+function _syncVfSliders(){
+  const f = _vidFilters;
+  const set = (id, rawVal) => {
+    const el = document.getElementById(id);
+    if(el) el.value = rawVal;
+  };
+  set('vf-brightness', Math.round(f.brightness*100));
+  set('vf-contrast',   Math.round(f.contrast*100));
+  set('vf-saturate',   Math.round(f.saturate*100));
+  set('vf-hue',        f.hue);
+  set('vf-grayscale',  Math.round(f.grayscale*100));
+  set('vf-sepia',      Math.round(f.sepia*100));
+  // Display values
+  const d = (id, txt) => { const e=document.getElementById(id); if(e) e.textContent=txt; };
+  d('vf-brightness-val', f.brightness.toFixed(2));
+  d('vf-contrast-val',   f.contrast.toFixed(2));
+  d('vf-saturate-val',   f.saturate.toFixed(2));
+  d('vf-hue-val',        f.hue+'°');
+  d('vf-grayscale-val',  Math.round(f.grayscale*100)+'%');
+  d('vf-sepia-val',      Math.round(f.sepia*100)+'%');
+}
+
+// ── Reset ──────────────────────────────────────────────────────
+function resetVfDefaults(){
+  _vidFilters = {..._VF_DEFAULTS};
+  _syncVfSliders();
+  applyVidFilter();
+  _saveVfState();
+}
+
+// ── Profile save / load / delete ──────────────────────────────
+function _loadVfProfiles(){
+  try{ return JSON.parse(localStorage.getItem('vid_filter_profiles')||'[]'); }catch(e){ return []; }
+}
+function _saveVfProfiles(arr){
+  try{ localStorage.setItem('vid_filter_profiles', JSON.stringify(arr)); }catch(e){}
+}
+
+function saveVfProfile(){
+  const nameEl = document.getElementById('vf-profile-name');
+  const name = (nameEl ? nameEl.value.trim() : '') || 'Profile '+(Date.now()%10000);
+  if(!name){ toast('Enter a profile name','wrn'); return; }
+  const profiles = _loadVfProfiles();
+  // Replace if same name exists
+  const existing = profiles.findIndex(p => p.name===name);
+  const entry = {name, filters:{..._vidFilters}};
+  if(existing>=0) profiles[existing]=entry; else profiles.push(entry);
+  _saveVfProfiles(profiles);
+  if(nameEl) nameEl.value='';
+  _renderVfProfiles();
+  toast('✓ Filter profile "'+name+'" saved','ok');
+}
+
+function loadVfProfile(idx){
+  const profiles = _loadVfProfiles();
+  if(!profiles[idx]) return;
+  _vidFilters = {..._VF_DEFAULTS, ...profiles[idx].filters};
+  _syncVfSliders();
+  applyVidFilter();
+  _saveVfState();
+  toast('Filter profile "'+profiles[idx].name+'" applied','info');
+}
+
+function deleteVfProfile(idx, e){
+  e.stopPropagation();
+  const profiles = _loadVfProfiles();
+  if(!profiles[idx]) return;
+  const name = profiles[idx].name;
+  profiles.splice(idx,1);
+  _saveVfProfiles(profiles);
+  _renderVfProfiles();
+  toast('Deleted profile "'+name+'"','info');
+}
+
+function _renderVfProfiles(){
+  const list = document.getElementById('vf-profile-list');
+  if(!list) return;
+  const profiles = _loadVfProfiles();
+  if(!profiles.length){
+    list.innerHTML='<span style="font-size:11px;color:var(--txt3);padding:4px 0">No saved profiles yet.</span>';
+    return;
+  }
+  list.innerHTML = profiles.map((p,i)=>`
+    <div class="vf-pli" onclick="loadVfProfile(${i})" title="Apply '${p.name}'">
+      <span class="vf-pli-name">🎨 ${p.name}</span>
+      <span style="font-size:10px;color:var(--txt3);flex-shrink:0;margin-right:4px">
+        ${_vfProfileSummary(p.filters)}
+      </span>
+      <button class="vf-pli-del" onclick="deleteVfProfile(${i},event)" title="Delete">✕</button>
+    </div>`).join('');
+}
+
+function _vfProfileSummary(f){
+  const parts=[];
+  if(f.brightness!==1)  parts.push('B:'+f.brightness.toFixed(1));
+  if(f.contrast!==1)    parts.push('C:'+f.contrast.toFixed(1));
+  if(f.saturate!==1)    parts.push('S:'+f.saturate.toFixed(1));
+  if(f.hue!==0)         parts.push('H:'+f.hue+'°');
+  if(f.grayscale!==0)   parts.push('Grey:'+Math.round(f.grayscale*100)+'%');
+  if(f.sepia!==0)       parts.push('Sepia:'+Math.round(f.sepia*100)+'%');
+  return parts.length ? parts.join(' ') : 'Default';
+}
+
+// ── Tab switching ─────────────────────────────────────────────
+function switchVfTab(tab){
+  document.querySelectorAll('.vf-tab').forEach(b=>b.classList.toggle('active', b.dataset.tab===tab));
+  document.querySelectorAll('.vf-tabpanel').forEach(p=>p.classList.toggle('active', p.id==='vf-panel-'+tab));
+  if(tab==='profiles') _renderVfProfiles();
+}
+
+// ── Open / close ──────────────────────────────────────────────
+function openVfPanel(){
+  _syncVfSliders();
+  switchVfTab('filters'); // always open on sliders tab
+  document.getElementById('vf-overlay').classList.add('open');
+}
+function closeVfPanel(){
+  document.getElementById('vf-overlay').classList.remove('open');
+}
+function toggleVfPanel(){
+  const ov = document.getElementById('vf-overlay');
+  if(ov.classList.contains('open')) closeVfPanel();
+  else openVfPanel();
+}
+
+// ── Boot: restore persisted filter on page load ───────────────
+(function _vfBoot(){
+  _loadVfState();
+  // Apply immediately — vid element already exists at DOM-ready
+  if(document.readyState==='loading')
+    document.addEventListener('DOMContentLoaded', applyVidFilter);
+  else
+    applyVidFilter();
+})();
+
+
 function setNP(t){document.getElementById('np').textContent=t;}
 function togglePlayerControls(){
   const panel = document.getElementById('pctrl-panel');
@@ -6245,12 +7049,12 @@ async function openProfileModal(){
   if(!document.getElementById('cdot').classList.contains('on')) return;
   const modal = document.getElementById('profile-modal');
   const body  = document.getElementById('profile-modal-body');
-  body.innerHTML = '<span style="color:var(--txt3)">Loading…</span>';
+  body.innerHTML = '<span style="color:var(--txt3)">Loading\u2026</span>';
   modal.style.display = 'flex';
   try{
     const r = await fetch('/api/profile');
     const d = await r.json();
-    const row=(label,val,extra='')=>val?`<div style="display:flex;gap:8px;align-items:center;border-bottom:1px solid var(--bdr);padding-bottom:6px"><span style="color:var(--txt3);min-width:120px;flex-shrink:0;font-size:11px">${label}</span><span style="color:var(--txt);word-break:break-all;font-size:12px"${extra}>${val}</span></div>`:'';
+    const row=(label,val,extra='')=>val?`<div style="display:flex;gap:8px;align-items:flex-start;border-bottom:1px solid var(--bdr);padding-bottom:6px"><span style="color:var(--txt3);min-width:120px;flex-shrink:0;font-size:11px">${label}</span><span style="color:var(--txt);word-break:break-all;font-size:12px"${extra}>${val}</span></div>`:'';
     const typeBadge={stalker:'background:rgba(168,85,247,.15);color:#a855f7;border:1px solid rgba(168,85,247,.3)',mac:'background:rgba(59,130,246,.15);color:#3b82f6;border:1px solid rgba(59,130,246,.3)',xtream:'background:rgba(34,197,94,.15);color:#22c55e;border:1px solid rgba(34,197,94,.3)',m3u:'background:rgba(239,68,68,.15);color:#ef4444;border:1px solid rgba(239,68,68,.3)'};
     const typeLabel={stalker:'STALKER / MAG',mac:'MAC PORTAL',xtream:'XTREAM API',m3u:'M3U'};
     const tk=d.type==='stalker'?'stalker':d.type==='xtream'?'xtream':d.type==='m3u'?'m3u':'mac';
@@ -6264,31 +7068,84 @@ async function openProfileModal(){
     };
     const isMacAddr=v=>v&&/^([0-9a-f]{2}[:\-]){5}[0-9a-f]{2}$/i.test(v.trim());
     const pwdStyle=' style="font-family:monospace;letter-spacing:2px;color:var(--acc)"';
+    const _hostname=u=>{try{return new URL(u).hostname;}catch{return '';}};
+    // Async IP resolve placeholder rows
+    const ipPH=(id,label)=>`<div id="${id}" style="display:flex;gap:8px;align-items:center;border-bottom:1px solid var(--bdr);padding-bottom:6px"><span style="color:var(--txt3);min-width:120px;flex-shrink:0;font-size:11px">${label}</span><span style="color:var(--txt3);font-size:11px;font-style:italic">resolving\u2026</span></div>`;
+    const vpnPH=(id)=>`<div id="${id}"></div>`;
+
     let html=`<div style="margin-bottom:10px"><span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:4px;${badgeStyle}">${typeLabel[tk]||tk.toUpperCase()}</span></div>`;
     html+=row('Portal',d.portal_url);
+
     if(d.type==='stalker'){
       html+=row('MAC',d.mac);
       html+=row('Login',d.login);
       html+=row('Password',d.password,pwdStyle);
       html+=row(d.exp_label==='last_billing'?'Last Billing':'Expiry',d.exp);
       html+=d.status?`<div style="display:flex;gap:8px;align-items:center;border-bottom:1px solid var(--bdr);padding-bottom:6px"><span style="color:var(--txt3);min-width:120px;flex-shrink:0;font-size:11px">Status</span>${statusBadge(d.status)}</div>`:'';
-      html+=row('Active connections', d.active_cons||'');
-      html+=row('Max connections', d.max_conn && d.max_conn!=='–' ? d.max_conn : '');
+      html+=row('Active connections',d.active_cons||'');
+      html+=row('Max connections',d.max_conn&&d.max_conn!=='–'?d.max_conn:'');
       html+=row('Settings password',d.settings_password,pwdStyle);
-      html+=row('Adult password',d.adult_password,pwdStyle);
-    } else {
+      html+=row('Parent password',d.adult_password,pwdStyle);
+      if(d.timezone) html+=row('Timezone',d.timezone);
+      if(d.client_ip) html+=row('Client IP',`<code style="background:rgba(0,0,0,.25);padding:1px 5px;border-radius:3px;font-size:11px">${d.client_ip}</code>`);
+      if(d.storage_ips&&d.storage_ips.length) html+=row('Storage IP'+(d.storage_ips.length>1?'s':''),d.storage_ips.map(ip=>`<code style="background:rgba(0,0,0,.25);padding:1px 5px;border-radius:3px;font-size:11px;display:inline-block;margin-bottom:2px">${ip}</code>`).join('<br>'));
+      html+=ipPH('prof-ip-row','Server IP');
+      html+=vpnPH('prof-vpn-row');
+      if(d.comment)  html+=row('Comment',d.comment);
+    } else if(d.type==='mac'){
+      if(!isMacAddr(d.user)) html+=row('Username',d.user);
       html+=row('MAC',d.mac);
+      html+=row('Expiry',d.exp);
+      html+=row('Connections',d.active_cons!==undefined&&d.active_cons!==''&&d.max_conn?d.active_cons+' / '+d.max_conn:d.max_conn||d.active_cons);
+      html+=row('Settings password',d.settings_password,pwdStyle);
+      html+=row('Parent password',d.adult_password,pwdStyle);
+      if(d.timezone) html+=row('Timezone',d.timezone);
+      if(d.client_ip) html+=row('Client IP',`<code style="background:rgba(0,0,0,.25);padding:1px 5px;border-radius:3px;font-size:11px">${d.client_ip}</code>`);
+      if(d.storage_ips&&d.storage_ips.length) html+=row('Storage IP'+(d.storage_ips.length>1?'s':''),d.storage_ips.map(ip=>`<code style="background:rgba(0,0,0,.25);padding:1px 5px;border-radius:3px;font-size:11px;display:inline-block;margin-bottom:2px">${ip}</code>`).join('<br>'));
+      html+=ipPH('prof-ip-row','Server IP');
+      html+=vpnPH('prof-vpn-row');
+      if(d.comment)  html+=row('Comment',d.comment);
+    } else {
+      // xtream / m3u
       if(!isMacAddr(d.user)) html+=row('Username',d.user);
       html+=row('Expiry',d.exp);
-      html+=row('Connections', d.active_cons!==undefined&&d.active_cons!==''&&d.max_conn ? d.active_cons+' / '+d.max_conn : d.max_conn||d.active_cons);
-      if(d.type==='xtream'){
-        // password intentionally omitted from portal info display
-      } else {
-        html+=row('Settings password',d.settings_password,pwdStyle);
-        html+=row('Adult password',d.adult_password,pwdStyle);
-      }
+      html+=row('Connections',d.active_cons!==undefined&&d.active_cons!==''&&d.max_conn?d.active_cons+' / '+d.max_conn:d.max_conn||d.active_cons);
+      if(d.timezone) html+=row('Timezone',d.timezone);
+      html+=ipPH('prof-ip-row','Server IP');
+      html+=vpnPH('prof-vpn-row');
     }
+
     body.innerHTML = html || '<span style="color:var(--txt3)">No profile data available.</span>';
+
+    // ── Async: resolve portal hostname → IP + country ─────────────────────────
+    const _resolveAndFill=async(urlStr)=>{
+      const host=_hostname(urlStr);
+      if(!host) return;
+      try{
+        const geo=await(await fetch(`/api/resolve_ip?host=${encodeURIComponent(host)}`)).json();
+        const ip=geo.ip||'';
+        const country=geo.country||'';
+        const cc=geo.country_code||'';
+        const flagEmoji=cc?String.fromCodePoint(...[...cc.toUpperCase()].map(c=>0x1F1A5+c.charCodeAt(0))):'';
+        const ipEl=document.getElementById('prof-ip-row');
+        const vpnEl=document.getElementById('prof-vpn-row');
+        if(ipEl){
+          if(ip){
+            ipEl.innerHTML=`<span style="color:var(--txt3);min-width:120px;flex-shrink:0;font-size:11px">Server IP</span><span style="color:var(--txt);word-break:break-all;font-size:12px;display:flex;align-items:center;gap:6px"><code style="background:rgba(0,0,0,.25);padding:1px 5px;border-radius:3px;font-size:11px">${ip}</code>${country?`<span style="color:var(--txt3);font-size:11px">${flagEmoji} ${country}</span>`:''}</span>`;
+            if(vpnEl&&cc){
+              vpnEl.innerHTML=`<div style="display:flex;gap:8px;align-items:center;border-bottom:1px solid var(--bdr);padding-bottom:6px"><span style="color:var(--txt3);min-width:120px;flex-shrink:0;font-size:11px">Suggested VPN</span><span style="color:var(--txt);font-size:12px">${flagEmoji} ${country}</span></div>`;
+            }
+          } else {
+            ipEl.innerHTML=`<span style="color:var(--txt3);min-width:120px;flex-shrink:0;font-size:11px">Server IP</span><span style="color:var(--txt3);font-size:11px">unavailable</span>`;
+          }
+        }
+      }catch(e){
+        const el=document.getElementById('prof-ip-row');
+        if(el) el.innerHTML=`<span style="color:var(--txt3);min-width:120px;flex-shrink:0;font-size:11px">Server IP</span><span style="color:var(--txt3);font-size:11px">unavailable</span>`;
+      }
+    };
+    _resolveAndFill(d.portal_url);
+
   }catch(e){
     body.innerHTML = `<span style="color:var(--red)">Failed to load profile: ${e.message}</span>`;
   }
@@ -6696,10 +7553,6 @@ function _xpOpen_(m){
   document.getElementById('vod-expand-overlay').classList.add('open');
   _xpOpen = true;
   document.addEventListener('keydown', _xpKeyDown);
-  console.log('[XP] Overlay opened mode=' + m
-    + ' | lazy: native(loading=lazy) + IO-batch(' + _XP_BATCH + ' cards/render)'
-    + ' | initial-cat=' + initialCat);
-
   _xpLoadCats(initialCat);
 }
 window.openVodExpandOverlay    = () => _xpOpen_('vod');
@@ -6714,7 +7567,13 @@ function _xpClose(){
 }
 window.closeVodExpandOverlay = _xpClose;
 
-function _xpKeyDown(e){ if(e.key === 'Escape') _xpClose(); }
+function _xpKeyDown(e){
+  if(e.key !== 'Escape') return;
+  // Two-level Escape: close detail popup first, then the full overlay
+  const det = document.getElementById('vod-expand-detail');
+  if(det && det.classList.contains('visible')){ _xpCloseDetail(); }
+  else { _xpClose(); }
+}
 
 // ── Mode switch (from header tabs) ────────────────────────────────────────
 window._xpSwitchMode = function(m){
@@ -6893,7 +7752,6 @@ async function _xpLoadItems(catId, _forceAll){
     let items = [];
     if(_xpItemsCache[cacheKey]){
       items = _xpItemsCache[cacheKey];
-      console.log('[XP] Cache hit: ' + cacheKey + ' (' + items.length + ' items)');
     } else if(catId !== '__all__'
         && typeof mode !== 'undefined' && mode === _xpMode
         && typeof curCat !== 'undefined' && curCat
@@ -7038,39 +7896,18 @@ window._xpCardClick = function(i){
   _xpRenderDetail(it, i);
 };
 
+// ── Close just the detail modal (backdrop click or × button) ─────────────
+window._xpCloseDetail = function(){
+  document.getElementById('vod-expand-detail').classList.remove('visible');
+  document.getElementById('vod-expand-detail-inner').innerHTML = '';
+  document.querySelectorAll('#vod-expand-grid-view .xp-card').forEach(c =>
+    c.classList.remove('active')
+  );
+  _xpDetailItem = null; _xpDetailIdx = -1;
+};
+
 // ── Detail panel ──────────────────────────────────────────────────────────
 function _xpRenderDetail(it, idx){
-  // ── Dev: log raw portal item — rating/logo fields inspectable in console ──
-  (function(){
-    const _n = it.name || it.o_name || it.fname || '?';
-    console.group('%c[XP Detail] ' + _n, 'color:#7c3aed;font-weight:700');
-    console.log('RAW item:', Object.assign({}, it));
-    console.log('LOGO fields →',
-      'logo:', it.logo||'\u2014',
-      '| stream_icon:', it.stream_icon||'\u2014',
-      '| cover:', it.cover||'\u2014',
-      '| screenshot_uri:', it.screenshot_uri||'\u2014',
-      '| pic:', it.pic||'\u2014',
-      '| backdrop_path:', it.backdrop_path||'\u2014'
-    );
-    console.log('RATING fields →',
-      'rating_imdb:', it.rating_imdb !== undefined ? JSON.stringify(it.rating_imdb) : '(absent)',
-      '| rating_kp:', it.rating_kinopoisk !== undefined ? JSON.stringify(it.rating_kinopoisk) : '(absent)',
-      '| rating:', it.rating !== undefined ? JSON.stringify(it.rating) : '(absent)',
-      '| rating_5based:', it.rating_5based !== undefined ? JSON.stringify(it.rating_5based) : '(absent)',
-      '| movie_rating:', it.movie_rating !== undefined ? JSON.stringify(it.movie_rating) : '(absent)'
-    );
-    const _plt = it.plot || it.description || '';
-    console.log('META →',
-      'plot/desc:', _plt ? '"'+_plt.substring(0,80)+(_plt.length>80?'…':'')+'"' : '(none)',
-      '| year:', it.year||it.releaseDate||'—',
-      '| genres_str:', it.genres_str||'—',
-      '| age:', it.age||'—',
-      '| director:', it.director||'—',
-      '| tmdb_id:', it.tmdb_id||it.tmdb||'—'
-    );
-    console.groupEnd();
-  })();
   const inner    = document.getElementById('vod-expand-detail-inner');
   const isSeries = (_xpMode === 'series');
   const ph       = isSeries ? '\u{1F4FA}' : '\u{1F3AC}';
@@ -7157,22 +7994,42 @@ function _xpRenderDetail(it, idx){
     : '<div class="xp-detail-poster-ph">' + ph + '</div>';
 
   inner.innerHTML =
-    '<div>' + bdHtml + '</div>'
-    + '<div class="xp-detail-poster-row">' + posterHtml
-    +   '<div class="xp-detail-title-block">'
-    +     '<div class="xp-detail-title">' + _xpe(name) + '</div>'
+    // × close button (absolute top-right; repositions to top-left ← on mobile via CSS)
+    '<button class="xp-modal-close" onclick="_xpCloseDetail()" title="Close">'
+    + '<span class="xp-close-x">&#x2715;</span>'
+    + '<span class="xp-close-back">&#x2190;</span>'
+    + '</button>'
+    // Two-column layout
+    + '<div class="xp-modal-layout">'
+    // ── LEFT: poster column with blurred bg ──────────────────────────────
+    +   '<div class="xp-modal-poster-col">'
+    +     ((bdsrc || lsrc)
+          ? '<div class="xp-modal-poster-bg" style="background-image:url('
+            + (bdsrc || lsrc) + ')"></div>'
+          : '')
+    +     (lsrc
+          ? '<img class="xp-modal-poster-img" src="' + lsrc
+            + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'">'
+            + '<div class="xp-modal-poster-ph" style="display:none">' + ph + '</div>'
+          : '<div class="xp-modal-poster-ph">' + ph + '</div>')
+    +   '</div>'
+    // ── RIGHT: scrollable info column ────────────────────────────────────
+    +   '<div class="xp-modal-info-col">'
+    +     '<div class="xp-modal-title">' + _xpe(name) + '</div>'
     +     '<div class="xp-detail-badges">' + badges + '</div>'
-    +   '</div></div>'
-    + '<div class="xp-detail-actions">' + actionBtn + '</div>'
-    + '<div class="xp-detail-ext-links">'
-    +   '<a class="xp-ext-btn" href="javascript:void(0)" onclick="_xpOpenIMDB(' + idx + ')">'
-    +   '\u{1F517} IMDB / TMDB</a></div>'
-    + '<div class="xp-detail-body">'
-    +   plotHtml
-    +   ((dirHtml || castHtml)
-       ? '<div class="xp-detail-meta-row">' + dirHtml + castHtml + '</div>' : '')
-    + '</div>'
-    + '<div class="xp-seasons" id="xp-seasons-wrap"></div>';
+    +     (actionBtn ? '<div class="xp-detail-actions">' + actionBtn + '</div>' : '')
+    +     '<div class="xp-detail-ext-links">'
+    +       '<a class="xp-ext-btn" href="javascript:void(0)" onclick="_xpOpenIMDB(' + idx + ')">'
+    +       '\u{1F517} IMDB / TMDB</a>'
+    +     '</div>'
+    +     '<div class="xp-detail-body">'
+    +       plotHtml
+    +       ((dirHtml || castHtml)
+           ? '<div class="xp-detail-meta-row">' + dirHtml + castHtml + '</div>' : '')
+    +     '</div>'
+    +     '<div class="xp-seasons" id="xp-seasons-wrap"></div>'
+    +   '</div>'
+    + '</div>';
 
   if(isGroup && it._episodes && it._episodes.length){
     _xpSeasonOpen = {};
