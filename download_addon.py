@@ -853,6 +853,7 @@ def register_download_routes(flask_app, state, run_async, run_worker, _make_clie
 
     _register_dl_ui_route(flask_app)
     _register_dlm_routes(flask_app, state)
+    state.log("[DL] Routes registered: /api/download/*  /api/record/*  /api/dlm/*")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2176,9 +2177,19 @@ function startLog(){
     if(msg==='Connected to log stream') return;
     let c='';
     if(msg.includes('[STATUS]')){c='s'; setStatus(msg.replace(/\[STATUS\]\s*/,''));}
-    else if(/✓|success|saved|Done/i.test(msg)) c='k';
+    // Raw portal response dumps (from _read_json in all client types) — blue.
+    // Checked before error/success so JSON payloads containing those words
+    // inside the response body don't bleed into the wrong color class.
+    else if(/ raw[\s:(]/.test(msg)) c='i';
+    // Success milestones: ✓ lines, explicit "Auth OK", "Token acquired/refreshed".
+    else if(/✓|success|saved|Done|token (?:acquired|refreshed)|Auth OK/i.test(msg)) c='k';
+    // ⚠ is an explicit warning marker — checked before the red pattern so that
+    // exception class names like LookupError / RuntimeError in the same line
+    // don't accidentally trigger red instead of orange.
+    else if(/⚠/.test(msg)) c='w';
     else if(/✗|error|failed|ERROR/i.test(msg)) c='e';
-    else if(/warn|⚠/i.test(msg)) c='w';
+    // Remaining warning patterns (no ⚠ marker but clearly warning-level events).
+    else if(/warn|\b429\b|backing off|\brejected\b|retrying with|returned empty/i.test(msg)) c='w';
     else if(/\[MKV\]|\[SERIES\]|\[REC\]/i.test(msg)) c='m';
     else if(/▶|Playing/i.test(msg)) c='i';
     alog(msg.replace(/\[STATUS\]\s*/,'').trim(),c);
