@@ -51,9 +51,12 @@ No HTML/JS changes required — all proxy routes are called via existing fetch()
 calls in the main template.
 """
 
+import math
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from urllib.parse import urlparse, quote
@@ -398,7 +401,7 @@ def register_proxy_routes(flask_app, state):
                     return Response(data, status=200, headers=hdrs)
                 elif resp.status_code == 403:
                     if _record_host_403(_host):
-                        state.log(f"[Proxy] {_HOTLINK_403_THRESHOLD}x 403 from {_host} — future image requests will skip fetch")
+                        state.log(f"[PROXY] ⚠ {_HOTLINK_403_THRESHOLD}x 403 from {_host} — future image requests will skip fetch")
                     hdrs = dict(cors)
                     hdrs["Content-Type"]  = "image/png"
                     hdrs["Cache-Control"] = "public, max-age=3600"
@@ -412,9 +415,9 @@ def register_proxy_routes(flask_app, state):
                     if is_img_url and resp.status_code == 404:
                         crossed = _record_host_404(_host)
                         if crossed:
-                            state.log(f"[Proxy] 404 x{_HOST_404_THRESHOLD} for {_host} — silencing future logo 404s")
+                            state.log(f"[PROXY] ⚠ 404 x{_HOST_404_THRESHOLD} for {_host} — silencing future logo 404s")
                         elif _HOST_404_COUNTS.get(_host, 0) <= _HOST_404_THRESHOLD:
-                            state.log(f"[Proxy] HTTP {resp.status_code} ← {url[:120]}")
+                            state.log(f"[PROXY] HTTP {resp.status_code} ← {url[:120]}")
                         # return transparent PNG silently once blocked
                         hdrs = dict(cors)
                         hdrs["Content-Type"]  = "image/png"
@@ -422,7 +425,7 @@ def register_proxy_routes(flask_app, state):
                         return Response(_TRANSPARENT_PNG, status=200, headers=hdrs)
                     elif (_DNS_FAIL_COUNTS.get(_host, 0) < 2 and
                             _HOTLINK_403_COUNTS.get(_host, 0) < 2):
-                        state.log(f"[Proxy] HTTP {resp.status_code} ← {url[:120]}")
+                        state.log(f"[PROXY] HTTP {resp.status_code} ← {url[:120]}")
                     hdrs = dict(cors)
                     hdrs["Content-Type"]  = "image/png"
                     hdrs["Cache-Control"] = "public, max-age=3600"
@@ -433,7 +436,14 @@ def register_proxy_routes(flask_app, state):
                 try:
                     for chunk in resp.iter_content(chunk_size=16384):
                         yield chunk
+                except GeneratorExit:
+                    # Client disconnected — explicitly close the upstream connection
+                    # so the requests socket is returned to the pool immediately
+                    # rather than waiting for GC.
+                    resp.close()
+                    return
                 except Exception:
+                    resp.close()
                     return
 
             h = dict(cors)
@@ -443,27 +453,27 @@ def register_proxy_routes(flask_app, state):
             if "Content-Range" in resp.headers:
                 h["Content-Range"] = resp.headers["Content-Range"]
             if resp.status_code not in (200, 206):
-                state.log(f"[Proxy] HTTP {resp.status_code} ← {url[:120]}")
+                state.log(f"[PROXY] HTTP {resp.status_code} ← {url[:120]}")
             return Response(stream_with_context(_gen()), status=resp.status_code, headers=h)
 
         except Exception as e:
             if _is_dns_fail(e):
                 crossed = _record_host_dns_fail(_host)
                 if crossed:
-                    state.log(f"[Proxy] DNS failure {_DNS_FAIL_THRESHOLD}x for {_host} — silencing future logo requests")
+                    state.log(f"[PROXY] ⚠ DNS failure {_DNS_FAIL_THRESHOLD}x for {_host} — silencing future logo requests")
                 elif _DNS_FAIL_COUNTS.get(_host, 0) < _DNS_FAIL_THRESHOLD:
-                    state.log(f"[Proxy] Error: {e} ← {url[:120]}")
+                    state.log(f"[PROXY] ✗ Error: {e} ← {url[:120]}")
             elif _is_connect_timeout(e):
                 crossed = _record_host_timeout(_host)
                 if crossed:
-                    state.log(f"[Proxy] ConnectTimeout {_TIMEOUT_THRESHOLD}x for {_host} — silencing future logo requests")
+                    state.log(f"[PROXY] ⚠ ConnectTimeout {_TIMEOUT_THRESHOLD}x for {_host} — silencing future logo requests")
                 elif _TIMEOUT_COUNTS.get(_host, 0) < _TIMEOUT_THRESHOLD:
-                    state.log(f"[Proxy] Logo fetch error ({type(e).__name__}) ← {url[:120]}")
+                    state.log(f"[PROXY] ✗ Logo fetch error ({type(e).__name__}) ← {url[:120]}")
             elif is_img_url:
                 if _DNS_FAIL_COUNTS.get(_host, 0) < 1 and _HOTLINK_403_COUNTS.get(_host, 0) < 1:
-                    state.log(f"[Proxy] Logo fetch error ({type(e).__name__}) ← {url[:120]}")
+                    state.log(f"[PROXY] ✗ Logo fetch error ({type(e).__name__}) ← {url[:120]}")
             else:
-                state.log(f"[Proxy] Error: {e} ← {url[:120]}")
+                state.log(f"[PROXY] ✗ Error: {e} ← {url[:120]}")
             if is_img_url:
                 hdrs = dict(cors)
                 hdrs["Content-Type"]  = "image/png"
@@ -535,6 +545,15 @@ def register_proxy_routes(flask_app, state):
         transcode   = request.args.get("transcode",   "0") == "1"
         audio_only  = request.args.get("audio_only",  "0") == "1" and not transcode
         is_vod      = request.args.get("vod",         "0") == "1"
+        # err_recover=1 + seek_secs=N: catchup recovery path — the watchdog
+        # detected a bad TS region (sync_byte≠0x47) that mpegts.js cannot skip.
+        # ffmpeg is more resilient: -err_detect ignore_err silently discards
+        # corrupt packets and -ss N starts output from approximately the last
+        # known good playback position, so playback resumes mid-stream rather
+        # than from the beginning.
+        err_recover = request.args.get("err_recover",  "0") == "1"
+        _ss_raw     = request.args.get("seek_secs", "").strip()
+        seek_secs   = int(_ss_raw) if _ss_raw.isdigit() else None
         # audio_track=N selects a specific audio stream by zero-based index.
         # When absent or invalid, ffmpeg falls back to its default (first/best stream).
         _at = request.args.get("audio_track", "").strip()
@@ -551,8 +570,19 @@ def register_proxy_routes(flask_app, state):
             "-reconnect_delay_max", "10",
             "-thread_queue_size", "512",
             "-fflags", "+genpts+igndts+discardcorrupt",
-            "-i", url,
+            # Silently discard corrupted TS packets (bad sync bytes, incomplete PES,
+            # splice-point glitches in catchup recordings) instead of aborting.
+            # This is the input-side complement to +discardcorrupt above.
+            "-err_detect", "ignore_err",
         ]
+        # seek_secs: catchup recovery path — watchdog detected an unrecoverable
+        # bad TS region and requests ffmpeg to resume from a known-good position.
+        # -ss before -i performs a fast input seek (keyframe-accurate, no decode
+        # cost) rather than the slow output seek that would come after -i.
+        if seek_secs is not None:
+            base_input += ["-ss", str(seek_secs)]
+            state.log(f"[ffmpeg/hls_proxy] err_recover seek to {seek_secs}s")
+        base_input += ["-i", url]
 
         # Build -map args when a specific audio track is requested.
         # -map 0:v:0        — first video stream
@@ -589,7 +619,7 @@ def register_proxy_routes(flask_app, state):
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except Exception as e:
-            state.log(f"[ffmpeg/{mode_str}] Failed to start: {e}")
+            state.log(f"[ffmpeg/{mode_str}] ✗ Failed to start: {e}")
             return Response(f"ffmpeg start error: {e}", status=502)
 
         stderr_lines = []
@@ -627,10 +657,10 @@ def register_proxy_routes(flask_app, state):
                         elif "conversion failed" in low or "cannot" in low:
                             state.log(f"[ffmpeg/{mode_str}] FAIL: {line[:120]}")
             except Exception as e:
-                state.log(f"[ffmpeg/{mode_str}] stderr thread error: {e}")
+                state.log(f"[ffmpeg/{mode_str}] ✗ stderr thread error: {e}")
 
         threading.Thread(target=_log_stderr, daemon=True).start()
-        state.log(f"[ffmpeg/{mode_str}] Started PID {proc.pid}: {url[:60]}...")
+        state.log(f"[ffmpeg/{mode_str}] ✓ Started PID {proc.pid}: {url[:60]}...")
 
         def _gen():
             chunk_count   = 0
@@ -642,14 +672,14 @@ def register_proxy_routes(flask_app, state):
                         if chunk_count == 0:
                             time.sleep(0.5)
                             if stderr_lines:
-                                state.log(f"[ffmpeg/{mode_str}] No output. Last error: {stderr_lines[-1][:100]}")
+                                state.log(f"[ffmpeg/{mode_str}] ✗ No output. Last error: {stderr_lines[-1][:100]}")
                         break
                     chunk_count += 1
                     yield chunk
             except GeneratorExit:
                 killed_by_us = True
             except Exception as e:
-                state.log(f"[ffmpeg/{mode_str}] Generator error: {e}")
+                state.log(f"[ffmpeg/{mode_str}] ✗ Generator error: {e}")
             finally:
                 _proc_killed[0] = True
                 proc.kill()
@@ -660,7 +690,7 @@ def register_proxy_routes(flask_app, state):
                 elif rc == 0:
                     state.log(f"[ffmpeg/{mode_str}] Finished cleanly after {chunk_count} chunks")
                 else:
-                    state.log(f"[ffmpeg/{mode_str}] Exited with error (exit code {rc}) after {chunk_count} chunks"
+                    state.log(f"[ffmpeg/{mode_str}] ✗ Exited with error (exit code {rc}) after {chunk_count} chunks"
                               + (f" — last stderr: {stderr_lines[-1][:120]}" if stderr_lines else ""))
 
         h = dict(cors)
@@ -668,3 +698,224 @@ def register_proxy_routes(flask_app, state):
         h["Cache-Control"] = "no-cache, no-store, must-revalidate"
         h["Pragma"]        = "no-cache"
         return Response(stream_with_context(_gen()), status=200, headers=h)
+
+    # ── /api/catchup/stream  +  /api/catchup/seg/<sid>/<seg> ─────────────────
+    # HLS-VOD proxy for Xtream timeshift/.ts catchup streams.
+    # Lives in proxy_addon because it is the same category as /api/hls_proxy:
+    # ffmpeg-driven, background-process managed, stream-serving.  Shares
+    # _FFMPEG_PATH, _FFMPEG_AVAILABLE, state.stream_ua and state.log() without
+    # any extra wiring.
+    #
+    # What it fixes vs. playing raw MPEG-TS directly in the browser:
+    #   1. Seek bar  — pre-declared #EXT-X-PLAYLIST-TYPE:VOD playlist with the
+    #      full segment list + #EXT-X-ENDLIST on first response, so HLS.js
+    #      renders the complete duration immediately.
+    #   2. sync_byte errors — ffmpeg normalises TS misalignment that crashes
+    #      mpegts.js and restarts playback from byte 0.
+    #   3. No restart-from-zero — each HLS segment is independent; a stall or
+    #      seek never reloads the whole stream.
+
+    _catchup_sessions: dict = {}        # sid → {proc, dir, ts}
+    _catchup_lock = threading.Lock()
+    _CATCHUP_SEG_SECS = 6               # target HLS segment duration (seconds)
+
+    def _catchup_cleanup():
+        """Daemon thread: evict temp dirs and kill ffmpeg for sessions idle > 2 h."""
+        while True:
+            time.sleep(300)
+            _now = time.time()
+            with _catchup_lock:
+                _dead = [s for s, i in _catchup_sessions.items()
+                         if _now - i.get('ts', 0) > 7200]
+            for s in _dead:
+                with _catchup_lock:
+                    info = _catchup_sessions.pop(s, {})
+                proc = info.get('proc')
+                if proc and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                d = info.get('dir')
+                if d and os.path.isdir(d):
+                    try:
+                        shutil.rmtree(d, ignore_errors=True)
+                    except Exception:
+                        pass
+
+    threading.Thread(target=_catchup_cleanup, daemon=True,
+                     name='catchup-cleanup').start()
+
+    @flask_app.route('/api/catchup/stream')
+    def api_catchup_stream():
+        """
+        Start an ffmpeg HLS-VOD remux session for a catchup/timeshift stream
+        and return a pre-built #EXT-X-PLAYLIST-TYPE:VOD m3u8 immediately.
+
+        Query params:
+            url      – raw Xtream timeshift URL (.ts path or timeshift.php)
+            duration – programme length in seconds  (integer > 0)
+            sid      – caller-generated session ID  (alphanumeric ≤ 32 chars)
+        """
+        # cors is a local in each sibling route handler, not a closure variable —
+        # define it explicitly here.
+        cors = _CORS_HEADERS
+
+        raw_url = request.args.get('url', '').strip()
+        sid     = request.args.get('sid', '').strip()
+        try:
+            duration = int(request.args.get('duration', 0))
+        except (ValueError, TypeError):
+            duration = 0
+
+        if not raw_url or not sid or duration <= 0:
+            return Response('url, sid, and duration > 0 are required', status=400,
+                            headers=cors)
+
+        sid = re.sub(r'[^a-zA-Z0-9_-]', '', sid)[:32]
+        if not sid:
+            return Response('Invalid sid', status=400, headers=cors)
+
+        if not _FFMPEG_AVAILABLE:
+            return Response('ffmpeg not available', status=503, headers=cors)
+
+        tmp_dir  = os.path.join(tempfile.gettempdir(), f'catchup_{sid}')
+        playlist = os.path.join(tmp_dir, 'stream.m3u8')
+
+        with _catchup_lock:
+            _already = sid in _catchup_sessions
+
+        if not _already:
+            os.makedirs(tmp_dir, exist_ok=True)
+            seg_pat  = os.path.join(tmp_dir, 'seg_%05d.ts')
+            _referer = raw_url.rsplit('/', 1)[0] + '/'
+
+            # Mirror hls_proxy's robust input flags:
+            #   -user_agent / -referer          portals that gate on these headers
+            #   -reconnect / -reconnect_streamed survive brief server hiccups
+            #   -fflags +genpts+igndts+discardcorrupt  tolerate TS timestamp glitches
+            #   -err_detect ignore_err           discard corrupt packets (sync_byte fix)
+            #   -t <duration>                    cap output at known programme length
+            cmd = [
+                _FFMPEG_PATH, '-y',
+                '-user_agent',          state.stream_ua,
+                '-referer',             _referer,
+                '-reconnect',           '1',
+                '-reconnect_streamed',  '1',
+                '-reconnect_delay_max', '10',
+                '-fflags',              '+genpts+igndts+discardcorrupt',
+                '-err_detect',          'ignore_err',
+                '-t',                   str(int(duration)),
+                '-i',                   raw_url,
+                '-c', 'copy',
+                '-f', 'hls',
+                '-hls_time',              str(_CATCHUP_SEG_SECS),
+                '-hls_list_size',         '0',
+                '-hls_flags',             'independent_segments',
+                '-hls_segment_type',      'mpegts',
+                '-hls_segment_filename',  seg_pat,
+                playlist,
+            ]
+            try:
+                proc = subprocess.Popen(cmd,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+            except Exception as exc:
+                state.log(f'[CATCHUP/HLS] ✗ ffmpeg launch failed: {exc}')
+                return Response(f'ffmpeg launch failed: {exc}', status=500,
+                                headers=cors)
+
+            with _catchup_lock:
+                _catchup_sessions[sid] = {
+                    'proc': proc, 'dir': tmp_dir, 'ts': time.time()
+                }
+            state.log(f'[CATCHUP/HLS] Started PID {proc.pid} — '
+                      f'{duration}s → {tmp_dir}  ({raw_url[:60]}…)')
+
+            # Wait up to 12 s for the first segment so the client doesn't get
+            # an immediate 503 on its very first segment request.
+            deadline = time.time() + 12
+            while time.time() < deadline:
+                if os.path.exists(os.path.join(tmp_dir, 'seg_00000.ts')):
+                    break
+                time.sleep(0.25)
+
+        # Build the pre-declared VOD playlist from the known duration.
+        n_segs   = math.ceil(duration / _CATCHUP_SEG_SECS)
+        last_dur = duration - (_CATCHUP_SEG_SECS * (n_segs - 1))
+        base_url = f'/api/catchup/seg/{sid}'
+
+        lines = [
+            '#EXTM3U',
+            '#EXT-X-VERSION:3',
+            f'#EXT-X-TARGETDURATION:{_CATCHUP_SEG_SECS + 1}',
+            '#EXT-X-PLAYLIST-TYPE:VOD',
+            '#EXT-X-MEDIA-SEQUENCE:0',
+        ]
+        for i in range(n_segs):
+            seg_dur = last_dur if i == n_segs - 1 else _CATCHUP_SEG_SECS
+            lines.append(f'#EXTINF:{float(seg_dur):.3f},')
+            lines.append(f'{base_url}/seg_{i:05d}.ts')
+        lines.append('#EXT-X-ENDLIST')
+
+        h = dict(cors)
+        h['Content-Type'] = 'application/vnd.apple.mpegurl'
+        h['Cache-Control'] = 'no-cache, no-store'
+        return Response('\n'.join(lines) + '\n', status=200, headers=h)
+
+    @flask_app.route('/api/catchup/seg/<sid>/<seg>')
+    def api_catchup_segment(sid, seg):
+        """
+        Serve a single HLS segment from an active catchup session.
+        Polls up to 60 s while ffmpeg writes it; returns 503 + Retry-After: 3
+        so HLS.js retries rather than escalating to a fatal error.
+        """
+        # Same reason as above — cors is not a closure variable here.
+        cors = _CORS_HEADERS
+
+        sid = re.sub(r'[^a-zA-Z0-9_-]', '', sid)[:32]
+        seg = re.sub(r'[^a-zA-Z0-9_.]', '', seg)
+        if not sid or not seg or not seg.endswith('.ts'):
+            return Response('Bad request', status=400, headers=cors)
+
+        with _catchup_lock:
+            info = _catchup_sessions.get(sid)
+        if info is None:
+            return Response('Session not found', status=404, headers=cors)
+
+        seg_path = os.path.join(info['dir'], seg)
+        proc     = info.get('proc')
+
+        deadline = time.time() + 60
+        while not os.path.exists(seg_path):
+            if proc and proc.poll() is not None:
+                break
+            if time.time() >= deadline:
+                h = dict(cors)
+                h['Retry-After'] = '3'
+                return Response('Segment not ready', status=503, headers=h)
+            time.sleep(0.25)
+
+        if not os.path.exists(seg_path):
+            return Response('Segment not found', status=404, headers=cors)
+
+        with _catchup_lock:
+            if sid in _catchup_sessions:
+                _catchup_sessions[sid]['ts'] = time.time()
+
+        def _gen():
+            with open(seg_path, 'rb') as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+
+        h = dict(cors)
+        h['Content-Type']  = 'video/mp2t'
+        h['Cache-Control'] = 'max-age=3600'
+        return Response(stream_with_context(_gen()), status=200, headers=h)
+    # ── End catchup HLS-VOD proxy ─────────────────────────────────────────────
+
+    state.log("[PROXY] Routes registered: /api/proxy  /api/video_proxy  /api/hls_proxy"
+              "  /api/catchup/stream  /api/catchup/seg")
