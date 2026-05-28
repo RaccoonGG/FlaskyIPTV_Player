@@ -85,7 +85,7 @@ import aiohttp
 from flask import request, jsonify, Response
 
 from portal_clients import (
-    PortalClient, StalkerPortalClient, XtreamClient,
+    PortalClient,
     normalize_base_url, safe_json, normalize_js,
 )
 
@@ -264,45 +264,17 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                     _timeout = aiohttp.ClientTimeout(total=30, connect=10)
 
                     async def _ensure_token():
-                        """Return cached headers, acquiring token if needed.
-                        For stalker portals: tokens are short-lived and invalidated
-                        under concurrent load — skip the cache entirely and always
-                        do a fresh handshake per request to avoid Authorization failures.
-                        For plain MAC portals: token is stable, so cache and reuse.
+                        """Return portal auth headers from the persistent PortalSessionManager.
+                        If portal_mgr is not yet available (e.g. M3U connection), return empty dict.
+                        401/403 recovery is handled by _with_auth_retry() on the persistent client.
                         """
-                        loop = asyncio.get_event_loop()
-                        def _sync_ensure():
+                        mgr = getattr(state, "portal_mgr", None)
+                        if mgr is not None and mgr.client is not None:
+                            client = mgr.client
                             if state.is_stalker_portal:
-                                # Always fresh handshake for stalker — no caching
-                                _cl = StalkerPortalClient(state.url, state.mac, state.log)
-                                _loop2 = asyncio.new_event_loop()
-                                try:
-                                    async def _do_hs():
-                                        async with _cl:
-                                            await _cl.handshake()
-                                            return _cl._headers(include_auth=True)
-                                    return _loop2.run_until_complete(_do_hs())
-                                finally:
-                                    _loop2.close()
-                            else:
-                                with state._mac_epg_token_lock:
-                                    if state._mac_epg_token:
-                                        return dict(state._mac_epg_headers)
-                                    _cl = PortalClient(state.url, state.mac, state.log)
-                                    _loop2 = asyncio.new_event_loop()
-                                    try:
-                                        async def _do_hs():
-                                            async with _cl:
-                                                await _cl.handshake()
-                                                return _cl.token, dict(_cl.headers)
-                                        _tok, _hdrs = _loop2.run_until_complete(_do_hs())
-                                    finally:
-                                        _loop2.close()
-                                    state._mac_epg_token = _tok
-                                    state._mac_epg_headers = _hdrs
-                                    state.log("[EPG] MAC token acquired and cached for reuse")
-                                    return dict(_hdrs)
-                        return await loop.run_in_executor(None, _sync_ensure)
+                                return client._headers(include_auth=True)
+                            return dict(client.headers) if client.headers else {}
+                        return {}
 
                     headers = await _ensure_token()
                     epg_url = (f"{base_url}{php}?type=itv&action=get_short_epg"
@@ -321,14 +293,22 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                     str(payload.get("text", "") if isinstance(payload, dict) else "").lower())
                             )
                             if _auth_failed:
-                                state.log("[EPG] ⚠ Portal token rejected (auth failed) — re-handshaking")
-                                # For plain MAC portals, clear the cached token so
-                                # _ensure_token() acquires a fresh one.
-                                # Stalker portals never cache a token, so this is a no-op for them.
-                                if not state.is_stalker_portal:
-                                    with state._mac_epg_token_lock:
-                                        state._mac_epg_token = ""
-                                        state._mac_epg_headers = {}
+                                state.log("[EPG] ⚠ Portal token rejected (auth failed) — forcing re-handshake")
+                                # Trigger re-handshake on the persistent client through its
+                                # auth lock so concurrent callers don't pile up.
+                                _mgr = getattr(state, "portal_mgr", None)
+                                if _mgr and _mgr.client:
+                                    _lock = getattr(_mgr.client, "_auth_lock", None)
+                                    if _lock:
+                                        async with _lock:
+                                            _last = getattr(_mgr.client, "_last_auth_refresh", 0)
+                                            if time.time() - _last > 5:
+                                                await _mgr.client.handshake()
+                                                _mgr.client._last_auth_refresh = time.time()
+                                            else:
+                                                state.log("[EPG] Token already refreshed by peer — skipping duplicate re-handshake")
+                                    else:
+                                        await _mgr.client.handshake()
                                 headers = await _ensure_token()
                             else:
                                 return r.status, payload
@@ -781,10 +761,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
 
                 if conn == "mac":
                     is_stalker = state.is_stalker_portal
-                    client_cls = StalkerPortalClient if is_stalker else PortalClient
-                    async with client_cls(state.url, state.mac, state.log) as client:
-                        await client.handshake()
-
+                    async with _make_client(do_handshake=False) as client:
                         # ── Attempt 1: get_all_channels — retry same path 2× before fallback ──
                         # Some portals return 0 on first call if the token is fresh/cold.
                         for _try in range(1, 3):
@@ -866,12 +843,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                             state.log(f"[FIND_CH] Category walk found {len(chans)} channels")
 
                 elif conn == "xtream" or (conn == "m3u_url" and state.m3u_xtream_override):
-                    creds = state.m3u_xtream_override if conn == "m3u_url" else None
-                    base  = creds["base"]     if creds else state.url
-                    user  = creds["username"] if creds else state.username
-                    pwd   = creds["password"] if creds else state.password
-                    async with XtreamClient(base, user, pwd, state.log) as client:
-                        await client.handshake()
+                    async with _make_client(do_handshake=False) as client:
                         url = client._api("get_live_streams")
                         async with client.session.get(url) as r:
                             chans = await safe_json(r) or []
@@ -1439,7 +1411,6 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
 
                 php        = "/stalker_portal/server/load.php" if state.is_stalker_portal else "/portal.php"
                 base_url   = normalize_base_url(state.url)
-                client_cls = StalkerPortalClient if state.is_stalker_portal else PortalClient
 
                 def _to_ts(v):
                     if not v: return 0
@@ -1449,8 +1420,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                     except: return 0
 
                 results = []
-                async with client_cls(state.url, state.mac, state.log) as client:
-                    await client.handshake()
+                async with _make_client(do_handshake=False) as client:
                     hdrs = client._headers(include_auth=True) if state.is_stalker_portal else client.headers
 
                     for day_offset in range(4):
@@ -1638,9 +1608,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
 
             state.log(f"[CATCHUP/Play] cmd={effective_cmd[:50]} archive_cmd={archive_cmd[:50] if archive_cmd else '(none)'} start={start_str} dur={duration_min}m")
 
-            client_cls = StalkerPortalClient if state.is_stalker_portal else PortalClient
-            async with client_cls(state.url, state.mac, state.log) as client:
-                await client.handshake()
+            async with _make_client(do_handshake=False) as client:
                 url = await client.create_catchup_link(effective_cmd, start_str, duration_min,
                                                        archive_cmd=archive_cmd)
                 # If tv_archive returned nothing (null storage response), fall back to
@@ -2971,10 +2939,20 @@ _EPG_UI_JS = r"""
 let _epgItem=null;
 
 // Xtream: tv_archive=1 → catchup supported, 0 → not supported.
-// MAC/Stalker/M3U: field absent → allow (API handles gracefully).
+// MAC/Stalker: tv_archive is now normalized from enable_tv_archive in portal_clients.py.
+// M3U: no archive fields → allow (API handles gracefully).
 function _channelSupportsCatchup(it){
   if(!it) return false;
+  // tv_archive is set by Xtream natively and by MAC/Stalker after normalization
   if('tv_archive' in it) return it.tv_archive===1 || it.tv_archive==='1';
+  // Secondary fallback: raw enable_tv_archive/tv_archive_duration if normalization
+  // didn't run yet (e.g. items loaded before prefetch completed)
+  if('enable_tv_archive' in it || 'tv_archive_duration' in it){
+    const ena = it.enable_tv_archive===1 || it.enable_tv_archive==='1';
+    const dur = parseInt(it.tv_archive_duration||0,10) > 0;
+    return ena || dur;
+  }
+  // M3U or unknown portal type — allow and let the API respond
   return true;
 }
 function _fmtEpgTime(ts){
