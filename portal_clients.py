@@ -573,6 +573,10 @@ class PortalClient:
             self.log(f"[MAC] get_all_channels: {len(self._all_channels_raw)} channels")
         except Exception as e:
             self.log(f"[MAC] get_all_channels error: {e}")
+        # Normalize archive flag → tv_archive (unified field checked by UI)
+        for ch in self._all_channels_raw:
+            if isinstance(ch, dict):
+                ch.setdefault("tv_archive", 1 if ch.get("enable_tv_archive", 0) else 0)
         return self._all_channels_raw
 
     async def _extract_xtream_creds(self) -> dict | None:
@@ -863,6 +867,21 @@ class PortalClient:
 
     async def fetch_items_page(self, mode: str, cat_id: str, page: int):
         assert self.session is not None
+        # Fast path: serve live category items from the get_all_channels pool.
+        # Avoids redundant per-category HTTP calls when the pool is already cached.
+        # page > 1 returns [] because the pool delivers all items in one shot on page 1.
+        if mode == "live" and cat_id not in ("*", "__all__"):
+            raw_all = getattr(self, "_all_channels_raw", None)
+            if raw_all:
+                if page > 1:
+                    return []
+                filtered = [ch for ch in raw_all
+                            if isinstance(ch, dict)
+                            and str(ch.get("tv_genre_id", "")) == str(cat_id)]
+                if filtered:
+                    self.log(f"[MAC] {mode.upper()} cat={cat_id}: {len(filtered)} items (pool)")
+                    return filtered
+                # Pool populated but no match for this cat_id — fall through to HTTP
         if mode == "live":
             url = (f"{self.base}/portal.php?type=itv&action=get_ordered_list"
                    f"&genre={cat_id}&JsHttpRequest=1-xml&p={page}&sortby=number")
@@ -919,6 +938,23 @@ class PortalClient:
 
         if page == 1:
             self.log(f"[MAC] {mode.upper()} cat={cat_id} p={page}: {len(items)} items")
+        # Enrich live items with tv_archive from get_all_channels pool (authoritative source).
+        # get_ordered_list may omit archive flags on some portal versions.
+        if mode == "live" and items:
+            raw_all = getattr(self, "_all_channels_raw", None)
+            if raw_all:
+                _amap = {str(ch.get("id", "")): ch for ch in raw_all
+                         if isinstance(ch, dict) and ch.get("id")}
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    src = _amap.get(str(it.get("id", "")).strip())
+                    if src:
+                        it.setdefault("tv_archive", src.get("tv_archive", 0))
+            # Fallback: normalize enable_tv_archive directly if pool not yet ready
+            for it in items:
+                if isinstance(it, dict) and "tv_archive" not in it:
+                    it["tv_archive"] = 1 if it.get("enable_tv_archive", 0) else 0
         return items
 
     async def fetch_vod_play_link(self, cmd: str) -> str:
@@ -2541,6 +2577,10 @@ class StalkerPortalClient:
             except Exception as e2:
                 self.log(f"[STALKER] get_all_channels portal.php error: {e2}")
 
+        # Normalize archive flag → tv_archive (unified field checked by UI)
+        for ch in self._all_channels_raw:
+            if isinstance(ch, dict):
+                ch.setdefault("tv_archive", 1 if ch.get("enable_tv_archive", 0) else 0)
         return self._all_channels_raw
 
     async def _extract_xtream_creds(self) -> dict | None:
@@ -2777,6 +2817,21 @@ class StalkerPortalClient:
 
     async def fetch_items_page(self, mode: str, cat_id: str, page: int):
         assert self.session is not None
+        # Fast path: serve live category items from the get_all_channels pool.
+        # Avoids redundant per-category HTTP calls when the pool is already cached.
+        # page > 1 returns [] because the pool delivers all items in one shot on page 1.
+        if mode == "live" and cat_id not in ("*", "__all__"):
+            raw_all = getattr(self, "_all_channels_raw", None)
+            if raw_all:
+                if page > 1:
+                    return []
+                filtered = [ch for ch in raw_all
+                            if isinstance(ch, dict)
+                            and str(ch.get("tv_genre_id", "")) == str(cat_id)]
+                if filtered:
+                    self.log(f"[STALKER] {mode.upper()} cat={cat_id}: {len(filtered)} items (pool)")
+                    return filtered
+                # Pool populated but no match for this cat_id — fall through to HTTP
         if mode == "live":
             url = self._load_url(type="itv", action="get_ordered_list",
                                  genre=cat_id, JsHttpRequest="1-xml", p=page)
@@ -2805,9 +2860,9 @@ class StalkerPortalClient:
                 self.log(f"[STALKER] Items (alt) HTTP {r2.status} ({mode.upper()} cat={cat_id})")
                 payload = await self._read_json(r2, f"Items alt ({mode.upper()} cat={cat_id})")
             items = normalize_js(payload)
-        # Final fallback for live categories: filter _all_channels_raw by tv_genre_id.
-        # Triggered when get_ordered_list returns "Access denied" or similar block — portal
-        # allows get_all_channels but not per-category listing (seen on 4k1.new4k.cc).
+        # Last-resort fallback: get_ordered_list returned empty AND pool wasn't ready
+        # at the top of this function (e.g. portal blocks per-category listing).
+        # Wait for the prefetch event then filter from the pool.
         if not items and page == 1 and mode == "live" and cat_id not in ("*", "__all__"):
             raw_all = getattr(self, "_all_channels_raw", None)
             # If _all_channels_raw is None the background prefetch is still in-flight.
@@ -2821,7 +2876,7 @@ class StalkerPortalClient:
                 # The prefetch ran on a DIFFERENT client instance (its own _make_client
                 # context), so self._all_channels_raw is still None even after the event
                 # fires.  Seed it from the shared items-cache that _make_client injected
-                # as self._shared_items_cache, then fall back to an empty list.
+                # as self._shared_items_cache, then fall back to an empty list. 
                 if self._all_channels_raw is None:
                     _shared = getattr(self, "_shared_items_cache", None)
                     if _shared is not None:
@@ -2833,8 +2888,7 @@ class StalkerPortalClient:
                 filtered = [ch for ch in raw_all
                             if isinstance(ch, dict) and str(ch.get("tv_genre_id", "")) == str(cat_id)]
                 if filtered:
-                    self.log(f"[STALKER] Items fallback: filtered {len(filtered)} channels "
-                             f"from _all_channels_raw for cat={cat_id}")
+                    self.log(f"[STALKER] Items fallback: {len(filtered)} channels from pool for cat={cat_id}")
                     items = filtered
         for it in items:
             if not isinstance(it, dict):
@@ -2890,6 +2944,23 @@ class StalkerPortalClient:
                         it["logo"] = cached
         if page == 1:
             self.log(f"[STALKER] {mode.upper()} cat={cat_id} p={page}: {len(items)} items")
+        # Enrich live items with tv_archive from get_all_channels pool (authoritative source).
+        # get_ordered_list may omit archive flags on some portal versions.
+        if mode == "live" and items:
+            raw_all = getattr(self, "_all_channels_raw", None)
+            if raw_all:
+                _amap = {str(ch.get("id", "")): ch for ch in raw_all
+                         if isinstance(ch, dict) and ch.get("id")}
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    src = _amap.get(str(it.get("id", "")).strip())
+                    if src:
+                        it.setdefault("tv_archive", src.get("tv_archive", 0))
+            # Fallback: normalize enable_tv_archive directly if pool not yet ready
+            for it in items:
+                if isinstance(it, dict) and "tv_archive" not in it:
+                    it["tv_archive"] = 1 if it.get("enable_tv_archive", 0) else 0
         return items
 
     async def fetch_series_episodes(self, series_id: str, category_id: str):
