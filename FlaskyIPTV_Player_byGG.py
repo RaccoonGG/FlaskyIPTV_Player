@@ -37,6 +37,7 @@ import queue
 import warnings
 import gzip as _gzip
 from datetime import datetime, timezone
+from typing import Optional
 from urllib.parse import urlparse, quote, quote_plus, unquote, parse_qs
 import asyncio
 import requests as _requests_lib
@@ -120,6 +121,7 @@ from portal_clients import (
     normalize_base_url, _extract_url_from_text, safe_json, normalize_js,
     extract_xtream_from_m3u_url, _extinf_line, _extract_series_name,
     PortalClient, StalkerPortalClient, XtreamClient, M3UClient,
+    PortalSessionManager,
 )
 
 
@@ -201,14 +203,8 @@ class AppState:
         self._xmltv_needs: set = set()       # cache_keys confirmed to need XMLTV (no portal data)
         self._xmltv_match_cache: dict = {}   # (lookup, feed_ck) → resolved cid | None
         # Plain MAC portal EPG token — cached after first handshake and reused
-        # for all subsequent EPG requests (avoids per-channel handshake → 429s).
-        # Stalker portals do NOT use this cache — their tokens are short-lived
-        # and invalidate under concurrent load, so they always do a fresh handshake.
-        self._mac_epg_token: str = ""
-        self._mac_epg_headers: dict = {}
-        # Guards the MAC token check+set as one atomic unit so only one thread
-        # ever handshakes; all others wait and return the cached result.
-        self._mac_epg_token_lock = threading.Lock()
+        # NOTE: _mac_epg_token/_mac_epg_headers/_mac_epg_token_lock removed —
+        # token management is now handled entirely by PortalSessionManager.
         self.profile_data: dict = {}   # raw profile/account info for display
         # UTC offset in seconds of the Xtream portal server clock (0 = UTC).
         # Populated by XtreamClient.handshake() via calendar.timegm arithmetic.
@@ -255,6 +251,11 @@ class AppState:
         self.task_file_elapsed  = ""    # "00:12:34" elapsed in current file
         self.task_speed         = ""    # "2.4 MB/s" or "512 KB/s"
         self.task_file_duration = 0.0   # probed duration of current file (seconds)
+        # Persistent session manager — owns the long-lived aiohttp.ClientSession
+        # and runs a background event loop for all portal I/O.  Created by
+        # api_connect() when connecting to MAC/Stalker/Xtream portals; None for
+        # pure M3U connections.  Torn down and recreated on each reconnect.
+        self.portal_mgr: Optional[PortalSessionManager] = None
 
     def log(self, msg: str):
         try:
@@ -332,7 +333,8 @@ async def _make_client(do_handshake=True):
         connect-time background prefetch already populated the shared cache,
         this request's client instance gets an immediate cache hit on the first
         call to get_all_channels / get_all_vod_streams / get_all_series_streams
-        instead of issuing a redundant HTTP call."""
+        instead of issuing a redundant HTTP call.
+        """
         for attr, key in (("_all_channels_raw", ("live",   "__all__")),
                           ("_all_vod_raw",      ("vod",    "__all__")),
                           ("_all_series_raw",   ("series", "__all__"))):
@@ -341,6 +343,59 @@ async def _make_client(do_handshake=True):
                 if pool:
                     setattr(client, attr, pool)
 
+    def _preseed_mac_caches(client):
+        """Inject shared caches and events into a MAC/Stalker client.
+
+        _ch_logo_cache: may be None (not yet fetched) or a dict — assign
+        directly so mutations (new logo entries) survive after this call.
+        _vod_logo_cache: always a dict — shared by reference.
+        _all_channels_ready_event: injected so _fetch_ch_logo_cache() can
+        wait on it instead of firing a concurrent get_all_channels HTTP call
+        when state._logo_cache_live is an empty dict (prefetch in progress).
+        _shared_items_cache: reference to the shared items cache so the
+        items-page fallback can seed _all_channels_raw from it after waiting
+        on the prefetch event.  Without this the browsing client's
+        _all_channels_raw stays None (the prefetch ran on a different
+        instance) and the first category click after connect returns 0 items
+        even though prefetch completed successfully.
+
+        Pre-seed all three __all__ caches from state._items_cache.
+        Live: prevents _fetch_ch_logo_cache() from issuing a redundant call.
+        VOD/Series: allows api_items() to serve \"All VOD\"/\"All Series\" from
+        cache on MAC/Stalker portals if a prior request already populated them
+        (e.g. user browsed "All VOD" → pagination result stored → next visit free).
+        """
+        client._ch_logo_cache = state._logo_cache_live
+        client._vod_logo_cache = state._logo_cache_vod
+        client._all_channels_ready_event = state._all_channels_ready
+        client._shared_items_cache = state._items_cache
+        for _attr, _key in (("_all_channels_raw", ("live",   "__all__")),
+                             ("_all_vod_raw",      ("vod",    "__all__")),
+                             ("_all_series_raw",   ("series", "__all__"))):
+            if getattr(client, _attr, None) is None:
+                _pool = state._items_cache.get(_key)
+                if _pool:
+                    setattr(client, _attr, _pool)
+
+    # ── Persistent session path (MAC / Stalker / Xtream via portal_mgr) ──────
+    # When PortalSessionManager is active, yield its persistent client directly.
+    # No __aenter__/__aexit__ — the session stays open between requests.
+    # do_handshake is intentionally ignored: authentication is managed once by
+    # portal_mgr.connect_sync(); 401/403 recovery is handled by _with_auth_retry().
+    mgr = getattr(state, "portal_mgr", None)
+    if mgr is not None and mgr.client is not None:
+        client = mgr.client
+        # Re-apply cache injections every call so newly-completed prefetches
+        # are visible (dict references remain stable; this is just attr assignment).
+        if conn == "xtream" or (conn == "m3u_url" and state.m3u_xtream_override):
+            client._logo_cache = state._logo_cache_vod
+            _preseed_xtream_caches(client)
+        else:
+            _preseed_mac_caches(client)
+        yield client
+        return
+
+    # ── Fallback path (M3U-only connections, or bootstrap before portal_mgr ──
     if conn == "xtream":
         client = XtreamClient(state.url, state.username, state.password, state.log,
                               custom_ua=_resolve_custom_ua())
@@ -358,6 +413,8 @@ async def _make_client(do_handshake=True):
             creds = state.m3u_xtream_override
             client = XtreamClient(creds["base"], creds["username"], creds["password"],
                                   state.log, custom_ua=_resolve_custom_ua())
+            # _logo_cache is a plain dict — share the same object so mutations
+            # (new entries added during this request) survive after the client exits.
             client._logo_cache = state._logo_cache_vod
             _preseed_xtream_caches(client)
             async with client:
@@ -372,7 +429,7 @@ async def _make_client(do_handshake=True):
                     await client.handshake()
                     state.m3u_cache = dict(client._all_groups)
                 yield client
-    else:  # mac
+    else:  # mac — bootstrap / no portal_mgr yet
         if state.is_stalker_portal:
             client = StalkerPortalClient(
                 state.url, state.mac, state.log,
@@ -387,38 +444,7 @@ async def _make_client(do_handshake=True):
             client = PortalClient(state.url, state.mac, state.log,
                                   ua_preset=state.portal_ua_preset,
                                   custom_ua=state.portal_ua_custom)
-        # Inject both caches from AppState so this request can read what
-        # previous requests already discovered.
-        # _ch_logo_cache may be None (not yet fetched) or a dict — assign directly.
-        # _vod_logo_cache is always a dict — share by reference.
-        client._ch_logo_cache = state._logo_cache_live
-        client._vod_logo_cache = state._logo_cache_vod
-        # Inject the prefetch ready-event so _fetch_ch_logo_cache() can wait
-        # on it instead of firing a concurrent get_all_channels HTTP call when
-        # state._logo_cache_live is an empty dict (prefetch in progress).
-        client._all_channels_ready_event = state._all_channels_ready
-
-        # Inject a reference to the shared items cache so that the items-page
-        # fallback can seed _all_channels_raw from it after waiting on the
-        # prefetch event.  Without this the browsing client's _all_channels_raw
-        # stays None (the prefetch ran on a different instance) and the first
-        # category click after connect returns 0 items even though prefetch
-        # completed successfully.
-        client._shared_items_cache = state._items_cache
-
-        # Pre-seed all three __all__ caches from state._items_cache.
-        # Live: prevents _fetch_ch_logo_cache() from issuing a redundant call.
-        # VOD/Series: allows api_items() to serve "All VOD"/"All Series" from
-        # cache on MAC/Stalker portals if a prior request already populated them
-        # (e.g. user browsed "All VOD" → pagination result stored → next visit free).
-        for _attr, _key in (("_all_channels_raw", ("live",   "__all__")),
-                             ("_all_vod_raw",      ("vod",    "__all__")),
-                             ("_all_series_raw",   ("series", "__all__"))):
-            if getattr(client, _attr, None) is None:
-                _pool = state._items_cache.get(_key)
-                if _pool:
-                    setattr(client, _attr, _pool)
-
+        _preseed_mac_caches(client)
         async with client:
             if do_handshake:
                 await client.handshake()
@@ -432,14 +458,31 @@ async def _make_client(do_handshake=True):
 def run_async(coro):
     """Run an async coroutine from sync context (blocking).
 
-    Stores the running loop and task in state._connect_loop/_connect_task so
-    that a concurrent api_connect() call can cancel this in-flight operation
-    immediately, tearing down any pending aiohttp requests without waiting for
-    timeouts.  These fields are separate from state.active_loop/active_task
-    which are owned by run_worker() background prefetch threads — keeping them
-    separate prevents a new api_connect() from accidentally cancelling a
-    prefetch that belongs to an already-successful portal connection.
+    When a PortalSessionManager is active (after the first successful connect),
+    dispatches *coro* to its persistent event loop so that the aiohttp
+    ClientSession's TCP keep-alive pool is reused between requests.
+
+    Falls back to a temporary event loop for M3U-only connections and during
+    the bootstrap phase of api_connect() itself (before portal_mgr is set).
+    In that case, _connect_loop/_connect_task are set so a concurrent
+    api_connect() can cancel this in-flight operation immediately, tearing
+    down any pending aiohttp requests without waiting for timeouts.
+    These fields are separate from state.active_loop/active_task which are
+    owned by run_worker() background prefetch threads — keeping them separate
+    prevents a new api_connect() from accidentally cancelling a prefetch that
+    belongs to an already-successful portal connection.
     """
+    mgr = getattr(state, "portal_mgr", None)
+    if mgr is not None and not mgr.loop.is_closed():
+        # Persistent-loop path: session stays open, no handshake overhead.
+        # _connect_loop/_connect_task are not set here — portal_mgr owns
+        # the loop lifetime; cancellation is handled by portal_mgr.disconnect().
+        try:
+            return mgr.submit(coro, timeout=30)
+        except Exception:
+            raise
+
+    # Temporary-loop fallback (M3U or bootstrap connect call).
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     state._connect_loop = loop
@@ -518,43 +561,50 @@ async def _connect_async():
         if detected:
             state.log(f"[CONNECT] Xtream credentials detected in M3U URL — trying Xtream API first")
             try:
-                xt = XtreamClient(detected["base"], detected["username"], detected["password"], state.log)
-                async with xt:
-                    await xt.handshake()
-                    ident, exp, max_conn, _pw, active_cons = await xt.account_info()
-                    # Epoch guard: a new api_connect() may have been called while we
-                    # awaited the Xtream handshake.  Discard this result if so.
-                    if state._connect_epoch != my_epoch:
-                        state.log("[CONNECT] Superseded by newer connection attempt — discarding Xtream result.")
-                        return {"success": False, "error": "superseded"}
+                state.portal_mgr = PortalSessionManager()
+                _pkey = f"xtream:{detected['base']}::{detected['username']}".lower()
+                result = state.portal_mgr.connect_sync(
+                    conn_type="xtream",
+                    url=detected["base"],
+                    mac="",
+                    username=detected["username"],
+                    password=detected["password"],
+                    portal_key=_pkey,
+                    log_cb=state.log,
+                    ua_preset=state.portal_ua_preset,
+                    custom_ua=state.portal_ua_custom,
+                    is_stalker=False,
+                    connect_epoch=my_epoch,
+                    get_epoch_fn=lambda: state._connect_epoch,
+                )
+                if result.get("success"):
+                    _cli = state.portal_mgr.client
+                    if _cli is not None:
+                        _cli._auth_lock = state.portal_mgr._auth_lock
                     state.m3u_xtream_override = detected
-                    state.log(f"[CONNECT] ✓ Xtream API connected: {ident} | {exp}")
-                    for m in ("live", "vod", "series"):
-                        try:
-                            cats = await xt.fetch_categories(m)
-                            state.cats_cache[m] = cats
-                            state.log(f"[CONNECT] {m.upper()}: {len(cats)} categories")
-                        except Exception as e:
-                            state.log(f"[CONNECT] ✗ {m.upper()} categories: {e}")
-                            state.cats_cache[m] = []
-                    # Final epoch guard: covers the fetch_categories() loop above.
-                    # Each category fetch is a real network call (live/VOD/series API
-                    # requests can be slow on large portals); a new api_connect() may
-                    # have arrived during that window.
-                    if state._connect_epoch != my_epoch:
-                        state.log("[CONNECT] Superseded during Xtream category fetch — discarding result.")
-                        return {"success": False, "error": "superseded"}
+                    state.cats_cache = result.get("categories", {})
+                    state.profile_data = result.get("profile_data", {})
+                    if _cli and hasattr(_cli, "_server_utc_offset"):
+                        state._portal_utc_offset = _cli._server_utc_offset
                     state.connected = True
-                    state.set_status(f"Connected (Xtream via M3U): {ident} | {exp}")
-                    state.profile_data = {'type':'xtream','user':ident,'exp':exp,'max_conn':str(max_conn) if max_conn else '','active_cons':active_cons,'portal_url':detected["base"],'timezone': getattr(xt,'_server_timezone','') or ''}
-                    if hasattr(xt, "_server_utc_offset"):
-                        state._portal_utc_offset = xt._server_utc_offset
-                    return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
-                            "max_connections": max_conn, "portal_url": detected["base"],
-                            "is_stalker": False}
+                    state.set_status(f"Connected (Xtream via M3U): {result['ident']} | {result['exp']}")
+                    return {"success": True, "categories": state.cats_cache,
+                            "ident": result["ident"], "exp": result["exp"],
+                            "max_connections": result.get("max_connections", 0),
+                            "portal_url": detected["base"], "is_stalker": False}
+                # Superseded
+                if not result.get("success") and result.get("error") == "superseded":
+                    return result
             except Exception as e:
                 state.log(f"[CONNECT] Xtream failed ({e}) — falling back to M3U download…")
-                state.m3u_xtream_override = None
+            # Clean up failed portal_mgr before falling through to pure M3U
+            if state.portal_mgr is not None:
+                try:
+                    state.portal_mgr.disconnect()
+                except Exception:
+                    pass
+                state.portal_mgr = None
+            state.m3u_xtream_override = None
 
         # Pure M3U
         state.m3u_xtream_override = None
@@ -586,165 +636,81 @@ async def _connect_async():
                 "max_connections": max_conn, "portal_url": state.m3u_url,
                 "is_stalker": state.is_stalker_portal}
 
-    # MAC / Xtream
+    # MAC / Stalker / Xtream — PortalSessionManager for keep-alive session.
+    # connect_sync() runs entirely in the persistent loop: creates the aiohttp
+    # session, builds the client, handshakes once to establish a fresh
+    # server-side session, then fetches account_info + profile + categories.
+    # After this call, state.portal_mgr.client is ready for all subsequent requests.
     if state.is_stalker_portal:
         state.log("[CONNECT] 🔌 Stalker portal detected — using StalkerPortalClient (/stalker_portal/server/load.php)")
-    async with _make_client() as client:
-        _ai4 = await client.account_info()
-        ident, exp = _ai4[0], _ai4[1]
-        max_conn = _ai4[2] if len(_ai4) > 2 else 0
-        # Epoch guard: bail immediately if a newer api_connect() arrived while we
-        # were suspended in account_info().  Do this before any state writes so
-        # the new portal's clean state is never overwritten by this stale result.
-        if state._connect_epoch != my_epoch:
-            state.log("[CONNECT] Superseded by newer connection attempt — discarding MAC/Stalker/Xtream result.")
-            return {"success": False, "error": "superseded"}
-        # For Stalker: also pull get_profile for richer display data
-        if state.is_stalker_portal and hasattr(client, 'get_profile'):
-            try:
-                prof = await client.get_profile()
-                login = prof.get('login') or prof.get('fname') or prof.get('username') or ''
-                if login:
-                    ident = login
-                # Use tariff_expired_date from profile only if account_info didn't get a real expiry.
-                # expire_billing_date is a billing timestamp, NOT subscription end — reference code
-                # only uses it as absolute last resort when phone/end_date are also empty.
-                exp_label = 'expiry'
-                if exp == 'unknown':
-                    exp_prof = prof.get('tariff_expired_date') or prof.get('end_date') or prof.get('phone') or ''
-                    if exp_prof and exp_prof != 'unknown':
-                        exp = str(exp_prof)
-                    elif prof.get('expire_billing_date'):
-                        exp = str(prof.get('expire_billing_date'))
-                        exp_label = 'last_billing'
-                # max_conn from get_main_info, but also check profile for it
-                if not max_conn:
-                    try:
-                        raw = (prof.get('max_online') or prof.get('playback_limit') or prof.get('max_connections')
-                               or prof.get('con_per_device') or prof.get('connections_limit') or 0)
-                        if not raw:
-                            storages = prof.get('storages')
-                            if isinstance(storages, dict):
-                                for store in storages.values():
-                                    if isinstance(store, dict) and store.get('max_online'):
-                                        raw = store['max_online']
-                                        break
-                        max_conn = int(raw) if raw else 0
-                    except Exception:
-                        pass
-                # Collect all storage IPs from storages dict (actual field name is storage_ip)
-                _storage_ips = []
-                _storages_raw = prof.get('storages')
-                if isinstance(_storages_raw, dict):
-                    for _sname, _st in _storages_raw.items():
-                        if isinstance(_st, dict) and _st.get('storage_ip'):
-                            _storage_ips.append(str(_st['storage_ip']))
-                state.profile_data = {
-                    'type': 'stalker',
-                    'mac': client.mac,
-                    'login': login or ident,
-                    'password': str(prof.get('password', '') or ''),
-                    'exp': exp,
-                    'exp_label': exp_label,
-                    'status': prof.get('status', ''),
-                    'max_conn': str(max_conn) if max_conn else '–',
-                    'active_cons': str(prof.get('active_cons') or prof.get('online_streams') or ''),
-                    'settings_password': str(prof.get('settings_password', '') or ''),
-                    'adult_password': str(prof.get('parent_password', '') or prof.get('adult_password', '') or ''),
-                    'portal_url': state.url or state.m3u_url,
-                    'timezone': str(prof.get('default_timezone') or prof.get('timezone') or prof.get('time_zone') or ''),
-                    'storage_ips': _storage_ips,            # list of "host:port" strings
-                    'client_ip': str(prof.get('ip') or ''), # user's IP as seen by server
-                    'comment': str(prof.get('comment') or ''),
-                }
-            except Exception as e:
-                state.log(f"[CONNECT] ✗ Could not fetch Stalker profile details: {e}")
-                state.profile_data = {'type': 'stalker', 'mac': client.mac, 'exp': exp,
-                                      'max_conn': str(max_conn) if max_conn else '',
-                                      'portal_url': state.url or state.m3u_url}
-        elif not state.is_stalker_portal:
-            _is_xtream = (state.conn_type == 'xtream' or
-                          (state.conn_type == 'm3u_url' and state.m3u_xtream_override))
-            # For MAC portals: _last_account_js holds the full get_main_info JS dict.
-            # It is set immediately after the dict is confirmed valid in account_info(),
-            # so it's always available here if the call succeeded.
-            # We read ALL display fields from it directly — the raw portal response
-            # has every key we need (settings_password, parent_password,
-            # default_timezone, ip, comment, storages) at the top level of js.
-            # For Xtream portals we fall back to _ai4 tuple / _server_timezone.
-            _mac_js = getattr(client, '_last_account_js', None) or {}
-            # For MAC portals: get_main_info often lacks default_timezone,
-            # parent_password, settings_password, ip, and storages.  These fields
-            # are present in portal.php?type=stb&action=get_profile.  Fetch and
-            # merge any missing fields into _mac_js so the display logic below
-            # picks them up without any further changes.
-            if not _is_xtream and hasattr(client, 'get_profile'):
-                try:
-                    _prof_js = await client.get_profile()
-                    if isinstance(_prof_js, dict):
-                        for _pk in ('default_timezone', 'timezone', 'parent_password',
-                                    'settings_password', 'ip', 'storages', 'comment'):
-                            if _pk in _prof_js and not _mac_js.get(_pk):
-                                _mac_js[_pk] = _prof_js[_pk]
-                except Exception as _pe:
-                    state.log(f"[CONNECT] MAC get_profile merge failed: {_pe}")
-            _mac_storage_ips = []
-            if not _is_xtream:
-                _mac_storages = _mac_js.get('storages')
-                if isinstance(_mac_storages, dict):
-                    for _st in _mac_storages.values():
-                        if isinstance(_st, dict) and _st.get('storage_ip'):
-                            _mac_storage_ips.append(str(_st['storage_ip']))
-            # For MAC: read passwords directly from the full js dict (primary source).
-            # Fall back to _ai4 indices only if the js dict doesn't have them.
-            def _str(v): return str(v) if v is not None else ''
-            _mac_settings_pwd = (_str(_mac_js.get('settings_password')) or
-                                 (_ai4[3] if not _is_xtream and len(_ai4) > 3 else ''))
-            _mac_adult_pwd    = (_str(_mac_js.get('parent_password') or _mac_js.get('adult_password')) or
-                                 (_ai4[4] if not _is_xtream and len(_ai4) > 4 else ''))
-            state.profile_data = {
-                'type': 'xtream' if _is_xtream else 'mac',
-                'user': ident,
-                'mac': client.mac if hasattr(client, 'mac') else '',
-                'exp': exp,
-                'max_conn': str(max_conn) if max_conn else '',
-                # Xtream: _ai4 = (user, exp, max_conn, password, active_cons)
-                'active_cons': _ai4[4] if _is_xtream and len(_ai4) > 4 else '',
-                'password':    _ai4[3] if _is_xtream and len(_ai4) > 3 else '',
-                # MAC: read passwords from raw js dict (always populated by account_info)
-                'settings_password': '' if _is_xtream else _mac_settings_pwd,
-                'adult_password':    '' if _is_xtream else _mac_adult_pwd,
-                'portal_url': state.url or state.m3u_url,
-                # Xtream: timezone from _server_timezone; MAC: from default_timezone in js
-                'timezone': (getattr(client, '_server_timezone', '') or ''
-                             if _is_xtream else
-                             _str(_mac_js.get('default_timezone') or _mac_js.get('timezone') or '')),
-                'storage_ips': [] if _is_xtream else _mac_storage_ips,
-                'client_ip':   '' if _is_xtream else _str(_mac_js.get('ip') or ''),
-                'comment':     '' if _is_xtream else _str(_mac_js.get('comment') or ''),
-            }
-        state.log(f"[CONNECT] ✓ Connected: {ident} | {exp}")
-        for m in ("live", "vod", "series"):
-            try:
-                extra = await client.fetch_categories(m)
-                state.cats_cache[m] = extra
-                state.log(f"[CONNECT] {m.upper()}: {len(extra)} categories")
-            except Exception as e:
-                state.log(f"[CONNECT] ✗ Could not load {m.upper()} categories: {e}")
-                state.cats_cache[m] = []
-    # Final epoch guard: covers the fetch_categories() loop above.
-    # If a new api_connect() arrived while we were fetching categories,
-    # discard everything rather than flipping state.connected on stale data.
-    if state._connect_epoch != my_epoch:
-        state.log("[CONNECT] Superseded during category fetch — discarding MAC/Stalker/Xtream result.")
-        return {"success": False, "error": "superseded"}
+
+    state.portal_mgr = PortalSessionManager()
+    _pkey = f"{state.conn_type}:{state.url}:{state.mac}:{state.username}".lower()
+
+    try:
+        result = state.portal_mgr.connect_sync(
+            conn_type=state.conn_type,
+            url=state.url,
+            mac=state.mac,
+            username=state.username,
+            password=state.password,
+            portal_key=_pkey,
+            log_cb=state.log,
+            ua_preset=state.portal_ua_preset,
+            custom_ua=state.portal_ua_custom,
+            stalker_sn=state.stalker_sn,
+            stalker_device_id=state.stalker_device_id,
+            stalker_device_id2=state.stalker_device_id2,
+            stalker_signature=state.stalker_signature,
+            is_stalker=state.is_stalker_portal,
+            connect_epoch=my_epoch,
+            get_epoch_fn=lambda: state._connect_epoch,
+        )
+    except Exception:
+        # Network error, timeout, auth exception — ensure the partially-created
+        # manager does not persist in AppState where it would incorrectly satisfy
+        # the portal_mgr-exists check in run_async() and _make_client().
+        try:
+            state.portal_mgr.disconnect()
+        except Exception:
+            pass
+        state.portal_mgr = None
+        raise  # propagate to api_connect()'s outer try/except
+
+    if not result.get("success"):
+        # Superseded or error — tear down the manager so portal_mgr is not left
+        # pointing at a half-initialised session.
+        try:
+            state.portal_mgr.disconnect()
+        except Exception:
+            pass
+        state.portal_mgr = None
+        return result
+
+    # Inject auth_lock and store_key into the persistent client so
+    # _with_auth_retry() can re-handshake with token persistence on 401/403.
+    _cli = state.portal_mgr.client
+    if _cli is not None:
+        _cli._auth_lock = state.portal_mgr._auth_lock
+
+    # Apply connect results to AppState.
+    state.cats_cache    = result.get("categories", {})
+    state.profile_data  = result.get("profile_data", {})
+    if state.conn_type == "xtream" and _cli and hasattr(_cli, "_server_utc_offset"):
+        state._portal_utc_offset = _cli._server_utc_offset
+
     state.connected = True
-    state.set_status(f"Connected: {ident} | {exp}")
-    if state.conn_type == "xtream" and hasattr(client, "_server_utc_offset"):
-        state._portal_utc_offset = client._server_utc_offset
-    return {"success": True, "categories": state.cats_cache, "ident": ident, "exp": exp,
-            "max_connections": max_conn, "portal_url": state.url or state.m3u_url,
-            "is_stalker": state.is_stalker_portal}
+    state.set_status(f"Connected: {result['ident']} | {result['exp']}")
+    return {
+        "success":         True,
+        "categories":      state.cats_cache,
+        "ident":           result["ident"],
+        "exp":             result["exp"],
+        "max_connections": result.get("max_connections", 0),
+        "portal_url":      state.url or state.m3u_url,
+        "is_stalker":      state.is_stalker_portal,
+    }
+
 
 
 # ===================== FLASK APP =====================
@@ -850,6 +816,15 @@ def api_connect():
             if state.stalker_device_id: state.log(f"[CONNECT] Device ID override: {state.stalker_device_id}")
             if state.stalker_device_id2:state.log(f"[CONNECT] Device ID2 override: {state.stalker_device_id2}")
             if state.stalker_signature: state.log(f"[CONNECT] Signature override: {state.stalker_signature}")
+        # Tear down any existing persistent portal session before rebuilding.
+        # This closes the aiohttp ClientSession cleanly so the old TCP pool
+        # is released before the new connect creates a fresh one.
+        if state.portal_mgr is not None:
+            try:
+                state.portal_mgr.disconnect()
+            except Exception:
+                pass
+            state.portal_mgr = None
         # Cancel any in-flight _connect_async() from a previous api_connect().
         # Uses _connect_loop/_connect_task (connect-only fields) rather than
         # active_loop/active_task (owned by run_worker() prefetch threads) to
@@ -872,8 +847,6 @@ def api_connect():
         state._xmltv_downloading = set()
         state._xmltv_needs = set()
         state._xmltv_match_cache = {}
-        state._mac_epg_token = ""
-        state._mac_epg_headers = {}
         state._short_epg_broken = set()
         state._xmltv_no_data = set()
         state._won_ch_cache = {}
@@ -987,17 +960,14 @@ def api_connect():
                 # change them.  _my_ch_epoch must live at this (outer) scope so the
                 # finally block below can reference it without a NameError even if
                 # _prefetch() returns early (before the inner assignment would run).
-                _pf_is_mac    = _is_mac
-                _my_ch_epoch  = state._all_channels_epoch
+                _pf_is_mac   = _is_mac
+                _my_ch_epoch = state._all_channels_epoch
                 try:
-                    _pf_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(_pf_loop)
-
                     async def _prefetch():
                         if not state.connected:
                             return
                         _ck = (f"{state.conn_type}:{state.url}"
-                               f":{getattr(state, 'mac', '')}:{getattr(state, 'username', '')}") 
+                               f":{getattr(state, 'mac', '')}:{getattr(state, 'username', '')}")
                         if _ck != _pf_portal_key:
                             return   # portal changed since connect
                         if ("live", "__all__") in state._items_cache:
@@ -1008,13 +978,12 @@ def api_connect():
                         # epoch already captured in outer scope; no re-assignment needed
                         async with _make_client() as client:
                             channels = await client.get_all_channels()
-                            # Post-fetch portal key guard — mirrors the pattern in
-                            # _bg_prefetch_vod_series (lines 1098, 1115).
-                            # get_all_channels() is a long network call; a new
-                            # api_connect() may have fired and reset state while we
-                            # were suspended. Re-verify the portal key before writing
-                            # anything so Portal 1 channel data never contaminates
-                            # Portal 2's _items_cache or _logo_cache_live.
+                            # Post-fetch portal key guard: get_all_channels() is a
+                            # long network call; a new api_connect() may have fired
+                            # and reset state while we were suspended.  Re-verify
+                            # the portal key before writing anything so Portal 1
+                            # channel data never contaminates Portal 2's
+                            # _items_cache or _logo_cache_live.
                             _ck2 = (f"{state.conn_type}:{state.url}"
                                     f":{getattr(state, 'mac', '')}:{getattr(state, 'username', '')}")
                             if _ck2 != _pf_portal_key:
@@ -1023,10 +992,11 @@ def api_connect():
                             if channels:
                                 state._items_cache[("live", "__all__")] = channels
                                 state._won_ch_cache[_pf_portal_key] = channels
-                                # Invalidate any empty-result Stalker category caches that
-                                # were populated before this prefetch completed — they will
-                                # re-fetch and use the _all_channels_raw fallback next time.
                                 if _pf_is_mac:
+                                    # Invalidate any empty-result Stalker category caches
+                                    # that were populated before this prefetch completed —
+                                    # they will re-fetch and use the _all_channels_raw
+                                    # fallback next time.
                                     stale = [k for k, v in state._items_cache.items()
                                              if k[0] == "live" and k[1] != "__all__"
                                              and isinstance(v, list) and len(v) == 0]
@@ -1053,8 +1023,14 @@ def api_connect():
                             else:
                                 state.log("[PREFETCH] get_all_channels returned empty")
 
-                    _pf_loop.run_until_complete(_prefetch())
-                    _pf_loop.close()
+                    mgr = getattr(state, "portal_mgr", None)
+                    if mgr is not None and not mgr.loop.is_closed():
+                        mgr.submit(_prefetch(), timeout=300)
+                    else:
+                        _pf_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(_pf_loop)
+                        _pf_loop.run_until_complete(_prefetch())
+                        _pf_loop.close()
                 except Exception as _pfe:
                     state.log(f"[PREFETCH] Background channel prefetch error: {_pfe}")
                 finally:
@@ -1097,9 +1073,6 @@ def api_connect():
 
             def _bg_prefetch_vod_series():
                 try:
-                    _pf_loop2 = asyncio.new_event_loop()
-                    asyncio.set_event_loop(_pf_loop2)
-
                     async def _prefetch_vs():
                         if not state.connected:
                             return
@@ -1120,9 +1093,9 @@ def api_connect():
                                 try:
                                     vods = await client.get_all_vod_streams()
                                     # Re-verify portal hasn't changed during the slow
-                                    # network call — this is the main race condition
-                                    # window where old portal data could contaminate
-                                    # a freshly connected portal's cache.
+                                    # network call — main race condition window where
+                                    # old portal data could contaminate a freshly
+                                    # connected portal's cache.
                                     _ck2 = f"{state.conn_type}:{state.url}:{state.mac}:{state.username}"
                                     if _ck2 != _pf_portal_key_vs:
                                         state.log("[PREFETCH] Portal changed during VOD fetch — discarding stale data")
@@ -1139,7 +1112,7 @@ def api_connect():
                                 state.log("[PREFETCH] Background: fetching full series list…")
                                 try:
                                     series = await client.get_all_series_streams()
-                                    # Same post-fetch guard as VOD above.
+                                    # Same post-fetch portal key guard as VOD above.
                                     _ck3 = f"{state.conn_type}:{state.url}:{state.mac}:{state.username}"
                                     if _ck3 != _pf_portal_key_vs:
                                         state.log("[PREFETCH] Portal changed during Series fetch — discarding stale data")
@@ -1151,8 +1124,14 @@ def api_connect():
                                 except Exception as _se:
                                     state.log(f"[PREFETCH] Series prefetch error: {_se}")
 
-                    _pf_loop2.run_until_complete(_prefetch_vs())
-                    _pf_loop2.close()
+                    mgr = getattr(state, "portal_mgr", None)
+                    if mgr is not None and not mgr.loop.is_closed():
+                        mgr.submit(_prefetch_vs(), timeout=300)
+                    else:
+                        _pf_loop2 = asyncio.new_event_loop()
+                        asyncio.set_event_loop(_pf_loop2)
+                        _pf_loop2.run_until_complete(_prefetch_vs())
+                        _pf_loop2.close()
                 except Exception as _pfe2:
                     state.log(f"[PREFETCH] VOD/Series prefetch error: {_pfe2}")
                 finally:
@@ -1750,7 +1729,7 @@ def api_get_tmdb_id():
         return jsonify({"tmdb_id": "", "imdb_id": ""})
     try:
         async def fetch():
-            async with _make_client(do_handshake=True) as client:
+            async with _make_client(do_handshake=False) as client:
                 if series_id:
                     url = client._api("get_series_info", series_id=series_id)
                     async with client.session.get(url) as r:
