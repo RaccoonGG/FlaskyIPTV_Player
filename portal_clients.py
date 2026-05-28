@@ -48,6 +48,7 @@ No other changes required — all call sites remain identical.
 """
 
 import base64
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -55,8 +56,10 @@ import random
 import re
 import string
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
+from typing import Optional
 from urllib.parse import urlparse, quote, quote_plus, unquote, parse_qs
 import asyncio
 import aiohttp
@@ -168,13 +171,6 @@ _UA_DEFAULT: dict = {
     "xtream":  "TiviMate",
     "m3u_url": "VLC",
 }
-
-# Headers that must never be overwritten by a profile merge in _headers()
-_UA_PRESERVE = frozenset({
-    "Referer", "Cookie", "Connection", "Accept-Encoding",
-    "Accept-Language", "Pragma", "Accept",
-})
-
 
 def get_effective_ua(preset: str, custom: str, conn_type: str = "mac") -> tuple:
     """
@@ -404,8 +400,11 @@ class PortalClient:
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        if self.session:
-            await self.session.close()
+        # When managed by PortalSessionManager, the session lifetime is controlled
+        # externally — do NOT close it here.
+        if not getattr(self, "_externally_managed", False):
+            if self.session:
+                await self.session.close()
 
     async def handshake(self) -> str:
         assert self.session is not None
@@ -1919,8 +1918,9 @@ class StalkerPortalClient:
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        if self.session:
-            await self.session.close()
+        if not getattr(self, "_externally_managed", False):
+            if self.session:
+                await self.session.close()
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -1961,8 +1961,15 @@ class StalkerPortalClient:
         return self.base.rstrip("/") + "/" + val.lstrip("/")
 
     def _cookie_str(self, include_token: bool = True) -> str:
+        # Read PHPSESSID from the session jar if the server set a real one via
+        # Set-Cookie.  Fall back to "null" for portals that use bearer-token
+        # auth only and never establish a PHP session.
+        _phpsessid = "null"
+        if self.session is not None:
+            _jar = {c.key: c.value for c in self.session.cookie_jar}
+            _phpsessid = _jar.get("PHPSESSID") or "null"
         parts = [
-            "PHPSESSID=null",
+            f"PHPSESSID={_phpsessid}",
             f"mac={quote(self.mac)}",
             f"sn={quote(self.serialcut)}",   # Go ref: SerialNumber = SNCUT (13-char)
             "stb_lang=en",
@@ -1984,18 +1991,21 @@ class StalkerPortalClient:
             "Accept-Language": "en-US,en;q=0.5",
             "Pragma":          "no-cache",
             "Cookie":          self._cookie_str(include_token=include_token),
-            "Connection":      "close",
             "Accept-Encoding": "gzip, deflate",
         }
         # Merge profile headers — allow Accept, Accept-Language, Accept-Encoding
         # to be overridden by the preset so the full profile is applied correctly.
         # Only protect headers that are Stalker-protocol-critical and must not
         # be overwritten by any preset:
-        #   Referer  — portal session anchor, must point at stalker_portal
-        #   Cookie   — auth token, computed per-request
-        #   Connection — always "close" for Stalker (no keep-alive pooling)
-        #   Pragma   — always "no-cache" for Stalker cache-busting
-        _STALK_PRESERVE = frozenset({"Referer", "Cookie", "Connection", "Pragma"})
+        #   Referer    — portal session anchor, must point at stalker_portal
+        #   Cookie     — auth token, computed per-request
+        #   Pragma     — always "no-cache" for Stalker cache-busting
+        #   Connection — protected so profiles cannot inject "Connection: close"
+        #                and defeat the keepalive connector.  We do NOT hardcode
+        #                a value here ourselves; the TCPConnector(keepalive_timeout=30)
+        #                on the persistent session handles connection reuse, and
+        #                aiohttp will send "Connection: keep-alive" at transport level.
+        _STALK_PRESERVE = frozenset({"Referer", "Cookie", "Pragma", "Connection"})
         # Also skip internal profile metadata keys that are not HTTP headers
         _NOT_HTTP = frozenset({"stb_type", "image_version"})
         for k, v in _profile.items():
@@ -3403,8 +3413,9 @@ class XtreamClient:
         return self
 
     async def __aexit__(self, *args):
-        if self.session:
-            await self.session.close()
+        if not getattr(self, "_externally_managed", False):
+            if self.session:
+                await self.session.close()
 
     def _api(self, action: str, **params) -> str:
         url = f"{self.base}/player_api.php?username={self.username}&password={self.password}&action={action}"
@@ -4260,3 +4271,406 @@ class M3UClient:
                     try: progress_cb(count, name)
                     except TypeError: progress_cb(count)
         self.log(f"[M3U] Finished {cat_title} (items: {count})")
+
+
+# ===================== PORTAL SESSION MANAGER =====================
+
+class PortalSessionManager:
+    """Persistent aiohttp session manager for MAC/Stalker/Xtream portals.
+
+    Owns a single asyncio event loop running forever in a daemon thread.
+    All portal I/O dispatches to this loop via ``submit()`` so that:
+
+    * The aiohttp ClientSession (and its TCPConnector keepalive pool) remains
+      open between requests — no reconnection overhead between operations.
+    * ``handshake()`` is called at most ONCE per portal connection (or zero
+      times if a valid token is found in the portal's session cache).
+    * Concurrent 401/403 responses trigger only ONE re-handshake, protected
+      by an asyncio.Lock created inside the persistent loop.
+
+    Usage (called from FlaskyIPTV_Player_byGG.py)::
+
+        state.portal_mgr = PortalSessionManager()
+        result = state.portal_mgr.connect_sync(
+            conn_type, url, mac, username, password,
+            portal_key, log_cb, **client_kwargs,
+        )
+        # All subsequent async with _make_client() as client: calls
+        # dispatch to portal_mgr.loop transparently.
+
+    Thread-safety: ``submit()`` is the only public entry point for coroutines;
+    ``connect_sync()`` / ``disconnect()`` / ``stop()`` are synchronous and
+    safe to call from any thread.
+    """
+
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._client = None          # PortalClient | StalkerPortalClient | XtreamClient
+        self._auth_lock: Optional[asyncio.Lock] = None  # created inside _loop
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="portal-io-loop"
+        )
+        self._thread.start()
+        # Create asyncio.Lock in the persistent loop (it is loop-bound in ≤3.9).
+        asyncio.run_coroutine_threadsafe(
+            self._init_internals(), self._loop
+        ).result(timeout=5)
+
+    # ── loop thread ──────────────────────────────────────────────────────────
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    async def _init_internals(self) -> None:
+        self._auth_lock = asyncio.Lock()
+
+    # ── properties ───────────────────────────────────────────────────────────
+    @property
+    def client(self):
+        return self._client
+
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop:
+        return self._loop
+
+    # ── public API ───────────────────────────────────────────────────────────
+    def submit(self, coro, timeout: float = 30):
+        """Dispatch *coro* to the persistent loop and block until it completes.
+
+        Exceptions from the coroutine are re-raised in the calling thread.
+        Raises ``TimeoutError`` if *timeout* seconds elapse.
+        """
+        if self._loop.is_closed():
+            raise RuntimeError("PortalSessionManager loop is closed")
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise TimeoutError(f"Portal operation timed out after {timeout}s")
+
+    def connect_sync(
+        self,
+        conn_type: str,
+        url: str,
+        mac: str,
+        username: str,
+        password: str,
+        portal_key: str,
+        log_cb,
+        *,
+        ua_preset: str = "",
+        custom_ua: str = "",
+        stalker_sn: str = "",
+        stalker_device_id: str = "",
+        stalker_device_id2: str = "",
+        stalker_signature: str = "",
+        is_stalker: bool = False,
+        connect_epoch: int = 0,
+        get_epoch_fn=None,
+    ) -> dict:
+        """Create session + client, handshake once (or reuse cached token).
+
+        Runs entirely in the persistent loop.  Returns the same dict shape
+        that ``_connect_async()`` currently returns from its MAC/Xtream block.
+
+        ``get_epoch_fn`` is a zero-arg callable that returns the current
+        ``state._connect_epoch`` — used to abort if a newer connect fired.
+        """
+        async def _do() -> dict:
+            # ── build client ─────────────────────────────────────────────
+            # Construct the client first so __aenter__ can initialise its
+            # session with the correct UA profile, Accept headers, and
+            # (for PortalClient) the MAC cookie jar entry that portal.php
+            # uses to associate the TCP connection with this device.
+            if conn_type == "xtream":
+                client = XtreamClient(url, username, password, log_cb,
+                                      custom_ua=custom_ua)
+            elif is_stalker:
+                client = StalkerPortalClient(
+                    url, mac, log_cb,
+                    custom_sn=stalker_sn,
+                    custom_device_id=stalker_device_id,
+                    custom_device_id2=stalker_device_id2,
+                    custom_signature=stalker_signature,
+                    ua_preset=ua_preset,
+                    custom_ua=custom_ua,
+                )
+            else:
+                client = PortalClient(url, mac, log_cb,
+                                      ua_preset=ua_preset,
+                                      custom_ua=custom_ua)
+
+            # ── set up persistent session via __aenter__ ──────────────────
+            # Calling __aenter__ lets each client class initialise its own
+            # aiohttp.ClientSession with the correct headers, cookies, and
+            # timeout — identical to the non-persistent path.  We then replace
+            # the connector with a keep-alive one and mark the session as
+            # externally managed so __aexit__ does not close it.
+            #
+            # For XtreamClient: resolve the effective UA from preset + custom_ua
+            # before entering __aenter__, which uses self.custom_ua to apply
+            # session-level headers.  Old _make_client() did this via
+            # _resolve_custom_ua(); we must replicate it here so that a user-
+            # selected UA preset (e.g. "MAG254") is correctly applied to Xtream.
+            if conn_type == "xtream" and ua_preset and not custom_ua:
+                _resolved_ua, _ = get_effective_ua(ua_preset, "", "xtream")
+                client.custom_ua = _resolved_ua  # inject resolved UA into instance
+
+            await client.__aenter__()
+
+            # Upgrade the connector to keep-alive (15 s → 30 s idle timeout,
+            # max 10 concurrent connections, clean up half-closed sockets).
+            # We can't swap the connector on an existing session, so we close
+            # the just-created session and open a new one copying its headers
+            # and cookies but using our persistent TCPConnector.
+            import aiohttp as _aio
+            _old_hdrs    = dict(client.session.headers)
+            _old_cookies = {c.key: c.value
+                            for c in client.session.cookie_jar}
+
+            # For Stalker: seed the MAC address into the session cookie jar,
+            # mirroring PortalClient's cookies={"mac": self.mac} approach.
+            # stb_lang and timezone are already carried per-request via _cookie_str()
+            # and are redundant in the jar.  Only the MAC address is seeded here so
+            # the portal can associate the persistent TCP connection with this device
+            # even on requests where the Cookie header is absent or minimal.
+            if is_stalker:
+                _old_cookies.setdefault("mac", mac)
+
+            await client.session.close()
+
+            _connector = _aio.TCPConnector(
+                limit=10,
+                keepalive_timeout=30,
+                enable_cleanup_closed=True,
+            )
+            # Use each client type's original timeout to avoid regressions:
+            #   StalkerPortalClient.__aenter__: total=60, connect=10
+            #   XtreamClient.__aenter__:        total=30, connect=10
+            #   PortalClient.__aenter__:         total=30, connect=10
+            if is_stalker:
+                _tot, _conn_t = 60, 10
+            elif conn_type == "xtream":
+                _tot, _conn_t = 30, 10
+            else:
+                _tot, _conn_t = 30, 10
+            client.session = _aio.ClientSession(
+                connector=_connector,
+                timeout=_aio.ClientTimeout(total=_tot, connect=_conn_t),
+                cookies=_old_cookies,
+            )
+            client.session.headers.update(_old_hdrs)
+
+            # Hand session ownership to the manager and mark externally managed.
+            self._session = client.session
+            client._externally_managed = True
+            self._client = client
+
+            # ── authentication: always fresh handshake ───────────────────
+            # All portal types perform a fresh handshake on every connect.
+            # Token caching across app restarts (SessionStore) is not used:
+            #   Xtream:  stateless URL credentials — no session token exists.
+            #   Stalker: server-side session state (STB variant, active session
+            #            binding) is initialised during handshake(); injecting a
+            #            cached token bypasses that and causes account_info() to
+            #            fail with "Authorization failed. 75".
+            #   MAC:     same principle — always a clean session start on reconnect.
+            # Within a single running session the token lives on client.token /
+            # client.bearer_token and is reused for all requests via the persistent
+            # aiohttp session — no per-request re-handshake.
+            await client.handshake()
+
+            # Epoch guard post-handshake
+            if get_epoch_fn and get_epoch_fn() != connect_epoch:
+                return {"success": False, "error": "superseded"}
+
+            # ── account info ─────────────────────────────────────────────
+            ai = await client.account_info()
+            ident, exp = ai[0], ai[1]
+            max_conn = ai[2] if len(ai) > 2 else 0
+            # Epoch guard: bail immediately if a newer api_connect() arrived while we
+            # were suspended in account_info().  Do this before any state writes so
+            # the new portal's clean state is never overwritten by this stale result.
+            if get_epoch_fn and get_epoch_fn() != connect_epoch:
+                log_cb("[CONNECT] Superseded during account_info — discarding result.")
+                return {"success": False, "error": "superseded"}
+
+            # ── profile (Stalker / plain MAC) ─────────────────────────────
+            # For Stalker: also pull get_profile for richer display data
+            profile_data: dict = {}
+            if is_stalker and hasattr(client, "get_profile"):
+                try:
+                    prof = await client.get_profile()
+                    login = prof.get("login") or prof.get("fname") or prof.get("username") or ""
+                    if login:
+                        ident = login
+                    # Use tariff_expired_date from profile only if account_info didn't get a real expiry.
+                    # expire_billing_date is a billing timestamp, NOT subscription end — reference code
+                    # only uses it as absolute last resort when phone/end_date are also empty.
+                    exp_label = "expiry"
+                    if exp == "unknown":
+                        exp_prof = (prof.get("tariff_expired_date") or prof.get("end_date")
+                                    or prof.get("phone") or "")
+                        if exp_prof and exp_prof != "unknown":
+                            exp = str(exp_prof)
+                        elif prof.get("expire_billing_date"):
+                            exp = str(prof.get("expire_billing_date"))
+                            exp_label = "last_billing"
+                    if not max_conn:
+                        try:
+                            raw = (prof.get("max_online") or prof.get("playback_limit") or
+                                   prof.get("max_connections") or prof.get("con_per_device") or
+                                   prof.get("connections_limit") or 0)
+                            if not raw:
+                                storages = prof.get("storages")
+                                if isinstance(storages, dict):
+                                    for store in storages.values():
+                                        if isinstance(store, dict) and store.get("max_online"):
+                                            raw = store["max_online"]
+                                            break
+                            max_conn = int(raw) if raw else 0
+                        except Exception:
+                            pass
+                    _storage_ips = []
+                    _storages_raw = prof.get("storages")
+                    if isinstance(_storages_raw, dict):
+                        for _sname, _st in _storages_raw.items():
+                            if isinstance(_st, dict) and _st.get("storage_ip"):
+                                _storage_ips.append(str(_st["storage_ip"]))
+                    profile_data = {
+                        "type": "stalker", "mac": client.mac, "login": login or ident,
+                        "password": str(prof.get("password", "") or ""), "exp": exp,
+                        "exp_label": exp_label, "status": prof.get("status", ""),
+                        "max_conn": str(max_conn) if max_conn else "–",
+                        "active_cons": str(prof.get("active_cons") or prof.get("online_streams") or ""),
+                        "settings_password": str(prof.get("settings_password", "") or ""),
+                        "adult_password": str(prof.get("parent_password", "") or prof.get("adult_password", "") or ""),
+                        "portal_url": url, "timezone": str(prof.get("default_timezone") or
+                                                           prof.get("timezone") or prof.get("time_zone") or ""),
+                        "storage_ips": _storage_ips,
+                        "client_ip": str(prof.get("ip") or ""),
+                        "comment": str(prof.get("comment") or ""),
+                    }
+                except Exception as e:
+                    log_cb(f"[CONNECT] ✗ Could not fetch Stalker profile: {e}")
+                    profile_data = {"type": "stalker", "mac": client.mac, "exp": exp,
+                                    "max_conn": str(max_conn) if max_conn else "", "portal_url": url}
+
+            elif conn_type != "xtream" and not is_stalker:
+                # Plain MAC: _last_account_js holds the full get_main_info JS dict,
+                # set immediately after the dict is confirmed valid in account_info().
+                # We read ALL display fields from it directly — the raw portal response
+                # has every key needed (settings_password, parent_password,
+                # default_timezone, ip, comment, storages) at the top level of js.
+                # get_main_info often lacks default_timezone, parent_password,
+                # settings_password, ip, and storages — these are present in
+                # portal.php?type=stb&action=get_profile.  Fetch and merge any
+                # missing fields so the display logic below picks them up.
+                _mac_js = getattr(client, "_last_account_js", None) or {}
+                if hasattr(client, "get_profile"):
+                    try:
+                        _prof_js = await client.get_profile()
+                        if isinstance(_prof_js, dict):
+                            for _pk in ("default_timezone", "timezone", "parent_password",
+                                        "settings_password", "ip", "storages", "comment"):
+                                if _pk in _prof_js and not _mac_js.get(_pk):
+                                    _mac_js[_pk] = _prof_js[_pk]
+                    except Exception as _pe:
+                        log_cb(f"[CONNECT] MAC get_profile merge failed: {_pe}")
+                _mac_storage_ips = []
+                _mac_storages = _mac_js.get("storages")
+                if isinstance(_mac_storages, dict):
+                    for _st in _mac_storages.values():
+                        if isinstance(_st, dict) and _st.get("storage_ip"):
+                            _mac_storage_ips.append(str(_st["storage_ip"]))
+                _str = lambda v: str(v) if v is not None else ""
+                profile_data = {
+                    "type": "mac", "user": ident,
+                    "mac": client.mac if hasattr(client, "mac") else "",
+                    "exp": exp, "max_conn": str(max_conn) if max_conn else "",
+                    "settings_password": _str(_mac_js.get("settings_password") or
+                                             (ai[3] if len(ai) > 3 else "")),
+                    "adult_password": _str(_mac_js.get("parent_password") or
+                                          _mac_js.get("adult_password") or
+                                          (ai[4] if len(ai) > 4 else "")),
+                    "portal_url": url,
+                    "timezone": _str(_mac_js.get("default_timezone") or _mac_js.get("timezone") or ""),
+                    "storage_ips": _mac_storage_ips,
+                    "client_ip": _str(_mac_js.get("ip") or ""),
+                    "comment": _str(_mac_js.get("comment") or ""),
+                    "active_cons": "",
+                }
+
+            elif conn_type == "xtream":
+                _server_tz = getattr(client, "_server_timezone", "") or ""
+                _utc_off   = getattr(client, "_server_utc_offset", 0)
+                profile_data = {
+                    "type": "xtream", "user": ident, "mac": "",
+                    "exp": exp, "max_conn": str(max_conn) if max_conn else "",
+                    "active_cons": ai[4] if len(ai) > 4 else "",
+                    "password": ai[3] if len(ai) > 3 else "",
+                    "portal_url": url, "timezone": _server_tz,
+                    "storage_ips": [], "client_ip": "", "comment": "",
+                    "_utc_offset": _utc_off,
+                }
+
+            log_cb(f"[CONNECT] ✓ Connected: {ident} | {exp}")
+
+            # ── fetch categories ──────────────────────────────────────────
+            # Each category fetch is a real network call (live/VOD/series API
+            # requests can be slow on large portals); a new api_connect() may
+            # have arrived during this window — guard checked before and after.
+            if get_epoch_fn and get_epoch_fn() != connect_epoch:
+                log_cb("[CONNECT] Superseded before category fetch — discarding.")
+                return {"success": False, "error": "superseded"}
+
+            cats: dict = {}
+            for m in ("live", "vod", "series"):
+                try:
+                    cats[m] = await client.fetch_categories(m)
+                    log_cb(f"[CONNECT] {m.upper()}: {len(cats[m])} categories")
+                except Exception as e:
+                    log_cb(f"[CONNECT] ✗ {m.upper()} categories: {e}")
+                    cats[m] = []
+
+            # Final epoch guard after category fetches
+            if get_epoch_fn and get_epoch_fn() != connect_epoch:
+                log_cb("[CONNECT] Superseded during category fetch — discarding.")
+                return {"success": False, "error": "superseded"}
+
+            return {
+                "success": True,
+                "categories": cats,
+                "ident": ident,
+                "exp": exp,
+                "max_connections": max_conn,
+                "portal_url": url,
+                "is_stalker": is_stalker,
+                "profile_data": profile_data,
+            }
+
+        return self.submit(_do(), timeout=90)
+
+    def disconnect(self) -> None:
+        """Close the persistent session.  Safe to call from any thread."""
+        async def _do() -> None:
+            self._client = None
+            if self._session and not self._session.closed:
+                await self._session.close()
+                self._session = None
+        if not self._loop.is_closed():
+            try:
+                asyncio.run_coroutine_threadsafe(_do(), self._loop).result(timeout=10)
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        """Graceful shutdown — call on app exit."""
+        self.disconnect()
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5)
+        # Loop is stopped after thread exits; close it now so is_closed() → True.
+        if not self._loop.is_closed():
+            self._loop.close()
