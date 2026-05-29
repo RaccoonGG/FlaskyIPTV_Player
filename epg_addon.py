@@ -2940,17 +2940,25 @@ let _epgItem=null;
 
 // Xtream: tv_archive=1 → catchup supported, 0 → not supported.
 // MAC/Stalker: tv_archive is now normalized from enable_tv_archive in portal_clients.py.
+// Both portal types also expose tv_archive_duration (days/hours of archive depth).
+// We require BOTH: archive enabled AND nonzero duration — a channel with tv_archive=1
+// but tv_archive_duration=0 has no actual content to display.
 // M3U: no archive fields → allow (API handles gracefully).
 function _channelSupportsCatchup(it){
   if(!it) return false;
-  // tv_archive is set by Xtream natively and by MAC/Stalker after normalization
-  if('tv_archive' in it) return it.tv_archive===1 || it.tv_archive==='1';
+  // tv_archive is set by Xtream natively and by MAC/Stalker after normalization.
+  // Require duration > 0 as well — archive flag alone doesn't guarantee content exists.
+  if('tv_archive' in it){
+    const enabled = it.tv_archive===1 || it.tv_archive==='1';
+    const hasDur  = parseInt(it.tv_archive_duration||0, 10) > 0;
+    return enabled && hasDur;
+  }
   // Secondary fallback: raw enable_tv_archive/tv_archive_duration if normalization
   // didn't run yet (e.g. items loaded before prefetch completed)
   if('enable_tv_archive' in it || 'tv_archive_duration' in it){
     const ena = it.enable_tv_archive===1 || it.enable_tv_archive==='1';
-    const dur = parseInt(it.tv_archive_duration||0,10) > 0;
-    return ena || dur;
+    const dur = parseInt(it.tv_archive_duration||0, 10) > 0;
+    return ena && dur;
   }
   // M3U or unknown portal type — allow and let the API respond
   return true;
