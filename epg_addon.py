@@ -2886,20 +2886,27 @@ _EPG_UI_JS = r"""
   <div id="catchup-overlay" style="display:none;position:fixed;inset:0;z-index:900;
     background:rgba(0,0,0,.7);align-items:flex-end;justify-content:center">
     <div style="background:var(--s2);border-radius:var(--rs) var(--rs) 0 0;
-      width:100%;max-width:600px;padding:16px;box-shadow:var(--sh);
-      border-top:1px solid var(--bdr2);max-height:70vh;overflow-y:auto">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-        <div>
-          <span style="font-size:13px;font-weight:700;color:var(--txt1)" id="catchup-ch-name">↺ Catch-up TV</span>
-          <div style="font-size:11px;color:var(--txt3);margin-top:2px">Select a past programme to watch</div>
+      width:100%;max-width:600px;box-shadow:var(--sh);
+      border-top:1px solid var(--bdr2);max-height:70vh;
+      display:flex;flex-direction:column;overflow:hidden">
+      <!-- Fixed header -->
+      <div style="padding:12px 16px 4px;flex-shrink:0">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+          <div>
+            <span style="font-size:13px;font-weight:700;color:var(--txt1)" id="catchup-ch-name">↺ Catch-up TV</span>
+            <div style="font-size:11px;color:var(--txt3);margin-top:2px">Select a past programme to watch</div>
+          </div>
+          <button class="btn-ghost" onclick="closeCatchup()"
+            style="height:28px;width:28px;padding:0;font-size:14px;border-radius:var(--rss)">✕</button>
         </div>
-        <button class="btn-ghost" onclick="closeCatchup()"
-          style="height:28px;width:28px;padding:0;font-size:14px;border-radius:var(--rss)">✕</button>
+        <div id="catchup-status" style="font-size:11px;color:var(--txt3);min-height:14px;margin-bottom:2px"></div>
       </div>
-      <div id="catchup-status" style="font-size:11px;color:var(--txt3);min-height:14px;margin-bottom:4px"></div>
-      <div id="catchup-body" style="margin-top:4px">
+      <!-- Scrollable programme list -->
+      <div id="catchup-body" style="flex:1;overflow-y:auto;padding:0 16px 4px">
         <div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Loading…</div>
       </div>
+      <!-- Fixed footer — manual time range always visible -->
+      <div id="catchup-footer" style="flex-shrink:0;padding:8px 16px 14px;border-top:1px solid var(--bdr)"></div>
     </div>
   </div>
 
@@ -3555,6 +3562,7 @@ function showCatchup(){
   document.getElementById('catchup-status').textContent='';
   document.getElementById('catchup-body').innerHTML=
     '<div style="color:var(--txt3);font-size:12px;text-align:center;padding:20px">Loading past programmes…</div>';
+  document.getElementById('catchup-footer').innerHTML=_cuManualForm();
   document.getElementById('catchup-overlay').style.display='flex';
   _loadCatchupEPG();
 }
@@ -3599,15 +3607,13 @@ async function _loadCatchupEPG(){
       _renderArchiveListings(d.archive_listings);
       return;
     }
-    // No archive data — show manual time picker
+    // No archive data — show message only (manual form is always in footer)
     const errMsg=d.error||'No archived programme data found';
     document.getElementById('catchup-body').innerHTML=
-      `<div style="color:var(--txt3);font-size:12px;text-align:center;padding:16px">${errMsg}</div>`
-      +'<div style="padding:12px">'+_cuManualForm()+'</div>';
+      `<div style="color:var(--txt3);font-size:12px;text-align:center;padding:16px">${errMsg}</div>`;
   }catch(e){
     document.getElementById('catchup-body').innerHTML=
-      `<div style="color:var(--err);font-size:12px;text-align:center;padding:20px">Failed: ${e.message}</div>`
-      +'<div style="padding:12px">'+_cuManualForm()+'</div>';
+      `<div style="color:var(--err);font-size:12px;text-align:center;padding:20px">Failed: ${e.message}</div>`;
   }
 }
 
@@ -3665,7 +3671,7 @@ function _renderArchiveListings(listings){
        </div>`
     : '';
   document.getElementById('catchup-body').innerHTML=
-    syntheticNotice+rows+'<div style="padding-top:8px;border-top:1px solid var(--bdr)">'+_cuManualForm()+'</div>';
+    syntheticNotice+rows;
 }
 
 function doPlayArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, encodedRealId, encodedStartStr){
