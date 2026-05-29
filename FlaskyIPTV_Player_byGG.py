@@ -5448,7 +5448,7 @@ function renderItems(items){
     const hasCatchup = mode==='live' && playable && _channelSupportsCatchup(it);
     return '<div class="irow'+(playing?' now':'')+'" style="--d:'+(Math.min(i,20)*.016)+'s" data-key="'+esc(name)+'">'
       +'<input class="ichk" type="checkbox" data-i="'+i+'" onchange="onChk('+i+',this.checked)">'
-      +(logoSrc?'<img class="ilogo" loading="lazy" src="'+esc(logoSrc)+'" onerror="this.style.display=\'none\'">'+'':'<span style="width:36px;height:24px;flex-shrink:0;display:inline-block"></span>')
+      +(logoSrc?'<img class="ilogo" loading="lazy" src="'+esc(logoSrc)+'" onerror="this.onerror=null;this.src=\'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7\'">'+'':'<span style="width:36px;height:24px;flex-shrink:0;display:inline-block"></span>')
       +'<button onclick="toggleFav('+i+')" title="Favourite"'
       +' style="background:none;border:none;cursor:pointer;font-size:15px;padding:0 2px;line-height:1;flex-shrink:0;color:'+(isFav(it)?'#f5c518':'rgba(255,255,255,0.25)')+'" >★</button>'
       +'<span class="iname"><span class="iname-inner">'+esc(name)+'</span></span>'
