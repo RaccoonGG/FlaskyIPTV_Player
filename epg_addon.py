@@ -79,7 +79,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from urllib.parse import urlparse, quote, unquote, parse_qs
+from urllib.parse import urlparse, quote, unquote, parse_qs, urlencode
 
 import aiohttp
 from flask import request, jsonify, Response
@@ -1458,9 +1458,14 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                 # cmd='auto /media/{id}.mpg' for type=tv_archive.
                                 # 'real_id' is a portal-internal field and is NOT used.
                                 epg_id = str(ep.get("id") or "").strip()
+                                # MAC portals return composite IDs like '641462_162096'
+                                # (format: {sequential_archive_id}_{ch_id}).  The original
+                                # ^\d+$ regex rejected these, zeroing valid_epg_id and causing
+                                # archive_cmd="" in api_catchup_play — Stage 1 (type=tv_archive)
+                                # was never attempted. Allow pure integers AND composite MAC IDs.
                                 valid_epg_id = (
                                     epg_id
-                                    if (re.match(r'^\d+$', epg_id) and epg_id not in ('0', ''))
+                                    if (re.match(r'^[1-9]\d*(_\d+)?$', epg_id) and epg_id not in ('0', ''))
                                     else ""
                                 )
                                 st = _to_ts(ep.get("start_timestamp") or ep.get("time"))
@@ -1517,6 +1522,10 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
         cmd_in   = str(data.get("cmd")      or "").strip()
         live_cmd = str(data.get("live_cmd") or "").strip()
         epg_id   = str(data.get("epg_id")   or data.get("real_id") or "").strip()
+        # ch_id is the portal's channel ID (e.g. 162096).  MAC portals whose cmd is
+        # just the bare base URL (no stream= param) need this injected so the portal
+        # can identify which channel's archive to return in type=itv create_link.
+        ch_id_in = str(data.get("ch_id")    or "").strip()
         start_ts = int(data.get("start") or 0)
         stop_ts  = int(data.get("stop")  or 0)
 
@@ -1537,6 +1546,29 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
             return jsonify({"error": "Missing cmd or start timestamp"})
         if not stop_ts or stop_ts <= start_ts:
             stop_ts = start_ts + 3600
+
+        # Inject ch_id as stream= into bare MAC cmd URLs that have no stream param.
+        # MAC portals whose get_ordered_list cmd is just the bare base URL
+        # (e.g. "ffmpeg http://host/play/live.php") can't identify the channel for
+        # type=itv create_link without it — the portal returns stream= empty → HTTP 405.
+        # This is done here in the outer scope (not inside _play()) to avoid the
+        # UnboundLocalError that occurs when any assignment to effective_cmd exists
+        # inside _play(), causing Python to treat it as local-but-unbound on first read.
+        if ch_id_in and effective_cmd:
+            _pfx = ""
+            _upart = effective_cmd
+            for _p in ("ffmpeg ", "auto ", "ffrt "):
+                if _upart.lower().startswith(_p):
+                    _pfx, _upart = _p, _upart[len(_p):]
+                    break
+            if "://" in _upart:
+                _purl = urlparse(_upart)
+                _qs_d = parse_qs(_purl.query, keep_blank_values=True)
+                if not _qs_d.get("stream") or not _qs_d["stream"][0]:
+                    _qs_d["stream"] = [ch_id_in]
+                    _new_q = urlencode({k: v[0] for k, v in _qs_d.items()})
+                    effective_cmd = _pfx + _upart.split("?")[0] + "?" + _new_q
+                    state.log(f"[CATCHUP/Play] Injected stream={ch_id_in} into effective_cmd")
 
         async def _play():
             # ── Xtream: build timeshift URL directly — no portal call needed ──────
@@ -1597,26 +1629,113 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 return {"url": cu_url, "fallback_url": cu_url_fallback, "duration_secs": int(stop_ts - start_ts)}
 
             # ── MAC / Stalker portal ──────────────────────────────────────────────
-            # Use the same server-UTC-offset approach as the Xtream path above.
-            # astimezone() would use the CLIENT's local timezone (DST-contaminated):
-            # after Belgrade's clock moves UTC+1→UTC+2, start_str shifts +1h,
-            # causing catchup to play one slot ahead on 60-min programmes.
-            _mac_offset_secs = getattr(state, "_portal_utc_offset", 0)
-            _mac_srv_local_ts = start_ts + _mac_offset_secs
-            start_str    = datetime.utcfromtimestamp(_mac_srv_local_ts).strftime("%Y-%m-%d:%H-%M")
+            # For MAC portals, start_str ("YYYY-MM-DD HH:MM" server-local) is the
+            # ONLY reliable time source. start_timestamp is a Unix epoch computed by
+            # the portal using a pre-DST timezone offset (e.g. CET instead of CEST),
+            # making it 1-2h off after DST changes. We use start_str directly and
+            # fall back to epoch+offset only when start_str is absent.
+            _start_str_raw = str(data.get("start_str") or "").strip()[:16]
+            if len(_start_str_raw) >= 13:
+                # Portal format: "2026-05-30 03:30" (date space time)
+                # create_link format: "2026-05-30:03-30" (date colon time-with-dashes)
+                _date_part, _time_part = _start_str_raw.split(" ", 1)
+                start_str = f"{_date_part}:{_time_part.replace(':', '-')}"
+            else:
+                _mac_offset_secs = getattr(state, "_portal_utc_offset", 0)
+                _mac_srv_local_ts = start_ts + _mac_offset_secs
+                start_str = datetime.utcfromtimestamp(_mac_srv_local_ts).strftime("%Y-%m-%d:%H-%M")
+
             duration_min = max(1, (stop_ts - start_ts) // 60)
 
             state.log(f"[CATCHUP/Play] cmd={effective_cmd[:50]} archive_cmd={archive_cmd[:50] if archive_cmd else '(none)'} start={start_str} dur={duration_min}m")
 
-            async with _make_client(do_handshake=False) as client:
-                url = await client.create_catchup_link(effective_cmd, start_str, duration_min,
-                                                       archive_cmd=archive_cmd)
-                # If tv_archive returned nothing (null storage response), fall back to
-                # type=itv + start/duration which works on Flussonic-backed portals.
-                if not url and archive_cmd:
-                    state.log(f"[CATCHUP/Play] ⚠ tv_archive failed — retrying with type=itv fallback")
+            url = None
+
+            # ── Stage 1: tv_archive (SFVIP-style) ────────────────────────────────
+            # SFVIP calls /portal.php?type=tv_archive&action=create_link directly
+            # with cmd=auto /media/{composite_id}.mpg, series=empty, no start/duration.
+            # The composite id (e.g. 600817522_110778) already encodes channel+recording.
+            # This MUST be done manually for plain MAC because the MAC client's
+            # create_catchup_link ignores archive_cmd and builds a timeshift URL.
+            if archive_cmd and not state.is_stalker_portal:
+                _mac_base = normalize_base_url(state.url)
+                _tv_archive_url = (
+                    f"{_mac_base}/portal.php?type=tv_archive&action=create_link"
+                    f"&cmd={quote(archive_cmd, safe='')}"
+                    f"&series=&forced_storage=0&disable_ad=0&download=0"
+                    f"&force_ch_link_check=0&JsHttpRequest=1-xml"
+                )
+                state.log(f"[CATCHUP/Play] Stage 1 tv_archive: {_tv_archive_url[:160]}")
+                try:
+                    async with _make_client(do_handshake=False) as client:
+                        _mac_hdrs = client.headers
+                        async with client.session.get(
+                            _tv_archive_url, headers=_mac_hdrs,
+                            timeout=aiohttp.ClientTimeout(total=10)
+                        ) as _tv_r:
+                            _tv_payload = await safe_json(_tv_r)
+                    state.log(f"[CATCHUP/Play] tv_archive raw: {str(_tv_payload)[:250]}")
+                    if isinstance(_tv_payload, dict):
+                        _tv_js = _tv_payload.get("js", {})
+                        if isinstance(_tv_js, dict):
+                            url = _tv_js.get("cmd") or _tv_js.get("url") or _tv_js.get("link")
+                        if not url:
+                            url = _tv_payload.get("text")
+                        if url and isinstance(url, str):
+                            # The portal may return a ffmpeg-prefixed URL or bare http URL.
+                            # Strip prefix and use the URL directly — it has the CORRECT
+                            # start time embedded (portal-computed), unlike our Stage 2.
+                            _url_clean = url
+                            for _pfx in ("ffmpeg ", "auto ", "ffrt "):
+                                if _url_clean.lower().startswith(_pfx):
+                                    _url_clean = _url_clean[len(_pfx):]
+                                    break
+                            if _url_clean.startswith("http"):
+                                state.log(f"[CATCHUP/Play] Stage 1 candidate → {_url_clean[:120]}")
+                                # For timeshift.php URLs, probe with the portal session
+                                # to resolve any redirects and get the real stream URL.
+                                if 'timeshift.php' in _url_clean:
+                                    try:
+                                        async with _make_client(do_handshake=False) as _probe_client:
+                                            async with _probe_client.session.get(
+                                                _url_clean, headers=_probe_client.headers,
+                                                timeout=aiohttp.ClientTimeout(total=10),
+                                                allow_redirects=True
+                                            ) as _probe_r:
+                                                _final_url = str(_probe_r.url)
+                                                state.log(f"[CATCHUP/Play] timeshift probe → {_probe_r.status} → {_final_url[:120]}")
+                                                if _probe_r.status == 200:
+                                                    # If response is small (< 5KB), might be M3U8/playlist
+                                                    if _probe_r.content_length and _probe_r.content_length < 5120:
+                                                        _probe_body = await _probe_r.text()
+                                                        state.log(f"[CATCHUP/Play] timeshift body preview: {_probe_body[:200]}")
+                                                    return {"url": _final_url}
+                                                elif _probe_r.status in (301, 302, 307, 308):
+                                                    return {"url": _final_url}
+                                                else:
+                                                    # 404 or other error - don't return broken URL,
+                                                    # let Stage 2 try a different approach
+                                                    state.log(f"[CATCHUP/Play] timeshift probe failed ({_probe_r.status}) — will try Stage 2")
+                                    except Exception as _probe_e:
+                                        state.log(f"[CATCHUP/Play] timeshift probe error: {_probe_e} — will try Stage 2")
+                                else:
+                                    # Non-timeshift URL (direct media) - return as-is
+                                    return {"url": _url_clean}
+                        url = None
+                except Exception as _tv_e:
+                    state.log(f"[CATCHUP/Play] Stage 1 error: {_tv_e}")
+
+            # ── Stage 2: type=itv with start+duration (fallback) ───────────────
+            if not url:
+                async with _make_client(do_handshake=False) as client:
                     url = await client.create_catchup_link(effective_cmd, start_str, duration_min,
-                                                           archive_cmd="")
+                                                           archive_cmd=archive_cmd)
+                    # If tv_archive returned nothing (null storage response), fall back to
+                    # type=itv + start/duration which works on Flussonic-backed portals.
+                    if not url and archive_cmd:
+                        state.log(f"[CATCHUP/Play] ⚠ tv_archive failed — retrying with type=itv fallback")
+                        url = await client.create_catchup_link(effective_cmd, start_str, duration_min,
+                                                               archive_cmd="")
 
             if not url:
                 return {"error": "Portal returned no catch-up URL"}
@@ -1643,7 +1762,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 dur_secs    = stop_ts - start_ts
                 # Preserve any extra query params beyond 'token' (some CDNs need them)
                 _extra_qs = '&'.join(
-                    f"{k}={v[0]}" for k, v in _pqs(_pu.query).items() if k != 'token'
+                    f"{k}={v[0]}" for k, v in parse_qs(_pu.query).items() if k != 'token'
                 )
                 archive_url = (f"{_pu.scheme}://{_pu.netloc}"
                                f"{_stream_base}/archive-{start_ts}-{dur_secs}.m3u8"
@@ -1651,6 +1770,16 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                + (f"&{_extra_qs}" if _extra_qs else ""))
                 state.log(f"[CATCHUP/Play] Flussonic → {archive_url}")
                 return {"url": archive_url}
+
+            # ── MAC panel timeshift.php fix ──────────────────────────────────────
+            # timeshift.php URLs with &extension=ts return raw MPEG-TS streams but
+            # the URL ends in .php, so the player defaults to HLS.js and fails.
+            # We append #.ts to the URL so the player recognizes MPEG-TS format.
+            # The fragment is NOT sent to the server.
+            if 'timeshift.php' in url and '&extension=ts' in url:
+                url = url + "#.ts"
+                state.log(f"[CATCHUP/Play] timeshift.php → MPEG-TS hint → {url[:120]}")
+                return {"url": url}
 
             state.log(f"[CATCHUP/Play] Resolved → {url}")
             return {"url": url}
@@ -3637,6 +3766,8 @@ function _renderArchiveListings(listings){
     const cmdSafe=encodeURIComponent(p.cmd||'');
     const liveCmdSafe=encodeURIComponent(p.live_cmd||'');
     const realIdSafe=encodeURIComponent(p.epg_id||p.id||'');
+    // ch_id: MAC portal channel ID — injected into cmd on server when stream= is absent
+    const chIdSafe=encodeURIComponent(p.ch_id||'');
     const titleDisplay=p.title||(p.synthetic?'—':'Unknown');
     const titleSafe=titleDisplay.replace(/'/g,"\\'");
     // start_str is the portal's own server-local datetime string ("YYYY-MM-DD HH:MM").
@@ -3645,10 +3776,10 @@ function _renderArchiveListings(listings){
     const startStrSafe=encodeURIComponent(p.start_str||'');
     const opacity=hasArchive?'1':'0.4';
     const click=hasArchive
-      ?`onclick="doPlayArchiveCmd('${cmdSafe}',${p.start||0},${p.stop||0},'${titleSafe}','${liveCmdSafe}','${realIdSafe}','${startStrSafe}')"`
+      ?`onclick="doPlayArchiveCmd('${cmdSafe}',${p.start||0},${p.stop||0},'${titleSafe}','${liveCmdSafe}','${realIdSafe}','${startStrSafe}','${chIdSafe}')"`
       :'';
     const extBtn=hasArchive
-      ?`<button class="btn-ghost" onclick="event.stopPropagation();doExternalArchiveCmd('${cmdSafe}',${p.start||0},${p.stop||0},'${titleSafe}','${liveCmdSafe}','${realIdSafe}','${startStrSafe}')" title="Play in external player" style="padding:0 6px;font-size:13px;flex-shrink:0">🎬</button>`
+      ?`<button class="btn-ghost" onclick="event.stopPropagation();doExternalArchiveCmd('${cmdSafe}',${p.start||0},${p.stop||0},'${titleSafe}','${liveCmdSafe}','${realIdSafe}','${startStrSafe}','${chIdSafe}')" title="Play in external player" style="padding:0 6px;font-size:13px;flex-shrink:0">🎬</button>`
       :'';
     const cursor=hasArchive?'pointer':'default';
     const archIcon=hasArchive?'<span style="font-size:14px;color:var(--acc)">▶</span>':'';
@@ -3674,16 +3805,17 @@ function _renderArchiveListings(listings){
     syntheticNotice+rows;
 }
 
-function doPlayArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, encodedRealId, encodedStartStr){
+function doPlayArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, encodedRealId, encodedStartStr, encodedChId){
   const cmd=decodeURIComponent(encodedCmd||'');
   const liveCmd=decodeURIComponent(encodedLiveCmd||'');
   const realId=decodeURIComponent(encodedRealId||'');
   const startStr=decodeURIComponent(encodedStartStr||'');
+  const chId=decodeURIComponent(encodedChId||'');
   const status=document.getElementById('catchup-status');
   if(status) status.textContent='Resolving…';
   fetch('/api/catchup/play',{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({cmd, live_cmd:liveCmd, epg_id:realId, start:startTs, stop:stopTs, start_str:startStr})})
+    body:JSON.stringify({cmd, live_cmd:liveCmd, epg_id:realId, start:startTs, stop:stopTs, start_str:startStr, ch_id:chId})})
   .then(r=>r.json()).then(d=>{
     if(d.url){
       const label=(_epgItem?_epgItem.name:'')+' — '+title+' [↺]';
@@ -3713,17 +3845,18 @@ function doPlayArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, en
   }).catch(e=>{if(status) status.textContent='❌ '+e.message;});
 }
 
-async function doExternalArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, encodedRealId, encodedStartStr){
+async function doExternalArchiveCmd(encodedCmd, startTs, stopTs, title, encodedLiveCmd, encodedRealId, encodedStartStr, encodedChId){
   const cmd=decodeURIComponent(encodedCmd||'');
   const liveCmd=decodeURIComponent(encodedLiveCmd||'');
   const realId=decodeURIComponent(encodedRealId||'');
   const startStr=decodeURIComponent(encodedStartStr||'');
+  const chId=decodeURIComponent(encodedChId||'');
   const status=document.getElementById('catchup-status');
   if(status) status.textContent='Resolving for external player…';
   try{
     const r=await fetch('/api/catchup/play',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({cmd, live_cmd:liveCmd, epg_id:realId, start:startTs, stop:stopTs, start_str:startStr})});
+      body:JSON.stringify({cmd, live_cmd:liveCmd, epg_id:realId, start:startTs, stop:stopTs, start_str:startStr, ch_id:chId})});
     const d=await r.json();
     if(!d.url){if(status) status.textContent='❌ '+(d.error||'Not available');return;}
     const url=d.url;
@@ -3780,9 +3913,11 @@ function doWatchCatchupManual(){
   const cmd=encodeURIComponent((match&&match.cmd)||liveCmd);
   const live_cmd=encodeURIComponent((match&&match.live_cmd)||liveCmd);
   const epg_id=encodeURIComponent((match&&(match.epg_id||match.id))||'');
+  const start_str=encodeURIComponent((match&&match.start_str)||'');
+  const ch_id=encodeURIComponent((match&&match.ch_id)||(_epgItem&&(_epgItem.ch_id||_epgItem.id))||'');
   const title=(match&&match.title)||'';
   const useStop=(match&&match.stop)||endTs;
-  doPlayArchiveCmd(cmd, startTs, useStop, title, live_cmd, epg_id);
+  doPlayArchiveCmd(cmd, startTs, useStop, title, live_cmd, epg_id, start_str, ch_id);
 }
 
 
