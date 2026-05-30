@@ -1629,21 +1629,32 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 return {"url": cu_url, "fallback_url": cu_url_fallback, "duration_secs": int(stop_ts - start_ts)}
 
             # ── MAC / Stalker portal ──────────────────────────────────────────────
-            # For MAC portals, start_str ("YYYY-MM-DD HH:MM" server-local) is the
-            # ONLY reliable time source. start_timestamp is a Unix epoch computed by
+            # start_str ("YYYY-MM-DD HH:MM" server-local time from get_simple_data_table)
+            # is the ONLY reliable time source. start_timestamp is a UTC epoch computed by
             # the portal using a pre-DST timezone offset (e.g. CET instead of CEST),
-            # making it 1-2h off after DST changes. We use start_str directly and
-            # fall back to epoch+offset only when start_str is absent.
+            # making it 1-2h off after DST changes. We use start_str directly — the same
+            # approach as the Xtream path — and fall back to epoch+offset only when absent.
+            _mac_offset_secs = getattr(state, "_portal_utc_offset", 0)
             _start_str_raw = str(data.get("start_str") or "").strip()[:16]
             if len(_start_str_raw) >= 13:
                 # Portal format: "2026-05-30 03:30" (date space time)
                 # create_link format: "2026-05-30:03-30" (date colon time-with-dashes)
-                _date_part, _time_part = _start_str_raw.split(" ", 1)
-                start_str = f"{_date_part}:{_time_part.replace(':', '-')}"
-            else:
-                _mac_offset_secs = getattr(state, "_portal_utc_offset", 0)
+                try:
+                    _dt_local = datetime.strptime(_start_str_raw, "%Y-%m-%d %H:%M")
+                    start_str = _dt_local.strftime("%Y-%m-%d:%H-%M")
+                except ValueError:
+                    _start_str_raw = ""  # fall through to epoch+offset below
+
+            if len(_start_str_raw) < 13:
+                # Fallback: epoch + server-UTC-offset (used when start_str absent,
+                # e.g. entries arriving from XMLTV EPG path instead of get_simple_data_table).
                 _mac_srv_local_ts = start_ts + _mac_offset_secs
                 start_str = datetime.utcfromtimestamp(_mac_srv_local_ts).strftime("%Y-%m-%d:%H-%M")
+
+            state.log(f"[CATCHUP/Play] MAC offset={_mac_offset_secs:+d}s  "
+                      f"start_utc={datetime.utcfromtimestamp(start_ts).strftime('%Y-%m-%d %H:%M')}  "
+                      f"start_server={start_str}"
+                      + ("  [from start_str]" if len(_start_str_raw) >= 13 else ""))
 
             duration_min = max(1, (stop_ts - start_ts) // 60)
 
@@ -1709,9 +1720,13 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                                                     if _probe_r.content_length and _probe_r.content_length < 5120:
                                                         _probe_body = await _probe_r.text()
                                                         state.log(f"[CATCHUP/Play] timeshift body preview: {_probe_body[:200]}")
-                                                    return {"url": _final_url}
+                                                    # Include duration_secs so the player's catchup HLS-VOD
+                                                    # proxy path fires (durationSecs>0 check in doPlay),
+                                                    # routing timeshift.php MPEG-TS through the seekable proxy
+                                                    # instead of letting isHls swallow it into bare HLS.js.
+                                                    return {"url": _final_url, "duration_secs": stop_ts - start_ts}
                                                 elif _probe_r.status in (301, 302, 307, 308):
-                                                    return {"url": _final_url}
+                                                    return {"url": _final_url, "duration_secs": stop_ts - start_ts}
                                                 else:
                                                     # 404 or other error - don't return broken URL,
                                                     # let Stage 2 try a different approach
@@ -1771,15 +1786,15 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                 state.log(f"[CATCHUP/Play] Flussonic → {archive_url}")
                 return {"url": archive_url}
 
-            # ── MAC panel timeshift.php fix ──────────────────────────────────────
-            # timeshift.php URLs with &extension=ts return raw MPEG-TS streams but
-            # the URL ends in .php, so the player defaults to HLS.js and fails.
-            # We append #.ts to the URL so the player recognizes MPEG-TS format.
-            # The fragment is NOT sent to the server.
-            if 'timeshift.php' in url and '&extension=ts' in url:
-                url = url + "#.ts"
-                state.log(f"[CATCHUP/Play] timeshift.php → MPEG-TS hint → {url[:120]}")
-                return {"url": url}
+            # timeshift.php URLs return raw MPEG-TS — player must not route them
+            # to HLS.js (which expects an m3u8 manifest and fails with manifestLoadError).
+            # The player's HLS-VOD proxy path (doPlay catchup routing) bypasses the
+            # isHls check when durationSecs>0 and routes timeshift.php through
+            # /api/catchup/stream — a seekable MPEG-TS → VOD HLS wrapper.
+            # Returning duration_secs here activates that path.
+            if 'timeshift.php' in url:
+                state.log(f"[CATCHUP/Play] Resolved → {url} [timeshift MPEG-TS, duration={stop_ts - start_ts}s]")
+                return {"url": url, "duration_secs": stop_ts - start_ts}
 
             state.log(f"[CATCHUP/Play] Resolved → {url}")
             return {"url": url}
