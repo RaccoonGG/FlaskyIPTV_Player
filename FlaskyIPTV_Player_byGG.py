@@ -1055,7 +1055,7 @@ def api_connect():
         # everything in a single HTTP call — identical to get_live_streams for live.
         #
         # For MAC/Stalker: we probe for Xtream credentials embedded in VOD item
-        # cmd URLs (via _extract_xtream_creds()).  If the portal runs on Xtream
+        # cmd URLs (via parse_xtream_info()).  If the portal runs on Xtream
         # Codes software it will expose player_api.php and we call get_vod_streams
         # / get_series there.  If creds cannot be extracted the methods return []
         # and api_items() falls back to per-category pagination automatically.
