@@ -608,15 +608,6 @@ class PortalClient:
         def _is_safe_cred(s: str) -> bool:
             return isinstance(s, str) and (3 <= len(s) <= 64) and not any(c in s for c in _SAFE_CRED_CHARS)
 
-        def _normalize_base_from_url(u: str) -> str:
-            try:
-                p = urlparse(u)
-                scheme = p.scheme or "http"
-                netloc = p.netloc or p.path or ""
-                return f"{scheme}://{netloc}"
-            except Exception:
-                return self.base
-
         def _try_extract_xtream_from_url(candidate: str):
             if not candidate:
                 return None
@@ -625,8 +616,9 @@ class PortalClient:
             xt = extract_xtream_from_m3u_url(cand)
             if xt:
                 xt["base"] = normalize_base_url(xt["base"])
-                return {"type": "xtream", "base": xt["base"], "username": xt["username"], "password": xt["password"]}
-            # path-style fallback
+                return {"type": "xtream", "base": xt["base"],
+                        "username": xt["username"], "password": xt["password"]}
+            # path-style: /movie/USER/PASS/id.ext, /live/USER/PASS/id.ts, etc.
             try:
                 p = urlparse(cand)
                 parts = [seg for seg in p.path.strip("/").split("/") if seg]
@@ -638,55 +630,38 @@ class PortalClient:
                     if "=" in pw:
                         pw = pw.split("=", 1)[0]
                     if _is_safe_cred(u) and _is_safe_cred(pw) and "." not in u and "." not in pw:
-                        base = f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else _normalize_base_from_url(cand)
+                        base = (f"{p.scheme}://{p.netloc}"
+                                if p.scheme and p.netloc
+                                else self.base)
                         return {"type": "xtream", "base": base, "username": u, "password": pw}
-            except Exception:
-                pass
-            # pipe/colon separated fallback (USER|PASS or USER:PASS)
-            if "|" in cand or ":" in cand:
-                sep = "|" if "|" in cand else ":"
-                parts = cand.split(sep)
-                if len(parts) >= 2:
-                    u, pw = parts[0].strip(), parts[1].strip()
-                    if _is_safe_cred(u) and _is_safe_cred(pw) and "." not in u and "." not in pw:
-                        return {"type": "xtream", "base": self.base, "username": u, "password": pw}
-            # try base64 decode if looks encoded
-            try:
-                import base64 as _b64
-                maybe = cand.strip()
-                if len(maybe) % 4 == 0 and re.fullmatch(r'[A-Za-z0-9+/=]+', maybe):
-                    dec = _b64.b64decode(maybe).decode(errors="ignore")
-                    return _try_extract_xtream_from_url(dec)
             except Exception:
                 pass
             return None
 
-        # ---------------- Primary probe: exact Player API endpoints (try many variants) ----------------
+        # ── Step 1: Player API probe — try multiple endpoint shapes ─────────
         try:
-            headers = getattr(self, "headers", {}) or {}
             probe_variants = [
                 f"{self.base}/c/",
-                f"{self.base}/c/{self.token}" if getattr(self, "token", None) else None,
-                f"{self.base}/c/{self.token}?mac={self.mac}" if getattr(self, "token", None) else None,
+                f"{self.base}/c/{self.token}" if self.token else None,
+                f"{self.base}/c/{self.token}?mac={self.mac}" if self.token else None,
                 f"{self.base}/player_api.php?mac={self.mac}",
                 f"{self.base}/portal.php?type=account_info&action=get_main_info&JsHttpRequest=1-xml",
                 f"{self.base}/portal.php?type=stb&action=get_profile&JsHttpRequest=1-xml",
             ]
             for probe in [p for p in probe_variants if p]:
                 try:
-                    async with self.session.get(probe, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as rp:
+                    async with self.session.get(probe, headers=self.headers,
+                                                timeout=aiohttp.ClientTimeout(total=8)) as rp:
+                        self.log(f"[MAC] Probe {probe.split('?')[0]} HTTP {rp.status}")
                         txt = await rp.text()
                 except Exception:
                     continue
-                # log preview for debugging
-                self.log(f"[MAC] Player API probe {probe} raw preview: {repr(txt[:1200])}")
-                # Special-case: Xtream-style player_api.php returns user_info/server_info
                 try:
                     parsed = json.loads(txt)
                 except Exception:
                     parsed = None
                 if isinstance(parsed, dict):
-                    # handle user_info/server_info shape
+                    # user_info / server_info shape (native Xtream player_api.php)
                     ui = parsed.get("user_info") or parsed.get("user") or parsed.get("auth")
                     si = parsed.get("server_info") or parsed.get("server")
                     if isinstance(ui, dict):
@@ -711,17 +686,15 @@ class PortalClient:
                                     base = f"http://{host}"
                             else:
                                 base = self.base
-                            self.log(f"[MAC] player_api.php returned user_info: user={user}")
-                            self._xtream_creds = {"type":"xtream", "base": base, "username": str(user), "password": str(pwd)}
+                            self.log(f"[MAC] Xtream creds via player_api probe (user_info): user={user}")
+                            self._xtream_creds = {"type": "xtream", "base": base,
+                                                  "username": str(user), "password": str(pwd)}
                             return self._xtream_creds
-                # If not user_info, try to find js-style payload (stalker/mac)
-                try:
-                    parsed2 = json.loads(txt)
-                    js = parsed2.get("js")
+                    # MAC / Stalker js-wrapper shape
+                    js = parsed.get("js")
                     if isinstance(js, list) and js:
                         js = js[0]
                     if isinstance(js, dict):
-                        # Stalker/MAC style
                         user = js.get("username") or js.get("login") or js.get("user") or js.get("fname")
                         pwd  = js.get("password") or js.get("pass") or js.get("parent_password")
                         host = js.get("url") or js.get("host") or js.get("server")
@@ -736,28 +709,27 @@ class PortalClient:
                                     base = f"{p.scheme}://{p.netloc}" if p.netloc else f"http://{host}"
                                 except Exception:
                                     base = f"http://{host}"
-                            self.log(f"[MAC] Player API probe returned Xtream creds (js): user={user}")
-                            self._xtream_creds = {"type":"xtream", "base": base, "username": str(user), "password": str(pwd)}
+                            self.log(f"[MAC] Xtream creds via player_api probe (js): user={user}")
+                            self._xtream_creds = {"type": "xtream", "base": base,
+                                                  "username": str(user), "password": str(pwd)}
                             return self._xtream_creds
-                except Exception:
-                    pass
-                # quick text fallback: naive extraction if JSON not parseable
+                # text fallback: brittle split when JSON is unparseable
                 if '"username"' in txt and '"password"' in txt:
                     try:
-                        u = txt.split('"username"')[1].split(':',1)[1].split(',')[0].strip().strip('" ')
-                        p = txt.split('"password"')[1].split(':',1)[1].split(',')[0].strip().strip('" ')
+                        u = txt.split('"username"')[1].split(':', 1)[1].split(',')[0].strip().strip('" ')
+                        p = txt.split('"password"')[1].split(':', 1)[1].split(',')[0].strip().strip('" ')
                         if u and p:
-                            base_url = self._extract_url_from_text(txt) or self.base
-                            base = normalize_base_url(base_url)
-                            self.log(f"[MAC] Player API probe (text) returned Xtream creds: user={u}")
-                            self._xtream_creds = {"type":"xtream", "base": base, "username": u, "password": p}
+                            base = normalize_base_url(self._extract_url_from_text(txt) or self.base)
+                            self.log(f"[MAC] Xtream creds via player_api probe (text): user={u}")
+                            self._xtream_creds = {"type": "xtream", "base": base,
+                                                  "username": u, "password": p}
                             return self._xtream_creds
                     except Exception:
                         pass
         except Exception:
             pass
 
-        # ---------------- Step 0 (profile) quick check (cached profile) ----------------
+        # ── Step 0: profile-embedded credentials (cached, zero network cost) ─
         try:
             _profile = self._last_profile_js or {}
             _prof_login = str(_profile.get("login") or "").strip()
@@ -769,11 +741,12 @@ class PortalClient:
         except Exception:
             pass
 
-        # ---------------- Fallback: get_ordered_list -> create_link ----------------
+        # ── Step 2: get_ordered_list → create_link ─────────────────────────
         try:
             url1 = (f"{self.base}/portal.php?type=vod&action=get_ordered_list"
                     f"&category=*&JsHttpRequest=1-xml&p=1&sortby=added")
-            async with self.session.get(url1, headers=getattr(self, "headers", {}), timeout=aiohttp.ClientTimeout(total=15)) as r1:
+            async with self.session.get(url1, headers=self.headers,
+                                        timeout=aiohttp.ClientTimeout(total=15)) as r1:
                 payload1 = await safe_json(r1)
             items = normalize_js(payload1)
             raw_cmd = ""
@@ -791,10 +764,11 @@ class PortalClient:
 
             url2 = (f"{self.base}/portal.php?type=vod&action=create_link"
                     f"&cmd={quote(raw_cmd)}&series=&forced_storage=&disable_ad=0&download=0&force_ch_link_check=0&JsHttpRequest=1-xml")
-            async with self.session.get(url2, headers=getattr(self, "headers", {}), timeout=aiohttp.ClientTimeout(total=15)) as r2:
+            async with self.session.get(url2, headers=self.headers,
+                                        timeout=aiohttp.ClientTimeout(total=15)) as r2:
                 raw2 = await r2.text()
 
-            self.log(f"[MAC] create_link raw preview: {repr(raw2[:1200])}")
+            self.log(f"[MAC] create_link raw: {repr(raw2[:200])}")
 
             # extract link from JSON or raw text
             link = ""
@@ -823,30 +797,36 @@ class PortalClient:
                 play_token = (qs.get("play_token") or qs.get("token") or [""])[0]
                 stream = (qs.get("stream") or [""])[0]
                 mac_q = (qs.get("mac") or [""])[0]
-                base = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else _normalize_base_from_url(play_url)
+                base = (f"{parsed.scheme}://{parsed.netloc}"
+                        if parsed.scheme and parsed.netloc
+                        else normalize_base_url(play_url))
                 self.log(f"[MAC] create_link resolved → {play_url}")
-                self._xtream_creds = {"type": "play_url", "base": base, "stream_url": play_url, "play_token": play_token, "stream": stream, "mac": mac_q}
+                self._xtream_creds = {"type": "play_url", "base": base, "stream_url": play_url,
+                                      "play_token": play_token, "stream": stream, "mac": mac_q}
                 return self._xtream_creds
 
-            # Try direct xtream extraction from link if present
+            # Try direct Xtream extraction from resolved link
             if link:
                 res = _try_extract_xtream_from_url(link)
                 if res:
                     self._xtream_creds = res
                     self.log(f"[MAC] Xtream creds via create_link: user={res.get('username')}")
                     return self._xtream_creds
-                # if link contains .php treat as play_url
+                # link contains a .php endpoint — treat as play_url
                 if ".php" in link:
                     parsed = urlparse(link)
-                    base = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else _normalize_base_from_url(link)
+                    base = (f"{parsed.scheme}://{parsed.netloc}"
+                            if parsed.scheme and parsed.netloc
+                            else normalize_base_url(link))
                     qs = parse_qs(parsed.query)
                     play_token = (qs.get("play_token") or qs.get("token") or [""])[0]
                     stream = (qs.get("stream") or [""])[0]
                     mac_q = (qs.get("mac") or [""])[0]
-                    self._xtream_creds = {"type": "play_url", "base": base, "stream_url": link, "play_token": play_token, "stream": stream, "mac": mac_q}
+                    self._xtream_creds = {"type": "play_url", "base": base, "stream_url": link,
+                                          "play_token": play_token, "stream": stream, "mac": mac_q}
                     return self._xtream_creds
 
-            # id-resolve attempts (several candidate endpoints)
+            # ── id-resolve fallback: try alternate endpoints with item id ──
             if item_id:
                 candidate_endpoints = [
                     f"{self.base}/portal.php?type=vod&action=get_streams&id={quote(item_id)}&JsHttpRequest=1-xml",
@@ -856,11 +836,12 @@ class PortalClient:
                 ]
                 for ep in candidate_endpoints:
                     try:
-                        async with self.session.get(ep, headers=getattr(self, "headers", {}), timeout=aiohttp.ClientTimeout(total=15)) as r3:
+                        async with self.session.get(ep, headers=self.headers,
+                                                    timeout=aiohttp.ClientTimeout(total=15)) as r3:
                             txt = await r3.text()
                     except Exception:
                         continue
-                    self.log(f"[MAC] id-resolve raw preview: {repr(txt[:800])}")
+                    self.log(f"[MAC] id-resolve HTTP — checking {ep.split('?')[0]}")
                     cand = self._extract_url_from_text(txt) or txt
                     res = _try_extract_xtream_from_url(cand)
                     if res:
@@ -870,44 +851,43 @@ class PortalClient:
                     if ".php" in cand:
                         try:
                             p = urlparse(cand)
-                            base = f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else _normalize_base_from_url(cand)
+                            base = (f"{p.scheme}://{p.netloc}"
+                                    if p.scheme and p.netloc
+                                    else normalize_base_url(cand))
                             qs = parse_qs(p.query)
                             play_token = (qs.get("play_token") or qs.get("token") or [""])[0]
                             stream = (qs.get("stream") or [""])[0]
                             mac_q = (qs.get("mac") or [""])[0]
-                            self._xtream_creds = {"type": "play_url", "base": base, "stream_url": cand, "play_token": play_token, "stream": stream, "mac": mac_q}
+                            self._xtream_creds = {"type": "play_url", "base": base, "stream_url": cand,
+                                                  "play_token": play_token, "stream": stream, "mac": mac_q}
                             self.log(f"[MAC] Xtream play_url from id-resolve: {cand}")
                             return self._xtream_creds
                         except Exception:
                             pass
 
-            # Final attempt: try raw2 or link directly with original brittle parsing (legacy fallback)
+            # ── legacy text-parse fallback ────────────────────────────────
             try:
-                # original-style split parsing attempts (best-effort)
-                if link:
-                    txt_try = link
-                else:
-                    txt_try = raw2
-                # look for username/password tokens in text
+                txt_try = link if link else raw2
                 if 'username=' in txt_try and 'password=' in txt_try:
-                    # parse query style
                     parsed_q = urlparse(txt_try)
                     qs = parse_qs(parsed_q.query)
                     u = (qs.get("username") or qs.get("user") or [""])[0]
                     p = (qs.get("password") or qs.get("pass") or [""])[0]
                     if u and p:
-                        base = f"{parsed_q.scheme}://{parsed_q.netloc}" if parsed_q.scheme and parsed_q.netloc else _normalize_base_from_url(txt_try)
-                        self._xtream_creds = {"type":"xtream", "base": base, "username": u, "password": p}
+                        base = (f"{parsed_q.scheme}://{parsed_q.netloc}"
+                                if parsed_q.scheme and parsed_q.netloc
+                                else normalize_base_url(txt_try))
+                        self.log(f"[MAC] Xtream creds via legacy query parse: user={u}")
+                        self._xtream_creds = {"type": "xtream", "base": base, "username": u, "password": p}
                         return self._xtream_creds
-                # brittle split: look for 'username":"' and 'password":"'
                 if 'username":"' in raw2 and 'password":"' in raw2:
                     try:
-                        u = raw2.split('username":"',1)[1].split('"',1)[0]
-                        p = raw2.split('password":"',1)[1].split('"',1)[0]
+                        u = raw2.split('username":"', 1)[1].split('"', 1)[0]
+                        p = raw2.split('password":"', 1)[1].split('"', 1)[0]
                         if u and p:
-                            base_url = self._extract_url_from_text(raw2) or self.base
-                            base = normalize_base_url(base_url)
-                            self._xtream_creds = {"type":"xtream", "base": base, "username": u, "password": p}
+                            base = normalize_base_url(self._extract_url_from_text(raw2) or self.base)
+                            self.log(f"[MAC] Xtream creds via legacy split parse: user={u}")
+                            self._xtream_creds = {"type": "xtream", "base": base, "username": u, "password": p}
                             return self._xtream_creds
                     except Exception:
                         pass
@@ -940,7 +920,7 @@ class PortalClient:
             return self._all_vod_raw
         self._all_vod_raw = []
         creds = await self._extract_xtream_creds()
-        if not creds:
+        if not creds or creds.get("type") != "xtream":
             return self._all_vod_raw
         base = creds["base"]; user = creds["username"]; pas = creds["password"]
         try:
@@ -993,7 +973,7 @@ class PortalClient:
             return self._all_series_raw
         self._all_series_raw = []
         creds = await self._extract_xtream_creds()
-        if not creds:
+        if not creds or creds.get("type") != "xtream":
             return self._all_series_raw
         base = creds["base"]; user = creds["username"]; pas = creds["password"]
         try:
@@ -2898,33 +2878,21 @@ class StalkerPortalClient:
         self._xtream_creds = {}  # mark as tried
         assert self.session is not None
 
-        # Config
         _SAFE_CRED_CHARS = frozenset("?=&/ \t\n\\:")
-        _MAX_RETRIES = 4
-        _DEBUG = getattr(self, "_debug", False)
 
         def _is_safe_cred(s: str) -> bool:
             return isinstance(s, str) and (3 <= len(s) <= 64) and not any(c in s for c in _SAFE_CRED_CHARS)
-
-        def _normalize_base_from_url(u: str) -> str:
-            try:
-                p = urlparse(u)
-                scheme = p.scheme or "http"
-                netloc = p.netloc or p.path or ""
-                return f"{scheme}://{netloc}"
-            except Exception:
-                return self.base
 
         def _try_extract_xtream_from_url(candidate: str):
             if not candidate:
                 return None
             cand = candidate.replace("\\/", "/").strip()
-            # direct query/path extraction helper from module
             xt = extract_xtream_from_m3u_url(cand)
             if xt:
                 xt["base"] = normalize_base_url(xt["base"])
-                return {"type": "xtream", "base": xt["base"], "username": xt["username"], "password": xt["password"]}
-            # path-style fallback
+                return {"type": "xtream", "base": xt["base"],
+                        "username": xt["username"], "password": xt["password"]}
+            # path-style: /movie/USER/PASS/id.ext, /live/USER/PASS/id.ts, etc.
             try:
                 p = urlparse(cand)
                 parts = [seg for seg in p.path.strip("/").split("/") if seg]
@@ -2936,86 +2904,39 @@ class StalkerPortalClient:
                     if "=" in pw:
                         pw = pw.split("=", 1)[0]
                     if _is_safe_cred(u) and _is_safe_cred(pw) and "." not in u and "." not in pw:
-                        base = f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else _normalize_base_from_url(cand)
+                        base = (f"{p.scheme}://{p.netloc}"
+                                if p.scheme and p.netloc
+                                else self.base)
                         return {"type": "xtream", "base": base, "username": u, "password": pw}
             except Exception:
                 pass
-            # pipe/colon separated fallback (USER|PASS or USER:PASS)
-            if "|" in cand or ":" in cand:
-                sep = "|" if "|" in cand else ":"
-                parts = cand.split(sep)
-                if len(parts) >= 2:
-                    u, pw = parts[0].strip(), parts[1].strip()
-                    if _is_safe_cred(u) and _is_safe_cred(pw) and "." not in u and "." not in pw:
-                        return {"type": "xtream", "base": self.base, "username": u, "password": pw}
-            # try base64 decode if looks encoded
-            try:
-                import base64 as _b64
-                maybe = cand.strip()
-                if len(maybe) % 4 == 0 and re.fullmatch(r'[A-Za-z0-9+/=]+', maybe):
-                    dec = _b64.b64decode(maybe).decode(errors="ignore")
-                    return _try_extract_xtream_from_url(dec)
-            except Exception:
-                pass
             return None
 
-        # Helper: GET with retry/backoff (handles 429)
-        async def _get_with_backoff(url: str, headers: dict | None = None, timeout_total: int = 15) -> str | None:
-            last_exc = None
-            for attempt in range(_MAX_RETRIES):
-                try:
-                    async with self.session.get(url, headers=headers or {}, timeout=aiohttp.ClientTimeout(total=timeout_total)) as r:
-                        if r.status == 429:
-                            wait = 2 ** attempt
-                            if _DEBUG:
-                                self.log(f"[MAC] {_short(url)} 429 — backing off {wait}s (attempt {attempt+1}/{_MAX_RETRIES})")
-                            await asyncio.sleep(wait)
-                            continue
-                        text = await r.text()
-                        return text
-                except Exception as e:
-                    last_exc = e
-                    wait = 2 ** attempt
-                    if _DEBUG:
-                        self.log(f"[MAC] {_short(url)} request error: {e} — retrying in {wait}s (attempt {attempt+1}/{_MAX_RETRIES})")
-                    await asyncio.sleep(wait)
-                    continue
-            if last_exc and _DEBUG:
-                self.log(f"[MAC] {_short(url)} final error: {last_exc}")
-            return None
-
-        # small helper to shorten logged URLs
-        def _short(u: str) -> str:
-            try:
-                p = urlparse(u)
-                return f"{p.scheme}://{p.netloc}{p.path}"
-            except Exception:
-                return u[:60]
-
-        # ---------------- Primary probe: exact Player API endpoints (try many variants) ----------------
+        # ── Step 1: Player API probe — try multiple endpoint shapes ─────────
         try:
-            headers = getattr(self, "headers", {}) or {}
+            _headers = self._headers(include_auth=True)
             probe_variants = [
                 f"{self.base}/c/",
-                f"{self.base}/c/{self.token}" if getattr(self, "token", None) else None,
-                f"{self.base}/c/{self.token}?mac={self.mac}" if getattr(self, "token", None) else None,
+                f"{self.base}/c/{self.token}" if self.token else None,
+                f"{self.base}/c/{self.token}?mac={self.mac}" if self.token else None,
                 f"{self.base}/player_api.php?mac={self.mac}",
                 f"{self.base}/portal.php?type=account_info&action=get_main_info&JsHttpRequest=1-xml",
                 f"{self.base}/portal.php?type=stb&action=get_profile&JsHttpRequest=1-xml",
             ]
             for probe in [p for p in probe_variants if p]:
-                txt = await _get_with_backoff(probe, headers=headers, timeout_total=8)
-                if txt is None:
+                try:
+                    async with self.session.get(probe, headers=_headers,
+                                                timeout=aiohttp.ClientTimeout(total=8)) as rp:
+                        self.log(f"[STALKER] Probe {probe.split('?')[0]} HTTP {rp.status}")
+                        txt = await rp.text()
+                except Exception:
                     continue
-                if _DEBUG:
-                    self.log(f"[MAC] Player API probe {probe} raw preview: {repr(txt[:800])}")
-                # Special-case: Xtream-style player_api.php returns user_info/server_info
-                parsed = None
                 try:
                     parsed = json.loads(txt)
                 except Exception:
                     parsed = None
                 if isinstance(parsed, dict):
+                    # user_info / server_info shape (native Xtream player_api.php)
                     ui = parsed.get("user_info") or parsed.get("user") or parsed.get("auth")
                     si = parsed.get("server_info") or parsed.get("server")
                     if isinstance(ui, dict):
@@ -3040,14 +2961,12 @@ class StalkerPortalClient:
                                     base = f"http://{host}"
                             else:
                                 base = self.base
-                            # Important success log (quiet)
-                            self.log(f"[MAC] Player API returned Xtream creds (user_info).")
-                            self._xtream_creds = {"type":"xtream", "base": base, "username": str(user), "password": str(pwd)}
+                            self.log(f"[STALKER] Xtream creds via player_api probe (user_info): user={user}")
+                            self._xtream_creds = {"type": "xtream", "base": base,
+                                                  "username": str(user), "password": str(pwd)}
                             return self._xtream_creds
-                # Try js-style payload (stalker/mac)
-                try:
-                    parsed2 = json.loads(txt)
-                    js = parsed2.get("js")
+                    # MAC / Stalker js-wrapper shape
+                    js = parsed.get("js")
                     if isinstance(js, list) and js:
                         js = js[0]
                     if isinstance(js, dict):
@@ -3065,52 +2984,60 @@ class StalkerPortalClient:
                                     base = f"{p.scheme}://{p.netloc}" if p.netloc else f"http://{host}"
                                 except Exception:
                                     base = f"http://{host}"
-                            self.log(f"[MAC] Player API returned Xtream creds (js).")
-                            self._xtream_creds = {"type":"xtream", "base": base, "username": str(user), "password": str(pwd)}
+                            self.log(f"[STALKER] Xtream creds via player_api probe (js): user={user}")
+                            self._xtream_creds = {"type": "xtream", "base": base,
+                                                  "username": str(user), "password": str(pwd)}
                             return self._xtream_creds
-                except Exception:
-                    pass
-                # quick text fallback (quiet)
+                # text fallback: brittle split when JSON is unparseable
                 if '"username"' in txt and '"password"' in txt:
                     try:
-                        u = txt.split('"username"')[1].split(':',1)[1].split(',')[0].strip().strip('" ')
-                        p = txt.split('"password"')[1].split(':',1)[1].split(',')[0].strip().strip('" ')
+                        u = txt.split('"username"')[1].split(':', 1)[1].split(',')[0].strip().strip('" ')
+                        p = txt.split('"password"')[1].split(':', 1)[1].split(',')[0].strip().strip('" ')
                         if u and p:
-                            base_url = self._extract_url_from_text(txt) or self.base
-                            base = normalize_base_url(base_url)
-                            self.log(f"[MAC] Player API probe returned Xtream creds (text).")
-                            self._xtream_creds = {"type":"xtream", "base": base, "username": u, "password": p}
+                            base = normalize_base_url(self._extract_url_from_text(txt) or self.base)
+                            self.log(f"[STALKER] Xtream creds via player_api probe (text): user={u}")
+                            self._xtream_creds = {"type": "xtream", "base": base,
+                                                  "username": u, "password": p}
                             return self._xtream_creds
                     except Exception:
                         pass
         except Exception as e:
-            if _DEBUG:
-                self.log(f"[MAC] Player API probe error: {e}")
+            self.log(f"[STALKER] _extract_xtream_creds probe error: {e}")
 
-        # ---------------- Step 0 (profile) quick check (cached profile) ----------------
+        # ── Step 0: profile-embedded credentials (cached, zero network cost) ─
         try:
             _profile = self._last_profile_js or {}
             _prof_login = str(_profile.get("login") or "").strip()
             _prof_pass  = str(_profile.get("password") or "").strip()
             if _is_safe_cred(_prof_login) and _is_safe_cred(_prof_pass):
-                self.log(f"[MAC] Xtream creds from profile.")
-                self._xtream_creds = {"type":"xtream", "base": self.base, "username": _prof_login, "password": _prof_pass}
+                self.log(f"[STALKER] Xtream creds from profile: user={_prof_login}")
+                self._xtream_creds = {"type": "xtream", "base": self.base,
+                                      "username": _prof_login, "password": _prof_pass}
                 return self._xtream_creds
         except Exception:
             pass
 
-        # ---------------- Fallback: get_ordered_list -> create_link ----------------
+        # ── Step 2: get_ordered_list → create_link ─────────────────────────
         try:
+            _headers = self._headers(include_auth=True)
             url1 = (f"{self.base}/portal.php?type=vod&action=get_ordered_list"
                     f"&category=*&JsHttpRequest=1-xml&p=1&sortby=added")
-            payload1_txt = await _get_with_backoff(url1, headers=getattr(self, "headers", {}), timeout_total=15)
             payload1 = None
-            if payload1_txt:
+            for _attempt in range(4):
                 try:
-                    payload1 = json.loads(payload1_txt)
-                except Exception:
-                    payload1 = None
-            payload1 = payload1 or await safe_json(await self.session.get(url1, headers=getattr(self, "headers", {}), timeout=aiohttp.ClientTimeout(total=15)))
+                    async with self.session.get(url1, headers=_headers,
+                                                timeout=aiohttp.ClientTimeout(total=15)) as r1:
+                        if r1.status == 429:
+                            _wait = 2 ** _attempt
+                            self.log(f"[STALKER] get_ordered_list 429 — backing off {_wait}s "
+                                     f"(attempt {_attempt+1}/4)")
+                            await asyncio.sleep(_wait)
+                            continue
+                        payload1 = await safe_json(r1)
+                    break
+                except Exception as e:
+                    self.log(f"[STALKER] get_ordered_list error: {e}")
+                    break
             items = normalize_js(payload1)
             raw_cmd = ""
             item_id = None
@@ -3121,20 +3048,32 @@ class StalkerPortalClient:
                     if raw_cmd:
                         break
             if not raw_cmd:
-                if _DEBUG:
-                    self.log("[MAC] _extract_xtream_creds: no cmd field in VOD items")
+                self.log("[STALKER] _extract_xtream_creds: no cmd field in VOD items")
                 return None
 
             url2 = (f"{self.base}/portal.php?type=vod&action=create_link"
                     f"&cmd={quote(raw_cmd)}&series=&forced_storage=&disable_ad=0&download=0&force_ch_link_check=0&JsHttpRequest=1-xml")
-            raw2 = await _get_with_backoff(url2, headers=getattr(self, "headers", {}), timeout_total=15)
-            if raw2 is None:
-                if _DEBUG:
-                    self.log("[MAC] create_link request failed after retries")
+            raw2 = None
+            for _attempt in range(4):
+                try:
+                    async with self.session.get(url2, headers=_headers,
+                                                timeout=aiohttp.ClientTimeout(total=15)) as r2:
+                        if r2.status == 429:
+                            _wait = 2 ** _attempt
+                            self.log(f"[STALKER] create_link 429 — backing off {_wait}s "
+                                     f"(attempt {_attempt+1}/4)")
+                            await asyncio.sleep(_wait)
+                            continue
+                        raw2 = await r2.text()
+                    break
+                except Exception as e:
+                    self.log(f"[STALKER] create_link error: {e}")
+                    break
+            if not raw2:
+                self.log("[STALKER] _extract_xtream_creds: create_link request failed")
                 return None
 
-            if _DEBUG:
-                self.log(f"[MAC] create_link raw preview: {repr(raw2[:800])}")
+            self.log(f"[STALKER] create_link raw: {repr(raw2[:200])}")
 
             # extract link from JSON or raw text
             link = ""
@@ -3163,30 +3102,36 @@ class StalkerPortalClient:
                 play_token = (qs.get("play_token") or qs.get("token") or [""])[0]
                 stream = (qs.get("stream") or [""])[0]
                 mac_q = (qs.get("mac") or [""])[0]
-                base = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else _normalize_base_from_url(play_url)
-                self.log(f"[MAC] create_link resolved to play_url.")
-                self._xtream_creds = {"type": "play_url", "base": base, "stream_url": play_url, "play_token": play_token, "stream": stream, "mac": mac_q}
+                base = (f"{parsed.scheme}://{parsed.netloc}"
+                        if parsed.scheme and parsed.netloc
+                        else normalize_base_url(play_url))
+                self.log(f"[STALKER] create_link resolved → {play_url}")
+                self._xtream_creds = {"type": "play_url", "base": base, "stream_url": play_url,
+                                      "play_token": play_token, "stream": stream, "mac": mac_q}
                 return self._xtream_creds
 
-            # Try direct xtream extraction from link if present
+            # Try direct Xtream extraction from resolved link
             if link:
                 res = _try_extract_xtream_from_url(link)
                 if res:
                     self._xtream_creds = res
-                    self.log(f"[MAC] Xtream creds extracted from create_link.")
+                    self.log(f"[STALKER] Xtream creds via create_link: user={res.get('username')}")
                     return self._xtream_creds
-                # if link contains .php treat as play_url
+                # link contains a .php endpoint — treat as play_url
                 if ".php" in link:
                     parsed = urlparse(link)
-                    base = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else _normalize_base_from_url(link)
+                    base = (f"{parsed.scheme}://{parsed.netloc}"
+                            if parsed.scheme and parsed.netloc
+                            else normalize_base_url(link))
                     qs = parse_qs(parsed.query)
                     play_token = (qs.get("play_token") or qs.get("token") or [""])[0]
                     stream = (qs.get("stream") or [""])[0]
                     mac_q = (qs.get("mac") or [""])[0]
-                    self._xtream_creds = {"type": "play_url", "base": base, "stream_url": link, "play_token": play_token, "stream": stream, "mac": mac_q}
+                    self._xtream_creds = {"type": "play_url", "base": base, "stream_url": link,
+                                          "play_token": play_token, "stream": stream, "mac": mac_q}
                     return self._xtream_creds
 
-            # id-resolve attempts (several candidate endpoints)
+            # ── id-resolve fallback: try alternate endpoints with item id ──
             if item_id:
                 candidate_endpoints = [
                     f"{self.base}/portal.php?type=vod&action=get_streams&id={quote(item_id)}&JsHttpRequest=1-xml",
@@ -3195,32 +3140,37 @@ class StalkerPortalClient:
                     f"{self.base}/portal.php?type=vod&action=get_ordered_list&JsHttpRequest=1-xml&p=1&id={quote(item_id)}",
                 ]
                 for ep in candidate_endpoints:
-                    txt = await _get_with_backoff(ep, headers=getattr(self, "headers", {}), timeout_total=15)
-                    if not txt:
+                    try:
+                        async with self.session.get(ep, headers=_headers,
+                                                    timeout=aiohttp.ClientTimeout(total=15)) as r3:
+                            txt = await r3.text()
+                    except Exception:
                         continue
-                    if _DEBUG:
-                        self.log(f"[MAC] id-resolve raw preview: {repr(txt[:600])}")
+                    self.log(f"[STALKER] id-resolve HTTP — checking {ep.split('?')[0]}")
                     cand = self._extract_url_from_text(txt) or txt
                     res = _try_extract_xtream_from_url(cand)
                     if res:
                         self._xtream_creds = res
-                        self.log(f"[MAC] Xtream creds from id-resolve.")
+                        self.log(f"[STALKER] Xtream creds from id-resolve: user={res.get('username')}")
                         return self._xtream_creds
                     if ".php" in cand:
                         try:
                             p = urlparse(cand)
-                            base = f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else _normalize_base_from_url(cand)
+                            base = (f"{p.scheme}://{p.netloc}"
+                                    if p.scheme and p.netloc
+                                    else normalize_base_url(cand))
                             qs = parse_qs(p.query)
                             play_token = (qs.get("play_token") or qs.get("token") or [""])[0]
                             stream = (qs.get("stream") or [""])[0]
                             mac_q = (qs.get("mac") or [""])[0]
-                            self._xtream_creds = {"type": "play_url", "base": base, "stream_url": cand, "play_token": play_token, "stream": stream, "mac": mac_q}
-                            self.log(f"[MAC] play_url from id-resolve.")
+                            self._xtream_creds = {"type": "play_url", "base": base, "stream_url": cand,
+                                                  "play_token": play_token, "stream": stream, "mac": mac_q}
+                            self.log(f"[STALKER] Xtream play_url from id-resolve: {cand}")
                             return self._xtream_creds
                         except Exception:
                             pass
 
-            # Final attempt: try raw2 or link directly with original brittle parsing (legacy fallback)
+            # ── legacy text-parse fallback ────────────────────────────────
             try:
                 txt_try = link or raw2
                 if txt_try and 'username=' in txt_try and 'password=' in txt_try:
@@ -3229,31 +3179,31 @@ class StalkerPortalClient:
                     u = (qs.get("username") or qs.get("user") or [""])[0]
                     p = (qs.get("password") or qs.get("pass") or [""])[0]
                     if u and p:
-                        base = f"{parsed_q.scheme}://{parsed_q.netloc}" if parsed_q.scheme and parsed_q.netloc else _normalize_base_from_url(txt_try)
-                        self._xtream_creds = {"type":"xtream", "base": base, "username": u, "password": p}
+                        base = (f"{parsed_q.scheme}://{parsed_q.netloc}"
+                                if parsed_q.scheme and parsed_q.netloc
+                                else normalize_base_url(txt_try))
+                        self.log(f"[STALKER] Xtream creds via legacy query parse: user={u}")
+                        self._xtream_creds = {"type": "xtream", "base": base, "username": u, "password": p}
                         return self._xtream_creds
                 if raw2 and 'username":"' in raw2 and 'password":"' in raw2:
                     try:
-                        u = raw2.split('username":"',1)[1].split('"',1)[0]
-                        p = raw2.split('password":"',1)[1].split('"',1)[0]
+                        u = raw2.split('username":"', 1)[1].split('"', 1)[0]
+                        p = raw2.split('password":"', 1)[1].split('"', 1)[0]
                         if u and p:
-                            base_url = self._extract_url_from_text(raw2) or self.base
-                            base = normalize_base_url(base_url)
-                            self._xtream_creds = {"type":"xtream", "base": base, "username": u, "password": p}
+                            base = normalize_base_url(self._extract_url_from_text(raw2) or self.base)
+                            self.log(f"[STALKER] Xtream creds via legacy split parse: user={u}")
+                            self._xtream_creds = {"type": "xtream", "base": base, "username": u, "password": p}
                             return self._xtream_creds
                     except Exception:
                         pass
             except Exception:
                 pass
 
-            # nothing found
-            if _DEBUG:
-                self.log("[MAC] _extract_xtream_creds: no usable Xtream creds or play_url found")
+            self.log("[STALKER] _extract_xtream_creds: create_link did not yield usable Xtream creds")
             return None
 
         except Exception as e:
-            if _DEBUG:
-                self.log(f"[MAC] _extract_xtream_creds error: {e}")
+            self.log(f"[STALKER] _extract_xtream_creds error: {e}")
             return None
 
 
@@ -3269,7 +3219,7 @@ class StalkerPortalClient:
             return self._all_vod_raw
         self._all_vod_raw = []
         creds = await self._extract_xtream_creds()
-        if not creds:
+        if not creds or creds.get("type") != "xtream":
             return self._all_vod_raw
         base = creds["base"]; user = creds["username"]; pas = creds["password"]
         headers = self._headers(include_auth=True)
@@ -3294,7 +3244,7 @@ class StalkerPortalClient:
                         "screenshot_uri": it.get("stream_icon", ""),
                         "cmd": f"{base}/movie/{user}/{pas}/{sid}.{ext}",
                         "category_id": str(it.get("category_id", "")),
-                        "rating": str(it.get("rating", "")),
+                        "rating": str(it.get("added", "")),
                         "added": str(it.get("added", "")),
                     })
                 self._all_vod_raw = out
@@ -3316,7 +3266,7 @@ class StalkerPortalClient:
             return self._all_series_raw
         self._all_series_raw = []
         creds = await self._extract_xtream_creds()
-        if not creds:
+        if not creds or creds.get("type") != "xtream":
             return self._all_series_raw
         base = creds["base"]; user = creds["username"]; pas = creds["password"]
         headers = self._headers(include_auth=True)
