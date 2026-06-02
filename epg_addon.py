@@ -1433,7 +1433,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                             state.log(f"[CATCHUP] get_simple_data_table ch={ch_id} date={date_str} p={page}")
                             try:
                                 async with client.session.get(epg_url, headers=hdrs,
-                                                              timeout=aiohttp.ClientTimeout(total=10)) as r:
+                                                              timeout=aiohttp.ClientTimeout(total=60)) as r:
                                     payload = await safe_json(r)
                             except Exception as e:
                                 state.log(f"[CATCHUP] ✗ fetch error: {e}")
@@ -2238,7 +2238,7 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
             total_bytes = 0
             try:
                 async with aiohttp.ClientSession() as sess:
-                    async with sess.get(xmltv_url, timeout=aiohttp.ClientTimeout(total=120)) as r:
+                    async with sess.get(xmltv_url, timeout=aiohttp.ClientTimeout(total=300)) as r:
                         if r.status != 200:
                             raise RuntimeError(f"XMLTV HTTP {r.status}")
                         async for chunk in r.content.iter_chunked(1 << 16):  # 64 KB chunks
