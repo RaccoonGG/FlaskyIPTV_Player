@@ -1191,7 +1191,7 @@ class PortalClient:
         if page == 1:
             self.log(f"[MAC] Fetching {mode.upper()} items cat={cat_id}…")
         # Large VOD/Series categories can be slow; give them more time than live.
-        _req_timeout = aiohttp.ClientTimeout(total=120 if mode in ("vod", "series") else 60)
+        _req_timeout = aiohttp.ClientTimeout(total=180 if mode in ("vod", "series") else 120)
         async with self.session.get(url, headers=self.headers, timeout=_req_timeout) as r:
             if page == 1:
                 self.log(f"[MAC] Items HTTP {r.status} ({mode.upper()} cat={cat_id} p={page})")
@@ -3290,6 +3290,9 @@ class StalkerPortalClient:
                         continue
                     data = await r.json(content_type=None)
                 break
+            if data is None:
+                self.log("[STALKER] get_vod_streams: all URL variants exhausted — portal does not support Xtream VOD API")
+                return self._all_vod_raw
             if isinstance(data, list):
                 out = []
                 for it in data:
@@ -3347,6 +3350,9 @@ class StalkerPortalClient:
                         continue
                     data = await r.json(content_type=None)
                 break
+            if data is None:
+                self.log("[STALKER] get_series: all URL variants exhausted — portal does not support Xtream series API")
+                return self._all_series_raw
             if isinstance(data, list):
                 out = []
                 for it in data:
@@ -5061,7 +5067,7 @@ class PortalSessionManager:
         return self._loop
 
     # ── public API ───────────────────────────────────────────────────────────
-    def submit(self, coro, timeout: float = 30):
+    def submit(self, coro, timeout: float = 300):
         """Dispatch *coro* to the persistent loop and block until it completes.
 
         Exceptions from the coroutine are re-raised in the calling thread.
