@@ -2936,8 +2936,13 @@ class StalkerPortalClient:
         # ── Step 1: Player API probe — try multiple endpoint shapes ─────────
         try:
             _headers = self._headers(include_auth=True)
+            # Derive the stalker portal prefix from LOAD_PHP:
+            # "/stalker_portal/server/load.php" → "/stalker_portal"
+            _lp_parts = [p for p in self.LOAD_PHP.strip("/").split("/") if p]
+            _stalker_pfx = ("/" + "/".join(_lp_parts[:-2])) if len(_lp_parts) > 2 else ""
             probe_variants = [
-                f"{self.base}/player_api.php",              # clean Xtream endpoint — try first
+                f"{self.base}/player_api.php",                          # clean Xtream root — try first
+                f"{self.base}{_stalker_pfx}/player_api.php" if _stalker_pfx else None,  # Xtream colocated with Stalker panel
                 f"{self.base}/c/",
                 f"{self.base}/c/{self.token}" if self.token else None,
                 f"{self.base}/c/{self.token}?mac={self.mac}" if self.token else None,
@@ -3264,14 +3269,27 @@ class StalkerPortalClient:
             return self._all_vod_raw
         base = creds["base"]; user = creds["username"]; pas = creds["password"]
         headers = self._headers(include_auth=True)
+        # Derive the stalker portal prefix from LOAD_PHP so we can try both
+        # /player_api.php (standard Xtream root) and /stalker_portal/player_api.php
+        # (Xtream API colocated with the Stalker panel).
+        _lp_parts = [p for p in self.LOAD_PHP.strip("/").split("/") if p]
+        _stalker_pfx = ("/" + "/".join(_lp_parts[:-2])) if len(_lp_parts) > 2 else ""
+        _api_urls = [f"{base}/player_api.php"]
+        if _stalker_pfx:
+            _api_urls.append(f"{base}{_stalker_pfx}/player_api.php")
         try:
-            url = (f"{base}/player_api.php"
-                   f"?username={user}&password={pas}&action=get_vod_streams")
-            self.log("[STALKER] get_vod_streams: fetching all VOD streams…")
-            async with self.session.get(url, headers=headers,
-                                        timeout=aiohttp.ClientTimeout(total=60)) as r:
-                self.log(f"[STALKER] get_vod_streams HTTP {r.status}")
-                data = await r.json(content_type=None)
+            data = None
+            for _api_base in _api_urls:
+                url = f"{_api_base}?username={user}&password={pas}&action=get_vod_streams"
+                self.log(f"[STALKER] get_vod_streams: fetching all VOD streams… ({_api_base})")
+                async with self.session.get(url, headers=headers,
+                                            timeout=aiohttp.ClientTimeout(total=60)) as r:
+                    self.log(f"[STALKER] get_vod_streams HTTP {r.status}")
+                    if r.status >= 400:
+                        self.log(f"[STALKER] get_vod_streams: HTTP {r.status} — trying next URL variant")
+                        continue
+                    data = await r.json(content_type=None)
+                break
             if isinstance(data, list):
                 out = []
                 for it in data:
@@ -3311,14 +3329,24 @@ class StalkerPortalClient:
             return self._all_series_raw
         base = creds["base"]; user = creds["username"]; pas = creds["password"]
         headers = self._headers(include_auth=True)
+        _lp_parts = [p for p in self.LOAD_PHP.strip("/").split("/") if p]
+        _stalker_pfx = ("/" + "/".join(_lp_parts[:-2])) if len(_lp_parts) > 2 else ""
+        _api_urls = [f"{base}/player_api.php"]
+        if _stalker_pfx:
+            _api_urls.append(f"{base}{_stalker_pfx}/player_api.php")
         try:
-            url = (f"{base}/player_api.php"
-                   f"?username={user}&password={pas}&action=get_series")
-            self.log("[STALKER] get_series: fetching all series…")
-            async with self.session.get(url, headers=headers,
-                                        timeout=aiohttp.ClientTimeout(total=60)) as r:
-                self.log(f"[STALKER] get_series HTTP {r.status}")
-                data = await r.json(content_type=None)
+            data = None
+            for _api_base in _api_urls:
+                url = f"{_api_base}?username={user}&password={pas}&action=get_series"
+                self.log(f"[STALKER] get_series: fetching all series… ({_api_base})")
+                async with self.session.get(url, headers=headers,
+                                            timeout=aiohttp.ClientTimeout(total=60)) as r:
+                    self.log(f"[STALKER] get_series HTTP {r.status}")
+                    if r.status >= 400:
+                        self.log(f"[STALKER] get_series: HTTP {r.status} — trying next URL variant")
+                        continue
+                    data = await r.json(content_type=None)
+                break
             if isinstance(data, list):
                 out = []
                 for it in data:
