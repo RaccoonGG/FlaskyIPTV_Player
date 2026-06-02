@@ -98,6 +98,48 @@ from portal_clients import (
 _build_xmltv_index_ref = None
 
 
+def _cleanup_stale_xmltv_tmp_files(log_cb=None, max_age_secs: int = 300):
+    """Scan the system temp directory for abandoned *.xmltv download files
+    and remove any older than *max_age_secs* (default 5 min).
+
+    Called at portal-connect time (start_epg_prefetch) and at the start of
+    each _build_xmltv_index download so files left behind by crashes or
+    aborted downloads don't accumulate in the temp directory.
+
+    A 5-minute threshold ensures we never touch a file belonging to an
+    actively-running download: chunks are written every 64 KB so a live
+    download's mtime is always within the last second or two.
+    """
+    _log = log_cb or (lambda _: None)
+    tmp_dir = tempfile.gettempdir()
+    removed = errors = 0
+    try:
+        candidates = [f for f in os.listdir(tmp_dir) if f.endswith(".xmltv")]
+    except Exception as e:
+        _log(f"[EPG] Temp-cleanup: could not list {tmp_dir}: {e}")
+        return
+    if not candidates:
+        return
+    now = time.time()
+    for fname in candidates:
+        fpath = os.path.join(tmp_dir, fname)
+        try:
+            age = now - os.path.getmtime(fpath)
+            if age < max_age_secs:
+                continue  # recently touched — active download may own this file
+            os.remove(fpath)
+            removed += 1
+            _log(f"[EPG] Temp-cleanup: removed stale {fname} (age {age / 60:.1f} min)")
+        except FileNotFoundError:
+            pass  # race: another thread already removed it
+        except Exception as e:
+            errors += 1
+            _log(f"[EPG] Temp-cleanup: could not remove {fname}: {e}")
+    if removed or errors:
+        _log(f"[EPG] Temp-cleanup: {removed} stale .xmltv file(s) removed"
+             + (f", {errors} error(s)" if errors else ""))
+
+
 def register_epg_routes(flask_app, state, run_async, _make_client):
     """Register all EPG/catchup/WON Flask routes and serve the UI JS."""
 
@@ -2232,6 +2274,11 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
         _log(f"[EPG] Downloading XMLTV from {xmltv_url}")
         _log(f"[EPG] Time window: -{win_back_h}h / +{win_fwd_h}h (discarding rest at parse time)")
 
+        # Remove any stale .xmltv temp files from previous aborted downloads
+        # before writing a new one (guards against temp-dir accumulation on
+        # repeated connect/disconnect or app crash mid-download).
+        _cleanup_stale_xmltv_tmp_files(_log)
+
         # Stream the response into a temp file to avoid OOM on large feeds
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xmltv") as tmp:
             tmp_path = tmp.name
@@ -2712,6 +2759,10 @@ def start_epg_prefetch(state):
     """
     if _build_xmltv_index_ref is None:
         return  # register_epg_routes not yet called
+
+    # Clean up any stale .xmltv temp files left behind by previous aborted
+    # or crashed downloads before starting the new portal's prefetch.
+    _cleanup_stale_xmltv_tmp_files(state.log)
 
     from urllib.parse import quote as _q2, urlparse as _up2
 
