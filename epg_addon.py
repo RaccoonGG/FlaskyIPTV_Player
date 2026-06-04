@@ -1055,6 +1055,39 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
 
         conn = state.conn_type
 
+        # ── Catchup listing cache check ───────────────────────────────────────────
+        # Cache key: conn_type + channel-id extracted from item (same data the
+        # per-path code inside _resolve() uses, just computed early so the cache
+        # can be checked synchronously before spawning any async work).
+        # The cache is cleared on every reconnect, so portal-change safety is free.
+        _cu_ch_id = ""
+        if conn in ("xtream", "m3u_url"):
+            _cu_ch_id = str(item.get("stream_id") or item.get("id") or "").strip()
+        elif conn == "mac":
+            _cu_ch_id = str(item.get("ch_id") or item.get("id") or "").strip()
+            if not _cu_ch_id:
+                _cmd_f = str(item.get("cmd") or "").strip()
+                _m_cmd = re.search(r'/ch/(\d+)', _cmd_f)
+                if _m_cmd:
+                    _cu_ch_id = _m_cmd.group(1)
+        _cu_cache_key = f"catchup:{conn}:{_cu_ch_id}" if _cu_ch_id else ""
+
+        if _cu_cache_key:
+            _cu_hit = state._catchup_cache.get(_cu_cache_key)
+            if _cu_hit:
+                _cu_ts, _cu_result = _cu_hit
+                if time.time() - _cu_ts < state._catchup_cache_ttl:
+                    _cu_age = int(time.time() - _cu_ts)
+                    state.log(
+                        f"[CATCHUP] Cache hit: {_cu_cache_key} "
+                        f"(age {_cu_age}s, "
+                        f"{len(_cu_result.get('archive_listings', []))} entries)"
+                    )
+                    return jsonify(_cu_result)
+                # Expired — evict so the fresh result replaces it cleanly
+                del state._catchup_cache[_cu_cache_key]
+                state.log(f"[CATCHUP] Cache expired: {_cu_cache_key}")
+
         async def _resolve():
             # ── Xtream timeshift ──────────────────────────────────────────────────
             if conn == "xtream" or (conn == "m3u_url" and state.m3u_xtream_override):
@@ -1544,7 +1577,16 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
             return {"error": "Catch-up not supported for this connection type"}
 
         try:
-            return jsonify(run_async(_resolve()))
+            _cu_result = run_async(_resolve())
+            # Store only successful results — errors are not worth caching since
+            # the user may reconnect / the portal may recover within the TTL window.
+            if _cu_cache_key and "archive_listings" in _cu_result:
+                state._catchup_cache[_cu_cache_key] = (time.time(), _cu_result)
+                state.log(
+                    f"[CATCHUP] Cached {len(_cu_result['archive_listings'])} entries "
+                    f"for {_cu_cache_key} (TTL {state._catchup_cache_ttl}s)"
+                )
+            return jsonify(_cu_result)
         except Exception as e:
             state.log(f"[CATCHUP] ✗ Error: {e}")
             return jsonify({"error": str(e)})
