@@ -662,6 +662,35 @@ def register_proxy_routes(flask_app, state):
         threading.Thread(target=_log_stderr, daemon=True).start()
         state.log(f"[ffmpeg/{mode_str}] ✓ Started PID {proc.pid}: {url[:60]}...")
 
+        # ── Pre-flight: detect immediate 456/458 geo-block before streaming ──────
+        # A geo-blocked portal returns 456/458 to ffmpeg within one HTTP round-trip
+        # (typically < 200 ms). A healthy stream keeps running. Poll every 50 ms for
+        # up to 400 ms: if ffmpeg exits in that window, inspect stderr for the error
+        # code and return it as the HTTP status so the frontend mpegts.js error handler
+        # can show the correct "use a VPN" / "max connections" tip.
+        # For working streams proc.poll() stays None → we exit the loop early and
+        # proceed to the streaming response with negligible added latency.
+        _t0 = time.monotonic()
+        while time.monotonic() - _t0 < 0.4:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+
+        if proc.poll() is not None:
+            # ffmpeg already exited — let the stderr reader thread catch up
+            time.sleep(0.15)
+            _early = " ".join(stderr_lines).lower()
+            for _sc in (456, 458):
+                if f"http error {_sc}" in _early:
+                    state.log(
+                        f"[ffmpeg/{mode_str}] ✗ Pre-flight: HTTP {_sc} detected"
+                        f" — returning {_sc} to client"
+                    )
+                    return Response(f"HTTP {_sc}", status=_sc)
+            # Exited for a different reason — fall through to _gen() which will
+            # log the 0-chunk error; no need for a special status here.
+        # ─────────────────────────────────────────────────────────────────────────
+
         def _gen():
             chunk_count   = 0
             killed_by_us  = False
