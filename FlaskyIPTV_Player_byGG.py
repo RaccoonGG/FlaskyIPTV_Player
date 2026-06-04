@@ -177,9 +177,15 @@ class AppState:
         self.record_file_path = ""
         self.mkv_folder = ""
         self.mkv_fallback = True
-        # EPG cache: key → (timestamp, result_dict), TTL = 30 minutes
+        # EPG cache: key → (timestamp, result_dict), TTL = 20 minutes
         self._epg_cache: dict = {}
         self._epg_cache_ttl = 1200  # seconds (20 min)
+        # Catchup listings cache: key → (timestamp, result_dict), TTL = 30 minutes.
+        # Keyed by "catchup:{conn_type}:{channel_id}" — cleared on every reconnect.
+        # Only successful results (containing archive_listings) are stored.
+        # Re-opening the same channel within 30 min returns instantly from cache.
+        self._catchup_cache: dict = {}
+        self._catchup_cache_ttl = 1800  # seconds (30 min)
         # Per-portal flag: set of base_urls where get_short_epg always returns empty.
         # After one confirmed empty response we skip straight to XMLTV for that portal.
         self._short_epg_broken: set = set()
@@ -841,6 +847,7 @@ def api_connect():
         state.m3u_is_local = False
         state.m3u_xtream_override = None
         state._epg_cache = {}
+        state._catchup_cache = {}
         state._xmltv_cache = {}
         state._xmltv_dl_locks = {}
         state._xmltv_dl_events = {}
@@ -6270,7 +6277,10 @@ function doPlay(url, name, opts={}){
       // handles these internally; do NOT destroy or retry from here.
       if(!data.fatal) return;
       // 503/403/404 — hard stop immediately, no retry
-      const hc=data?.response?.code||0;
+      // data.response.code covers MANIFEST_LOAD_ERROR (HLS.js sets it on HTTP errors);
+      // data.networkDetails.status is the fallback for manifestParsingError where
+      // HLS.js parsed the error but didn't promote the code to data.response.
+      const hc=data?.response?.code||data?.networkDetails?.status||0;
       if(hc===456){
         alog('[HLS] Wrong location — use a VPN (456)','w');
         setNP('✗ Wrong location — use a VPN');
@@ -6367,8 +6377,11 @@ function doPlay(url, name, opts={}){
                   });
                   mpegtsObj.attachMediaElement(vid); mpegtsObj.load(); vid.play().catch(()=>{});
                   // Error handler so remux failures surface cleanly instead of silently re-entering watchdog
-                  mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
+                  mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2,ei2)=>{
                     if(!_stale()){
+                      const _rc2=ei2?.httpStatusCode||ei2?.statusCode||ei2?.code||0;
+                      if(_rc2===456){alog('[MPEGTS/remux] Wrong location — use a VPN (456)','w');setNP('✗ Wrong location — use a VPN');document.getElementById('ppbtn').textContent='▶';return;}
+                      if(_rc2===458){alog('[MPEGTS/remux] Max connections already in use (458)','w');setNP('✗ Max connections in use');document.getElementById('ppbtn').textContent='▶';return;}
                       alog('[MPEGTS/remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
                       setNP('✗ Stream unavailable: '+name);
                       document.getElementById('ppbtn').textContent='▶';
@@ -6484,8 +6497,11 @@ function doPlay(url, name, opts={}){
                     if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
                       mpegtsObj=mpegts.createPlayer({type:'mse',isLive:true,url:remuxUrl,cors:true},{enableWorker:false});
                       mpegtsObj.attachMediaElement(vid); mpegtsObj.load(); vid.play().catch(()=>{});
-                      mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
+                      mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2,ei2)=>{
                         if(!_stale()){
+                          const _rc2=ei2?.httpStatusCode||ei2?.statusCode||ei2?.code||0;
+                          if(_rc2===456){alog('[MPEGTS/remux] Wrong location — use a VPN (456)','w');setNP('✗ Wrong location — use a VPN');document.getElementById('ppbtn').textContent='▶';return;}
+                          if(_rc2===458){alog('[MPEGTS/remux] Max connections already in use (458)','w');setNP('✗ Max connections in use');document.getElementById('ppbtn').textContent='▶';return;}
                           alog('[MPEGTS/remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
                           setNP('✗ Stream unavailable: '+name);
                           document.getElementById('ppbtn').textContent='▶';
@@ -6628,8 +6644,11 @@ function doPlay(url, name, opts={}){
                     mpegtsObj.attachMediaElement(vid);
                     mpegtsObj.load();
                     vid.play().catch(()=>{});
-                    mpegtsObj.on(mpegts.Events.ERROR,(et3,ed3)=>{
+                    mpegtsObj.on(mpegts.Events.ERROR,(et3,ed3,ei3)=>{
                       if(!_stale()){
+                        const _rc3=ei3?.httpStatusCode||ei3?.statusCode||ei3?.code||0;
+                        if(_rc3===456){alog('[MPEGTS/remux] Wrong location — use a VPN (456)','w');setNP('✗ Wrong location — use a VPN');document.getElementById('ppbtn').textContent='▶';return;}
+                        if(_rc3===458){alog('[MPEGTS/remux] Max connections already in use (458)','w');setNP('✗ Max connections in use');document.getElementById('ppbtn').textContent='▶';return;}
                         alog('[MPEGTS/remux] '+(ed3?.msg||JSON.stringify(ed3)),'e');
                         setNP('✗ Stream unavailable: '+name);
                         document.getElementById('ppbtn').textContent='▶';
@@ -6659,8 +6678,11 @@ function doPlay(url, name, opts={}){
             mpegtsObj.attachMediaElement(vid);
             mpegtsObj.load();
             vid.play().catch(()=>{});
-            mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2)=>{
+            mpegtsObj.on(mpegts.Events.ERROR,(et2,ed2,ei2)=>{
               if(!_stale()){
+                const _rc2=ei2?.httpStatusCode||ei2?.statusCode||ei2?.code||0;
+                if(_rc2===456){alog('[MPEGTS/remux] Wrong location — use a VPN (456)','w');setNP('✗ Wrong location — use a VPN');document.getElementById('ppbtn').textContent='▶';return;}
+                if(_rc2===458){alog('[MPEGTS/remux] Max connections already in use (458)','w');setNP('✗ Max connections in use');document.getElementById('ppbtn').textContent='▶';return;}
                 alog('[MPEGTS/remux] '+(ed2?.msg||JSON.stringify(ed2)),'e');
                 setNP('\u2717 Stream unavailable: '+name);
                 document.getElementById('ppbtn').textContent='\u25b6';
