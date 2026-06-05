@@ -6261,6 +6261,10 @@ function doPlay(url, name, opts={}){
       fragLoadingMaxRetry:  2,      // 2 retries max; each attempt ties up 60 s poll
       fragLoadingRetryDelay:3000,   // matches Retry-After: 3 from segment server
       backBufferLength:     60,     // 60 s back-buffer for backward seeking
+      maxBufferLength:         60,     // 10 × 6 s segs; HLS.js fills this from burst
+      maxMaxBufferLength:      120,    // hard cap 20 segs
+      manifestLoadingTimeOut:  95000,
+      manifestLoadingMaxRetry: 0,
     }) : _HLS_CFG;
 
     hlsObj=new Hls(_activeCfg);
