@@ -691,13 +691,18 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                         p_title, p_start, p_end, p_desc = prog[0], prog[1], prog[2], prog[3] if len(prog) > 3 else ""
                     else:
                         p_title, p_start, p_end, p_desc = prog["title"], prog["start"], prog["end"], prog.get("desc", "")
-                    if p_start <= now < p_end:
+                    # Apply EPG display offset: positive offset means portal times are behind
+                    # real time, so we query "portal_now = real_now - offset" to find
+                    # programmes currently airing in the corrected time frame.
+                    _epg_off = getattr(state, "epg_offset_secs", 0)
+                    _eff_now = now - _epg_off
+                    if p_start <= _eff_now < p_end:
                         key = (p_title.lower(), channel_id)
                         if key not in seen:
                             seen.add(key)
                             # Calculate progress percentage through the show
                             duration = p_end - p_start
-                            elapsed = now - p_start
+                            elapsed = _eff_now - p_start
                             progress = int((elapsed / duration * 100)) if duration > 0 else 0
                             results.append({
                                 "title": p_title,
@@ -2012,16 +2017,22 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                         if e["end"]:
                             e["end"] -= _utc_offset
 
+        # Apply EPG display offset: if user set a display offset (+N seconds means portal
+        # times are behind), we look for the "current" programme relative to the corrected
+        # clock (real_now - offset = equivalent portal-now).
+        _epg_disp_off = getattr(state, "epg_offset_secs", 0)
+        _eff_now = now - _epg_disp_off
+
         for ep in entries:
-            if ep["start"] <= now < ep["end"]:
+            if ep["start"] <= _eff_now < ep["end"]:
                 out["current"] = ep
-            elif ep["start"] > now and out["next"] is None:
+            elif ep["start"] > _eff_now and out["next"] is None:
                 out["next"] = ep
 
         # If nothing matched by time window, pick closest past as current and first future as next
         if not out["current"] and entries:
-            past = [e for e in entries if e["end"] <= now]
-            future = [e for e in entries if e["start"] > now]
+            past = [e for e in entries if e["end"] <= _eff_now]
+            future = [e for e in entries if e["start"] > _eff_now]
             if past:
                 out["current"] = past[-1]
             if future:
@@ -2088,9 +2099,13 @@ def register_epg_routes(flask_app, state, run_async, _make_client):
                     continue
                 prog = {"title": title, "start": start, "end": end, "desc": desc}
                 out["schedule"].append(prog)
-                if start <= now < end:
+                # Apply EPG display offset: find current programme relative to
+                # the corrected clock (real_now - offset = equivalent portal-now).
+                _epg_disp_off = getattr(state, "epg_offset_secs", 0)
+                _eff_now = now - _epg_disp_off
+                if start <= _eff_now < end:
                     out["current"] = prog
-                elif start > now and out["next"] is None:
+                elif start > _eff_now and out["next"] is None:
                     out["next"] = prog
             except Exception:
                 continue
@@ -3207,9 +3222,26 @@ function _channelSupportsCatchup(it){
   // M3U or unknown portal type — allow and let the API respond
   return true;
 }
+function _epgOffSecs(){
+  // Read live from the connect-form field that corresponds to the currently
+  // connected portal type (set as window._epgOffsetFieldId on each connect).
+  // This lets the offset take effect immediately when the user changes the
+  // field value — no reconnect needed.
+  // Falls back to window._epgOffsetSecs (snapshot from last connect) when
+  // the field is absent or empty (e.g. before first connect).
+  const fieldId = window._epgOffsetFieldId;
+  if(fieldId){
+    const el = document.getElementById(fieldId);
+    if(el && el.value !== ''){
+      const v = parseInt(el.value, 10);
+      if(!isNaN(v)) return v * 60;
+    }
+  }
+  return (window._epgOffsetSecs|0);
+}
 function _fmtEpgTime(ts){
   if(!ts) return '';
-  const d=new Date(ts*1000);
+  const d=new Date((ts + _epgOffSecs()) * 1000);
   return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
 }
 function _epgCard(prog, label){
@@ -3244,8 +3276,9 @@ async function showEPG(){
       document.getElementById('epg-body').innerHTML=_epgCard(d.current,'Now')+_epgCard(d.next,'Next');
     } else {
       const now=Date.now()/1000;
+      const off=_epgOffSecs();
       const rows=schedule.map(p=>{
-        const isCurrent=p.start<=now&&now<p.end;
+        const isCurrent=(p.start+off)<=now&&now<(p.end+off);
         const start=_fmtEpgTime(p.start), end=_fmtEpgTime(p.end);
         const bg=isCurrent?'var(--s3)':'transparent';
         const titleColor=isCurrent?'var(--acc)':'var(--txt1)';
@@ -3653,16 +3686,21 @@ async function _loadEpgRow(ch, idx){
     schedule.forEach(prog => {
       const pStart = prog.start || 0;
       const pEnd   = prog.end   || (pStart + 3600);
+      // Apply EPG display offset: shift block positions on the timeline so the
+      // programme appears at its corrected real-time position.
+      const off     = _epgOffSecs();
+      const adjStart = pStart + off;
+      const adjEnd   = pEnd   + off;
       // Clamp to visible window
-      if(pEnd < winStart || pStart > winEnd) return;
+      if(adjEnd < winStart || adjStart > winEnd) return;
 
-      const x1 = Math.max(1, _epgTsToX(pStart));
-      const x2 = Math.min(_epgTotalW(), _epgTsToX(pEnd));
+      const x1 = Math.max(1, _epgTsToX(adjStart));
+      const x2 = Math.min(_epgTotalW(), _epgTsToX(adjEnd));
       const w  = x2 - x1;
       if(w < 2) return;
 
-      const isCurrent = pStart <= nowSec && nowSec < pEnd;
-      const startLbl  = _fmtEpgTime(pStart);
+      const isCurrent = adjStart <= nowSec && nowSec < adjEnd;
+      const startLbl  = _fmtEpgTime(pStart);   // _fmtEpgTime already applies offset internally
       const endLbl    = _fmtEpgTime(pEnd);
       const progTitle = esc(prog.title || '—');
 
@@ -3807,8 +3845,8 @@ function showCatchup(){
 function closeCatchup(){document.getElementById('catchup-overlay').style.display='none';_mvCatchupCtx=null;}
 document.getElementById('catchup-overlay').addEventListener('click',function(e){if(e.target===this)closeCatchup();});
 
-function _cuFmtTime(ts){const d=new Date(ts*1000);return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
-function _cuFmtDate(ts){const d=new Date(ts*1000);return d.toLocaleDateString([],{weekday:'short',month:'short',day:'numeric'});}
+function _cuFmtTime(ts){const d=new Date((ts+_epgOffSecs())*1000);return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
+function _cuFmtDate(ts){const d=new Date((ts+_epgOffSecs())*1000);return d.toLocaleDateString([],{weekday:'short',month:'short',day:'numeric'});}
 // Display-only helpers — read directly from start_str ("YYYY-MM-DD HH:MM" server-local)
 // to avoid Unix-timestamp timezone ambiguity. Catchup request values are untouched.
 function _cuDispTime(str){ return str ? str.slice(-5) : ''; }
@@ -3829,6 +3867,26 @@ function _cuDispEndTime(startStr, startTs, stopTs){
   const mEnd = totalMins % 60;
   return String(hEnd).padStart(2,'0') + ':' + String(mEnd).padStart(2,'0');
 }
+// ── EPG-offset-aware display helpers for start_str (catchup listings) ────────
+// These shift the server-local "YYYY-MM-DD HH:MM" string by the global EPG
+// display offset before rendering.  The ORIGINAL start_str is always passed
+// to the server for timeshift URL construction — only the display changes.
+function _cuStrAddOffSecs(str, offSecs){
+  if(!str || !offSecs) return str;
+  const sp = str.split(' ');
+  if(sp.length < 2) return str;
+  const [y,mo,d] = sp[0].split('-').map(Number);
+  const hm = sp[1].split(':');
+  const h = parseInt(hm[0])||0, m = parseInt(hm[1])||0;
+  if(isNaN(h)||isNaN(m)) return str;
+  const ms = Date.UTC(y, mo-1, d, h, m) + offSecs * 1000;
+  const dt = new Date(ms);
+  const pad = n => String(n).padStart(2,'0');
+  return `${dt.getUTCFullYear()}-${pad(dt.getUTCMonth()+1)}-${pad(dt.getUTCDate())} ${pad(dt.getUTCHours())}:${pad(dt.getUTCMinutes())}`;
+}
+function _cuDispTimeOff(str){ return _cuDispTime(_cuStrAddOffSecs(str, _epgOffSecs())); }
+function _cuDispDateOff(str){ return _cuDispDate(_cuStrAddOffSecs(str, _epgOffSecs())); }
+function _cuDispEndTimeOff(startStr, startTs, stopTs){ return _cuDispEndTime(_cuStrAddOffSecs(startStr, _epgOffSecs()), startTs, stopTs); }
 
 async function _loadCatchupEPG(){
   document.getElementById('catchup-body').innerHTML=
@@ -3862,14 +3920,14 @@ function _renderArchiveListings(listings){
   let lastDate='';
   const rows=listings.map(p=>{
     const hasArchive=(p.mark_archive==='1'||p.mark_archive===1);
-    const dateStr=p.start_str?_cuDispDate(p.start_str):(p.start?_cuFmtDate(p.start):'');
+    const dateStr=p.start_str?_cuDispDateOff(p.start_str):(p.start?_cuFmtDate(p.start):'');
     let dateHdr='';
     if(dateStr&&dateStr!==lastDate){
       lastDate=dateStr;
       dateHdr=`<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--acc);padding:8px 0 4px">${dateStr}</div>`;
     }
     const t=p.start_str
-      ?`${_cuDispTime(p.start_str)}–${_cuDispEndTime(p.start_str,p.start,p.stop)}`
+      ?`${_cuDispTimeOff(p.start_str)}–${_cuDispEndTimeOff(p.start_str,p.start,p.stop)}`
       :(p.start&&p.stop?`${_cuFmtTime(p.start)}–${_cuFmtTime(p.stop)}`:(p.start?_cuFmtTime(p.start):''));
     const cmdSafe=encodeURIComponent(p.cmd||'');
     const liveCmdSafe=encodeURIComponent(p.live_cmd||'');
@@ -4210,7 +4268,7 @@ async function wonOpenExternal(idx){
 }
 
 function _wonFmt(ts){
-  const d = new Date(ts * 1000);
+  const d = new Date((ts + _epgOffSecs()) * 1000);
   return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 }
 
@@ -4419,7 +4477,8 @@ function wonFindChannel(btn, idx){
   function _fmtTime(iso){
     if(!iso) return '';
     try{
-      const d = typeof iso === 'number' ? new Date(iso * 1000) : new Date(iso);
+      const off = window._epgOffsetSecs|0;
+      const d = typeof iso === 'number' ? new Date((iso + off) * 1000) : new Date(iso);
       return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',hour12:false});
     }catch(e){ return ''; }
   }
@@ -4430,7 +4489,8 @@ function wonFindChannel(btn, idx){
   function _secsUntil(iso){
     if(!iso) return null;
     try{
-      const ms = (typeof iso === 'number' ? iso * 1000 : new Date(iso).getTime()) - Date.now();
+      const off = window._epgOffsetSecs|0;
+      const ms = (typeof iso === 'number' ? (iso + off) * 1000 : new Date(iso).getTime()) - Date.now();
       return ms > 0 ? Math.ceil(ms/1000) : null;
     }catch(e){ return null; }
   }
