@@ -137,6 +137,11 @@ class AppState:
         self.password = ""
         self.m3u_url = ""
         self.ext_epg_url = ""  # User-supplied external XMLTV EPG URL (overrides portal's own)
+        # User-supplied EPG display offset in seconds (positive = advance displayed times,
+        # negative = delay).  Applied AFTER all auto-detection (portal_utc_offset etc.)
+        # as the final correction for wrong EPG times.  Affects WON, EPG overlay, EPG
+        # grid, video overlay, catchup listing display — NOT the timeshift playback URLs.
+        self.epg_offset_secs: int = 0
         self.connected = False
         self.is_stalker_portal = False  # True when URL contains 'stalker_portal'
         # Optional user-supplied Stalker device IDs (override computed values when non-empty)
@@ -461,7 +466,7 @@ async def _make_client(do_handshake=True):
         # _vod_logo_cache is a shared dict object; no re-assignment needed.
 
 
-def run_async(coro):
+def run_async(coro, timeout=None):
     """Run an async coroutine from sync context (blocking).
 
     When a PortalSessionManager is active (after the first successful connect),
@@ -477,6 +482,14 @@ def run_async(coro):
     owned by run_worker() background prefetch threads — keeping them separate
     prevents a new api_connect() from accidentally cancelling a prefetch that
     belongs to an already-successful portal connection.
+
+    *timeout* defaults to None (no outer wall-clock deadline) because player
+    operations — pagination, channel walks, catchup listings — should run to
+    completion as long as the portal keeps responding.  Individual HTTP
+    requests are already bounded by the per-session aiohttp ClientTimeout
+    (30-60 s), so a truly dead/hung connection is handled at that layer.
+    Prefetch threads that call submit() directly keep their own explicit
+    timeout=300 and are not affected by this default.
     """
     mgr = getattr(state, "portal_mgr", None)
     if mgr is not None and not mgr.loop.is_closed():
@@ -484,7 +497,7 @@ def run_async(coro):
         # _connect_loop/_connect_task are not set here — portal_mgr owns
         # the loop lifetime; cancellation is handled by portal_mgr.disconnect().
         try:
-            return mgr.submit(coro, timeout=30)
+            return mgr.submit(coro, timeout=timeout)
         except Exception:
             raise
 
@@ -803,6 +816,7 @@ def api_connect():
         state.password = data.get("password", "").strip()
         state.m3u_url = data.get("m3u_url", "").strip()
         state.ext_epg_url = data.get("ext_epg_url", "").strip()
+        state.epg_offset_secs = int(data.get("epg_offset_secs", 0) or 0)
         state.is_stalker_portal = (
             state.conn_type == "mac" and
             "stalker_portal" in state.url.lower()
@@ -865,6 +879,11 @@ def api_connect():
         state._all_channels_epoch += 1   # invalidates any Portal 1 prefetch finally-block set()
         state._logo_cache_vod = {}
         state._portal_utc_offset = 0
+        state.epg_offset_secs    = 0
+        # Clear EPG caches so stale current/next detection with old offset
+        # doesn't persist after reconnect with a different EPG offset.
+        state._epg_cache.clear()
+        state._catchup_cache.clear()
         state._xmltv_catchup_cache = {}
         state._xmltv_catchup_downloading = set()
         # Local M3U file: pre-parse content, set flag so _connect_async skips network
@@ -1159,8 +1178,9 @@ def api_connect():
 
         # Inject effective UA so the JS can cache it for multiview stream requests
         if result.get("success"):
-            result["effective_ua"] = state.effective_ua
-            result["stream_ua"]    = state.stream_ua
+            result["effective_ua"]    = state.effective_ua
+            result["stream_ua"]       = state.stream_ua
+            result["epg_offset_secs"] = state.epg_offset_secs
 
         return jsonify(result)
     except Exception as e:
@@ -2820,6 +2840,11 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   .xp-close-x{display:none}
   .xp-close-back{display:inline}
 }
+
+  /* Hide spin buttons on all number inputs */
+  input[type=number]::-webkit-inner-spin-button,
+  input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+  input[type=number]{-moz-appearance:textfield}
 </style>
 </head>
 <body>
@@ -2880,7 +2905,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           </div>
         </details>
         <div style="display:flex;gap:6px;align-items:center">
-          <label title="Optional: external XMLTV EPG URL(s). One URL per line. Leave blank to use portal's own EPG.">EPG</label><textarea id="i-mac-epg" rows="2" placeholder="https://… xmltv URL (optional, one per line)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;flex:1"></textarea>
+          <label title="Optional: external XMLTV EPG URL(s). One URL per line. Leave blank to use portal's own EPG.">EPG</label><textarea id="i-mac-epg" rows="2" placeholder="https://… xmltv URL (optional, one per line)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="flex:1;resize:vertical;height:34px"></textarea><label style="flex-shrink:0" title="Shift EPG display times by this many minutes (±720). Positive=advance, negative=delay.">EPG±</label><input type="number" id="i-mac-epg-offset" step="30" min="-720" max="720" placeholder="0" style="flex:none;min-width:0;width:60px;appearance:none;-moz-appearance:textfield">
         </div>
       </div>
       <div id="cr-xtream" class="cr hidden" style="flex-direction:column;align-items:stretch">
@@ -2902,7 +2927,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           </div>
         </details>
         <div style="display:flex;gap:6px;align-items:center">
-          <label title="Optional: external XMLTV EPG URL(s). One URL per line. Leave blank to use provider's own EPG.">EPG</label><textarea id="i-epg" rows="2" placeholder="https://epg.best/xmltv.php?… (optional, one per line)" style="flex:1;resize:vertical" autocomplete="new-password" autocorrect="off" spellcheck="false"></textarea>
+          <label title="Optional: external XMLTV EPG URL(s). One URL per line. Leave blank to use provider's own EPG.">EPG</label><textarea id="i-epg" rows="2" placeholder="https://epg.best/xmltv.php?… (optional, one per line)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="flex:1;resize:vertical;height:34px"></textarea><label style="flex-shrink:0" title="Shift EPG display times by this many minutes (±720). Positive=advance, negative=delay.">EPG±</label><input type="number" id="i-epg-offset" step="30" min="-720" max="720" placeholder="0" style="flex:none;min-width:0;width:60px;appearance:none;-moz-appearance:textfield">
         </div>
       </div>
       <div id="cr-m3u" class="cr hidden" style="flex-direction:column;align-items:stretch;gap:5px">
@@ -2920,8 +2945,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         </details>
         <!-- EPG row -->
         <div style="display:flex;gap:6px;align-items:center">
-          <label title="Optional: external XMLTV EPG URL. Leave blank to use tvg-url from M3U.">EPG</label>
-          <textarea id="i-m3u-epg" rows="2" placeholder="https://epg.best/xmltv.php?… (optional, one per line)" style="flex:1;resize:vertical" autocomplete="new-password" autocorrect="off" spellcheck="false"></textarea>
+          <label title="Optional: external XMLTV EPG URL. Leave blank to use tvg-url from M3U.">EPG</label><textarea id="i-m3u-epg" rows="2" placeholder="https://epg.best/xmltv.php?… (optional, one per line)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="flex:1;resize:vertical;height:34px"></textarea><label style="flex-shrink:0" title="Shift EPG display times by this many minutes (±720). Positive=advance, negative=delay.">EPG±</label><input type="number" id="i-m3u-epg-offset" step="30" min="-720" max="720" placeholder="0" style="flex:none;min-width:0;width:60px;appearance:none;-moz-appearance:textfield">
         </div>
         <!-- File row — always visible -->
         <div style="display:flex;gap:6px;align-items:center">
@@ -3542,13 +3566,13 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
               <div class="pl-row"><label style="min-width:80px;font-size:11px">Signature</label><input id="pl-sig" placeholder="leave blank — auto-computed" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
             </div>
           </details>
-          <div class="pl-row"><label>EPG</label><textarea id="pl-mac-epg" rows="2" placeholder="External EPG URL(s), one per line (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;width:100%"></textarea></div>
+          <div class="pl-row"><label>EPG</label><textarea id="pl-mac-epg" rows="2" placeholder="External EPG URL(s), one per line (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;flex:1;height:34px"></textarea><label style="flex-shrink:0" title="Shift EPG display times by this many minutes (±720).">EPG±</label><input type="number" id="pl-mac-epg-offset" step="30" min="-720" max="720" placeholder="0" style="flex:none;min-width:0;width:60px;appearance:none;-moz-appearance:textfield"></div>
         </div>
         <div id="plf-xtream" class="hidden">
           <div class="pl-row"><label>URL</label><input id="pl-xu" type="text" inputmode="url" placeholder="http://server.host:8080" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
           <div class="pl-row"><label>User</label><input id="pl-us" placeholder="username" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
           <div class="pl-row"><label>Pass</label><span style="position:relative;display:inline-flex;align-items:center;flex:1"><input id="pl-pw" type="password" placeholder="password" autocomplete="new-password" style="flex:1;padding-right:28px"><button type="button" onclick="(function(b){var i=document.getElementById('pl-pw');i.type=i.type==='password'?'text':'password';b.textContent=i.type==='password'?'👁':'🙈'})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button></span></div>
-          <div class="pl-row"><label>EPG</label><textarea id="pl-epg" rows="2" placeholder="External EPG URL(s), one per line (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;width:100%"></textarea></div>
+          <div class="pl-row"><label>EPG</label><textarea id="pl-epg" rows="2" placeholder="External EPG URL(s), one per line (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;flex:1;height:34px"></textarea><label style="flex-shrink:0" title="Shift EPG display times by this many minutes (±720).">EPG±</label><input type="number" id="pl-epg-offset" step="30" min="-720" max="720" placeholder="0" style="flex:none;min-width:0;width:60px;appearance:none;-moz-appearance:textfield"></div>
           <details style="margin:4px 0 2px"><summary style="font-size:11px;color:var(--txt3);cursor:pointer;user-select:none;padding:2px 0">Advanced (optional)</summary>
             <div style="display:flex;flex-direction:column;gap:4px;margin-top:6px">
               <div class="pl-row ua-row"><label style="min-width:80px;font-size:11px">User-Agent</label><select id="pl-xu-ua-preset" onchange="uaPresetChange('pl-xu-ua-preset','pl-xu-ua-custom')" style="flex:1;font-size:11px"><option value="">Auto (TiviMate default)</option><option value="TiviMate">TiviMate</option><option value="GSE_IPTV">GSE IPTV</option><option value="OTTPlayer">OTT Player</option><option value="IPTVSmarters">IPTV Smarters</option><option value="VLC">VLC</option><option value="Chrome">Chrome</option><option value="custom">Custom…</option></select></div>
@@ -3558,7 +3582,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         </div>
         <div id="plf-m3u" class="hidden">
           <div class="pl-row"><label>URL</label><input id="pl-m3u" type="text" inputmode="url" placeholder="http://example.com/list.m3u" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
-          <div class="pl-row"><label>EPG</label><textarea id="pl-m3u-epg" rows="2" placeholder="External EPG URL(s), one per line (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;width:100%"></textarea></div>
+          <div class="pl-row"><label>EPG</label><textarea id="pl-m3u-epg" rows="2" placeholder="External EPG URL(s), one per line (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;flex:1;height:34px"></textarea><label style="flex-shrink:0" title="Shift EPG display times by this many minutes (±720).">EPG±</label><input type="number" id="pl-m3u-epg-offset" step="30" min="-720" max="720" placeholder="0" style="flex:none;min-width:0;width:60px;appearance:none;-moz-appearance:textfield"></div>
           <details style="margin:4px 0 2px"><summary style="font-size:11px;color:var(--txt3);cursor:pointer;user-select:none;padding:2px 0">Advanced (optional)</summary>
             <div style="display:flex;flex-direction:column;gap:4px;margin-top:6px">
               <div class="pl-row ua-row"><label style="min-width:80px;font-size:11px">User-Agent</label><select id="pl-m3u-ua-preset" onchange="uaPresetChange('pl-m3u-ua-preset','pl-m3u-ua-custom')" style="flex:1;font-size:11px"><option value="">Auto (VLC default)</option><option value="TiviMate">TiviMate</option><option value="GSE_IPTV">GSE IPTV</option><option value="OTTPlayer">OTT Player</option><option value="IPTVSmarters">IPTV Smarters</option><option value="VLC">VLC</option><option value="Chrome">Chrome</option><option value="custom">Custom…</option></select></div>
@@ -3840,6 +3864,11 @@ async function doConnect(){
       : CT==='mac'
         ? document.getElementById('i-mac-epg').value.trim()
         : document.getElementById('i-m3u-epg').value.trim()),
+    epg_offset_secs:(CT==='xtream'
+      ? (parseInt(document.getElementById('i-epg-offset')?.value)||0)*60
+      : CT==='mac'
+        ? (parseInt(document.getElementById('i-mac-epg-offset')?.value)||0)*60
+        : (parseInt(document.getElementById('i-m3u-epg-offset')?.value)||0)*60),
     stalker_sn:         CT==='mac' ? (document.getElementById('i-sn')?.value.trim()||'')     : '',
     stalker_device_id:  CT==='mac' ? (document.getElementById('i-devid')?.value.trim()||'')  : '',
     stalker_device_id2: CT==='mac' ? (document.getElementById('i-devid2')?.value.trim()||'') : '',
@@ -3880,6 +3909,13 @@ async function doConnect(){
       categoryItemsCache = {}; 
       // Cache stream UA for multiview stream requests (separate from portal API UA)
       window._mvEffectiveUa = d.stream_ua || d.effective_ua || 'VLC/3.0.0 LibVLC/3.0.0';
+      // Store EPG display offset so EPG addon can apply it to all time displays
+      window._epgOffsetSecs = d.epg_offset_secs || 0;
+      // Store the field ID for the connected portal type so _epgOffSecs() can
+      // read live changes without a full reconnect
+      window._epgOffsetFieldId = CT==='xtream' ? 'i-epg-offset'
+                                : CT==='mac'    ? 'i-mac-epg-offset'
+                                               : 'i-m3u-epg-offset';
       // Always land on Live categories after any connect
       mode='live';
       switchMode('live', catsCache['live']||[]);
@@ -3906,6 +3942,7 @@ async function doConnect(){
           password: payload.password,
           m3u_url: payload.m3u_url,
           ext_epg_url: payload.ext_epg_url||'',
+          epg_offset_secs: payload.epg_offset_secs||0,
         };
         arr.push(entry);
         plSaveAll(arr);
@@ -7237,6 +7274,11 @@ function plSave(){
       : plCT==='mac'
         ? document.getElementById('pl-mac-epg').value.trim()
         : document.getElementById('pl-m3u-epg').value.trim()),
+    epg_offset_secs: (plCT==='xtream'
+      ? (parseInt(document.getElementById('pl-epg-offset')?.value)||0)*60
+      : plCT==='mac'
+        ? (parseInt(document.getElementById('pl-mac-epg-offset')?.value)||0)*60
+        : (parseInt(document.getElementById('pl-m3u-epg-offset')?.value)||0)*60),
     stalker_sn:         plCT==='mac' ? (document.getElementById('pl-sn')?.value.trim()||'')    : '',
     stalker_device_id:  plCT==='mac' ? (document.getElementById('pl-devid')?.value.trim()||'') : '',
     stalker_device_id2: plCT==='mac' ? (document.getElementById('pl-devid2')?.value.trim()||''): '',
@@ -7270,6 +7312,11 @@ function plEdit(i){
   document.getElementById('pl-epg').value=p.ext_epg_url||'';
   document.getElementById('pl-mac-epg').value=p.ext_epg_url||'';
   document.getElementById('pl-m3u-epg').value=p.ext_epg_url||'';
+  // Restore EPG offset (stored as seconds, displayed as minutes)
+  const _plOffMin = Math.round((p.epg_offset_secs||0)/60);
+  if(document.getElementById('pl-epg-offset'))     document.getElementById('pl-epg-offset').value     = _plOffMin||'';
+  if(document.getElementById('pl-mac-epg-offset')) document.getElementById('pl-mac-epg-offset').value = _plOffMin||'';
+  if(document.getElementById('pl-m3u-epg-offset')) document.getElementById('pl-m3u-epg-offset').value = _plOffMin||'';
   if(document.getElementById('pl-sn'))     document.getElementById('pl-sn').value=p.stalker_sn||'';
   if(document.getElementById('pl-devid'))  document.getElementById('pl-devid').value=p.stalker_device_id||'';
   if(document.getElementById('pl-devid2')) document.getElementById('pl-devid2').value=p.stalker_device_id2||'';
@@ -7288,7 +7335,8 @@ function plDelete(i){
 function plClearForm(){
   plEditId=null;
   ['pl-name','pl-url','pl-mac','pl-xu','pl-us','pl-pw','pl-m3u',
-   'pl-epg','pl-mac-epg','pl-m3u-epg','pl-sn','pl-devid','pl-devid2','pl-sig'].forEach(id=>{
+   'pl-epg','pl-mac-epg','pl-m3u-epg','pl-epg-offset','pl-mac-epg-offset','pl-m3u-epg-offset',
+   'pl-sn','pl-devid','pl-devid2','pl-sig'].forEach(id=>{
     const el=document.getElementById(id); if(el) el.value='';
   });
   // Reset all UA preset selectors, hide custom rows, sync custom dropdowns
@@ -7340,6 +7388,11 @@ async function plConnect(i){
   document.getElementById('i-epg').value=p.ext_epg_url||'';
   document.getElementById('i-mac-epg').value=p.ext_epg_url||'';
   document.getElementById('i-m3u-epg').value=p.ext_epg_url||'';
+  // Restore EPG offset into connect form (stored as seconds → displayed as minutes)
+  const _connOffMin = Math.round((p.epg_offset_secs||0)/60);
+  const _iOff = document.getElementById('i-epg-offset');     if(_iOff)     _iOff.value     = _connOffMin||'';
+  const _iMacOff = document.getElementById('i-mac-epg-offset'); if(_iMacOff) _iMacOff.value = _connOffMin||'';
+  const _iM3uOff = document.getElementById('i-m3u-epg-offset'); if(_iM3uOff) _iM3uOff.value = _connOffMin||'';
   // Stalker override hidden inputs
   const sn=document.getElementById('i-sn'); if(sn) sn.value=p.stalker_sn||'';
   const di=document.getElementById('i-devid'); if(di) di.value=p.stalker_device_id||'';
