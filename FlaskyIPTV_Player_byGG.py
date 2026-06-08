@@ -6307,7 +6307,109 @@ function doPlay(url, name, opts={}){
     hlsObj=new Hls(_activeCfg);
     hlsObj.loadSource(px);
     hlsObj.attachMedia(vid);
-    hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>vid.play().catch(()=>{}));
+    hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>{
+      if(!_isCatchupVOD){ vid.play().catch(()=>{}); return; }
+      // ── Catchup VOD: pre-roll buffer guard ───────────────────────────────
+      // The portal delivers at ~1× real-time speed.  Starting playback
+      // immediately after MANIFEST_PARSED means HLS.js reaches the download
+      // edge within one segment → rebuffering at every boundary.
+      //
+      // Fix: keep the video paused until vid.buffered has _PRE_ROLL_SECS of
+      // content ahead of currentTime.  While waiting, vid.buffered grows and
+      // the native <video controls> render the growing lighter bar ahead of
+      // the playhead — the visible "buffer line".  Plays immediately once the
+      // threshold is met or the 90-second deadline expires.
+      const _PRE_ROLL_SECS = 30;
+      let _seekGuardActive   = false;
+      let _catchupPlayStarted = false;
+
+      setNP('\u27f3 Buffering\u2026 '+pName);
+      const _preRollDeadline = Date.now() + 90000;
+      const _preRollCheck = ()=>{
+        if(_stale()) return;
+        let _bufferedEnd = 0;
+        const _ct = vid.currentTime || 0;
+        try{
+          for(let i = 0; i < vid.buffered.length; i++){
+            if(vid.buffered.start(i) <= _ct + 0.5)
+              _bufferedEnd = Math.max(_bufferedEnd, vid.buffered.end(i));
+          }
+        }catch(e){}
+        const _needed = _ct + _PRE_ROLL_SECS;
+        if(_bufferedEnd >= _needed || Date.now() > _preRollDeadline){
+          hlsObj && hlsObj.off(Hls.Events.FRAG_BUFFERED, _preRollCheck);
+          alog('[HLS] Pre-roll: '+_bufferedEnd.toFixed(1)+'s buffered — starting','k');
+          _catchupPlayStarted = true;
+          setNP('\u25b6 '+pName);
+          vid.play().catch(()=>{});
+          // Persistent recovery listener (watchdog stall-recovery via FRAG_BUFFERED)
+          const _recoveryHandler = ()=>{
+            if(_stale()){ hlsObj && hlsObj.off(Hls.Events.FRAG_BUFFERED, _recoveryHandler); return; }
+            if(window._hlsRecoverySuccessHandler){
+              try{ window._hlsRecoverySuccessHandler(); }catch(e){}
+              window._hlsRecoverySuccessHandler = null;
+            }
+          };
+          hlsObj && hlsObj.on(Hls.Events.FRAG_BUFFERED, _recoveryHandler);
+        }
+      };
+      hlsObj.on(Hls.Events.FRAG_BUFFERED, _preRollCheck);
+
+      // ── Catchup VOD: post-seek buffer guard ──────────────────────────────
+      // After a seek the proxy restarts ffmpeg from the seek offset.  Allow
+      // the same buffer to accumulate before resuming — same visual mechanism
+      // as pre-roll (video paused, native seek bar shows growing buffer line).
+      // Bypass if the seek target is already fully covered by the MSE buffer.
+      vid.addEventListener('play', ()=>{
+        if(_seekGuardActive) vid.pause();
+      });
+
+      vid.addEventListener('seeking', ()=>{
+        if(_stale() || !hlsObj) return;
+        if(_seekGuardActive) return;
+        if(!_catchupPlayStarted) return;
+
+        const _seekTarget = vid.currentTime;
+        let _alreadyCovered = false;
+        try{
+          for(let i = 0; i < vid.buffered.length; i++){
+            if(vid.buffered.start(i) <= _seekTarget + 0.5 &&
+               vid.buffered.end(i)   >= _seekTarget + _PRE_ROLL_SECS){
+              _alreadyCovered = true; break;
+            }
+          }
+        }catch(e){}
+        if(_alreadyCovered) return;
+
+        _seekGuardActive = true;
+        vid.pause();
+        setNP('\u27f3 Seeking\u2026 '+pName);
+        const _seekDeadline = Date.now() + 90000;
+        const _seekCheck = ()=>{
+          if(_stale()){
+            hlsObj && hlsObj.off(Hls.Events.FRAG_BUFFERED, _seekCheck);
+            _seekGuardActive = false;
+            return;
+          }
+          let _bufferedEnd = 0;
+          try{
+            for(let i = 0; i < vid.buffered.length; i++){
+              if(vid.buffered.start(i) <= _seekTarget + 0.5)
+                _bufferedEnd = Math.max(_bufferedEnd, vid.buffered.end(i));
+            }
+          }catch(e){}
+          const _needed = _seekTarget + _PRE_ROLL_SECS;
+          if(_bufferedEnd >= _needed || Date.now() > _seekDeadline){
+            hlsObj && hlsObj.off(Hls.Events.FRAG_BUFFERED, _seekCheck);
+            alog('[HLS] Seek buffer ready: '+_bufferedEnd.toFixed(1)+'s @ seek '+_seekTarget.toFixed(1)+'s','k');
+            _seekGuardActive = false;
+            setNP('\u25b6 '+pName);
+            vid.play().catch(()=>{});
+          }
+        };
+        hlsObj.on(Hls.Events.FRAG_BUFFERED, _seekCheck);
+      }, {passive: true});
+    });
     let _hlsRetryFired = false;
     const hlsErrorHandler = (_,data)=>{
       const _det=(data.details||'').toLowerCase();
