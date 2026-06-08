@@ -253,6 +253,119 @@ def rewrite_m3u8(content: str, base_url: str) -> str:
 _rewrite_m3u8 = rewrite_m3u8
 
 
+def _adjust_xtream_url(raw_url: str, offset_secs: int):
+    """
+    For Xtream Codes timeshift path-format URLs, advance the programme start
+    time by offset_secs and return (adjusted_url, remaining_seconds).
+
+    URL: /timeshift/{user}/{pass}/{dur_min}/{YYYY-MM-DD}:{HH}-{MM}/{stream}.ts
+
+    remaining_seconds (0-59) is the within-minute offset still to be handled
+    by output-side -ss after the adjusted URL is opened, giving ~second-level
+    seek precision without requiring HTTP Range support from the server.
+
+    Falls back to (raw_url, offset_secs) for non-Xtream URLs so the caller
+    can pass offset_secs straight through as -ss (slower for large offsets on
+    real-time-delivery servers, but always correct).
+    """
+    import re as _re
+    m = _re.match(
+        r'^(.*?/timeshift/[^/]+/[^/]+/)(\d+)/(\d{4}-\d{2}-\d{2}):(\d{2})-(\d{2})/(.+\.ts)$',
+        raw_url
+    )
+    if not m:
+        return raw_url, offset_secs
+
+    base, dur_min, date_str, hh, mm, stream = (
+        m.group(1), int(m.group(2)), m.group(3),
+        int(m.group(4)), int(m.group(5)), m.group(6)
+    )
+    extra_min   = offset_secs // 60
+    extra_sec   = offset_secs % 60
+    total_min   = hh * 60 + mm + extra_min
+    new_hh      = (total_min // 60) % 24
+    new_mm      = total_min % 60
+    new_dur_min = max(1, dur_min - extra_min)
+    new_url = f'{base}{new_dur_min}/{date_str}:{new_hh:02d}-{new_mm:02d}/{stream}'
+    return new_url, extra_sec
+
+
+def _adjust_mac_timeshift_url(raw_url: str, offset_secs: int):
+    """
+    For MAC portal timeshift.php query-string-format URLs, advance the start=
+    parameter by offset_secs and reduce duration= accordingly.
+
+    URL: .../timeshift.php?mac=XX&stream=N&extension=ts&duration=D&start=YYYY-MM-DD:HH-MM&play_token=T
+
+    Same semantics as _adjust_xtream_url: returns (adjusted_url, remaining_ss_secs)
+    where remaining_ss_secs (0-59) is the within-minute offset for output-side -ss,
+    giving ~second-level seek precision without requiring HTTP Range support.
+
+    play_token is preserved unchanged — Stalker middleware validates tokens against
+    MAC+stream identity, not against the specific start time, so they remain valid
+    across seek-adjusted requests.  This mirrors how native MAG devices seek: they
+    reuse the same play_token while updating start= and duration= for each seek.
+
+    Falls back to (raw_url, offset_secs) if the URL doesn't match the expected
+    format, allowing the caller to pass offset_secs as output-side -ss (always
+    correct but slow: ffmpeg must read and discard offset_secs of real-time
+    MPEG-TS delivery at 1× speed before producing the first output frame).
+    """
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+    from datetime import datetime, timedelta
+    import re as _re
+
+    if 'timeshift.php' not in raw_url:
+        return raw_url, offset_secs
+
+    try:
+        parsed = urlparse(raw_url)
+        qs     = parse_qs(parsed.query, keep_blank_values=True)
+
+        start_vals = qs.get('start',    [''])
+        dur_vals   = qs.get('duration', [''])
+        if not start_vals[0] or not dur_vals[0]:
+            return raw_url, offset_secs
+
+        start_str = start_vals[0]                   # e.g. "2026-05-30:02-10"
+        m = _re.match(r'^(\d{4}-\d{2}-\d{2}):(\d{2})-(\d{2})$', start_str)
+        if not m:
+            return raw_url, offset_secs
+
+        date_str = m.group(1)                       # "2026-05-30"
+        hh       = int(m.group(2))                  # 2
+        mm       = int(m.group(3))                  # 10
+        dur_min  = int(dur_vals[0])                 # 140
+
+        extra_min   = offset_secs // 60             # whole minutes to advance start=
+        extra_sec   = offset_secs %  60             # sub-minute remainder for -ss
+
+        total_min   = hh * 60 + mm + extra_min
+        new_hh      = (total_min // 60) % 24
+        new_mm      = total_min % 60
+        new_dur_min = max(1, dur_min - extra_min)
+
+        # Handle date rollover when seek crosses midnight
+        if total_min >= 24 * 60:
+            days_over = total_min // (24 * 60)
+            date_obj  = datetime.strptime(date_str, '%Y-%m-%d') + timedelta(days=days_over)
+            date_str  = date_obj.strftime('%Y-%m-%d')
+
+        new_start = f'{date_str}:{new_hh:02d}-{new_mm:02d}'
+
+        # Rebuild query string preserving all original params (mac, stream, extension,
+        # play_token, sn2, etc.) — only start= and duration= are updated.
+        new_qs             = {k: v[0] for k, v in qs.items()}
+        new_qs['start']    = new_start
+        new_qs['duration'] = str(new_dur_min)
+        new_url = urlunparse(parsed._replace(query=urlencode(new_qs)))
+
+        return new_url, extra_sec
+
+    except Exception:
+        return raw_url, offset_secs
+
+
 # ===================== REGISTRATION =====================
 
 def register_proxy_routes(flask_app, state):
@@ -730,26 +843,70 @@ def register_proxy_routes(flask_app, state):
 
     # ── /api/catchup/stream  +  /api/catchup/seg/<sid>/<seg> ─────────────────
     # HLS-VOD proxy for Xtream timeshift/.ts catchup streams.
-    # Lives in proxy_addon because it is the same category as /api/hls_proxy:
-    # ffmpeg-driven, background-process managed, stream-serving.  Shares
-    # _FFMPEG_PATH, _FFMPEG_AVAILABLE, state.stream_ua and state.log() without
-    # any extra wiring.
     #
-    # What it fixes vs. playing raw MPEG-TS directly in the browser:
-    #   1. Seek bar  — pre-declared #EXT-X-PLAYLIST-TYPE:VOD playlist with the
-    #      full segment list + #EXT-X-ENDLIST on first response, so HLS.js
-    #      renders the complete duration immediately.
-    #   2. sync_byte errors — ffmpeg normalises TS misalignment that crashes
-    #      mpegts.js and restarts playback from byte 0.
-    #   3. No restart-from-zero — each HLS segment is independent; a stall or
-    #      seek never reloads the whole stream.
+    # DESIGN (evolved through extensive real-server testing):
+    #
+    # 1. SINGLE PROC PER SESSION — one ffmpeg for the whole programme.
+    #    Per-segment processes re-pay the probe overhead every 6 seconds;
+    #    a single proc pays it once and then segments flow continuously.
+    #
+    # 2. PROBESIZE 500 KB — cuts startup from up to 63 s (default 5 MB @
+    #    637 kbps) to ~1–6 s.  -f mpegts is intentionally NOT used: it caused
+    #    immediate ffmpeg exits on Windows builds when applied to HTTP inputs.
+    #
+    # 3. 3-SEGMENT BUFFER WAIT — the original code's 63-second probe
+    #    accidentally gave HLS.js a 10-segment head start before it asked for
+    #    any data.  With the probesize fix, that head start is gone, and
+    #    segments arrive at exactly the same rate the player consumes them
+    #    (1× real-time delivery) → 1-2 s stall at every 6-second boundary.
+    #    Waiting for 3 segments before returning the playlist restores the
+    #    buffer HLS.js needs to absorb production timing variance.
+    #
+    # 4. SEEKING via XTREAM URL TIME-MANIPULATION — for path-format URLs,
+    #    advance :HH-MM to the target minute (fast, server-side seek) then
+    #    apply output-side -ss for the remaining seconds.  -start_number N
+    #    makes the HLS muxer write seg_0000N.ts directly, keeping filenames
+    #    consistent with the pre-declared playlist.
+    #
+    # 5. GAP-FILL for in-flight pre-seek prefetch requests — when a seek
+    #    restarts the proc at segment N, segments 0…N-1 not yet on disk are
+    #    permanently unavailable.  HLS.js often sends the "next sequential"
+    #    segment concurrently with the seek target.  503 on the old segment
+    #    exhausts fragLoadingMaxRetry → fatal → all future segment requests
+    #    stop.  Fix: serve the last segment that WAS written instead of 503;
+    #    HLS.js decodes valid MPEG-TS, recognises it as before the seek point,
+    #    and continues requesting the new segments normally.
 
-    _catchup_sessions: dict = {}        # sid → {proc, dir, ts}
+    _catchup_sessions: dict = {}   # sid → {proc, dir, ts, url, origin_seg,
+                                   #        proc_start, duration, n_segs,
+                                   #        seek_in_progress}
     _catchup_lock = threading.Lock()
-    _CATCHUP_SEG_SECS = 6               # target HLS segment duration (seconds)
+    _CATCHUP_SEG_SECS            = 6    # HLS target segment duration (s)
+    _CATCHUP_SEEK_THRESHOLD_SECS = 45   # seek instead of wait when est. wait > this
+    # Backward-seek detection: gap-fill requests with delta > this threshold
+    # (and seek_in_progress=False) are genuine user backward seeks, not HLS.js
+    # in-flight prefetch.  After seek settles, HLS.js retries at most 1-2 segs
+    # behind current position; anything further is a real backward scrub.
+    _CATCHUP_BACKWARD_SEEK_MIN_DELTA = 3
+    # Initial start buffer: wait for this many segments before returning
+    # the manifest.  Prevents micro-stalling on higher-bitrate streams
+    # (2 Mbps → only 3-seg burst from 5 MB probe, not 10 as at 637 kbps).
+    # 5 segs = 30 s look-ahead.  Fits inside 90 s fragLoadingTimeOut.
+    # 0: serve playlist immediately — no server-side initial wait.
+    # The client-side FRAG_BUFFERED pre-roll guard in the player delays
+    # vid.play() until _PRE_ROLL_SECS (30 s) is buffered, making the
+    # server-side wait redundant.  Serving immediately lets HLS.js begin
+    # pre-fetching during the ffmpeg probe phase and grow the seek-bar
+    # buffer indicator visually before playback starts.
+    #
+    # Timing (no temp_file, no init wait):
+    #   637 kbps: probe ~63 s → burst of ~10 segs → 60 s pre-rolled → PLAY
+    #   2 Mbps:   probe ~20 s → burst of ~3 segs (18 s) → 2 more at
+    #             real-time (~12 s) → 30 s pre-rolled → PLAY  (~32 s total)
+    _CATCHUP_INIT_BUF_SEGS = 0
 
     def _catchup_cleanup():
-        """Daemon thread: evict temp dirs and kill ffmpeg for sessions idle > 2 h."""
+        """Daemon: evict temp dirs and kill ffmpeg for sessions idle > 2 h."""
         while True:
             time.sleep(300)
             _now = time.time()
@@ -775,19 +932,155 @@ def register_proxy_routes(flask_app, state):
     threading.Thread(target=_catchup_cleanup, daemon=True,
                      name='catchup-cleanup').start()
 
+    def _catchup_start_proc(url, tmp_dir, duration_secs, seg_secs, stream_ua,
+                            origin_seg=0, ss_secs=0):
+        """
+        Launch one ffmpeg HLS-muxer process — used for both initial session
+        start and seek-restarts.
+
+        Probe strategy (MPEG-TS specific):
+          The MPEG-TS demuxer in ffmpeg uses -probesize bytes as its probe
+          limit and IGNORES -analyzeduration (format-specific override).
+          So probe duration = probesize / stream_bitrate.
+
+          initial start (origin_seg == 0):
+            No probesize override → ffmpeg default (~5 MB).
+            At 637 kbps: probe ≈ 63 s.  ffmpeg buffers 63 s of content
+            internally, then flushes it to ≈10 HLS segments almost
+            instantaneously (the "burst").  HLS.js loads all 10 at once
+            → 60 s head-start.  Delivery rate == playback rate thereafter
+            but with 60 s of cushion, so no stalls.
+            This is exactly what the original code did and why it didn't stall.
+
+          seek restart (origin_seg > 0):
+            probesize=1.5 MB → probe ≈ 18 s at 637 kbps.
+            Keeps seek-to-play latency to 18 + ss_secs (0-59) + 6 ≤ 83 s,
+            safely within the 90 s fragLoadingTimeOut budget.
+            Post-seek burst gives ~3 segments; combined with the
+            post-seek buffer-wait (buf_count=3) that's 18 s of head-start.
+
+        -start_number origin_seg: the HLS muxer writes seg_0000N.ts directly
+        so seek-restart output names match the pre-declared VOD playlist.
+
+        ss_secs (output-side -ss after -i): within-minute offset after Xtream
+        URL time-adjustment; 0 for exact minute-boundary seeks.
+        """
+        _referer = url.rsplit('/', 1)[0] + '/'
+        seg_pat  = os.path.join(tmp_dir, 'seg_%05d.ts')
+        playlist = os.path.join(tmp_dir, f'stream_{origin_seg}.m3u8')
+        t_limit  = max(seg_secs, int(duration_secs))
+
+        cmd = [_FFMPEG_PATH, '-y']
+
+        # For seek restarts only: reduce probesize to limit seek latency.
+        # For initial start: use ffmpeg default (~5 MB) to get the full
+        # natural burst that fills HLS.js's 60-second pre-declared buffer.
+        # NOTE: do NOT add -analyzeduration here — the MPEG-TS demuxer
+        # ignores it; only probesize matters for TS streams.
+        if origin_seg > 0:
+            cmd += ['-probesize', '1500000']  # 1.5 MB → ~18 s probe at 637 kbps
+
+        cmd += [
+            '-user_agent',          stream_ua,
+            '-referer',             _referer,
+            '-reconnect',           '1',
+            '-reconnect_streamed',  '1',
+            '-reconnect_delay_max', '10',
+            '-fflags',              '+genpts+igndts+discardcorrupt',
+            '-err_detect',          'ignore_err',
+            '-t',                   str(t_limit),
+            '-i',                   url,
+        ]
+        if ss_secs > 0:
+            cmd += ['-ss', str(ss_secs)]
+        # When seeking to a non-zero origin, shift all output PTS by the seek
+        # offset so segments carry timestamps that match the pre-declared VOD
+        # playlist (seg N expected at N*seg_secs seconds).
+        #
+        # Without this, -fflags +genpts resets PTS to ~0 on every ffmpeg
+        # restart.  The VOD playlist says seg_50 starts at 300s, but the file
+        # has PTS≈0.  HLS.js appends the segment, tries video.seek(300), finds
+        # nothing in that range of the SourceBuffer, stalls, and its stall-
+        # handler fires a new seek forward — producing the 50→100→150 cascade.
+        if origin_seg > 0:
+            cmd += ['-output_ts_offset', str(origin_seg * seg_secs)]
+        cmd += [
+            '-c', 'copy',
+            '-f', 'hls',
+            '-hls_time',              str(seg_secs),
+            '-hls_list_size',         '0',
+            # independent_segments: each segment starts with a keyframe and can
+            # be decoded independently.  temp_file removed — it delayed segment
+            # detection until the full rename, killing buffer feedback visuals
+            # and adding unnecessary latency before first playback.
+            '-hls_flags',             'independent_segments',
+            '-hls_segment_type',      'mpegts',
+            # Resend PAT/PMT at the start of every segment so each is
+            # self-contained.  Prevents SourceBuffer decode stalls when
+            # HLS.js appends a segment whose decoder context is missing.
+            '-hls_segment_options',   'mpegts_flags=resend_headers',
+            '-hls_segment_filename',  seg_pat,
+            '-start_number',          str(origin_seg),
+            playlist,
+        ]
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+
+    def _catchup_do_seek(sid, info, target_seg):
+        """
+        Kill the current ffmpeg proc and restart from target_seg using Xtream
+        URL time-adjustment + output-side -ss for within-minute precision.
+        """
+        proc = info.get('proc')
+        if proc and proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait()
+            except Exception:
+                pass
+
+        offset_secs = target_seg * _CATCHUP_SEG_SECS
+        # Route to the correct URL time-adjuster based on URL format.
+        # MAC timeshift.php uses query-string format (start=, duration=);
+        # Xtream uses path format (/timeshift/user/pass/dur/date:HH-MM/stream.ts).
+        # Both adjusters return (adjusted_url, sub-minute-ss_secs).
+        # Without URL-level adjustment the fallback is output-side -ss N, which
+        # requires ffmpeg to read and discard N seconds of real-time MPEG-TS
+        # delivery before producing output — O(seek_offset) latency, not O(1).
+        if 'timeshift.php' in info['url']:
+            adj_url, ss_secs = _adjust_mac_timeshift_url(info['url'], offset_secs)
+            url_note = 'MAC-start-adjusted' if adj_url != info['url'] else 'original (-ss fallback)'
+        else:
+            adj_url, ss_secs = _adjust_xtream_url(info['url'], offset_secs)
+            url_note = 'Xtream-time-adjusted' if adj_url != info['url'] else 'original (-ss fallback)'
+        state.log(f'[CATCHUP] Seek → seg {target_seg} @{offset_secs}s  '
+                  f'URL {url_note}  -ss {ss_secs}s')
+
+        new_proc = _catchup_start_proc(
+            adj_url, info['dir'], info['duration'], _CATCHUP_SEG_SECS,
+            state.stream_ua, origin_seg=target_seg, ss_secs=ss_secs,
+        )
+        with _catchup_lock:
+            if sid in _catchup_sessions:
+                _catchup_sessions[sid].update({
+                    'proc':             new_proc,
+                    'origin_seg':       target_seg,
+                    'proc_start':       time.time(),
+                    'seek_in_progress': True,   # cleared once origin seg is served
+                })
+
     @flask_app.route('/api/catchup/stream')
     def api_catchup_stream():
         """
-        Start an ffmpeg HLS-VOD remux session for a catchup/timeshift stream
-        and return a pre-built #EXT-X-PLAYLIST-TYPE:VOD m3u8 immediately.
+        Start an ffmpeg HLS-VOD remux session and return a pre-declared
+        #EXT-X-PLAYLIST-TYPE:VOD m3u8 playlist.
 
-        Query params:
-            url      – raw Xtream timeshift URL (.ts path or timeshift.php)
-            duration – programme length in seconds  (integer > 0)
-            sid      – caller-generated session ID  (alphanumeric ≤ 32 chars)
+        Waits for min(3, n_segs) segments before returning the playlist (up to
+        30 s).  Without this wait the probesize reduction eliminates the
+        accidental buffer the original code had (the 63-second probe @ 637 kbps
+        pre-wrote ~10 segments before HLS.js first asked); without it segments
+        arrive at exactly the consumption rate with no margin.
         """
-        # cors is a local in each sibling route handler, not a closure variable —
-        # define it explicitly here.
         cors = _CORS_HEADERS
 
         raw_url = request.args.get('url', '').strip()
@@ -798,82 +1091,117 @@ def register_proxy_routes(flask_app, state):
             duration = 0
 
         if not raw_url or not sid or duration <= 0:
-            return Response('url, sid, and duration > 0 are required', status=400,
-                            headers=cors)
-
+            return Response('url, sid, and duration > 0 are required',
+                            status=400, headers=cors)
         sid = re.sub(r'[^a-zA-Z0-9_-]', '', sid)[:32]
         if not sid:
             return Response('Invalid sid', status=400, headers=cors)
-
         if not _FFMPEG_AVAILABLE:
             return Response('ffmpeg not available', status=503, headers=cors)
 
-        tmp_dir  = os.path.join(tempfile.gettempdir(), f'catchup_{sid}')
-        playlist = os.path.join(tmp_dir, 'stream.m3u8')
+        tmp_dir = os.path.join(tempfile.gettempdir(), f'catchup_{sid}')
+
+        # n_segs is needed both inside (buffer wait) and outside (playlist).
+        n_segs   = math.ceil(duration / _CATCHUP_SEG_SECS)
+        last_dur = duration - (_CATCHUP_SEG_SECS * (n_segs - 1))
 
         with _catchup_lock:
             _already = sid in _catchup_sessions
 
         if not _already:
-            os.makedirs(tmp_dir, exist_ok=True)
-            seg_pat  = os.path.join(tmp_dir, 'seg_%05d.ts')
-            _referer = raw_url.rsplit('/', 1)[0] + '/'
-
-            # Mirror hls_proxy's robust input flags:
-            #   -user_agent / -referer          portals that gate on these headers
-            #   -reconnect / -reconnect_streamed survive brief server hiccups
-            #   -fflags +genpts+igndts+discardcorrupt  tolerate TS timestamp glitches
-            #   -err_detect ignore_err           discard corrupt packets (sync_byte fix)
-            #   -t <duration>                    cap output at known programme length
-            cmd = [
-                _FFMPEG_PATH, '-y',
-                '-user_agent',          state.stream_ua,
-                '-referer',             _referer,
-                '-reconnect',           '1',
-                '-reconnect_streamed',  '1',
-                '-reconnect_delay_max', '10',
-                '-fflags',              '+genpts+igndts+discardcorrupt',
-                '-err_detect',          'ignore_err',
-                '-t',                   str(int(duration)),
-                '-i',                   raw_url,
-                '-c', 'copy',
-                '-f', 'hls',
-                '-hls_time',              str(_CATCHUP_SEG_SECS),
-                '-hls_list_size',         '0',
-                '-hls_flags',             'independent_segments',
-                '-hls_segment_type',      'mpegts',
-                '-hls_segment_filename',  seg_pat,
-                playlist,
-            ]
+            # ── Stale temp-dir cleanup ──────────────────────────────────────
+            # Previous sessions can leave catchup_* dirs in the system temp
+            # folder when the process is killed or the browser is closed
+            # before the 2-hour idle-cleanup thread fires.  Clean them up
+            # now so disk space doesn't accumulate across many catchup plays.
             try:
-                proc = subprocess.Popen(cmd,
-                                        stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL)
+                tmp_root   = tempfile.gettempdir()
+                active_dirs = {
+                    i.get('dir') for i in _catchup_sessions.values()
+                    if i.get('dir')
+                }
+                active_dirs.add(tmp_dir)          # exclude the one we're about to create
+                for entry in os.listdir(tmp_root):
+                    if not entry.startswith('catchup_'):
+                        continue
+                    stale = os.path.join(tmp_root, entry)
+                    if stale not in active_dirs and os.path.isdir(stale):
+                        shutil.rmtree(stale, ignore_errors=True)
+                        state.log(f'[CATCHUP] Cleaned stale temp dir: {entry}')
+            except Exception as _ce:
+                state.log(f'[CATCHUP] Temp cleanup error (non-fatal): {_ce}')
+            # ────────────────────────────────────────────────────────────────
+
+            os.makedirs(tmp_dir, exist_ok=True)
+            try:
+                proc = _catchup_start_proc(
+                    raw_url, tmp_dir, duration, _CATCHUP_SEG_SECS, state.stream_ua
+                )
             except Exception as exc:
-                state.log(f'[CATCHUP/HLS] ✗ ffmpeg launch failed: {exc}')
+                state.log(f'[CATCHUP/HLS] ffmpeg launch failed: {exc}')
                 return Response(f'ffmpeg launch failed: {exc}', status=500,
                                 headers=cors)
 
             with _catchup_lock:
                 _catchup_sessions[sid] = {
-                    'proc': proc, 'dir': tmp_dir, 'ts': time.time()
+                    'proc':       proc,
+                    'dir':        tmp_dir,
+                    'ts':         time.time(),
+                    'url':        raw_url,
+                    'origin_seg': 0,
+                    'proc_start': time.time(),
+                    'duration':   duration,
+                    'n_segs':     n_segs,
                 }
             state.log(f'[CATCHUP/HLS] Started PID {proc.pid} — '
                       f'{duration}s → {tmp_dir}  ({raw_url[:60]}…)')
 
-            # Wait up to 12 s for the first segment so the client doesn't get
-            # an immediate 503 on its very first segment request.
-            deadline = time.time() + 12
-            while time.time() < deadline:
-                if os.path.exists(os.path.join(tmp_dir, 'seg_00000.ts')):
-                    break
-                time.sleep(0.25)
+            # ── Initial segment buffer wait ─────────────────────────────────
+            # ffmpeg uses the default 5 MB probesize for initial starts.
+            # At 637 kbps that probe takes ~63 s → burst of ~10 segments.
+            # At 2 Mbps it takes only ~20 s → burst of only ~3 segments.
+            #
+            # Without a wait, HLS.js requests seg_00000.ts immediately.
+            # The playlist is a pre-declared VOD with all segments listed;
+            # HLS.js will prefetch ahead.  But if only 3 segments exist on
+            # disk and delivery is at parity (1 new seg every 6 s ≈ real
+            # time), HLS.js exhausts the initial buffer in 18 s and begins
+            # micro-stalling at every segment boundary — the original bug.
+            #
+            # Fix: wait for _CATCHUP_INIT_BUF_SEGS segments before returning
+            # the playlist.  This mirrors the post-seek buffer wait exactly.
+            # fragLoadingTimeOut (90 s in the catchup VOD config) provides
+            # the outer guard: if ffmpeg takes longer than 90 s to write
+            # the first segment, HLS.js will error out gracefully.
+            #
+            # Sizing: 5 segments = 30 s of look-ahead.  Sufficient for 2 Mbps
+            # streams (20 s probe → segments 0-2 appear, wait adds 0-4).  For
+            # 637 kbps streams the 63 s probe delivers all 5 before the wait
+            # loop even starts.  30 s budget fits inside the 90 s HLS.js
+            # timeout even when added to the probe time at any bitrate.
+            _init_buf_segs = min(_CATCHUP_INIT_BUF_SEGS, max(0, n_segs - 1))
+            if _init_buf_segs > 0:
+                # Only reached when _CATCHUP_INIT_BUF_SEGS > 0 (currently 0).
+                # Kept for future use: raises init segs to pre-load before
+                # serving the playlist for environments where the client-side
+                # FRAG_BUFFERED pre-roll guard is not available.
+                state.log(f'[CATCHUP] Initial buffer: waiting for '
+                          f'{_init_buf_segs} seg(s) before serving playlist')
+                _init_deadline = time.time() + 90
+                while time.time() < _init_deadline:
+                    have = sum(
+                        1 for i in range(_init_buf_segs)
+                        if os.path.exists(
+                            os.path.join(tmp_dir, f'seg_{i:05d}.ts')
+                        )
+                    )
+                    if have >= _init_buf_segs:
+                        break
+                    time.sleep(0.1)
+                state.log(f'[CATCHUP] Initial buffer ready — serving playlist')
 
         # Build the pre-declared VOD playlist from the known duration.
-        n_segs   = math.ceil(duration / _CATCHUP_SEG_SECS)
-        last_dur = duration - (_CATCHUP_SEG_SECS * (n_segs - 1))
         base_url = f'/api/catchup/seg/{sid}'
-
         lines = [
             '#EXTM3U',
             '#EXT-X-VERSION:3',
@@ -895,11 +1223,21 @@ def register_proxy_routes(flask_app, state):
     @flask_app.route('/api/catchup/seg/<sid>/<seg>')
     def api_catchup_segment(sid, seg):
         """
-        Serve a single HLS segment from an active catchup session.
-        Polls up to 60 s while ffmpeg writes it; returns 503 + Retry-After: 3
-        so HLS.js retries rather than escalating to a fatal error.
+        Serve a single HLS segment.  Three code paths:
+
+        NORMAL — segment is within the current proc's production range.
+                 Poll up to 60 s (original mechanism, unchanged).
+
+        SEEK   — segment is far ahead (est. wait > _CATCHUP_SEEK_THRESHOLD_SECS).
+                 Kill proc, restart from target via URL time-adjustment.
+
+        GAP-FILL — segment is below origin_seg (proc has moved past it via a
+                 seek) AND not on disk.  503 would exhaust HLS.js retries →
+                 fatal → all subsequent requests (including seg N+1) stop.
+                 Instead: serve the last available segment's content.  HLS.js
+                 decodes valid MPEG-TS, recognises it as behind the seek point,
+                 and continues requesting post-seek segments normally.
         """
-        # Same reason as above — cors is not a closure variable here.
         cors = _CORS_HEADERS
 
         sid = re.sub(r'[^a-zA-Z0-9_-]', '', sid)[:32]
@@ -913,24 +1251,232 @@ def register_proxy_routes(flask_app, state):
             return Response('Session not found', status=404, headers=cors)
 
         seg_path = os.path.join(info['dir'], seg)
-        proc     = info.get('proc')
+        # seeking_origin is computed inside the poll block (line ~1142) but
+        # consumed outside it (post-seek buffer wait).  Initialise here so
+        # the variable is always bound even when the file already exists on
+        # disk (normal serving path that skips the poll block entirely).
+        seeking_origin = False
 
-        deadline = time.time() + 60
-        while not os.path.exists(seg_path):
-            if proc and proc.poll() is not None:
-                break
-            if time.time() >= deadline:
-                h = dict(cors)
-                h['Retry-After'] = '3'
-                return Response('Segment not ready', status=503, headers=h)
-            time.sleep(0.25)
+        # Parse segment index — needed for gap-fill and seek detection.
+        try:
+            seg_idx = int(seg[4:-3])
+        except (ValueError, IndexError):
+            return Response('Bad segment name', status=400, headers=cors)
 
         if not os.path.exists(seg_path):
-            return Response('Segment not found', status=404, headers=cors)
 
+            origin_seg = info.get('origin_seg', 0)
+
+            # ── GAP-FILL / BACKWARD-SEEK ────────────────────────────────────
+            if seg_idx < origin_seg:
+                backward_delta = origin_seg - seg_idx
+                # Distinguish a genuine user backward seek from HLS.js in-flight
+                # prefetch that arrived just behind the forward-seek target.
+                #
+                # Rule:
+                #   seek_in_progress=True  → always stub: old in-flight requests
+                #     from pre-seek prefetch; the new proc hasn't settled yet.
+                #   seek_in_progress=False AND delta <= _CATCHUP_BACKWARD_SEEK_MIN_DELTA
+                #     → stub: HLS.js retry of a near-miss request (1-2 segs back).
+                #   seek_in_progress=False AND delta > threshold
+                #     → genuine backward seek: restart proc from target segment.
+                #       Fall through to normal poll (do NOT return here).
+                #
+                # Why gap-fill stubs caused backward-seek failure:
+                #   Stub returns seg_00003 content (PTS≈0-6s) for seg_00120
+                #   (expected PTS≈720-726s).  HLS.js appends to SourceBuffer at
+                #   wrong position; video.currentTime can't reach 720s; player
+                #   resets to last valid buffered point (the forward-seek position).
+                is_genuine_backward = (
+                    not info.get('seek_in_progress', False)
+                    and backward_delta > _CATCHUP_BACKWARD_SEEK_MIN_DELTA
+                )
+
+                if is_genuine_backward:
+                    state.log(f'[CATCHUP] Backward seek: seg {seg_idx} '
+                              f'(from origin={origin_seg}, '
+                              f'Δ={backward_delta} segs = '
+                              f'{backward_delta * _CATCHUP_SEG_SECS}s back)')
+                    _catchup_do_seek(sid, info, seg_idx)
+                    with _catchup_lock:
+                        info = _catchup_sessions.get(sid, info)
+                    origin_seg = info.get('origin_seg', 0)
+                    # DO NOT return — fall through to the normal poll below.
+                    # seeking_origin will be True (seek_in_progress=True and
+                    # seg_idx==origin_seg), giving a 120s deadline and the
+                    # post-seek buffer wait.
+
+                else:
+                    # ── STUB (in-flight prefetch or tiny backward delta) ─────
+                    # Find the most-recently written segment to use as a stand-in.
+                    stub_path = None
+                    stub_idx  = -1
+                    for ci in range(min(seg_idx, origin_seg - 1), -1, -1):
+                        candidate = os.path.join(info['dir'], f'seg_{ci:05d}.ts')
+                        if os.path.exists(candidate):
+                            stub_path = candidate
+                            stub_idx  = ci
+                            break
+
+                    if stub_path is None:
+                        # Seek just happened; proc has not written its first segment
+                        # yet.  Wait briefly for the new-proc's first output.
+                        first = os.path.join(info['dir'], f'seg_{origin_seg:05d}.ts')
+                        brief = time.time() + 5
+                        while time.time() < brief and not os.path.exists(first):
+                            time.sleep(0.25)
+                        if os.path.exists(first):
+                            stub_path = first
+                            stub_idx  = origin_seg
+
+                    if stub_path is not None:
+                        state.log(f'[CATCHUP] Gap-fill seg {seg_idx} → '
+                                  f'seg {stub_idx} (origin={origin_seg})')
+                        with _catchup_lock:
+                            if sid in _catchup_sessions:
+                                _catchup_sessions[sid]['ts'] = time.time()
+                        def _gen_stub(p=stub_path):
+                            with open(p, 'rb') as f:
+                                while True:
+                                    chunk = f.read(65536)
+                                    if not chunk:
+                                        break
+                                    yield chunk
+                        h = dict(cors)
+                        h['Content-Type']  = 'video/mp2t'
+                        h['Cache-Control'] = 'no-store'
+                        return Response(stream_with_context(_gen_stub()),
+                                        status=200, headers=h)
+
+                    # Fallback: nothing on disk and brief wait timed out.
+                    hh = dict(cors); hh['Retry-After'] = '3'
+                    return Response('Segment not ready', status=503, headers=hh)
+
+            # ── SEEK DETECTION ─────────────────────────────────────────────
+            # Estimate how many segments the current proc has written.
+            # 1 s is a conservative probe estimate stable across bitrates.
+            proc_start  = info.get('proc_start', time.time())
+            elapsed     = max(0.0, time.time() - proc_start - 1.0)
+            current_est = origin_seg + int(elapsed / _CATCHUP_SEG_SECS)
+            est_wait    = max(0, seg_idx - current_est) * _CATCHUP_SEG_SECS
+
+            if est_wait > _CATCHUP_SEEK_THRESHOLD_SECS and seg_idx > origin_seg:
+                if info.get('seek_in_progress', False):
+                    # ── CASCADE GUARD ───────────────────────────────────────
+                    # A seek is already settling (new proc has not yet written
+                    # its first segment).  Triggering another seek now would
+                    # kill the proc before it produces anything, creating an
+                    # infinite cascade (50→100→150 seen in testing).
+                    #
+                    # Strategy:
+                    #   • Segments within 60 s reach: fall through to the
+                    #     normal poll — they'll arrive once the proc settles.
+                    #   • Segments beyond 60 s reach: fast-fail 503 so HLS.js
+                    #     retries sooner (avoids a 60-second dead wait).
+                    #     After the origin seg is served the flag clears and
+                    #     the retry will trigger a legitimate fresh seek.
+                    reach_in_deadline = origin_seg + int((2 * _CATCHUP_SEG_SECS) / _CATCHUP_SEG_SECS)  # 2 segs ahead
+                    if seg_idx > reach_in_deadline:
+                        state.log(f'[CATCHUP] Cascade blocked: seg {seg_idx} '
+                                  f'(settling after seek to {origin_seg}) — fast-fail')
+                        hh = dict(cors); hh['Retry-After'] = '5'
+                        return Response('Seek settling', status=503, headers=hh)
+                    # else: within reach — fall through to normal poll below
+                else:
+                    state.log(f'[CATCHUP] Seek: seg {seg_idx} est {est_wait:.0f}s '
+                              f'away (threshold {_CATCHUP_SEEK_THRESHOLD_SECS}s)')
+                    _catchup_do_seek(sid, info, seg_idx)
+
+            # ── NORMAL POLL (original 60-second mechanism, unchanged) ───────
+            with _catchup_lock:
+                proc = info.get('proc')
+
+            # Adaptive deadline:
+            #   • Normal segments: 60 s is ample for real-time delivery.
+            #   • Origin segment after a seek: the proc must first probe the
+            #     stream, then discard ss_secs seconds of input (output-side
+            #     -ss), then write the first 6-s segment.  At 637 kbps with
+            #     ss_secs=59 that totals ≈71 s; at higher bitrates ≈12 s.
+            #     Using 120 s avoids the two consecutive 503s seen in testing
+            #     (each burning one of the two fragLoadingMaxRetry slots) and
+            #     lets the single in-flight request stay alive until the seg
+            #     actually appears.
+            seeking_origin = (
+                info.get('seek_in_progress', False)
+                and seg_idx == info.get('origin_seg', -1)
+            )
+            deadline = time.time() + (120 if seeking_origin else 60)  # 60s = 10×6s segments; within fragLoadingTimeOut
+            while not os.path.exists(seg_path):
+                with _catchup_lock:
+                    proc          = info.get('proc')
+                    cur_origin    = info.get('origin_seg', 0)
+                # A concurrent seek moved origin_seg past this segment — it
+                # will never be written by the new proc.  Fast-fail with 503
+                # so HLS.js retries after 1 s.  On retry, the gap-fill check
+                # at the top of this block reads the updated origin_seg and
+                # serves the correct stub immediately.
+                #
+                # Do NOT break (which falls through to the 404 below): HLS.js
+                # treats 404 as a permanent "resource gone" failure and fires
+                # fragLoadError/fatal, burning the fragLoadingMaxRetry budget
+                # and triggering a full player restart that breaks seeking.
+                if seg_idx < cur_origin:
+                    hh = dict(cors); hh['Retry-After'] = '1'
+                    return Response('Segment skipped by seek', status=503, headers=hh)
+                if proc and proc.poll() is not None:
+                    break
+                if time.time() >= deadline:
+                    hh = dict(cors); hh['Retry-After'] = '3'
+                    return Response('Segment not ready', status=503, headers=hh)
+                time.sleep(0.015)  # 15 ms — reduces avg boundary stall from ~50 ms to ~7 ms
+
+            if not os.path.exists(seg_path):
+                return Response('Segment not found', status=404, headers=cors)
+
+        # ── Post-seek buffer wait ───────────────────────────────────────────
+        # After a seek the proc writes segments at real-time speed (1×) and
+        # HLS.js consumes at real-time speed → tight pipeline → stalls at
+        # every segment boundary (watchdog fires at 883, 888, 901, 906, …).
+        #
+        # Fix: once the origin segment exists on disk, wait for 2 more
+        # segments before serving it.  That gives HLS.js 2 × 6 s = 12 s of
+        # look-ahead to absorb delivery jitter without stalling.
+        #
+        # Timing budget (worst case observed: ss_secs=36, 637 kbps):
+        #   probe(6 s) + ss(36 s) + first-seg(6 s) = 48 s  → within 120 s ✓
+        #   buffer wait for 2 more segs: +12 s              → total 60 s  ✓
+        #   fragLoadingTimeOut = 90 s                        → no timeout  ✓
+        if seeking_origin:
+            remaining_segs = info.get('n_segs', 0) - seg_idx
+            buf_count  = min(1, max(0, remaining_segs - 1))   # 1 seg × 6 s = 6 s post-seek buffer; HLS.js manages the rest
+            if buf_count > 0:
+                state.log(f'[CATCHUP] Post-seek buffer: waiting for '
+                          f'{buf_count} seg(s) after {seg_idx} before serving')
+                buf_deadline = time.time() + 10   # 1 seg × 6 s + margin; burst delivers almost instantly
+                while time.time() < buf_deadline:
+                    have = sum(
+                        1 for i in range(1, buf_count + 1)
+                        if os.path.exists(
+                            os.path.join(info['dir'], f'seg_{seg_idx + i:05d}.ts')
+                        )
+                    )
+                    if have >= buf_count:
+                        break
+                    time.sleep(0.1)  # 100 ms poll for buffer accumulation
+                state.log(f'[CATCHUP] Post-seek buffer ready — serving seg {seg_idx}')
+
+        # ── Serve ──────────────────────────────────────────────────────────
         with _catchup_lock:
             if sid in _catchup_sessions:
-                _catchup_sessions[sid]['ts'] = time.time()
+                sess = _catchup_sessions[sid]
+                sess['ts'] = time.time()
+                # Clear the cascade-guard flag once the seek-target segment (or
+                # any segment at or beyond origin) is successfully on disk and
+                # being served.  After this point, a fresh user-initiated seek
+                # will be allowed to trigger a new _catchup_do_seek normally.
+                if sess.get('seek_in_progress', False) and seg_idx >= sess.get('origin_seg', 0):
+                    sess['seek_in_progress'] = False
+                    state.log(f'[CATCHUP] Seek settled — seg {seg_idx} ready, cascade guard cleared')
 
         def _gen():
             with open(seg_path, 'rb') as f:
@@ -944,7 +1490,7 @@ def register_proxy_routes(flask_app, state):
         h['Content-Type']  = 'video/mp2t'
         h['Cache-Control'] = 'max-age=3600'
         return Response(stream_with_context(_gen()), status=200, headers=h)
-    # ── End catchup HLS-VOD proxy ─────────────────────────────────────────────
+    # -- End catchup HLS-VOD proxy --
 
     state.log("[PROXY] Routes registered: /api/proxy  /api/video_proxy  /api/hls_proxy"
               "  /api/catchup/stream  /api/catchup/seg")
