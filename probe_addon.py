@@ -607,6 +607,10 @@ _PROBE_UI_JS = r"""
 }
 #si-panel .si-track-btn.si-info-only{ cursor:default; opacity:.6; }
 #si-panel .si-track-btn.si-info-only:hover{ background:none; }
+/* Subtitle items that are info-only (image-based, live) still respond with
+   burn-in or an explanatory toast — cursor:pointer reflects that they react. */
+#si-panel .si-track-btn.si-info-only[data-sub-track-idx]{ cursor:pointer; }
+#si-panel .si-track-btn.si-info-only[data-sub-track-idx]:hover{ background:rgba(255,255,255,.04); }
 #si-panel .si-track-dot{
   width:5px;height:5px;border-radius:50%;
   background:rgba(255,255,255,.18);flex-shrink:0;
@@ -643,6 +647,11 @@ _PROBE_UI_JS = r"""
   let _curStreamUrl   = null;
   let _curStreamName  = null;
   let _curStreamLive  = true;
+  // Original portal URL before hls_proxy wrapping — needed for subtitle extraction.
+  // d.url is the hls_proxy URL when transcoding; d.origin_url is the ffmpeg input.
+  let _curOriginUrl   = null;
+  // Currently injected <track> DOM element for embedded subtitle rendering.
+  let _injectedSubTrackEl = null;
   let _snapRestoreTimer = null;  // handle for the fast-path panel-restore setTimeout
   // Touch reveal timer — drives si-touch-visible lifecycle on mobile
   let _revealTimer = null;
@@ -728,16 +737,25 @@ _PROBE_UI_JS = r"""
 
     // ── Track selector: event delegation on _panel ──────────────────────
     // A single persistent listener on _panel catches clicks on any
-    // .si-track-btn[data-track-idx] child regardless of innerHTML resets.
-    // This eliminates the need for window._siSwitchAudio to be globally
-    // reachable at click time (inline onclick has that fragile dependency).
+    // .si-track-btn[data-track-idx] or .si-track-btn[data-sub-track-idx]
+    // child regardless of innerHTML resets.
+    // data-track-idx     → audio track  → _switchAudio()
+    // data-sub-track-idx → subtitle track → _switchSubtitle()
     _panel.addEventListener('click', function(e){
-      const btn = e.target.closest('.si-track-btn[data-track-idx]');
-      if(!btn) return;
-      e.stopPropagation();
-      const idx = parseInt(btn.getAttribute('data-track-idx'), 10);
-      if(!isNaN(idx)){
-        _switchAudio(idx);
+      // Audio track buttons
+      const audioBtn = e.target.closest('.si-track-btn[data-track-idx]');
+      if(audioBtn){
+        e.stopPropagation();
+        const idx = parseInt(audioBtn.getAttribute('data-track-idx'), 10);
+        if(!isNaN(idx)) _switchAudio(idx);
+        return;
+      }
+      // Subtitle track buttons
+      const subBtn = e.target.closest('.si-track-btn[data-sub-track-idx]');
+      if(subBtn){
+        e.stopPropagation();
+        const idx = parseInt(subBtn.getAttribute('data-sub-track-idx'), 10);
+        if(!isNaN(idx)) _switchSubtitle(idx);
       }
     });
 
@@ -847,10 +865,14 @@ _PROBE_UI_JS = r"""
       _rebuildTracks();
 
       // Snapshot everything needed to fully restore the panel after _siHide fires.
-      // _siHide clears _curStreamUrl/_curStreamName too, so we must carry them in
-      // the snapshot and restore them — otherwise the NEXT switch has no fast-path URL.
-      const _snapUrl  = newUrl;
-      const _snapName = name;
+      // _siHide clears _curStreamUrl/_curStreamName/_curOriginUrl/_activeSub too,
+      // so we must carry them in the snapshot and restore them — otherwise the NEXT
+      // audio switch has no fast-path URL, the NEXT subtitle switch has no origin URL,
+      // and the active subtitle highlight disappears.
+      const _snapUrl       = newUrl;
+      const _snapName      = name;
+      const _snapOriginUrl = _curOriginUrl;   // preserve for subtitle re-selection
+      const _snapActiveSub = _activeSub;      // preserve burn-in subtitle highlight
       const _infoSnapshot = Object.assign({}, _curInfo, { active_audio_track: trackIdx });
       if(typeof doPlay === 'function'){ doPlay(newUrl, _displayName, {isLive: isLive}); }
       // _siHide has fired. Restore panel + URL state so subsequent switches work.
@@ -860,6 +882,8 @@ _PROBE_UI_JS = r"""
         _curStreamUrl  = _snapUrl;
         _curStreamName = _snapName;
         _curStreamLive = isLive;
+        _curOriginUrl  = _snapOriginUrl;      // restore so subtitle switching still works
+        _activeSub     = _snapActiveSub;      // restore burn-in highlight
         _siShow(_infoSnapshot);
       }, 120);
       return;
@@ -875,23 +899,184 @@ _PROBE_UI_JS = r"""
       toast('Cannot switch audio track — no current item', 'err');
       return;
     }
+    // Save origin URL and active subtitle before the fetch — doPlay() inside the
+    // then() handler runs synchronously through _destroyPlayers() → _siHide()
+    // → _curOriginUrl = null, _activeSub = -1.  Restoring explicitly after doPlay()
+    // is deterministic (same microtask, no race).
+    const _savedOriginUrl = _curOriginUrl;
+    const _savedActiveSub = _activeSub;
+    // If a subtitle is burned in, include it so the new stream preserves it.
+    const _activeBurnSub  = (_activeSub >= 0 && _curInfo && _curInfo.subtitle_tracks
+                             && (_curInfo.subtitle_tracks[_activeSub] || {}).is_image_based)
+                            ? _activeSub : null;
     _activeAudio = trackIdx;
     _rebuildTracks();
+    const _fallbackBody = {
+      item:        _curIt,
+      mode:        (typeof mode   !== 'undefined' ? mode   : 'live'),
+      category:    (typeof curCat !== 'undefined' ? curCat : {}),
+      audio_track: trackIdx,
+    };
+    if(_activeBurnSub !== null) _fallbackBody.subtitle_track = _activeBurnSub;
     fetch('/api/resolve', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        item:        _curIt,
-        mode:        (typeof mode   !== 'undefined' ? mode   : 'live'),
-        category:    (typeof curCat !== 'undefined' ? curCat : {}),
-        audio_track: trackIdx,
-      })
+      body: JSON.stringify(_fallbackBody)
     }).then(function(r){ return r.json(); }).then(function(d){
       if(d.url && typeof doPlay === 'function'){
         doPlay(d.url, name, {isLive: isLive});
       }
+      // doPlay() → _destroyPlayers() → _siHide() → _curOriginUrl = null has run.
+      // Restore: prefer fresh origin_url from this resolve; fall back to pre-switch snapshot.
+      const _freshOrigin = (d.origin_url && typeof d.origin_url === 'string'
+                            && d.origin_url.startsWith('http')) ? d.origin_url : null;
+      _curOriginUrl = _freshOrigin || _savedOriginUrl;
+      // Restore subtitle highlight (_activeSub was cleared by _siHide).
+      // The fetch interceptor sets _activeSub when it sees subtitle_track in the body;
+      // but if the interceptor's clone.json().then() runs after this microtask, it
+      // would overwrite — since both use the same value, that's harmless.
+      _activeSub = (_activeBurnSub !== null) ? _activeBurnSub : _savedActiveSub;
     }).catch(function(e){
       toast('Audio track switch failed: ' + (e.message||e), 'err');
+    });
+  }
+
+  /* ── Subtitle track management ──────────────────────────────────────── */
+  // Remove any injected <track> element and reset active subtitle state.
+  // Safe to call when nothing is injected (burn-in mode has no element to remove).
+  function _clearSubtitles(){
+    if(_injectedSubTrackEl){
+      try{ _injectedSubTrackEl.track.mode = 'disabled'; }catch(e){}
+      if(_injectedSubTrackEl.parentNode){
+        _injectedSubTrackEl.parentNode.removeChild(_injectedSubTrackEl);
+      }
+      _injectedSubTrackEl = null;
+    }
+    _activeSub = -1;
+  }
+
+  // Subtitle switching — two mechanisms depending on codec type:
+  //
+  //  Image-based (DVB, DVD, PGS): bitmap frames — cannot be converted to WebVTT.
+  //    → _resolveSubtitle(trackIdx): POST to /api/resolve with subtitle_track=N,
+  //      server adds -filter_complex "[0:v:0][0:s:N]overlay[vout]" to ffmpeg,
+  //      stream restarts with subtitles burned into the video signal.
+  //    Works on BOTH live and VOD streams.
+  //
+  //  Text-based (subrip, ass, webvtt, mov_text…): extractable as WebVTT.
+  //    → /api/probe/subtitle_vtt endpoint + <track> element injection.
+  //    VOD only — live stream extraction requires sequential read of an infinite stream.
+  function _switchSubtitle(trackIdx){
+    if(!_curInfo){ setStatus('[probe] No stream info — try replaying'); return; }
+
+    const subTracks = _curInfo.subtitle_tracks || [];
+    const t         = subTracks[trackIdx];
+    if(!t) return;
+
+    // Toggle off ─────────────────────────────────────────────────────────────
+    if(trackIdx === _activeSub){
+      if(t.is_image_based){
+        _resolveSubtitle(-1);  // restart stream without sub_track
+      } else {
+        _clearSubtitles();     // remove <track> element
+        _rebuildTracks();
+      }
+      return;
+    }
+
+    // ── Image-based: burn-in via re-resolve ──────────────────────────────────
+    if(t.is_image_based){
+      _resolveSubtitle(trackIdx);
+      return;
+    }
+
+    // ── Text-based: WebVTT extraction + <track> injection ────────────────────
+    if(_curStreamLive !== false){
+      if(typeof toast === 'function') toast('Embedded subtitle switching is not available for live streams', 'w');
+      return;
+    }
+    if(!_curOriginUrl){
+      setStatus('[probe] Origin URL unavailable — replay to enable subtitle switching');
+      return;
+    }
+
+    _clearSubtitles();
+
+    const vttSrc  = '/api/probe/subtitle_vtt?url=' + encodeURIComponent(_curOriginUrl)
+                  + '&track=' + trackIdx;
+    const lang    = t.language || '';
+    const label   = t.title || lang || ('Track ' + (trackIdx + 1));
+    const vidEl   = document.getElementById('vid');
+    if(!vidEl){ setStatus('[probe] No video element'); return; }
+
+    setStatus('[probe] Extracting subtitle track ' + trackIdx + '\u2026');
+
+    const trackEl   = document.createElement('track');
+    trackEl.kind    = 'subtitles';
+    trackEl.src     = vttSrc;
+    trackEl.srclang = lang;
+    trackEl.label   = label;
+
+    trackEl.addEventListener('load', function(){
+      try{ trackEl.track.mode = 'showing'; }catch(e){}
+      _activeSub = trackIdx;
+      _rebuildTracks();
+      setStatus('[probe] Subtitle: ' + label);
+    });
+    trackEl.addEventListener('error', function(){
+      if(trackEl.parentNode) trackEl.parentNode.removeChild(trackEl);
+      if(_injectedSubTrackEl === trackEl) _injectedSubTrackEl = null;
+      _activeSub = -1;
+      _rebuildTracks();
+      if(typeof toast === 'function') toast('Subtitle extraction failed \u2014 see activity log', 'err');
+    });
+
+    vidEl.appendChild(trackEl);
+    try{ trackEl.track.mode = 'showing'; }catch(e){}
+    _injectedSubTrackEl = trackEl;
+  }
+
+  /* ── Subtitle burn-in: re-resolve with subtitle_track=N ─────────────────── */
+  // Used for image-based subs (DVB, DVD, PGS) — analogous to _switchAudio fallback.
+  // trackIdx >= 0 → activate burn-in for that subtitle stream.
+  // trackIdx  = -1 → deactivate (restart without sub_track).
+  // Preserves current audio selection across the restart.
+  function _resolveSubtitle(trackIdx){
+    const name   = _curStreamName || '';
+    const isLive = _curStreamLive !== false;
+    const _curIt = (typeof filtItems !== 'undefined' && typeof pIdx !== 'undefined')
+                   ? filtItems[pIdx] : null;
+    if(!_curIt){
+      if(typeof toast === 'function') toast('Cannot switch subtitle — no current item', 'err');
+      return;
+    }
+
+    setStatus(trackIdx >= 0 ? '[probe] Activating subtitle\u2026' : '[probe] Disabling subtitle\u2026');
+
+    const _savedOriginUrl = _curOriginUrl;
+    const body = {
+      item:     _curIt,
+      mode:     (typeof mode   !== 'undefined' ? mode   : 'live'),
+      category: (typeof curCat !== 'undefined' ? curCat : {}),
+    };
+    if(_activeAudio >= 0)  body.audio_track    = _activeAudio;
+    if(trackIdx    >= 0)   body.subtitle_track  = trackIdx;
+
+    fetch('/api/resolve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    }).then(function(r){ return r.json(); }).then(function(d){
+      if(d.url && typeof doPlay === 'function'){
+        doPlay(d.url, name, {isLive: isLive});
+      }
+      // doPlay() → _siHide() → _curOriginUrl = null.  Restore.
+      const _freshOrigin = (d.origin_url && typeof d.origin_url === 'string'
+                            && d.origin_url.startsWith('http')) ? d.origin_url : null;
+      _curOriginUrl = _freshOrigin || _savedOriginUrl;
+      // _activeSub is set by the fetch interceptor from _reqSubTrackVal.
+    }).catch(function(e){
+      if(typeof toast === 'function') toast('Subtitle switch failed: ' + (e.message||e), 'err');
     });
   }
 
@@ -980,25 +1165,38 @@ _PROBE_UI_JS = r"""
     }
 
     // ── Subtitle tracks ───────────────────────────────────────────────
-    // subtitleTrackController is fully no-op'd in the HLS config (subtitles_addon
-    // owns the subtitle pipeline via addTextTrack + VTT cues for external subs).
-    // Embedded subtitle streams from the container are shown as informational only.
-    // Image-based subs (PGS/DVD) cannot be rendered in a browser at all.
+    // Image-based subs (PGS/DVD/DVB) cannot be converted to WebVTT → info-only.
+    // Text-based subs (subrip, ass, webvtt, mov_text…) on VOD streams are
+    // switchable: clicking calls _switchSubtitle(i) which POSTs to
+    // /api/probe/subtitle_vtt (ffmpeg -map 0:s:<N> -f webvtt) and injects
+    // the result as a <track> element on the video element.
+    // Live streams always show as info-only (sequential extraction impractical).
+    const isLiveStream = _curStreamLive !== false;
     const subTracks = info.subtitle_tracks || [];
     if(subTracks.length > 0){
       html += '<div class="si-divider"></div>';
-      html += '<div class="si-section-hdr">Subtitle streams</div>';
-      html += '<div class="si-tracks">';
+      html += '<div class="si-section-hdr">Subtitle tracks</div>';
+      html += '<div class="si-tracks" id="si-sub-tracks">';
       subTracks.forEach(function(t, i){
-        const lang  = (t.language || '').toUpperCase() || '—';
-        const name  = t.title || '';
-        const codec = (t.codec || '').toLowerCase();
-        const imgBadge = t.is_image_based ? '<span class="si-img-badge">image</span>' : '';
-        // All embedded subs are informational — use subtitles_addon for external subs
-        html += '<div class="si-track-btn si-info-only">'
+        const lang      = (t.language || '').toUpperCase() || '\u2014';
+        const name      = t.title || '';
+        const codec     = (t.codec || '').toLowerCase();
+        const imgBadge  = t.is_image_based ? '<span class="si-img-badge">image</span>' : '';
+        // Image-based subs (DVB/DVD/PGS): si-info-only styling (dimmed, no hover bg)
+        // but STILL receive data-sub-track-idx so clicks reach _switchSubtitle() →
+        // _resolveSubtitle() for burn-in, instead of silently doing nothing.
+        // Text-based VOD subs: fully switchable, no si-info-only.
+        // CSS adds cursor:pointer back for si-info-only[data-sub-track-idx] items.
+        const canSwitch = !t.is_image_based && !isLiveStream;
+        const isActive  = (_activeSub === i);
+        html += '<div class="si-track-btn'
+              + (isActive  ? ' si-active' : '')
+              + (canSwitch ? '' : ' si-info-only') + '"'
+              + ' data-sub-track-idx="' + i + '"'
+              + '>'
               + '<span class="si-track-dot"></span>'
               + '<span class="si-track-lang">' + lang + '</span>'
-              + (name  ? '<span class="si-track-name">' + name  + '</span>' : '')
+              + (name  ? '<span class="si-track-name">'  + name  + '</span>' : '')
               + '<span class="si-track-codec">' + codec + '</span>'
               + imgBadge
               + '</div>';
@@ -1064,10 +1262,12 @@ _PROBE_UI_JS = r"""
     // Cancel any pending fast-path panel-restore before wiping state —
     // prevents stale snapshot from a previous channel bleeding into the next.
     if(_snapRestoreTimer){ clearTimeout(_snapRestoreTimer); _snapRestoreTimer = null; }
+    // Remove any injected subtitle <track> element before clearing state.
+    _clearSubtitles();
     _open = false; _sticky = false; _hasData = false; _curInfo = null;
     _hlsAudioTracks = []; _activeAudio = -1;
     _hlsSubTracks   = []; _activeSub   = -1;
-    _curStreamUrl = null; _curStreamName = null;
+    _curStreamUrl = null; _curStreamName = null; _curOriginUrl = null;
     if(_isTouch && _btn) _cancelReveal();
     if(_btn){ _btn.classList.remove('si-hover','si-open','si-sticky','si-warn'); }
     if(_panel){ _panel.classList.remove('si-open'); }
@@ -1109,12 +1309,23 @@ _PROBE_UI_JS = r"""
       // (body contains audio_track). Without this guard, switching channels inherits
       // the previous channel's track highlight — the stale UI tag bug.
       let _reqHadAudioTrack = false;
+      let _reqHadSubTrack   = false;
+      let _reqSubTrackVal   = -1;
       try {
         const _body = (opts && opts.body) ? JSON.parse(opts.body) : null;
-        _reqHadAudioTrack = (_body && typeof _body.audio_track === 'number');
+        _reqHadAudioTrack = (_body && typeof _body.audio_track   === 'number');
+        _reqHadSubTrack   = (_body && typeof _body.subtitle_track === 'number');
+        _reqSubTrackVal   = _reqHadSubTrack ? _body.subtitle_track : -1;
       } catch(_){}
       const _savedAudio = _reqHadAudioTrack ? _activeAudio : -1;
       _hlsBound = false; _hlsAudioTracks = []; _activeAudio = -1;
+      // New channel resolve (not an audio-track or subtitle-track switch):
+      // clear any active subtitle and origin URL.
+      // Audio/subtitle switches re-resolve the same stream — state stays valid.
+      if(!_reqHadAudioTrack && !_reqHadSubTrack){
+        _clearSubtitles();
+        _curOriginUrl = null;
+      }
       const clone = res.clone();
       clone.json().then(function(d){
         if(d && d.stream_info && (d.stream_info.vcodec || d.stream_info.acodec)){
@@ -1131,9 +1342,22 @@ _PROBE_UI_JS = r"""
               _curStreamLive = (bodyObj && bodyObj.mode) ? bodyObj.mode === 'live' : true;
             } catch(_){ _curStreamName = ''; _curStreamLive = true; }
           }
+          // Capture original portal URL for embedded subtitle extraction.
+          // d.url is the hls_proxy URL when transcoding; d.origin_url is the
+          // ffmpeg input URL (the actual portal stream address).
+          if(d.origin_url && typeof d.origin_url === 'string'
+             && (d.origin_url.startsWith('http://') || d.origin_url.startsWith('https://'))){
+            _curOriginUrl = d.origin_url;
+          }
           _siShow(d.stream_info);
-          // Restore active track highlight for audio-switch resolves only.
+          // Restore active track highlights for track-switch resolves only.
           if(_savedAudio >= 0){ _activeAudio = _savedAudio; _rebuildTracks(); }
+          // Burn-in sub switch: set _activeSub from the resolved subtitle_track value.
+          // -1 means "turn off" (user toggled the active sub).
+          if(_reqHadSubTrack){
+            _activeSub = (_reqSubTrackVal >= 0) ? _reqSubTrackVal : -1;
+            _rebuildTracks();
+          }
           // Schedule HLS event binding — hlsObj is created shortly after
           // doPlay() receives this response, so defer a few ticks
           setTimeout(_bindHlsEvents, 200);
@@ -1162,6 +1386,7 @@ _PROBE_UI_JS = r"""
   window._streamInfoShow  = _siShow;
   window._streamInfoHide  = _siHide;
   window._siSwitchAudio   = _switchAudio;
+  window._siSwitchSubtitle = _switchSubtitle;
 
 })();
 """
@@ -1400,6 +1625,22 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                     # Rebuild stream_info with transcode=True so JS panel reflects new state
                     stream_info = dict(stream_info, transcode=True, transcode_reason=transcode_reason)
 
+                # subtitle_track: optional zero-based subtitle stream index for burn-in.
+                # Subtitle frames are composited onto the video via ffmpeg filter_complex.
+                # Requires full video re-encode (libx264) — audio_only mode is upgraded.
+                req_sub_track = data.get("subtitle_track")
+                st_param = (f"&sub_track={int(req_sub_track)}"
+                            if isinstance(req_sub_track, int) and req_sub_track >= 0
+                            else "")
+
+                if req_sub_track is not None and isinstance(req_sub_track, int) and req_sub_track >= 0:
+                    state.log(f"[PROBE] Subtitle burn-in requested: track {req_sub_track}")
+                    if not needs_transcode:
+                        needs_transcode  = True
+                        transcode_reason = f"subtitle burn-in (track {req_sub_track})"
+                        state.log(f"[PROBE] Forcing full transcode for subtitle burn-in: track {req_sub_track}")
+                        stream_info = dict(stream_info, transcode=True, transcode_reason=transcode_reason)
+
                 if needs_transcode:
                     vod_flag = "1" if is_vod else "0"
                     # audio_only when: bad audio codec, OR explicit track selection
@@ -1408,27 +1649,112 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                         (transcode_reason or "").startswith("incompatible audio")
                         or (transcode_reason or "").startswith("audio track selection")
                     )
+                    # Subtitle burn-in requires full libx264 re-encode — cannot use -c:v copy.
+                    # Override audio_only_issue so the full transcode URL is emitted.
+                    if st_param:
+                        audio_only_issue = False
                     if is_multiview:
                         if audio_only_issue:
                             state.log(f"[PROBE] MV audio → hls_proxy: {transcode_reason}")
                             audio_url = f"/api/hls_proxy?audio_only=1&vod={vod_flag}{at_param}&url={quote(url, safe='')}"
-                            return jsonify({"url": audio_url, "hevc": False, "stream_info": stream_info})
+                            return jsonify({"url": audio_url, "origin_url": url, "hevc": False, "stream_info": stream_info})
                         else:
-                            return jsonify({"url": url, "hevc": True, "stream_info": stream_info})
+                            return jsonify({"url": url, "origin_url": url, "hevc": True, "stream_info": stream_info})
                     else:
                         state.log(f"[PROBE] Routing to transcode proxy: {transcode_reason}"
-                                  + (f" [audio track {req_audio_track}]" if at_param else ""))
+                                  + (f" [audio track {req_audio_track}]" if at_param else "")
+                                  + (f" [subtitle burn-in track {req_sub_track}]" if st_param else ""))
                         if audio_only_issue:
                             # Copy video stream, re-encode audio only — much cheaper
                             # than a full libx264 video re-encode.
                             transcode_url = f"/api/hls_proxy?audio_only=1&vod={vod_flag}{at_param}&url={quote(url, safe='')}"
                         else:
-                            transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}{at_param}&url={quote(url, safe='')}"
-                        return jsonify({"url": transcode_url, "hevc": True, "stream_info": stream_info})
+                            transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}{at_param}{st_param}&url={quote(url, safe='')}"
+                        return jsonify({"url": transcode_url, "origin_url": url, "hevc": True, "stream_info": stream_info})
 
-            return jsonify({"url": url, "stream_info": stream_info})
+            return jsonify({"url": url, "origin_url": url, "stream_info": stream_info})
         except Exception as e:
             state.log(f"[PROBE] ✗ Error: {type(e).__name__}: {e}")
             return jsonify({"url": "", "error": str(e)})
 
-    state.log("[PROBE] Routes registered: /api/resolve  /api/probe/ui.js")
+    # ── /api/probe/subtitle_vtt ───────────────────────────────────────────────
+    # Extract embedded subtitle stream N from a URL as WebVTT and return it
+    # for <track> injection by the probe overlay JS (_switchSubtitle).
+    #
+    # Works well for:
+    #   - Seekable containers (MKV, MP4) — ffmpeg uses range requests / index table,
+    #     reads only the subtitle track data.  Near-instantaneous for text subs.
+    #   - VOD direct streams with finite duration.
+    #
+    # Not suitable for:
+    #   - Live streams (infinite; extraction would block indefinitely — JS guards prevent this)
+    #   - Non-seekable MPEG-TS with interleaved subtitle packets (must read full stream;
+    #     the 30-second timeout fires and returns 504, which the JS error handler surfaces
+    #     as a toast notification)
+    @flask_app.route("/api/probe/subtitle_vtt")
+    def _api_probe_subtitle_vtt():
+        import shutil as _shutil
+        from flask import Response as _Response
+
+        ffmpeg_path = _shutil.which("ffmpeg") or "ffmpeg"
+
+        raw_url   = request.args.get("url", "").strip()
+        track_raw = request.args.get("track", "").strip()
+
+        if not raw_url or not raw_url.startswith(("http://", "https://")):
+            return _Response("Invalid URL", status=400)
+        try:
+            track_n = int(track_raw)
+            if track_n < 0:
+                raise ValueError("negative index")
+        except (ValueError, TypeError):
+            return _Response("Invalid track index", status=400)
+
+        if not _shutil.which("ffmpeg"):
+            return _Response("ffmpeg not available", status=503)
+
+        cmd = [
+            ffmpeg_path, "-y", "-hide_banner", "-nostdin",
+            "-user_agent", state.stream_ua,
+            "-i", raw_url,
+            "-map", f"0:s:{track_n}",
+            "-f", "webvtt",
+            "pipe:1",
+        ]
+        state.log(f"[PROBE/subtitle] Extracting track {track_n} from {raw_url[:60]}…")
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            state.log(f"[PROBE/subtitle] ✗ Timeout extracting track {track_n} — stream may not be seekable")
+            return _Response("Subtitle extraction timed out", status=504)
+        except Exception as exc:
+            state.log(f"[PROBE/subtitle] ✗ {exc}")
+            return _Response(f"Error: {exc}", status=500)
+
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", errors="replace")[-200:]
+            state.log(f"[PROBE/subtitle] ✗ ffmpeg failed (rc={proc.returncode}) — {err.strip()}")
+            return _Response("Subtitle stream not found or extraction failed", status=404)
+
+        vtt_bytes = proc.stdout
+        if not vtt_bytes or not vtt_bytes.strip():
+            state.log(f"[PROBE/subtitle] ✗ No subtitle data in track {track_n}")
+            return _Response("No subtitle data", status=404)
+
+        state.log(f"[PROBE/subtitle] ✓ Track {track_n}: {len(vtt_bytes)} bytes WebVTT")
+        return _Response(
+            vtt_bytes,
+            status=200,
+            headers={
+                "Content-Type":              "text/vtt; charset=utf-8",
+                "Cache-Control":             "no-cache, no-store",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    state.log("[PROBE] Routes registered: /api/resolve  /api/probe/ui.js  /api/probe/subtitle_vtt")
