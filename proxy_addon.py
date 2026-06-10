@@ -672,6 +672,16 @@ def register_proxy_routes(flask_app, state):
         _at = request.args.get("audio_track", "").strip()
         audio_track = int(_at) if _at.isdigit() else None
 
+        # sub_track=N burns subtitle stream N into the video via -filter_complex overlay.
+        # Supports bitmap codecs (DVB, DVD, PGS) that cannot be extracted as text.
+        # Only valid with transcode=1 (libx264 re-encode); api_resolve() ensures this.
+        _st = request.args.get("sub_track", "").strip()
+        try:
+            _st_int   = int(_st) if _st else None
+            sub_track = _st_int if (_st_int is not None and _st_int >= 0) else None
+        except (ValueError, TypeError):
+            sub_track = None
+
         cors = _CORS_HEADERS
 
         base_input = [
@@ -697,24 +707,41 @@ def register_proxy_routes(flask_app, state):
             state.log(f"[ffmpeg/hls_proxy] err_recover seek to {seek_secs}s")
         base_input += ["-i", url]
 
-        # Build -map args when a specific audio track is requested.
-        # -map 0:v:0        — first video stream
-        # -map 0:a:<N>      — audio stream at index N within the audio streams
-        # Without explicit maps ffmpeg auto-selects, which is correct for the
-        # default (no track preference) case.
-        map_args = ["-map", "0:v:0", "-map", f"0:a:{audio_track}"] if audio_track is not None else []
-        if audio_track is not None:
+        # ── Stream selection ──────────────────────────────────────────────────
+        # sub_track set  → -filter_complex "[0:v:0][0:s:N]overlay[vout]"
+        #                    burns bitmap subtitle frames into the video signal;
+        #                    requires libx264 re-encode (incompatible with -c:v copy).
+        #                    audio_map explicitly selects audio track or defaults to 0:a:0.
+        # audio_track only → -map 0:v:0 -map 0:a:N  (video copy + audio select)
+        # neither          → no explicit -map (ffmpeg auto-selects best streams)
+        if sub_track is not None:
+            audio_map    = f"0:a:{audio_track}" if audio_track is not None else "0:a:0"
+            stream_select = [
+                "-filter_complex", f"[0:v:0][0:s:{sub_track}]overlay[vout]",
+                "-map", "[vout]",
+                "-map", audio_map,
+            ]
+            state.log(f"[ffmpeg] Subtitle burn-in: track {sub_track}"
+                      + (f"  audio track {audio_track}" if audio_track is not None else ""))
+        elif audio_track is not None:
+            stream_select = ["-map", "0:v:0", "-map", f"0:a:{audio_track}"]
             state.log(f"[ffmpeg] Audio track: {audio_track} (-map 0:a:{audio_track})")
+        else:
+            stream_select = []
 
         if transcode:
-            cmd = base_input + map_args + [
+            cmd = base_input + stream_select + [
                 "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23",
                 "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
                 "-f", "mpegts", "-",
             ]
-            mode_str = "transcode"
+            mode_str = "transcode" + ("/burnin" if sub_track is not None else "")
         elif audio_only:
-            cmd = base_input + map_args + [
+            # audio_only: copy video, re-encode audio.  sub_track is not applied here —
+            # overlay requires -c:v libx264, incompatible with -c:v copy.
+            # api_resolve() upgrades audio_only → full transcode when sub_track is set.
+            ao_select = ["-map", "0:v:0", "-map", f"0:a:{audio_track}"] if audio_track is not None else []
+            cmd = base_input + ao_select + [
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
                 "-f", "mpegts", "-",
