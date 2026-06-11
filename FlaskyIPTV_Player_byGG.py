@@ -109,6 +109,13 @@ except ImportError:
     def register_epg_routes(*a, **kw): pass
     def _epg_prefetch(*a, **kw): pass
 
+try:
+    from radio_addon import register_radio_addon
+    _RADIO_AVAILABLE = True
+except ImportError:
+    _RADIO_AVAILABLE = False
+    def register_radio_addon(*a, **kw): pass
+
 # ===================== OPTIONAL DEPS =====================
 
 try:
@@ -770,6 +777,7 @@ if _DVR_AVAILABLE:
 
 register_subtitles_routes(flask_app, state)
 register_proxy_routes(flask_app, state)
+register_radio_addon(flask_app)
 
 @flask_app.route('/api/multiview/available')
 def multiview_available():
@@ -2539,6 +2547,93 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   border:1px solid var(--bdr2);letter-spacing:.5px;transition:var(--tr)}
 #vf-btn:hover{background:var(--s3);color:var(--txt)}
 
+/* ── Radio open button (toolbar) ─────────────────────────────── */
+#radio-open-btn{height:26px;width:26px;padding:0;font-size:14px;
+  border-radius:var(--rss);background:var(--s4);color:var(--txt2);
+  border:1px solid var(--bdr2);transition:var(--tr);display:inline-flex;
+  align-items:center;justify-content:center;flex-shrink:0}
+#radio-open-btn:hover{background:var(--s3);color:var(--txt);
+  border-color:rgba(124,58,237,.5);box-shadow:0 0 10px rgba(124,58,237,.2)}
+#radio-open-btn.active{background:rgba(124,58,237,.18);color:var(--acc);
+  border-color:rgba(124,58,237,.5);box-shadow:0 0 10px rgba(124,58,237,.25)}
+
+/* ── Radio modal overlay ─────────────────────────────────────── */
+#radio-overlay{position:fixed;inset:0;z-index:700;background:rgba(0,0,0,.72);
+  display:none;align-items:center;justify-content:center;padding:12px}
+#radio-overlay.open{display:flex}
+#radio-modal{background:var(--s2);border:1px solid var(--bdr2);border-radius:var(--r);
+  width:min(620px,100%);max-height:90dvh;display:flex;flex-direction:column;
+  box-shadow:0 24px 72px rgba(0,0,0,.9),0 0 0 1px rgba(124,58,237,.12);
+  transform:translateZ(0)}
+/* reuse existing slide-up animation from pl-modal */
+#radio-overlay.open #radio-modal{animation:rdio-up .22s cubic-bezier(.34,1.3,.64,1)}
+@keyframes rdio-up{from{opacity:0;transform:translateY(18px) scale(.97)}to{opacity:1;transform:none}}
+.rdio-hdr{display:flex;align-items:center;gap:10px;padding:14px 16px 12px;
+  border-bottom:1px solid var(--bdr);flex-shrink:0;
+  background:linear-gradient(135deg,rgba(124,58,237,.08) 0%,transparent 60%)}
+.rdio-hdr h2{flex:1;font-size:15px;font-weight:800;color:var(--txt);margin:0;
+  letter-spacing:.3px}
+/* tab row */
+.rdio-tabs{display:flex;gap:3px;padding:8px 10px;border-bottom:1px solid var(--bdr);
+  flex-shrink:0;overflow-x:auto;scrollbar-width:none}
+.rdio-tabs::-webkit-scrollbar{display:none}
+.rdio-tab{height:26px;padding:0 11px;font-size:11px;font-weight:600;
+  border-radius:var(--rss);background:transparent;color:var(--txt2);
+  border:1px solid transparent;cursor:pointer;white-space:nowrap;transition:all .15s;flex-shrink:0}
+.rdio-tab.active{background:rgba(124,58,237,.18);color:var(--acc);
+  border-color:rgba(124,58,237,.35)}
+.rdio-tab:hover:not(.active){background:var(--s4);color:var(--txt)}
+/* search bar */
+.rdio-search-row{display:flex;gap:6px;padding:9px 12px;flex-shrink:0;
+  border-bottom:1px solid var(--bdr);align-items:center}
+.rdio-search-row input{flex:1;height:32px;font-size:12px;padding:0 10px;border-radius:var(--rss)}
+#rdio-country{width:130px;height:32px;font-size:11px;padding:0 22px 0 8px;
+  flex-shrink:0;border-radius:var(--rss)}
+.rdio-search-row button{height:32px;padding:0 14px;font-size:12px;flex-shrink:0}
+/* scrollable body */
+.rdio-body{flex:1;overflow-y:auto;min-height:120px}
+/* station list */
+.rdio-list{list-style:none}
+.rdio-item{display:flex;align-items:center;gap:8px;padding:9px 12px;
+  transition:background .12s;border-bottom:1px solid rgba(255,255,255,.03)}
+.rdio-item:hover{background:rgba(124,58,237,.07)}
+.rdio-item-logo{width:34px;height:34px;border-radius:5px;object-fit:contain;
+  background:var(--s4);flex-shrink:0;display:flex;align-items:center;
+  justify-content:center;font-size:17px;overflow:hidden}
+.rdio-item-info{flex:1;min-width:0}
+.rdio-item-name{font-size:12px;font-weight:600;color:var(--txt);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rdio-item-meta{font-size:10px;color:var(--txt3);margin-top:1px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rdio-item-play{height:28px;width:28px;padding:0;font-size:13px;flex-shrink:0;
+  border-radius:50%;background:rgba(124,58,237,.14);color:var(--acc);
+  border:1px solid rgba(124,58,237,.28)}
+.rdio-item-play:hover:not(:disabled){background:rgba(124,58,237,.28);
+  border-color:rgba(124,58,237,.6);box-shadow:0 0 12px rgba(124,58,237,.3)}
+.rdio-item-fav{height:24px;width:24px;padding:0;font-size:14px;flex-shrink:0;
+  background:none;border:none;color:var(--txt3);cursor:pointer;transition:color .15s;
+  line-height:1;display:flex;align-items:center;justify-content:center}
+.rdio-item-fav:hover{color:var(--txt)}
+.rdio-item-fav.active{color:#f59e0b}
+/* empty / loading states */
+.rdio-empty{text-align:center;padding:44px 20px;color:var(--txt3);font-size:12px;line-height:1.7}
+.rdio-empty span{font-size:38px;display:block;margin-bottom:10px;opacity:.2}
+.rdio-loading{text-align:center;padding:36px;color:var(--acc);font-size:12px;
+  display:flex;align-items:center;justify-content:center;gap:8px}
+/* tag / country grid */
+.rdio-tag-grid{display:flex;flex-wrap:wrap;gap:6px;padding:12px}
+.rdio-tag{height:28px;padding:0 13px;font-size:11px;border-radius:20px;cursor:pointer;
+  background:var(--s4);color:var(--txt2);border:1px solid var(--bdr);
+  transition:all .15s;white-space:nowrap}
+.rdio-tag:hover{background:rgba(124,58,237,.15);color:var(--acc);
+  border-color:rgba(124,58,237,.35)}
+/* M3U sources list */
+.rdio-src-item{display:flex;align-items:center;gap:10px;padding:11px 14px;
+  border-bottom:1px solid rgba(255,255,255,.03)}
+.rdio-src-name{flex:1;font-size:12px;color:var(--txt);font-weight:500;min-width:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rdio-back-btn{margin:8px 12px;height:26px;padding:0 12px;font-size:11px}
+
 /* ── VOD / Series Expanded Browse Overlay ──────────────────────────────── */
 #vod-expand-overlay{position:fixed;inset:0;z-index:650;background:rgba(0,0,0,.72);
   display:none;align-items:stretch;justify-content:center}
@@ -3213,6 +3308,12 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <!-- RIGHT BUTTON GROUP -->
           <div style="display:flex;align-items:center;gap:6px">
 
+            <button id="radio-open-btn"
+              onclick="event.stopPropagation();radioOpen()"
+              title="Radio Stations">
+              📻
+            </button>
+
             <button id="vf-btn"
               onclick="event.stopPropagation();toggleVfPanel()"
               title="Video Filters">
@@ -3596,6 +3697,49 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         </div>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- ── RADIO MODAL ──────────────────────────────────────────────── -->
+<div id="radio-overlay" onclick="if(event.target===this)radioClose()">
+  <div id="radio-modal">
+
+    <!-- header -->
+    <div class="rdio-hdr">
+      <span style="font-size:20px;line-height:1">📻</span>
+      <h2>Radio Stations</h2>
+      <button class="btn-ghost" onclick="radioClose()"
+        style="height:28px;width:28px;padding:0;font-size:13px;flex-shrink:0">✕</button>
+    </div>
+
+    <!-- tabs -->
+    <div class="rdio-tabs" id="rdio-tabs">
+      <button class="rdio-tab active" data-tab="search"   onclick="radioTab(this,'search')"  >🔍 Search</button>
+      <button class="rdio-tab"        data-tab="top"      onclick="radioTab(this,'top')"     >🔥 Top 100</button>
+      <button class="rdio-tab"        data-tab="builtin"  onclick="radioTab(this,'builtin')" >⚡ Quick</button>
+      <button class="rdio-tab"        data-tab="country"  onclick="radioTab(this,'country')" >🌍 Country</button>
+      <button class="rdio-tab"        data-tab="genre"    onclick="radioTab(this,'genre')"   >🎵 Genre</button>
+      <button class="rdio-tab"        data-tab="favorites"onclick="radioTab(this,'favorites')">★ Favorites</button>
+      <button class="rdio-tab"        data-tab="sources"  onclick="radioTab(this,'sources')" >📂 M3U</button>
+    </div>
+
+    <!-- search bar (visible on search tab only) -->
+    <div class="rdio-search-row" id="rdio-search-row">
+      <input id="rdio-q" type="search" placeholder="Station name, genre, country…"
+        onkeydown="if(event.key==='Enter')radioSearch()"
+        autocomplete="off" autocorrect="off" spellcheck="false">
+      <select id="rdio-country" title="Filter by country"></select>
+      <button class="btn-acc" onclick="radioSearch()">Search</button>
+    </div>
+
+    <!-- scrollable content area -->
+    <div class="rdio-body" id="rdio-body">
+      <div class="rdio-empty">
+        <span>📻</span>
+        Search for a station or pick a tab above
+      </div>
+    </div>
+
   </div>
 </div>
 
@@ -6667,7 +6811,24 @@ function doPlay(url, name, opts={}){
         if(!_stale() && !url.includes('transcode=1') && !window._mseTranscodeFired){
           window._mseTranscodeFired = true; // guard: only fire once per play session
           alog('[MPEGTS] MSE codec error — re-encoding via ffmpeg (H.264)…','w');
-          const transcodeUrl='/api/hls_proxy?transcode=1&url='+encodeURIComponent(url);
+          // If the current URL is already an hls_proxy URL (e.g. audio_only=1),
+          // extract the inner source URL to avoid building a nested proxy chain
+          // (/api/hls_proxy?transcode=1&url=/api/hls_proxy?audio_only=1&...) which
+          // the server rejects with 400 because the inner URL doesn't start with http://.
+          let _txSource = url;
+          if(url.includes('/api/hls_proxy')){
+            try{
+              const _qi = url.indexOf('?');
+              if(_qi !== -1){
+                const _inner = new URLSearchParams(url.slice(_qi + 1)).get('url');
+                if(_inner && (_inner.startsWith('http://') || _inner.startsWith('https://'))){
+                  _txSource = _inner;
+                  alog('[MPEGTS] Unwrapped proxy URL for transcode fallback','k');
+                }
+              }
+            }catch(_e){}
+          }
+          const transcodeUrl='/api/hls_proxy?transcode=1&url='+encodeURIComponent(_txSource);
           // Defer to next tick — cannot safely destroy mpegts from within its own error callback
           setTimeout(()=>{
           if(_stale()) return;
@@ -8363,7 +8524,757 @@ window._xpOpenIMDB = function(idx){
   _iMenuIMDBOpen(it, _xpMode);
 };
 
+// Expose user's ISO-2 country code for radio modal (derived from same TZ/language detection)
+// _LOCALE_TAG_CANDIDATES[0] is always the clean ISO-2 code (e.g. "RS", "GB", "US")
+window._rdioLocalCC = (_LOCALE_TAG_CANDIDATES[0] || '').toUpperCase().slice(0, 2);
+
 })(); // end IIFE
+
+// ════════════════════════════════════════════════════════════════════════════
+// RADIO MODAL  —  self-contained IIFE, uses global doPlay() and toast()
+// ════════════════════════════════════════════════════════════════════════════
+(function(){
+'use strict';
+
+// ── state ─────────────────────────────────────────────────────────────────
+const _FAV_KEY = 'rdio_favs_v1';
+let _curTab    = 'search';
+let _favs      = [];
+let _ctriesLoaded = false;
+
+// ── open / close ──────────────────────────────────────────────────────────
+window.radioOpen = function(){
+  document.getElementById('radio-overlay').classList.add('open');
+  document.getElementById('radio-open-btn').classList.add('active');
+  _favsLoad();
+  if(!_ctriesLoaded) _loadCountryDropdown();
+  // activate the current tab (re-entering keeps previous tab selected)
+  const activeTab = document.querySelector('.rdio-tab.active');
+  const tabName   = activeTab ? activeTab.dataset.tab : 'search';
+  _activateTab(tabName, activeTab);
+};
+
+window.radioClose = function(){
+  document.getElementById('radio-overlay').classList.remove('open');
+  document.getElementById('radio-open-btn').classList.remove('active');
+};
+
+// ── tab switching ─────────────────────────────────────────────────────────
+window.radioTab = function(btn, name){
+  _curTab = name;
+  document.querySelectorAll('.rdio-tab').forEach(b => b.classList.remove('active'));
+  if(btn) btn.classList.add('active');
+  _activateTab(name, btn);
+};
+
+function _activateTab(name, btn){
+  _curTab = name;
+  const searchRow = document.getElementById('rdio-search-row');
+  searchRow.style.display = (name === 'search') ? '' : 'none';
+  switch(name){
+    case 'search':    _setBody(_emptyHtml('🔍', 'Type a query and press Search')); break;
+    case 'top':       _loadTop();       break;
+    case 'builtin':   _loadBuiltin();   break;
+    case 'country':   _loadCountryGrid(); break;
+    case 'genre':     _loadGenreGrid(); break;
+    case 'favorites': _renderFavs();    break;
+    case 'sources':   _loadSources();   break;
+  }
+}
+
+// ── search ────────────────────────────────────────────────────────────────
+window.radioSearch = async function(){
+  const q  = (document.getElementById('rdio-q').value || '').trim();
+  const cc = document.getElementById('rdio-country').value || '';
+  if(!q){ if(typeof toast === 'function') toast('Enter a search query','w'); return; }
+  _setBody(_loadingHtml());
+  try{
+    const p = new URLSearchParams({q, limit: 60});
+    if(cc) p.set('country', cc);
+    const d = await _api('/api/radio/search?' + p);
+    _renderList(d.data || [], q);
+  }catch(e){ _setBody(_emptyHtml('⚠️', 'Search failed: ' + _esc(e.message))); }
+};
+
+// ── top 100 ───────────────────────────────────────────────────────────────
+async function _loadTop(){
+  _setBody(_loadingHtml());
+  try{
+    const d = await _api('/api/radio/top?limit=100');
+    _renderList(d.data || []);
+  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
+}
+
+// ── builtin (instant, no network) ─────────────────────────────────────────
+async function _loadBuiltin(){
+  _setBody(_loadingHtml());
+  try{
+    const d = await _api('/api/radio/builtin');
+    _renderList(d.data || []);
+  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
+}
+
+// ── locale-aware country ordering ─────────────────────────────────────────
+// Mirrors sortedCountryTags() in the main IIFE:
+//   1. User's own country (ISO-2 from timezone / navigator.language)
+//   2. US → CA → GB  (skip if already shown as local)
+//   3. Everything else in original stationcount-desc order from RadioBrowser
+const _RDIO_LOCAL_CC     = (window._rdioLocalCC || '').toUpperCase();
+const _RDIO_PRIORITY_CC  = ['US', 'CA', 'GB'];   // mirrors PRIORITY_AFTER_LOCAL
+
+function _sortCountries(list){
+  // list: [{iso_3166_1, name, stationcount}, …] already stationcount-desc from API
+  const byCC = {};
+  for(const c of list){ byCC[(c.iso_3166_1||'').toUpperCase()] = c; }
+
+  const used   = new Set();
+  const result = [];
+
+  // 1 — local
+  if(_RDIO_LOCAL_CC && byCC[_RDIO_LOCAL_CC]){
+    result.push(byCC[_RDIO_LOCAL_CC]);
+    used.add(_RDIO_LOCAL_CC);
+  }
+  // 2 — US / CA / GB
+  for(const cc of _RDIO_PRIORITY_CC){
+    if(!used.has(cc) && byCC[cc]){ result.push(byCC[cc]); used.add(cc); }
+  }
+  // 3 — rest in original API order (stationcount desc)
+  for(const c of list){
+    const cc = (c.iso_3166_1||'').toUpperCase();
+    if(!used.has(cc)){ result.push(c); used.add(cc); }
+  }
+  return result;
+}
+
+// ── country grid → stations ───────────────────────────────────────────────
+async function _loadCountryGrid(){
+  _setBody(_loadingHtml());
+  try{
+    const d  = await _api('/api/radio/countries');
+    const raw = (d.data || []).filter(c => c.name && (c.stationcount||0) > 0).slice(0, 200);
+    if(!raw.length){ _setBody(_emptyHtml('🌍','No country data available')); return; }
+
+    const sorted = _sortCountries(raw);
+    let h = '<div class="rdio-tag-grid">';
+    for(const c of sorted){
+      const cc    = (c.iso_3166_1 || c.name).toUpperCase();
+      const label = _esc(c.name);
+      const count = c.stationcount
+        ? `<span style="font-size:9px;opacity:.45;margin-left:3px">${c.stationcount}</span>`
+        : '';
+      // Highlight local country
+      const isLocal    = cc === _RDIO_LOCAL_CC;
+      const isPriority = !isLocal && _RDIO_PRIORITY_CC.includes(cc);
+      const extra = isLocal
+        ? ' style="background:rgba(124,58,237,.22);color:var(--acc);border-color:rgba(124,58,237,.5);font-weight:700"'
+        : isPriority
+          ? ' style="border-color:rgba(255,255,255,.18)"'
+          : '';
+      h += `<button class="rdio-tag" onclick="_rdioByCountry('${_esc(cc)}','${label}')"${extra}>${label}${count}</button>`;
+    }
+    h += '</div>';
+    _setBody(h);
+  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
+}
+
+window._rdioByCountry = async function(cc, label){
+  _setBody(_loadingHtml('Loading ' + _esc(label) + '…'));
+  try{
+    const d = await _api(`/api/radio/country/${encodeURIComponent(cc)}?limit=200`);
+    _renderList(d.data || [], label, true);
+  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
+};
+
+// ── genre grid → stations ─────────────────────────────────────────────────
+async function _loadGenreGrid(){
+  _setBody(_loadingHtml());
+  try{
+    const d = await _api('/api/radio/genres?limit=80');
+    const ts = (d.data || []).filter(t => t.name && (t.stationcount||0) > 0);
+    if(!ts.length){ _setBody(_emptyHtml('🎵','No genre data available')); return; }
+    let h = '<div class="rdio-tag-grid">';
+    for(const t of ts){
+      const name  = _esc(t.name);
+      const count = t.stationcount ? `<span style="font-size:9px;opacity:.45;margin-left:3px">${t.stationcount}</span>` : '';
+      h += `<button class="rdio-tag" onclick="_rdioByGenre('${name}')">${name}${count}</button>`;
+    }
+    h += '</div>';
+    _setBody(h);
+  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
+}
+
+window._rdioByGenre = async function(tag){
+  _setBody(_loadingHtml('Loading ' + _esc(tag) + '…'));
+  try{
+    const d = await _api(`/api/radio/genre/${encodeURIComponent(tag)}?limit=200`);
+    _renderList(d.data || [], tag, true);
+  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
+};
+
+// ── M3U sources ───────────────────────────────────────────────────────────
+async function _loadSources(){
+  _setBody(_loadingHtml());
+  try{
+    const d = await _api('/api/radio/sources');
+    const srcs = d.sources || [];
+    if(!srcs.length){ _setBody(_emptyHtml('📂','No M3U sources configured')); return; }
+    let h = '<ul class="rdio-list">';
+    for(const s of srcs){
+      h += `<li class="rdio-src-item">
+        <span class="rdio-src-name">${_esc(s)}</span>
+        <button class="btn-ghost" style="height:26px;padding:0 12px;font-size:11px;flex-shrink:0"
+          onclick="_rdioLoadM3U('${_esc(s)}')">Load</button>
+      </li>`;
+    }
+    h += '</ul>';
+    _setBody(h);
+  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
+}
+
+window._rdioLoadM3U = async function(name){
+  _setBody(_loadingHtml('Fetching ' + _esc(name) + ' — may take a moment…'));
+  try{
+    const d = await _api('/api/radio/load_source', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({source: name}),
+    }, 50000);  // M3U loads can be slow
+    _renderList(d.data || [], name, true);
+  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
+};
+
+// ── favorites ─────────────────────────────────────────────────────────────
+function _favsLoad(){
+  try{ _favs = JSON.parse(localStorage.getItem(_FAV_KEY) || '[]'); }
+  catch(e){ _favs = []; }
+}
+function _favsSave(){
+  try{ localStorage.setItem(_FAV_KEY, JSON.stringify(_favs)); }
+  catch(e){}
+}
+function _isFav(url, uuid){
+  return _favs.some(f => (uuid && f.stationuuid && f.stationuuid === uuid) || f.url === url);
+}
+
+window._rdioToggleFav = function(btn, urlEnc, uuidEnc, stJsonEnc){
+  const url  = decodeURIComponent(urlEnc);
+  const uuid = decodeURIComponent(uuidEnc);
+  _favsLoad();
+  if(_isFav(url, uuid)){
+    _favs = _favs.filter(f => !((uuid && f.stationuuid && f.stationuuid===uuid) || f.url===url));
+    btn.classList.remove('active'); btn.textContent = '☆';
+    if(typeof toast === 'function') toast('Removed from Radio Favorites','k');
+  } else {
+    let st;
+    try{ st = JSON.parse(decodeURIComponent(stJsonEnc)); }
+    catch(e){ st = {name:'Unknown', url}; }
+    _favs.push(st);
+    btn.classList.add('active'); btn.textContent = '★';
+    if(typeof toast === 'function') toast('Added to Radio Favorites ★','k');
+  }
+  _favsSave();
+  // If we're on the favorites tab, refresh it live
+  if(_curTab === 'favorites') _renderFavs();
+};
+
+function _renderFavs(){
+  _favsLoad();
+  if(!_favs.length){
+    _setBody(_emptyHtml('★', 'No favorites yet — tap ☆ on any station to save it'));
+    return;
+  }
+  _renderList(_favs, '', false);
+}
+
+// ── render station list ───────────────────────────────────────────────────
+function _renderList(stations, queryOrLabel, showBack){
+  if(!stations || !stations.length){
+    _setBody(_emptyHtml('📭', 'No stations found'));
+    return;
+  }
+  let h = '';
+  if(showBack){
+    const tabName = _curTab;
+    h += `<button class="btn-ghost rdio-back-btn"
+      onclick="radioTab(document.querySelector('.rdio-tab[data-tab=&quot;${tabName}&quot;]'),'${tabName}')">
+      ← Back
+    </button>`;
+  }
+  h += '<ul class="rdio-list">';
+  for(const s of stations){
+    const url  = (s.url_resolved || s.url || '').trim();
+    if(!url) continue;
+    const name = _esc(s.name || 'Unknown Station');
+    const cc   = (s.countrycode || '').toUpperCase();
+    const tags = (s.tags || '').split(',').slice(0,2).map(t=>t.trim()).filter(Boolean).join(' · ');
+    const br   = s.bitrate ? s.bitrate + ' kbps' : '';
+    const meta = [cc, tags, br].filter(Boolean).join('  ·  ');
+    const logo = (s.logo || '').trim();
+    const uuid = s.stationuuid || '';
+    const fav  = _isFav(url, uuid);
+
+    // Logo or placeholder emoji
+    const logoH = logo
+      ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(logo)}"
+           onerror="this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'">`
+      : `<div class="rdio-item-logo" style="font-size:18px">📻</div>`;
+
+    // Encode station data for fav callback without inline JSON
+    const stEnc = encodeURIComponent(JSON.stringify({
+      name: s.name || 'Unknown', url, url_resolved: s.url_resolved || url,
+      logo, countrycode: cc, tags: s.tags || '',
+      bitrate: s.bitrate || 0, stationuuid: uuid,
+    }));
+    const urlEnc  = encodeURIComponent(url);
+    const uuidEnc = encodeURIComponent(uuid);
+
+    h += `<li class="rdio-item">
+      ${logoH}
+      <div class="rdio-item-info">
+        <div class="rdio-item-name">${name}</div>
+        ${meta ? `<div class="rdio-item-meta">${_esc(meta)}</div>` : ''}
+      </div>
+      <button class="rdio-item-fav${fav?' active':''}" title="${fav?'Remove from favorites':'Add to favorites'}"
+        onclick="_rdioToggleFav(this,'${urlEnc}','${uuidEnc}','${stEnc}')">${fav?'★':'☆'}</button>
+      <button class="rdio-item-play" title="Play ${_esc(s.name||'')}"
+        onclick="radioPlayStation('${urlEnc}','${stEnc}')">▶</button>
+    </li>`;
+  }
+  h += '</ul>';
+  _setBody(h);
+}
+
+// ── play ──────────────────────────────────────────────────────────────────
+window.radioPlayStation = function(urlEnc, stEnc){
+  const url = decodeURIComponent(urlEnc);
+  if(!url) return;
+
+  // Parse full station info for the visualizer
+  let st = {name: url, url};
+  if(stEnc){
+    try{ st = JSON.parse(decodeURIComponent(stEnc)); }catch(e){}
+  }
+  st.url = url;  // always trust the passed URL
+
+  radioClose();
+  _rdioVizStart(st);   // start visualizer before doPlay so canvas is ready
+  if(typeof doPlay === 'function'){
+    doPlay(url, st.name || url, {isLive: true});
+  } else {
+    const v = document.getElementById('vid');
+    if(v){ v.src = url; v.play().catch(()=>{}); }
+  }
+};
+
+// ── country dropdown population ───────────────────────────────────────────
+function _loadCountryDropdown(){
+  _ctriesLoaded = true;
+  const sel = document.getElementById('rdio-country');
+  if(!sel) return;
+  // Add placeholder option
+  sel.innerHTML = '<option value="">🌍 All countries</option>';
+  _api('/api/radio/countries').then(d => {
+    (d.data || [])
+      .filter(c => c.name && (c.stationcount||0) > 5)
+      .slice(0, 150)
+      .forEach(c => {
+        const o  = document.createElement('option');
+        o.value  = c.iso_3166_1 || c.name;
+        o.textContent = c.name + (c.stationcount ? ` (${c.stationcount})` : '');
+        sel.appendChild(o);
+      });
+  }).catch(()=>{});
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────
+function _setBody(html){ document.getElementById('rdio-body').innerHTML = html; }
+
+function _loadingHtml(msg){
+  return `<div class="rdio-loading">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none"
+         style="animation:spin .8s linear infinite;flex-shrink:0">
+      <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="2" opacity=".25"/>
+      <path d="M8 2a6 6 0 0 1 6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+    ${_esc(msg || 'Loading…')}
+  </div>`;
+}
+
+function _emptyHtml(ico, msg){
+  return `<div class="rdio-empty"><span>${ico}</span>${_esc(msg)}</div>`;
+}
+
+function _esc(s){
+  return String(s || '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+async function _api(url, opts, timeout){
+  const ctrl = new AbortController();
+  const tid  = setTimeout(() => ctrl.abort(), timeout || 15000);
+  try{
+    const r = await fetch(url, {...(opts||{}), signal: ctrl.signal});
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  } finally { clearTimeout(tid); }
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// RADIO VISUALIZER
+// Animated canvas overlay on #vwrap when radio is playing.
+//
+// Layers (bottom to top):
+//  0  Persistent dark trail  (motion blur effect)
+//  1  Drifting nebula radial gradient  (purple / cyan / green, bass-reactive)
+//  2  Scrolling perspective grid  (subtle, avg-amp driven opacity)
+//  3  128-bar radial spectrum  (rotates slowly, color-coded by frequency)
+//  4  Inner pulsing ring  (bass-driven radius + purple glow)
+//  5  Outer orbit ring  (mid-driven)
+//  6  Center circle  (station logo or 📻 emoji fallback)
+//  7  36 floating particles  (bass-reactive speed + size)
+//  8  Bottom gradient scrim  (station name + country · tags · bitrate)
+//  9  RADIO badge  (top-right, bass-reactive opacity)
+//
+// Audio: Web Audio API createMediaElementSource(<video id="vid">)
+// Fallback: simulated sine-wave frequency data
+// ════════════════════════════════════════════════════════════════════════════
+
+class _RdioViz {
+  constructor(){
+    this._canvas     = null;
+    this._ctx        = null;
+    this._animId     = null;
+    this._audioCtx   = null;
+    this._analyser   = null;
+    this._source     = null;
+    this._audioOk    = false;
+    this._running    = false;
+    this._info       = {};
+    this._dpr        = 1;
+    this._simT       = 0;
+    this._particles  = this._mkParticles();
+    this._logoImg    = null;
+    this._logoLoaded = false;
+    this._logoSrc    = "";
+    this._onResize   = null;
+  }
+
+  start(info){
+    this._info = info || {};
+    this._ensureCanvas();
+    if(!this._canvas) return;
+    this._setLogo(this._info.logo || "");
+    this._canvas.style.display = "block";
+    this._resize();
+    this._setupAudio();
+    this._running  = true;
+    this._onResize = () => this._resize();
+    window.addEventListener("resize", this._onResize);
+    this._loop();
+  }
+
+  stop(){
+    this._running = false;
+    if(this._animId){ cancelAnimationFrame(this._animId); this._animId = null; }
+    if(this._canvas)  this._canvas.style.display = "none";
+    if(this._onResize){
+      window.removeEventListener("resize", this._onResize);
+      this._onResize = null;
+    }
+  }
+
+  _ensureCanvas(){
+    if(this._canvas) return;
+    const vwrap = document.getElementById("vwrap");
+    if(!vwrap) return;
+    const c = document.createElement("canvas");
+    c.id = "radio-viz";
+    Object.assign(c.style, {
+      position:"absolute", inset:"0",
+      width:"100%", height:"100%",
+      display:"none", pointerEvents:"none", zIndex:"2",
+    });
+    vwrap.insertBefore(c, vwrap.querySelector("#vph"));
+    this._canvas = c;
+    this._ctx    = c.getContext("2d");
+  }
+
+  _resize(){
+    if(!this._canvas) return;
+    const vwrap = document.getElementById("vwrap");
+    const rect  = (vwrap || this._canvas).getBoundingClientRect();
+    this._dpr   = window.devicePixelRatio || 1;
+    this._canvas.width  = Math.round(rect.width  * this._dpr);
+    this._canvas.height = Math.round(rect.height * this._dpr);
+  }
+
+  _setupAudio(){
+    const vid = document.getElementById("vid");
+    if(!vid) return;
+    try{
+      if(!this._audioCtx)
+        this._audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if(this._audioCtx.state === "suspended")
+        this._audioCtx.resume().catch(()=>{});
+      if(!this._analyser){
+        this._analyser = this._audioCtx.createAnalyser();
+        this._analyser.fftSize               = 512;
+        this._analyser.smoothingTimeConstant = 0.80;
+        this._analyser.minDecibels           = -88;
+        this._analyser.maxDecibels           = -10;
+      }
+      if(!this._source){
+        this._source = this._audioCtx.createMediaElementSource(vid);
+        this._source.connect(this._analyser);
+        this._analyser.connect(this._audioCtx.destination);
+      }
+      this._audioOk = true;
+    }catch(e){
+      this._audioOk = false;
+    }
+  }
+
+  _setLogo(src){
+    if(!src || src === this._logoSrc) return;
+    this._logoSrc    = src;
+    this._logoLoaded = false;
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload  = ()=>{ this._logoImg = img; this._logoLoaded = true; };
+    img.onerror = ()=>{ this._logoImg = null; this._logoLoaded = false; };
+    img.src = src;
+  }
+
+  _mkParticles(){
+    const CLRS = [["#7c3aed","#a855f7"],["#06b6d4","#22d3ee"],["#22c55e","#4ade80"]];
+    return Array.from({length:36}, ()=>({
+      x:   Math.random(),
+      y:   Math.random(),
+      r:   0.9 + Math.random() * 1.9,
+      vx:  (Math.random() - 0.5) * 0.00022,
+      vy:  -(0.00007 + Math.random() * 0.00017),
+      a:   0.12 + Math.random() * 0.34,
+      clr: CLRS[Math.floor(Math.random()*3)],
+    }));
+  }
+
+  _loop(){
+    if(!this._running) return;
+    this._animId = requestAnimationFrame(()=> this._loop());
+    this._draw();
+  }
+
+  _draw(){
+    const c = this._canvas, ctx = this._ctx;
+    if(!c || !ctx) return;
+    const dpr = this._dpr;
+    const W = c.width/dpr, H = c.height/dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const t    = Date.now() / 1000;
+    const freq = this._getFreq();
+    const N    = freq.length;
+
+    const avgAmp  = freq.reduce((s,v)=>s+v,0) / N / 255;
+    const bassEnd = Math.floor(N * 0.12);
+    const midEnd  = Math.floor(N * 0.45);
+    const bassAmp = freq.slice(0,bassEnd).reduce((s,v)=>s+v,0) / bassEnd / 255;
+    const midAmp  = freq.slice(bassEnd,midEnd).reduce((s,v)=>s+v,0) / (midEnd-bassEnd) / 255;
+
+    const cx = W/2, cy = H/2;
+    const innerR = Math.min(W,H) * 0.13;
+    const maxBar = Math.min(W,H) * 0.27;
+
+    // L0: dark trail
+    ctx.fillStyle = "rgba(6,6,18,0.32)";
+    ctx.fillRect(0,0,W,H);
+
+    // L1: nebula gradient
+    const gx = cx + Math.sin(t*0.19)*W*0.20;
+    const gy = cy + Math.cos(t*0.14)*H*0.14;
+    const gr = ctx.createRadialGradient(gx,gy,0,cx,cy,Math.max(W,H)*0.72);
+    gr.addColorStop(0,   `rgba(124,58,237,${+(0.12+bassAmp*0.15).toFixed(3)})`);
+    gr.addColorStop(0.38,`rgba(6,182,212,${+(0.05+midAmp*0.08).toFixed(3)})`);
+    gr.addColorStop(0.75,`rgba(34,197,94,${+(0.01+avgAmp*0.03).toFixed(3)})`);
+    gr.addColorStop(1,   "rgba(0,0,0,0)");
+    ctx.fillStyle = gr;
+    ctx.fillRect(0,0,W,H);
+
+    // L2: scrolling grid
+    const gs = 44;
+    ctx.strokeStyle = `rgba(124,58,237,${+(0.030+avgAmp*0.038).toFixed(3)})`;
+    ctx.lineWidth   = 0.5;
+    ctx.beginPath();
+    for(let x=(t*6)%gs-gs; x<W+gs; x+=gs){ ctx.moveTo(x,0); ctx.lineTo(x,H); }
+    for(let y=(t*3)%gs-gs; y<H+gs; y+=gs){ ctx.moveTo(0,y); ctx.lineTo(W,y); }
+    ctx.stroke();
+
+    // L3: radial spectrum bars
+    const numBars = 128, rot = t*0.13;
+    ctx.lineCap = "round";
+    for(let i=0; i<numBars; i++){
+      const angle  = (i/numBars)*Math.PI*2 - Math.PI/2 + rot;
+      const binIdx = Math.floor((i/numBars)*N*0.68);
+      const amp    = freq[binIdx]/255;
+      const barLen = innerR*0.08 + amp*maxBar;
+
+      const frac = i/numBars;
+      let r,g,b;
+      if(frac<0.34){
+        const p=frac/0.34;
+        r=Math.round(124+p*(6-124)); g=Math.round(58+p*(182-58)); b=Math.round(237+p*(212-237));
+      } else if(frac<0.67){
+        const p=(frac-0.34)/0.33;
+        r=Math.round(6+p*(34-6)); g=Math.round(182+p*(197-182)); b=Math.round(212+p*(94-212));
+      } else {
+        const p=(frac-0.67)/0.33;
+        r=Math.round(34+p*(124-34)); g=Math.round(197+p*(58-197)); b=Math.round(94+p*(237-94));
+      }
+      const alpha = 0.42 + amp*0.58;
+
+      const x1=cx+Math.cos(angle)*innerR,         y1=cy+Math.sin(angle)*innerR;
+      const x2=cx+Math.cos(angle)*(innerR+barLen), y2=cy+Math.sin(angle)*(innerR+barLen);
+      const bg = ctx.createLinearGradient(x1,y1,x2,y2);
+      bg.addColorStop(0,`rgba(${r},${g},${b},${alpha.toFixed(2)})`);
+      bg.addColorStop(1,`rgba(${r},${g},${b},0)`);
+      ctx.strokeStyle = bg;
+      ctx.lineWidth   = 2.4;
+      ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+    }
+
+    // L4: inner bass ring
+    const pR = innerR*(1+bassAmp*0.38);
+    ctx.shadowColor = "#7c3aed"; ctx.shadowBlur = 7+bassAmp*20;
+    ctx.strokeStyle = `rgba(124,58,237,${+(0.42+bassAmp*0.52).toFixed(2)})`;
+    ctx.lineWidth=2; ctx.beginPath(); ctx.arc(cx,cy,pR,0,Math.PI*2); ctx.stroke();
+    ctx.shadowBlur=0;
+
+    // L5: outer mid ring
+    ctx.shadowColor = "#06b6d4"; ctx.shadowBlur = 3+midAmp*9;
+    ctx.strokeStyle = `rgba(6,182,212,${+(0.16+midAmp*0.22).toFixed(2)})`;
+    ctx.lineWidth=1;
+    ctx.beginPath(); ctx.arc(cx,cy,innerR*1.72+midAmp*innerR*0.55,0,Math.PI*2); ctx.stroke();
+    ctx.shadowBlur=0;
+
+    // L6: center circle
+    ctx.fillStyle="#060612";
+    ctx.beginPath(); ctx.arc(cx,cy,innerR*0.98,0,Math.PI*2); ctx.fill();
+
+    if(this._logoLoaded && this._logoImg){
+      const lr = innerR*0.84;
+      ctx.save();
+      ctx.beginPath(); ctx.arc(cx,cy,lr,0,Math.PI*2); ctx.clip();
+      ctx.drawImage(this._logoImg, cx-lr, cy-lr, lr*2, lr*2);
+      ctx.restore();
+    } else {
+      const es = Math.round(innerR*0.78);
+      ctx.font=""+es+"px serif";
+      ctx.textAlign="center"; ctx.textBaseline="middle";
+      ctx.globalAlpha = 0.70+Math.sin(t*1.8)*0.14;
+      ctx.fillText("\uD83D\uDCFB", cx, cy+es*0.04);
+      ctx.globalAlpha=1;
+    }
+
+    // L7: particles
+    for(const p of this._particles){
+      p.x += p.vx + (Math.random()-0.5)*0.00014;
+      p.y += p.vy*(1+bassAmp*2.4);
+      if(p.y < -0.04){ p.y=1.04; p.x=Math.random(); }
+      const sz = p.r*(1+bassAmp*1.9);
+      ctx.globalAlpha = p.a*(0.5+avgAmp*0.55);
+      ctx.shadowColor=p.clr[1]; ctx.shadowBlur=5;
+      ctx.fillStyle=p.clr[0];
+      ctx.beginPath(); ctx.arc(p.x*W, p.y*H, sz, 0, Math.PI*2); ctx.fill();
+    }
+    ctx.globalAlpha=1; ctx.shadowBlur=0;
+
+    // L8: station info scrim
+    const name = (this._info.name||"").trim();
+    const cc   = (this._info.countrycode||"").toUpperCase();
+    const tags = (this._info.tags||"").split(",").slice(0,3).map(s=>s.trim()).filter(Boolean).join(" \u00B7 ");
+    const br   = this._info.bitrate ? this._info.bitrate+" kbps" : "";
+    const sub  = [cc,tags,br].filter(Boolean).join("  \u00B7  ");
+    if(name||sub){
+      const sh = Math.max(56,H*0.20);
+      const sc = ctx.createLinearGradient(0,H-sh,0,H);
+      sc.addColorStop(0,"rgba(0,0,0,0)"); sc.addColorStop(1,"rgba(0,0,0,0.80)");
+      ctx.fillStyle=sc; ctx.fillRect(0,H-sh,W,sh);
+      if(name){
+        const fz=Math.max(12,Math.min(22,W*0.028));
+        ctx.font=`600 ${fz}px "Segoe UI",system-ui,sans-serif`;
+        ctx.textAlign="center"; ctx.textBaseline="alphabetic";
+        ctx.fillStyle="rgba(228,234,248,0.93)";
+        ctx.shadowColor="rgba(0,0,0,0.95)"; ctx.shadowBlur=5;
+        ctx.fillText(name.length>46?name.slice(0,45)+"\u2026":name, cx, H-(sub?28:12));
+        ctx.shadowBlur=0;
+      }
+      if(sub){
+        const fz=Math.max(9,Math.min(13,W*0.016));
+        ctx.font=`${fz}px "Segoe UI",system-ui,sans-serif`;
+        ctx.textAlign="center"; ctx.textBaseline="alphabetic";
+        ctx.fillStyle="rgba(125,138,162,0.88)";
+        ctx.fillText(sub.length>60?sub.slice(0,59)+"\u2026":sub, cx, H-10);
+      }
+    }
+
+    // L9: RADIO badge
+    const bfz=Math.max(9,Math.min(12,W*0.014));
+    ctx.font=`bold ${bfz}px "Segoe UI",sans-serif`;
+    ctx.textAlign="right"; ctx.textBaseline="top";
+    ctx.fillStyle=`rgba(124,58,237,${+(0.5+bassAmp*0.4).toFixed(2)})`;
+    ctx.fillText("\u25CF RADIO", W-10, 10);
+  }
+
+  _getFreq(){
+    if(this._audioOk && this._analyser){
+      const buf = new Uint8Array(this._analyser.frequencyBinCount);
+      this._analyser.getByteFrequencyData(buf);
+      if(buf.some(v=>v>0)) return buf;
+    }
+    this._simT += 0.022;
+    const st=this._simT, N=256, buf=new Uint8Array(N);
+    for(let i=0;i<N;i++){
+      const f=i/N;
+      const bass=Math.pow(Math.max(0,Math.sin(st*0.88+i*0.11)),2)*200*(1-f*0.78);
+      const mid =Math.abs(Math.sin(st*2.14+i*0.27))*125*(f<0.55?1:0.35);
+      const hi  =Math.abs(Math.sin(st*5.40+i*0.74))*52*f;
+      buf[i]=Math.min(255,Math.round(bass+mid+hi+Math.random()*14));
+    }
+    return buf;
+  }
+}
+
+const _rdioViz       = new _RdioViz();
+let   _rdioVizActive = false;
+let   _rdioJustStart = false;
+
+function _rdioVizStart(stInfo){
+  _rdioVizActive = true;
+  _rdioJustStart = true;
+  setTimeout(()=>{ _rdioJustStart = false; }, 1500);
+  _rdioViz.start(stInfo || {});
+}
+function _rdioVizStop(){
+  _rdioVizActive = false;
+  _rdioJustStart = false;
+  _rdioViz.stop();
+}
+
+;(function(){
+  const vid = document.getElementById("vid");
+  if(!vid) return;
+  const _onLoad = ()=>{
+    if(_rdioVizActive && !_rdioJustStart) _rdioVizStop();
+    _rdioJustStart = false;
+  };
+  vid.addEventListener("loadstart", _onLoad, {passive:true});
+  vid.addEventListener("emptied",   _onLoad, {passive:true});
+})();
+
+})(); // end radio IIFE
 </script>
 <script src="/api/dl/ui.js"></script>
 <script src="/api/mv/ui.js"></script>
