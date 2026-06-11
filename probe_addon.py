@@ -178,6 +178,8 @@ def probe_stream_codecs(url: str, pre_input_args=None, timeout=15,
             "width": None, "height": None, "fps": None,
             "video_bitrate": None, "audio_bitrate": None, "total_bitrate": None,
             "audio_tracks": [], "subtitle_tracks": [],
+            # "progressive", "tt" (top-first), "bb" (bottom-first), "tb", "bt", or None
+            "field_order": None,
         }
         for s in streams:
             typ   = s.get("codec_type")
@@ -204,6 +206,14 @@ def probe_stream_codecs(url: str, pre_input_args=None, timeout=15,
                         result["video_bitrate"] = int(s["bit_rate"])
                     except Exception:
                         pass
+                # Capture field_order from the first video stream only.
+                # Possible values: "progressive", "tt", "bb", "tb", "bt" (or absent).
+                # Interlaced streams have top-first ("tt") or bottom-first ("bb") etc.
+                # Browser MSE rejects interlaced H264 — must deinterlace before encoding.
+                if result["field_order"] is None:
+                    fo = (s.get("field_order") or "").strip()
+                    if fo:
+                        result["field_order"] = fo
             elif typ == "audio" and codec:
                 result["audio"].append(codec)
                 if result["audio_bitrate"] is None:
@@ -370,6 +380,18 @@ def _check_codecs(codecs: dict):
             needs_transcode  = True
             transcode_reason = f"hevc video ({vcodec})"
 
+    # Interlaced video check: browser MSE rejects interlaced H264 even when the codec
+    # itself is otherwise compatible.  "-c:v copy" in audio_only mode preserves the
+    # interlaced flag, causing immediate MediaMSEError.  Force full transcode so
+    # libx264 + yadif deinterlacing produces a progressive, MSE-compatible stream.
+    # Only fires when HEVC hasn't already taken the transcode path.
+    if not needs_transcode:
+        _fo = (codecs.get("field_order") or "").strip()
+        # "progressive" or absent = not interlaced; any other value ("tt","bb","tb","bt") = interlaced
+        if _fo and _fo != "progressive":
+            needs_transcode  = True
+            transcode_reason = f"interlaced video ({_fo})"
+
     if not needs_transcode and codecs.get("audio"):
         acodec = codecs["audio"][0].lower()
         if acodec not in _SAFE_AUDIO and (
@@ -451,6 +473,13 @@ def _build_stream_info(codecs: dict, transcode_reason: str | None, is_hls: bool 
         "audio_tracks":       codecs.get("audio_tracks", []),
         "subtitle_tracks":    codecs.get("subtitle_tracks", []),
         "active_audio_track": codecs.get("active_audio_track", 0),
+        # field_order: "progressive", "tt", "bb", "tb", "bt", or None.
+        # Surfaced in log and JS panel to make interlaced-triggered transcodes
+        # self-explanatory without having to parse transcode_reason.
+        "field_order":        codecs.get("field_order") or None,
+        "interlaced":         bool(
+            codecs.get("field_order") and codecs["field_order"] != "progressive"
+        ),
     }
 
 
@@ -462,7 +491,8 @@ def _log_stream_info(state, info: dict, source: str = "ffprobe") -> None:
         lbl  = f" ({info['res_label']})" if info.get("res_label") else ""
         fps  = f"  {info['fps']} fps" if info.get("fps") else ""
         vbr  = f"  {info['video_bitrate']}" if info.get("video_bitrate") else ""
-        lines.append(f"[PROBE] Video : {info['vcodec']}{res}{lbl}{fps}{vbr}")
+        itag = "  [interlaced]" if info.get("interlaced") else ""
+        lines.append(f"[PROBE] Video : {info['vcodec']}{res}{lbl}{fps}{vbr}{itag}")
     if info.get("acodec"):
         abr  = f"  {info['audio_bitrate']}" if info.get("audio_bitrate") else ""
         lines.append(f"[PROBE] Audio : {info['acodec']}{abr}")
@@ -1097,11 +1127,17 @@ _PROBE_UI_JS = r"""
       const vbr = info.video_bitrate ? '<span class="si-br">'  + info.video_bitrate + '</span>'
                 : (info.bitrate      ? '<span class="si-br">'  + info.bitrate       + '</span>'
                 : (isHLS             ? '<span class="si-abr">ABR</span>' : ''));
-      const tx  = (info.transcode && !(info.transcode_reason||'').startsWith('incompatible'))
+      // → transcode on the video row: show when transcoding for any video-side reason
+      // (HEVC, interlaced, subtitle burn-in) but NOT for pure audio reasons (audio_only
+      // copies video verbatim so no video re-encode takes place).
+      const tx  = (info.transcode && !(info.transcode_reason||'').startsWith('incompatible')
+                                  && !(info.transcode_reason||'').startsWith('audio track'))
                   ? '<span class="si-tx">\u2192 transcode</span>' : '';
+      // [i] badge: stream has non-progressive field_order (interlaced scan lines).
+      const itag = info.interlaced ? '<span class="si-img-badge" title="Interlaced scan">[i]</span>' : '';
       html += '<div class="si-row"><span class="si-label"></span>'
             + '<span class="si-codec' + (bad?' si-bad':'') + '">' + info.vcodec + '</span>'
-            + vbr + tx + '</div>';
+            + vbr + itag + tx + '</div>';
     }
 
     html += '<div class="si-divider"></div>';
@@ -1116,7 +1152,11 @@ _PROBE_UI_JS = r"""
       const bad = _BAD_ACODEC.has(info.acodec.toUpperCase().replace('-',''));
       const abr = info.audio_bitrate ? '<span class="si-br">'  + info.audio_bitrate + '</span>'
                 : (isHLS             ? '<span class="si-abr">ABR</span>' : '');
-      const tx  = (info.transcode && (info.transcode_reason||'').startsWith('incompatible'))
+      // → transcode on the audio row: show whenever we're transcoding AND the audio codec
+      // is incompatible.  This covers both audio_only (reason='incompatible audio …') and
+      // full transcode for video reasons (HEVC, interlaced) where bad audio is also being
+      // re-encoded as part of the same ffmpeg pass.
+      const tx  = (info.transcode && (bad || (info.transcode_reason||'').startsWith('incompatible')))
                   ? '<span class="si-tx">\u2192 transcode</span>' : '';
       html += '<div class="si-row"><span class="si-label">A</span>'
             + '<span class="si-codec' + (bad?' si-bad':'') + '">' + info.acodec + '</span>'
@@ -1653,6 +1693,15 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                     # Override audio_only_issue so the full transcode URL is emitted.
                     if st_param:
                         audio_only_issue = False
+                    # Interlaced video requires full libx264 re-encode with yadif deinterlacing
+                    # even when the primary trigger was bad audio: -c:v copy propagates the
+                    # interlaced flags that browsers reject via MSE.  Override audio_only_issue
+                    # and add &deinterlace=1 so the proxy applies yadif before encoding.
+                    _field_order = codecs.get("field_order") if codecs else None
+                    _is_interlaced = bool(_field_order and _field_order != "progressive")
+                    if _is_interlaced:
+                        audio_only_issue = False
+                    di_param = "&deinterlace=1" if _is_interlaced else ""
                     if is_multiview:
                         if audio_only_issue:
                             state.log(f"[PROBE] MV audio → hls_proxy: {transcode_reason}")
@@ -1663,13 +1712,14 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                     else:
                         state.log(f"[PROBE] Routing to transcode proxy: {transcode_reason}"
                                   + (f" [audio track {req_audio_track}]" if at_param else "")
-                                  + (f" [subtitle burn-in track {req_sub_track}]" if st_param else ""))
+                                  + (f" [subtitle burn-in track {req_sub_track}]" if st_param else "")
+                                  + (" [deinterlace]" if di_param else ""))
                         if audio_only_issue:
                             # Copy video stream, re-encode audio only — much cheaper
                             # than a full libx264 video re-encode.
                             transcode_url = f"/api/hls_proxy?audio_only=1&vod={vod_flag}{at_param}&url={quote(url, safe='')}"
                         else:
-                            transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}{at_param}{st_param}&url={quote(url, safe='')}"
+                            transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}{di_param}{at_param}{st_param}&url={quote(url, safe='')}"
                         return jsonify({"url": transcode_url, "origin_url": url, "hevc": True, "stream_info": stream_info})
 
             return jsonify({"url": url, "origin_url": url, "stream_info": stream_info})
