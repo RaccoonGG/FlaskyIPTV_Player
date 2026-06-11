@@ -658,6 +658,13 @@ def register_proxy_routes(flask_app, state):
         transcode   = request.args.get("transcode",   "0") == "1"
         audio_only  = request.args.get("audio_only",  "0") == "1" and not transcode
         is_vod      = request.args.get("vod",         "0") == "1"
+        # deinterlace=1: apply yadif deinterlace filter before libx264 re-encode.
+        # Set by api_resolve() when ffprobe detects a non-progressive field_order
+        # (e.g. "tt" = top-first interlaced H264).  Browser MSE rejects interlaced
+        # H264; yadif deint=1 only processes frames flagged as interlaced, so
+        # progressive content passes through with negligible extra cost.
+        # Only meaningful when transcode=1; ignored for audio_only/remux paths.
+        deinterlace = request.args.get("deinterlace", "0") == "1" and transcode
         # err_recover=1 + seek_secs=N: catchup recovery path — the watchdog
         # detected a bad TS region (sync_byte≠0x47) that mpegts.js cannot skip.
         # ffmpeg is more resilient: -err_detect ignore_err silently discards
@@ -714,20 +721,38 @@ def register_proxy_routes(flask_app, state):
         #                    audio_map explicitly selects audio track or defaults to 0:a:0.
         # audio_track only → -map 0:v:0 -map 0:a:N  (video copy + audio select)
         # neither          → no explicit -map (ffmpeg auto-selects best streams)
+        #
+        # When deinterlace=1, yadif=mode=0:parity=-1:deint=1 is prepended to the
+        # video filter chain.  deint=1 means "only process frames flagged as
+        # interlaced" — progressive frames pass through untouched.
+        _yadif = "yadif=mode=0:parity=-1:deint=1" if deinterlace else None
         if sub_track is not None:
             audio_map    = f"0:a:{audio_track}" if audio_track is not None else "0:a:0"
+            if _yadif:
+                # Chain yadif before subtitle overlay in filter_complex
+                _fc = f"[0:v:0]{_yadif}[v_di];[v_di][0:s:{sub_track}]overlay[vout]"
+            else:
+                _fc = f"[0:v:0][0:s:{sub_track}]overlay[vout]"
             stream_select = [
-                "-filter_complex", f"[0:v:0][0:s:{sub_track}]overlay[vout]",
+                "-filter_complex", _fc,
                 "-map", "[vout]",
                 "-map", audio_map,
             ]
             state.log(f"[ffmpeg] Subtitle burn-in: track {sub_track}"
-                      + (f"  audio track {audio_track}" if audio_track is not None else ""))
+                      + (f"  audio track {audio_track}" if audio_track is not None else "")
+                      + ("  deinterlace" if _yadif else ""))
         elif audio_track is not None:
-            stream_select = ["-map", "0:v:0", "-map", f"0:a:{audio_track}"]
-            state.log(f"[ffmpeg] Audio track: {audio_track} (-map 0:a:{audio_track})")
+            if _yadif:
+                stream_select = ["-vf", _yadif, "-map", "0:v:0", "-map", f"0:a:{audio_track}"]
+            else:
+                stream_select = ["-map", "0:v:0", "-map", f"0:a:{audio_track}"]
+            state.log(f"[ffmpeg] Audio track: {audio_track} (-map 0:a:{audio_track})"
+                      + ("  deinterlace" if _yadif else ""))
         else:
-            stream_select = []
+            if _yadif:
+                stream_select = ["-vf", _yadif]
+            else:
+                stream_select = []
 
         if transcode:
             cmd = base_input + stream_select + [
@@ -735,7 +760,9 @@ def register_proxy_routes(flask_app, state):
                 "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
                 "-f", "mpegts", "-",
             ]
-            mode_str = "transcode" + ("/burnin" if sub_track is not None else "")
+            mode_str = ("transcode"
+                        + ("/burnin" if sub_track is not None else "")
+                        + ("/deinterlace" if deinterlace else ""))
         elif audio_only:
             # audio_only: copy video, re-encode audio.  sub_track is not applied here —
             # overlay requires -c:v libx264, incompatible with -c:v copy.
