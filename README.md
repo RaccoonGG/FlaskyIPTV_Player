@@ -60,6 +60,7 @@ It is a local player interface — a front-end that connects to IPTV portals and
 | `cast_addon.py` | optional | Casting to Chromecast / DLNA / AirPlay |
 | `multiview_addon.py` | optional | Multi-View grid player |
 | `dvr_addon.py` | optional | DVR — scheduled and manual recordings |
+| `radio_addon.py` | optional | Internet radio — RadioBrowser API, Shoutcast directory, M3U playlists, favourites |
 | `multiview_layouts.json` | auto-created | Saved Multi-View layouts (created on first save) |
 | `dvr_jobs.json` | auto-created | Saved DVR job list (created on first scheduled recording) |
 
@@ -83,6 +84,7 @@ The installer will:
 - **Detect `cast_addon.py`** and interactively offer to install each cast protocol package
 - **Detect `multiview_addon.py`** and verify its dependencies (ffmpeg + yt-dlp)
 - **Detect `dvr_addon.py`** and verify its dependencies (ffmpeg required)
+- **Detect `radio_addon.py`** and confirm `requests` (already a core requirement) is available
 - On **Android/Termux** — automatically installs `ffmpeg` via `pkg install ffmpeg` if missing
 - On **Windows/macOS/Linux** — prints install instructions for your platform if ffmpeg is missing
 - Check that port 5000 is free
@@ -129,8 +131,10 @@ On Android (Termux), the server binds to all interfaces so you can also reach it
 ### Browsing & Playback
 - Browse Live TV, VOD, and Series categories with search and tag filtering
 - **All Channels** — a synthetic category aggregates every live channel from the portal into a single browsable list, populated from the prefetched channel pool without extra portal API calls
+- **Background prefetch** — on connect, live channels, VOD, and series listings are all prefetched and cached in the background; subsequent category opens are instant without making portal API calls
 - HLS.js in-browser playback with automatic ffmpeg fallback for problematic streams
 - HEVC/H.265 streams are routed through an ffmpeg HLS proxy automatically
+- **Geo-block detection** — HTTP 456 and 458 responses (geo-restriction/max connections codes used by IPTV providers) are detected at the ffmpeg and player level; the player reports a geo-restriction/max connection error rather than a generic playback failure
 - Favourites — saved per portal in browser storage, survive page reloads
 - Playlist manager — save and quickly reconnect to multiple portals
 
@@ -284,12 +288,16 @@ pip install pyatv                 # AirPlay
 - Shows current and upcoming programme info per channel
 - Supports portal-native EPG (Stalker and Xtream)
 - Supports external XMLTV EPG URLs as a fallback or override
+- **Per-portal EPG time offset** — an offset in minutes can be set per portal in the connect panel to compensate for EPG data that is in a different timezone; the offset is read live from the form field and applied immediately to all programme times without requiring a reconnect
 - **What's On Now** tab — searches your EPG for what's currently airing across all channels, with a Find Channel button to check if your portal carries it
 
 ### Catch-Up TV
 - Stalker Portal catch-up (where supported by the portal)
 - Xtream Codes catch-up (where supported by the portal)
-- Browse archived listings by date and time
+- Browse archived programme listings by date and time from the EPG catch-up panel; click any past programme to play its archive directly
+- **Seek bar support** — MPEG-TS catch-up streams with a known duration are routed through an HLS-VOD proxy (`/api/catchup/stream`), giving the browser a full `<video>` seek bar instead of a plain live stream; HEVC streams are transcoded automatically via the same path
+- **Partial-success chain** — the extractor tries multiple URL patterns in sequence and displays visual status icons per variant: ✓ confirmed working, ~ provisional / unverified, ✗ failed; you can see at a glance which strategy succeeded
+- **Archive availability flags** — channel archive support is determined from the portal's `tv_archive` / `tv_archive_duration` fields; catch-up controls are shown only for channels the portal reports as archive-capable
 
 ### Downloading (`download_addon.py`)
 - **Save M3U** — export selected categories or all channels as a .m3u playlist file
@@ -381,6 +389,54 @@ When ffprobe detects embedded subtitle streams in the container (e.g. DVB telete
 
 **Requires:** `probe_addon.py` in the same directory. `ffprobe` (bundled with ffmpeg) is strongly recommended for accurate detection; the pure-Python fallback covers the most common cases when ffprobe is absent.
 
+### Internet Radio (`radio_addon.py`)
+
+A built-in internet radio browser and player that works independently of any IPTV portal. Discover and play stations from multiple sources with search, favourites, and stream verification — no subscription required.
+
+**Requires:** `radio_addon.py` in the same directory. No additional Python packages are needed beyond the core requirements (`requests` is already required).
+
+#### Station Sources
+
+Stations are discovered from four source tiers in priority order:
+
+| Source | Description |
+|---|---|
+| **RadioBrowser API** | radio-browser.info community database — ~35,000 live-checked stations with multi-server failover |
+| **Shoutcast directory** | Genre / keyword CSV search via the public Shoutcast API; no API key required |
+| **Named M3U playlists** | iptv-org radio index (~20k stations), Free-TV country playlists (UK, US, IT, FR, DE, ES, PL, NL), Tundrak Italia, and more |
+| **Built-in streams** | ~30 hardcoded verified stations — BBC Radio (1/2/4/6/World), NPR, France Radio (Inter/Info/Musique/Culture/NRJ), Deutschlandfunk, Cadena SER, Italian commercial (RTL 102.5, Radio DeeJay, Virgin, Kiss Kiss…), SomaFM ambient channels |
+
+Built-in stations load instantly with no network access and serve as an immediate fallback while API results come in.
+
+#### Browsing & Search
+- **Search** — search by name, keyword, genre, country, or language across all RadioBrowser stations; optional `country`, `language`, and `genre` filters; falls back automatically to Shoutcast directory when RadioBrowser returns no results
+- **Top stations** — globally most-played stations ordered by click count
+- **Browse by country** — all stations for any ISO country code (e.g. `GB`, `US`, `IT`, `RS`)
+- **Browse by genre / tag** — stations for a music genre or tag (e.g. `jazz`, `classical`, `pop`, `metal`, `ambient`)
+- **Country browser** — full list of countries with station counts, ordered by popularity
+- **Genre browser** — top genre tags with station counts
+- **M3U playlist sources** — load any named playlist from the source list; cached on disk for 24 h so repeat loads are instant
+
+#### Favourites
+- Add any station to a persistent favourites list with one click
+- Stored at `~/.flasky_radio_cache/radio_favorites.json`; survives restarts
+- Favourites are tagged (`_is_favorite`) in all search and browse results so stars show correctly everywhere
+
+#### Stream Verification
+- **Verify** button sends a live HEAD request (with ICY-MetaData header) to any station URL
+- Reports: HTTP status code, latency in ms, ICY name, ICY genre, and bitrate as reported by the stream server
+- Falls back to a minimal GET when the server refuses HEAD — common with ICY-protocol Shoutcast/Icecast servers
+
+#### Caching
+- Two-tier cache: **10-minute in-memory** + **24-hour disk** (MD5-keyed JSON files at `~/.flasky_radio_cache/`)
+- Repeat queries and M3U playlist loads are served from cache without network access
+- `POST /api/radio/cache/clear` purges the entire cache (memory + disk)
+
+#### Multi-Server Failover
+RadioBrowser queries rotate across five geographically distributed servers (Austria, Germany, Netherlands, France, USA) — the first server to respond wins; failures are transparent to the user.
+
+---
+
 ### External Player
 - Send any stream to an external player instead of the built-in one
 - **Desktop:** set path to any player executable (VLC, MPV, MPC-HC, etc.)
@@ -426,6 +482,7 @@ All settings are saved in browser localStorage and persist across sessions.
 | External player (mobile) | ⚙ Settings | Choose VLC / MX Player / MX Pro / Just Player / Ask |
 | OpenSubtitles API key | ⚙ Settings | Free key from opensubtitles.com/en/consumers |
 | External EPG URL | Connect panel | XMLTV URL used for EPG and What's On Now |
+| EPG time offset | Connect panel | Per-portal EPG offset in minutes; compensates for portal EPG data in a different timezone; applied live without reconnect |
 | DVR output folder | DVR tab | Folder where `.ts` recording files are saved |
 
 ---
@@ -445,7 +502,7 @@ All settings are saved in browser localStorage and persist across sessions.
 ## Architecture Notes
 
 - The app is split across multiple files — the main `.py` entry point plus required and optional addon modules, all in the same directory
-- `cast_addon.py`, `multiview_addon.py`, `dvr_addon.py`, and `subtitles_addon.py` are fully self-contained drop-in modules; the main app degrades gracefully if any of them are absent
+- `cast_addon.py`, `multiview_addon.py`, `dvr_addon.py`, and `radio_addon.py` are fully self-contained drop-in modules; the main app degrades gracefully if any of them are absent
 - `portal_clients.py`, `proxy_addon.py`, `download_addon.py`, `probe_addon.py`, `epg_addon.py`, and `subtitles_addon.py` are required — the app will not function correctly without them
 - The HTML is a Jinja2 template rendered by Flask's `render_template_string`
 - HLS playback uses **HLS.js** loaded from CDN
@@ -458,6 +515,7 @@ All settings are saved in browser localStorage and persist across sessions.
 - Cast stream proxy runs on a separate port and serves plain LAN URLs; cast devices never see auth headers directly
 - Multi-View stream proxy (`/api/multiview/stream`) runs one ffmpeg process per unique stream URL, shared across all tiles showing the same channel. A background janitor thread cleans up idle streams after 30 seconds.
 - DVR scheduler runs as a background daemon thread, waking every 5 seconds to fire any due jobs. Job state persists to `dvr_jobs.json`. On startup, any job stuck in `recording` state (ffmpeg died while the app was stopped) is recovered — completed if the file exists and has size, otherwise marked as error.
+- Radio addon uses a two-tier cache (10-minute memory + 24-hour disk) stored at `~/.flasky_radio_cache/`. RadioBrowser queries rotate across five geographically distributed API servers with automatic failover. Favourites persist at `~/.flasky_radio_cache/radio_favorites.json`.
 
 ---
 
@@ -473,3 +531,6 @@ All settings are saved in browser localStorage and persist across sessions.
 - DVR recordings are saved as raw `.ts` files — they are not remuxed to MKV or MP4. Most players (VLC, MPV, Kodi) handle `.ts` natively; Windows Media Player may not.
 - DVR timeshift (watch while recording) transcodes on the fly via ffmpeg — on low-end hardware this may be slow to start or choppy. Timeshift works best on the same machine running the Flask server.
 - If the app is stopped while a recording is in progress, ffmpeg is killed and the partial `.ts` file is kept. On next startup the job is recovered as completed (if the file has content) or error (if the file is empty/missing).
+- Radio station discovery requires internet access to the RadioBrowser API and Shoutcast directory; only the ~30 built-in hardcoded streams work without network access
+- Large M3U radio playlists (e.g. the iptv-org all-radio list at ~20k stations) may take several seconds to load on first access; repeat loads within 24 hours are served from disk cache
+- Stream verification in the radio panel is a lightweight HEAD/GET check — it confirms the server is reachable but does not guarantee the audio stream is free of buffering or quality issues
