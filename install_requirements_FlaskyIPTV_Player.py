@@ -38,7 +38,7 @@ def err(msg):  print(f"{RED}  ✗  {msg}{RESET}")
 def info(msg): print(f"{CYAN}  →  {msg}{RESET}")
 def hdr(msg):  print(f"\n{BOLD}{msg}{RESET}")
 
-SCRIPT_NAME = "FlaskyIPTV_Player_byGG.py"
+SCRIPT_NAME = "FlaskyIPTV_Player.py"
 
 # ── Termux detection ──────────────────────────────────────────────────────────
 def is_termux() -> bool:
@@ -296,6 +296,32 @@ def check_dvr_addon():
         info("Install ffmpeg (see system dependencies section above)")
 
 
+# ── radio_addon check ─────────────────────────────────────────────────────────
+def check_radio_addon():
+    hdr("Checking radio_addon.py …")
+
+    radio_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "radio_addon.py")
+    if not os.path.isfile(radio_file):
+        warn("radio_addon.py not found in this directory — Internet Radio feature will be disabled")
+        info("Place radio_addon.py alongside the Flask app to enable internet radio browsing")
+        return
+
+    ok("radio_addon.py found")
+    print()
+    print(f"  {BOLD}Radio addon requirements:{RESET}")
+    print(f"  • requests       — required for RadioBrowser API, Shoutcast, and M3U playlist loading")
+    print(f"  • Internet access — needed for station discovery; ~30 built-in streams work offline")
+    print(f"  • No additional Python packages needed beyond the core requirements")
+    print()
+
+    # requests is already a required core package — just confirm it is importable
+    if check_import("requests"):
+        ok("requests available — RadioBrowser API, Shoutcast search, and stream verification will work")
+    else:
+        warn("requests NOT installed — radio station discovery will be unavailable")
+        info("Install with:  pip install requests")
+
+
 # ── Port availability check ───────────────────────────────────────────────────
 def check_port(port: int = 5000):
     import socket
@@ -355,6 +381,7 @@ def main():
     check_cast_addon()
     check_multiview_addon()
     check_dvr_addon()
+    check_radio_addon()
     check_system_deps()
     check_port(5000)
 
