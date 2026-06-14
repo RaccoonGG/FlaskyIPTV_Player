@@ -274,7 +274,7 @@ class AppState:
         # api_connect() when connecting to MAC/Stalker/Xtream portals; None for
         # pure M3U connections.  Torn down and recreated on each reconnect.
         self.portal_mgr: Optional[PortalSessionManager] = None
-
+        
     def log(self, msg: str):
         try:
             self.log_queue.put_nowait(str(msg).rstrip())
@@ -2575,7 +2575,8 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   letter-spacing:.3px}
 /* tab row */
 .rdio-tabs{display:flex;gap:3px;padding:8px 10px;border-bottom:1px solid var(--bdr);
-  flex-shrink:0;overflow-x:auto;scrollbar-width:none}
+  flex-shrink:0;overflow-x:auto;scrollbar-width:none;cursor:grab;user-select:none}
+.rdio-tabs.rdio-tabs-dragging{cursor:grabbing}
 .rdio-tabs::-webkit-scrollbar{display:none}
 .rdio-tab{height:26px;padding:0 11px;font-size:11px;font-weight:600;
   border-radius:var(--rss);background:transparent;color:var(--txt2);
@@ -2633,6 +2634,18 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .rdio-src-name{flex:1;font-size:12px;color:var(--txt);font-weight:500;min-width:0;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .rdio-back-btn{margin:8px 12px;height:26px;padding:0 12px;font-size:11px}
+#rdio-np-bar{display:flex;align-items:center;gap:6px;padding:4px 12px;flex-shrink:0;
+  background:rgba(124,58,237,.08);border-bottom:1px solid rgba(124,58,237,.15);overflow:hidden}
+.rdio-np-icon{font-size:11px;color:var(--acc);flex-shrink:0;animation:rdio-np-pulse 1.8s ease-in-out infinite}
+@keyframes rdio-np-pulse{0%,100%{opacity:.5}50%{opacity:1}}
+#rdio-np-text{font-size:10px;color:var(--acc);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rdio-viz-toggle{height:28px;width:28px;padding:0;border-radius:var(--rss);
+  background:transparent;border:1px solid transparent;cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;
+  transition:all .15s;opacity:.45;color:var(--txt2)}
+.rdio-viz-toggle:hover{background:var(--s4);border-color:var(--bdr);opacity:.8}
+.rdio-viz-toggle.viz-on{opacity:1;color:var(--acc);border-color:rgba(124,58,237,.35);
+  background:rgba(124,58,237,.12)}
 
 /* ── VOD / Series Expanded Browse Overlay ──────────────────────────────── */
 #vod-expand-overlay{position:fixed;inset:0;z-index:650;background:rgba(0,0,0,.72);
@@ -3708,6 +3721,15 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
     <div class="rdio-hdr">
       <span style="font-size:20px;line-height:1">📻</span>
       <h2>Radio Stations</h2>
+      <button id="rdio-viz-btn" class="rdio-viz-toggle"
+        onclick="_rdioVizToggle()" title="Visualizer OFF — click to enable">
+        <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
+          <rect x="0"   y="5"  width="2" height="8"  fill="currentColor" rx="1"/>
+          <rect x="3.5" y="2"  width="2" height="11" fill="currentColor" rx="1"/>
+          <rect x="7"   y="0"  width="2" height="13" fill="currentColor" rx="1"/>
+          <rect x="10.5" y="3" width="2" height="10" fill="currentColor" rx="1"/>
+        </svg>
+      </button>
       <button class="btn-ghost" onclick="radioClose()"
         style="height:28px;width:28px;padding:0;font-size:13px;flex-shrink:0">✕</button>
     </div>
@@ -3721,6 +3743,9 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <button class="rdio-tab"        data-tab="genre"    onclick="radioTab(this,'genre')"   >🎵 Genre</button>
       <button class="rdio-tab"        data-tab="favorites"onclick="radioTab(this,'favorites')">★ Favorites</button>
       <button class="rdio-tab"        data-tab="sources"  onclick="radioTab(this,'sources')" >📂 M3U</button>
+      <button class="rdio-tab"        data-tab="trending" onclick="radioTab(this,'trending')">📈 Trending</button>
+      <button class="rdio-tab"        data-tab="history"  onclick="radioTab(this,'history')" >🕐 History</button>
+      <button class="rdio-tab"        data-tab="nearby"   onclick="radioTab(this,'nearby')"  >📍 Nearby</button>
     </div>
 
     <!-- search bar (visible on search tab only) -->
@@ -3733,6 +3758,10 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
     </div>
 
     <!-- scrollable content area -->
+    <div id="rdio-np-bar" style="display:none">
+      <span class="rdio-np-icon">♫</span>
+      <span id="rdio-np-text"></span>
+    </div>
     <div class="rdio-body" id="rdio-body">
       <div class="rdio-empty">
         <span>📻</span>
@@ -6298,6 +6327,10 @@ function doPlay(url, name, opts={}){
         vid.play().catch(()=>{});
       }
     } else {
+      if(window._stallHits > 0){   // stall was in progress but self-resolved
+        alog('[Watchdog] Stall self-resolved (currentTime resumed) — restoring title','k');
+        setNP('\u25b6 '+pName);     // restore ▶ pName (clears ⟳ Buffering…)
+      }
       window._stallHits = 0; // time advancing — reset counter
     }
     window._stallLastTime = ct;
@@ -8530,391 +8563,7 @@ window._rdioLocalCC = (_LOCALE_TAG_CANDIDATES[0] || '').toUpperCase().slice(0, 2
 
 })(); // end IIFE
 
-// ════════════════════════════════════════════════════════════════════════════
-// RADIO MODAL  —  self-contained IIFE, uses global doPlay() and toast()
-// ════════════════════════════════════════════════════════════════════════════
-(function(){
-'use strict';
 
-// ── state ─────────────────────────────────────────────────────────────────
-const _FAV_KEY = 'rdio_favs_v1';
-let _curTab    = 'search';
-let _favs      = [];
-let _ctriesLoaded = false;
-
-// ── open / close ──────────────────────────────────────────────────────────
-window.radioOpen = function(){
-  document.getElementById('radio-overlay').classList.add('open');
-  document.getElementById('radio-open-btn').classList.add('active');
-  _favsLoad();
-  if(!_ctriesLoaded) _loadCountryDropdown();
-  // activate the current tab (re-entering keeps previous tab selected)
-  const activeTab = document.querySelector('.rdio-tab.active');
-  const tabName   = activeTab ? activeTab.dataset.tab : 'search';
-  _activateTab(tabName, activeTab);
-};
-
-window.radioClose = function(){
-  document.getElementById('radio-overlay').classList.remove('open');
-  document.getElementById('radio-open-btn').classList.remove('active');
-};
-
-// ── tab switching ─────────────────────────────────────────────────────────
-window.radioTab = function(btn, name){
-  _curTab = name;
-  document.querySelectorAll('.rdio-tab').forEach(b => b.classList.remove('active'));
-  if(btn) btn.classList.add('active');
-  _activateTab(name, btn);
-};
-
-function _activateTab(name, btn){
-  _curTab = name;
-  const searchRow = document.getElementById('rdio-search-row');
-  searchRow.style.display = (name === 'search') ? '' : 'none';
-  switch(name){
-    case 'search':    _setBody(_emptyHtml('🔍', 'Type a query and press Search')); break;
-    case 'top':       _loadTop();       break;
-    case 'builtin':   _loadBuiltin();   break;
-    case 'country':   _loadCountryGrid(); break;
-    case 'genre':     _loadGenreGrid(); break;
-    case 'favorites': _renderFavs();    break;
-    case 'sources':   _loadSources();   break;
-  }
-}
-
-// ── search ────────────────────────────────────────────────────────────────
-window.radioSearch = async function(){
-  const q  = (document.getElementById('rdio-q').value || '').trim();
-  const cc = document.getElementById('rdio-country').value || '';
-  if(!q){ if(typeof toast === 'function') toast('Enter a search query','w'); return; }
-  _setBody(_loadingHtml());
-  try{
-    const p = new URLSearchParams({q, limit: 60});
-    if(cc) p.set('country', cc);
-    const d = await _api('/api/radio/search?' + p);
-    _renderList(d.data || [], q);
-  }catch(e){ _setBody(_emptyHtml('⚠️', 'Search failed: ' + _esc(e.message))); }
-};
-
-// ── top 100 ───────────────────────────────────────────────────────────────
-async function _loadTop(){
-  _setBody(_loadingHtml());
-  try{
-    const d = await _api('/api/radio/top?limit=100');
-    _renderList(d.data || []);
-  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
-}
-
-// ── builtin (instant, no network) ─────────────────────────────────────────
-async function _loadBuiltin(){
-  _setBody(_loadingHtml());
-  try{
-    const d = await _api('/api/radio/builtin');
-    _renderList(d.data || []);
-  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
-}
-
-// ── locale-aware country ordering ─────────────────────────────────────────
-// Mirrors sortedCountryTags() in the main IIFE:
-//   1. User's own country (ISO-2 from timezone / navigator.language)
-//   2. US → CA → GB  (skip if already shown as local)
-//   3. Everything else in original stationcount-desc order from RadioBrowser
-const _RDIO_LOCAL_CC     = (window._rdioLocalCC || '').toUpperCase();
-const _RDIO_PRIORITY_CC  = ['US', 'CA', 'GB'];   // mirrors PRIORITY_AFTER_LOCAL
-
-function _sortCountries(list){
-  // list: [{iso_3166_1, name, stationcount}, …] already stationcount-desc from API
-  const byCC = {};
-  for(const c of list){ byCC[(c.iso_3166_1||'').toUpperCase()] = c; }
-
-  const used   = new Set();
-  const result = [];
-
-  // 1 — local
-  if(_RDIO_LOCAL_CC && byCC[_RDIO_LOCAL_CC]){
-    result.push(byCC[_RDIO_LOCAL_CC]);
-    used.add(_RDIO_LOCAL_CC);
-  }
-  // 2 — US / CA / GB
-  for(const cc of _RDIO_PRIORITY_CC){
-    if(!used.has(cc) && byCC[cc]){ result.push(byCC[cc]); used.add(cc); }
-  }
-  // 3 — rest in original API order (stationcount desc)
-  for(const c of list){
-    const cc = (c.iso_3166_1||'').toUpperCase();
-    if(!used.has(cc)){ result.push(c); used.add(cc); }
-  }
-  return result;
-}
-
-// ── country grid → stations ───────────────────────────────────────────────
-async function _loadCountryGrid(){
-  _setBody(_loadingHtml());
-  try{
-    const d  = await _api('/api/radio/countries');
-    const raw = (d.data || []).filter(c => c.name && (c.stationcount||0) > 0).slice(0, 200);
-    if(!raw.length){ _setBody(_emptyHtml('🌍','No country data available')); return; }
-
-    const sorted = _sortCountries(raw);
-    let h = '<div class="rdio-tag-grid">';
-    for(const c of sorted){
-      const cc    = (c.iso_3166_1 || c.name).toUpperCase();
-      const label = _esc(c.name);
-      const count = c.stationcount
-        ? `<span style="font-size:9px;opacity:.45;margin-left:3px">${c.stationcount}</span>`
-        : '';
-      // Highlight local country
-      const isLocal    = cc === _RDIO_LOCAL_CC;
-      const isPriority = !isLocal && _RDIO_PRIORITY_CC.includes(cc);
-      const extra = isLocal
-        ? ' style="background:rgba(124,58,237,.22);color:var(--acc);border-color:rgba(124,58,237,.5);font-weight:700"'
-        : isPriority
-          ? ' style="border-color:rgba(255,255,255,.18)"'
-          : '';
-      h += `<button class="rdio-tag" onclick="_rdioByCountry('${_esc(cc)}','${label}')"${extra}>${label}${count}</button>`;
-    }
-    h += '</div>';
-    _setBody(h);
-  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
-}
-
-window._rdioByCountry = async function(cc, label){
-  _setBody(_loadingHtml('Loading ' + _esc(label) + '…'));
-  try{
-    const d = await _api(`/api/radio/country/${encodeURIComponent(cc)}?limit=200`);
-    _renderList(d.data || [], label, true);
-  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
-};
-
-// ── genre grid → stations ─────────────────────────────────────────────────
-async function _loadGenreGrid(){
-  _setBody(_loadingHtml());
-  try{
-    const d = await _api('/api/radio/genres?limit=80');
-    const ts = (d.data || []).filter(t => t.name && (t.stationcount||0) > 0);
-    if(!ts.length){ _setBody(_emptyHtml('🎵','No genre data available')); return; }
-    let h = '<div class="rdio-tag-grid">';
-    for(const t of ts){
-      const name  = _esc(t.name);
-      const count = t.stationcount ? `<span style="font-size:9px;opacity:.45;margin-left:3px">${t.stationcount}</span>` : '';
-      h += `<button class="rdio-tag" onclick="_rdioByGenre('${name}')">${name}${count}</button>`;
-    }
-    h += '</div>';
-    _setBody(h);
-  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
-}
-
-window._rdioByGenre = async function(tag){
-  _setBody(_loadingHtml('Loading ' + _esc(tag) + '…'));
-  try{
-    const d = await _api(`/api/radio/genre/${encodeURIComponent(tag)}?limit=200`);
-    _renderList(d.data || [], tag, true);
-  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
-};
-
-// ── M3U sources ───────────────────────────────────────────────────────────
-async function _loadSources(){
-  _setBody(_loadingHtml());
-  try{
-    const d = await _api('/api/radio/sources');
-    const srcs = d.sources || [];
-    if(!srcs.length){ _setBody(_emptyHtml('📂','No M3U sources configured')); return; }
-    let h = '<ul class="rdio-list">';
-    for(const s of srcs){
-      h += `<li class="rdio-src-item">
-        <span class="rdio-src-name">${_esc(s)}</span>
-        <button class="btn-ghost" style="height:26px;padding:0 12px;font-size:11px;flex-shrink:0"
-          onclick="_rdioLoadM3U('${_esc(s)}')">Load</button>
-      </li>`;
-    }
-    h += '</ul>';
-    _setBody(h);
-  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
-}
-
-window._rdioLoadM3U = async function(name){
-  _setBody(_loadingHtml('Fetching ' + _esc(name) + ' — may take a moment…'));
-  try{
-    const d = await _api('/api/radio/load_source', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({source: name}),
-    }, 50000);  // M3U loads can be slow
-    _renderList(d.data || [], name, true);
-  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
-};
-
-// ── favorites ─────────────────────────────────────────────────────────────
-function _favsLoad(){
-  try{ _favs = JSON.parse(localStorage.getItem(_FAV_KEY) || '[]'); }
-  catch(e){ _favs = []; }
-}
-function _favsSave(){
-  try{ localStorage.setItem(_FAV_KEY, JSON.stringify(_favs)); }
-  catch(e){}
-}
-function _isFav(url, uuid){
-  return _favs.some(f => (uuid && f.stationuuid && f.stationuuid === uuid) || f.url === url);
-}
-
-window._rdioToggleFav = function(btn, urlEnc, uuidEnc, stJsonEnc){
-  const url  = decodeURIComponent(urlEnc);
-  const uuid = decodeURIComponent(uuidEnc);
-  _favsLoad();
-  if(_isFav(url, uuid)){
-    _favs = _favs.filter(f => !((uuid && f.stationuuid && f.stationuuid===uuid) || f.url===url));
-    btn.classList.remove('active'); btn.textContent = '☆';
-    if(typeof toast === 'function') toast('Removed from Radio Favorites','k');
-  } else {
-    let st;
-    try{ st = JSON.parse(decodeURIComponent(stJsonEnc)); }
-    catch(e){ st = {name:'Unknown', url}; }
-    _favs.push(st);
-    btn.classList.add('active'); btn.textContent = '★';
-    if(typeof toast === 'function') toast('Added to Radio Favorites ★','k');
-  }
-  _favsSave();
-  // If we're on the favorites tab, refresh it live
-  if(_curTab === 'favorites') _renderFavs();
-};
-
-function _renderFavs(){
-  _favsLoad();
-  if(!_favs.length){
-    _setBody(_emptyHtml('★', 'No favorites yet — tap ☆ on any station to save it'));
-    return;
-  }
-  _renderList(_favs, '', false);
-}
-
-// ── render station list ───────────────────────────────────────────────────
-function _renderList(stations, queryOrLabel, showBack){
-  if(!stations || !stations.length){
-    _setBody(_emptyHtml('📭', 'No stations found'));
-    return;
-  }
-  let h = '';
-  if(showBack){
-    const tabName = _curTab;
-    h += `<button class="btn-ghost rdio-back-btn"
-      onclick="radioTab(document.querySelector('.rdio-tab[data-tab=&quot;${tabName}&quot;]'),'${tabName}')">
-      ← Back
-    </button>`;
-  }
-  h += '<ul class="rdio-list">';
-  for(const s of stations){
-    const url  = (s.url_resolved || s.url || '').trim();
-    if(!url) continue;
-    const name = _esc(s.name || 'Unknown Station');
-    const cc   = (s.countrycode || '').toUpperCase();
-    const tags = (s.tags || '').split(',').slice(0,2).map(t=>t.trim()).filter(Boolean).join(' · ');
-    const br   = s.bitrate ? s.bitrate + ' kbps' : '';
-    const meta = [cc, tags, br].filter(Boolean).join('  ·  ');
-    const logo = (s.logo || '').trim();
-    const uuid = s.stationuuid || '';
-    const fav  = _isFav(url, uuid);
-
-    // Logo or placeholder emoji
-    const logoH = logo
-      ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(logo)}"
-           onerror="this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'">`
-      : `<div class="rdio-item-logo" style="font-size:18px">📻</div>`;
-
-    // Encode station data for fav callback without inline JSON
-    const stEnc = encodeURIComponent(JSON.stringify({
-      name: s.name || 'Unknown', url, url_resolved: s.url_resolved || url,
-      logo, countrycode: cc, tags: s.tags || '',
-      bitrate: s.bitrate || 0, stationuuid: uuid,
-    }));
-    const urlEnc  = encodeURIComponent(url);
-    const uuidEnc = encodeURIComponent(uuid);
-
-    h += `<li class="rdio-item">
-      ${logoH}
-      <div class="rdio-item-info">
-        <div class="rdio-item-name">${name}</div>
-        ${meta ? `<div class="rdio-item-meta">${_esc(meta)}</div>` : ''}
-      </div>
-      <button class="rdio-item-fav${fav?' active':''}" title="${fav?'Remove from favorites':'Add to favorites'}"
-        onclick="_rdioToggleFav(this,'${urlEnc}','${uuidEnc}','${stEnc}')">${fav?'★':'☆'}</button>
-      <button class="rdio-item-play" title="Play ${_esc(s.name||'')}"
-        onclick="radioPlayStation('${urlEnc}','${name}')">▶</button>
-    </li>`;
-  }
-  h += '</ul>';
-  _setBody(h);
-}
-
-// ── play ──────────────────────────────────────────────────────────────────
-window.radioPlayStation = function(urlEnc, nameEsc){
-  const url  = decodeURIComponent(urlEnc);
-  const name = nameEsc || url;
-  if(!url) return;
-  radioClose();
-  if(typeof doPlay === 'function'){
-    doPlay(url, name, {isLive: true});
-  } else {
-    // Fallback: set video src directly
-    const v = document.getElementById('vid');
-    if(v){ v.src = url; v.play().catch(()=>{}); }
-  }
-};
-
-// ── country dropdown population ───────────────────────────────────────────
-function _loadCountryDropdown(){
-  _ctriesLoaded = true;
-  const sel = document.getElementById('rdio-country');
-  if(!sel) return;
-  // Add placeholder option
-  sel.innerHTML = '<option value="">🌍 All countries</option>';
-  _api('/api/radio/countries').then(d => {
-    (d.data || [])
-      .filter(c => c.name && (c.stationcount||0) > 5)
-      .slice(0, 150)
-      .forEach(c => {
-        const o  = document.createElement('option');
-        o.value  = c.iso_3166_1 || c.name;
-        o.textContent = c.name + (c.stationcount ? ` (${c.stationcount})` : '');
-        sel.appendChild(o);
-      });
-  }).catch(()=>{});
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────
-function _setBody(html){ document.getElementById('rdio-body').innerHTML = html; }
-
-function _loadingHtml(msg){
-  return `<div class="rdio-loading">
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none"
-         style="animation:spin .8s linear infinite;flex-shrink:0">
-      <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="2" opacity=".25"/>
-      <path d="M8 2a6 6 0 0 1 6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-    </svg>
-    ${_esc(msg || 'Loading…')}
-  </div>`;
-}
-
-function _emptyHtml(ico, msg){
-  return `<div class="rdio-empty"><span>${ico}</span>${_esc(msg)}</div>`;
-}
-
-function _esc(s){
-  return String(s || '')
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-}
-
-async function _api(url, opts, timeout){
-  const ctrl = new AbortController();
-  const tid  = setTimeout(() => ctrl.abort(), timeout || 15000);
-  try{
-    const r = await fetch(url, {...(opts||{}), signal: ctrl.signal});
-    if(!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
-  } finally { clearTimeout(tid); }
-}
-
-})(); // end radio IIFE
 </script>
 <script src="/api/dl/ui.js"></script>
 <script src="/api/mv/ui.js"></script>
@@ -8924,6 +8573,7 @@ async function _api(url, opts, timeout){
 <script src="/api/dvr/ui.js"></script>
 <script src="/api/dlm/ui.js"></script>
 <script src="/api/probe/ui.js"></script>
+<script src="/api/radio/ui.js"></script>
 </body>
 </html>
 """
