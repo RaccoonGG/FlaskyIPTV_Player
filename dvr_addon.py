@@ -999,6 +999,10 @@ def register_dvr_routes(app, state=None) -> None:
             _start_recording_unlocked(job)
             _save_jobs(jobs)
 
+        # Reset heartbeat timer so the watchdog grace starts fresh on this job
+        if _app_state is not None:
+            _app_state.last_client_heartbeat = time.time()
+
         return jsonify(job), 201
 
     _register_dvr_ui_route(app)
