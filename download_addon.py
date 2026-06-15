@@ -322,6 +322,79 @@ def run_yt_dlp_download(url: str, out_path: str,
 
 # ===================== REGISTRATION =====================
 
+# ── Lifecycle watchdog ────────────────────────────────────────────────────────
+# The frontend sends a fetch(keepalive) to /api/heartbeat every HEARTBEAT_INTERVAL s.
+# If the heartbeat goes stale for HEARTBEAT_GRACE s AND active jobs exist the
+# watchdog calls _abort_active_jobs() — covers tab close and browser crash.
+# On page refresh the new page reconnects well within the grace window (< 5 s),
+# so downloads are never interrupted by a refresh.
+
+_HEARTBEAT_INTERVAL = 5   # seconds — must match JS setInterval
+_HEARTBEAT_GRACE    = 20  # seconds before considering client gone (4 missed beats)
+
+
+def _abort_active_jobs(state) -> None:
+    """Kill any active recording and MKV/yt-dlp/M3U download.
+
+    Mirrors api_record_stop + api_stop without returning HTTP responses.
+    Idempotent — safe to call when nothing is active.
+    Called by the DLM watchdog thread when heartbeat goes stale.
+    """
+    # ── Quick recording ──────────────────────────────────────────────────────
+    if state.recording:
+        with state.record_proc_lock:
+            p = state.record_proc
+            state.record_proc = None
+        state.recording = False
+        saved = getattr(state, "record_file_path", "")
+        if p:
+            try:
+                p.terminate()
+                p.wait(timeout=5)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        state.log(f"[WATCHDOG] ⏹ Recording aborted (client disconnected). Saved: {saved}")
+        state.set_status("Recording stopped (tab closed).")
+        _rec_jid = getattr(state, "record_job_id", None)
+        if _rec_jid:
+            _dlm_complete_job(_rec_jid, saved)
+            state.record_job_id = None
+
+    # ── MKV download / yt-dlp / M3U worker ──────────────────────────────────
+    # stop_flag cancels all run_worker()-based jobs (MKV ffmpeg, yt-dlp, M3U).
+    # mkv_proc is the current ffmpeg subprocess (None for yt-dlp/M3U workers).
+    had_download = state.busy or state.mkv_proc is not None
+    state.stop_flag.set()
+    with state.mkv_proc_lock:
+        p = state.mkv_proc
+    if p:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    # Also cancel the asyncio task that drives the worker loop
+    loop = state.active_loop
+    task = state.active_task
+    if loop and task and not task.done():
+        try:
+            loop.call_soon_threadsafe(task.cancel)
+        except Exception:
+            pass
+    if had_download:
+        state.log("[WATCHDOG] ⏹ Download aborted (client disconnected).")
+        state.set_status("Download stopped (tab closed).")
+
+    # ── Addon abort hooks (e.g. DVR addon) ──────────────────────────────────
+    for hook in getattr(state, "addon_abort_hooks", []):
+        try:
+            hook()
+        except Exception:
+            pass
+
+
 def register_download_routes(flask_app, state, run_async, run_worker, _make_client,
                              ffmpeg_path, ffprobe_path,
                              ffmpeg_available, ytdlp_available):
@@ -851,9 +924,50 @@ def register_download_routes(flask_app, state, run_async, run_worker, _make_clie
             "filename":  os.path.basename(state.record_file_path),
         })
 
+    # ── /api/heartbeat ────────────────────────────────────────────────────────
+    # Called by the frontend every 5 s via fetch({keepalive:true}).
+    # Returns active-job state so the JS can show a beforeunload prompt for ANY
+    # active job type (quick record, DVR record, MKV/yt-dlp download).
+    @flask_app.route("/api/heartbeat", methods=["POST"])
+    def api_heartbeat():
+        state.last_client_heartbeat = time.time()
+        addon_active = any(fn() for fn in getattr(state, "addon_active_checks", []))
+        return jsonify({
+            "recording":   bool(state.recording or addon_active),
+            "downloading": bool(state.busy or state.mkv_proc is not None),
+        })
+
+    # ── DLM watchdog thread ───────────────────────────────────────────────────
+    # Aborts active recordings/downloads when the client heartbeat goes stale.
+    # Only acts when there are actually active jobs — pure no-op otherwise.
+    def _dlm_watchdog():
+        while True:
+            time.sleep(_HEARTBEAT_INTERVAL)
+            try:
+                active = (
+                    state.recording
+                    or state.mkv_proc is not None
+                    or state.busy
+                    or any(fn() for fn in getattr(state, "addon_active_checks", []))
+                )
+                if not active:
+                    continue
+                elapsed = time.time() - state.last_client_heartbeat
+                if elapsed > _HEARTBEAT_GRACE:
+                    state.log(
+                        f"[WATCHDOG] No heartbeat for {int(elapsed)}s with active jobs"
+                        " — aborting."
+                    )
+                    _abort_active_jobs(state)
+            except Exception:
+                pass  # never let the watchdog crash
+
+    _wd = threading.Thread(target=_dlm_watchdog, daemon=True, name="dlm-watchdog")
+    _wd.start()
+
     _register_dl_ui_route(flask_app)
     _register_dlm_routes(flask_app, state)
-    state.log("[DL] Routes registered: /api/download/*  /api/record/*  /api/dlm/*")
+    state.log("[DL] Routes registered: /api/download/*  /api/record/*  /api/dlm/*  /api/heartbeat")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1570,6 +1684,69 @@ dlmRefresh = async function(){
 document.getElementById('dlm-overlay').addEventListener('click', e=>{
   if(e.target === document.getElementById('dlm-overlay')) dlmClose();
 });
+
+// ── Lifecycle heartbeat ────────────────────────────────────────────────────
+// Pings /api/heartbeat every 5 s so the server watchdog knows we are alive.
+//
+// Uses fetch({keepalive:true}) instead of sendBeacon so we can READ the JSON
+// response: the server returns {recording, downloading} reflecting the live
+// Python state.  keepalive:true lets the browser complete the request even
+// during page unload (same guarantee as sendBeacon).
+//
+// _flaskyActive is updated on every successful response and is used by the
+// beforeunload guard below.  It covers cases that the pure-JS flags miss:
+//   • isRec is never set for DVR recordings (iMenuRec returns before startRec)
+//   • _dlmActive only reflects DLM jobs; DVR jobs live in a separate list
+//   • _dlmActive items use status "in_progress", not "active"/"recording"
+(function(){
+  var _flaskyActive = { recording: false, downloading: false };
+
+  function _heartbeat(){
+    fetch('/api/heartbeat', { method: 'POST', keepalive: true })
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if(d){
+          _flaskyActive.recording   = !!d.recording;
+          _flaskyActive.downloading = !!d.downloading;
+        }
+      })
+      .catch(function(){}); // swallow — network errors are harmless here
+  }
+
+  // Fire once immediately so _flaskyActive is populated before user could
+  // trigger beforeunload (otherwise the first 5 s window is blind).
+  _heartbeat();
+  setInterval(_heartbeat, 5000);
+
+  // ── beforeunload confirmation ──────────────────────────────────────────
+  // Shows the browser's native "Leave site?" dialog when anything is active.
+  // The server-side watchdog handles the actual abort after the grace period;
+  // this is purely a UX safeguard to prevent accidental data loss.
+  //
+  // Checks (in order of priority):
+  //  1. isRec            — quick-record button flag (dl/ui.js, loaded first)
+  //  2. _flaskyActive    — server state polled every 5 s; catches DVR records
+  //                        and any active worker (yt-dlp, MKV, M3U)
+  //  3. _dlmActive       — DLM job list (status "in_progress"), belt+braces
+  window.addEventListener('beforeunload', function(e){
+    // _dvrJobs is populated by dvr/ui.js (loaded before dlm/ui.js).
+    // /api/dvr/jobs only returns active/scheduled jobs — completed ones
+    // live in /api/dvr/recordings — so length > 0 means DVR is busy.
+    var dvrActive  = typeof _dvrJobs !== 'undefined' && _dvrJobs.length > 0;
+    var recActive  = (typeof isRec !== 'undefined' && isRec)
+                     || _flaskyActive.recording
+                     || dvrActive;
+    var dlActive   = _flaskyActive.downloading
+                     || _dlmActive.length > 0;
+    if(recActive || dlActive){
+      e.preventDefault();
+      // returnValue text shown by legacy browsers; modern ones use a generic
+      // "Leave site?" dialog and ignore the string.
+      e.returnValue = 'A recording or download is in progress. Are you sure you want to close?';
+      return e.returnValue;
+    }
+  });
+})();
 """
 
 
