@@ -808,7 +808,8 @@ class PortalClient:
                 elif 'cmd":' in raw2:
                     link = raw2.split('cmd":', 1)[1].split('\n', 1)[0].strip().strip('",')
 
-            # If link contains ffmpeg play URL, return play_url typed result
+            # If link contains ffmpeg play URL, resolve it first, then try
+            # Xtream path extraction -- /movie/USER/PASS/id.ext carries creds.
             if link and "ffmpeg" in link.lower():
                 if " " in link:
                     link = link.split(" ", 1)[-1].strip()
@@ -822,6 +823,19 @@ class PortalClient:
                         if parsed.scheme and parsed.netloc
                         else normalize_base_url(play_url))
                 self.log(f"[MAC] create_link resolved → {play_url}")
+                # Prefer Xtream path creds (/movie/USER/PASS/...) when present
+                # so get_vod_streams/get_series can call player_api.php directly.
+                _xt = _try_extract_xtream_from_url(play_url)
+                if _xt and _xt.get("type") == "xtream":
+                    self.log(f"[MAC] create_link ffmpeg → Xtream creds: "
+                             f"user={_xt.get('username')!r} "
+                             f"pass={_xt.get('password')!r} "
+                             f"base={_xt.get('base')!r}")
+                    self._xtream_creds = _xt
+                    return self._xtream_creds
+                # No path creds -- fall back to play_url type
+                self.log(f"[MAC] create_link ffmpeg: no Xtream path creds; "
+                         f"play_token={play_token!r}")
                 self._xtream_creds = {"type": "play_url", "base": base, "stream_url": play_url,
                                       "play_token": play_token, "stream": stream, "mac": mac_q}
                 return self._xtream_creds
@@ -942,6 +956,10 @@ class PortalClient:
         self._all_vod_raw = []
         creds = await self.parse_xtream_info()
         if not creds or creds.get("type") != "xtream":
+            _ct = creds.get("type") if creds else None
+            _cu = creds.get("username", "") if creds else ""
+            _cp = creds.get("password", "") if creds else ""
+            self.log(f"[MAC] get_vod_streams: creds type={_ct!r} user={_cu!r} pass={_cp!r} → skipping")
             return self._all_vod_raw
         base = creds["base"]; user = creds["username"]; pas = creds["password"]
         try:
@@ -995,6 +1013,10 @@ class PortalClient:
         self._all_series_raw = []
         creds = await self.parse_xtream_info()
         if not creds or creds.get("type") != "xtream":
+            _ct = creds.get("type") if creds else None
+            _cu = creds.get("username", "") if creds else ""
+            _cp = creds.get("password", "") if creds else ""
+            self.log(f"[MAC] get_series: creds type={_ct!r} user={_cu!r} pass={_cp!r} → skipping")
             return self._all_series_raw
         base = creds["base"]; user = creds["username"]; pas = creds["password"]
         try:
@@ -3266,6 +3288,10 @@ class StalkerPortalClient:
         self._all_vod_raw = []
         creds = await self.parse_xtream_info()
         if not creds or creds.get("type") != "xtream":
+            _ct = creds.get("type") if creds else None
+            _cu = creds.get("username", "") if creds else ""
+            _cp = creds.get("password", "") if creds else ""
+            self.log(f"[MAC] get_vod_streams: creds type={_ct!r} user={_cu!r} pass={_cp!r} → skipping")
             return self._all_vod_raw
         base = creds["base"]; user = creds["username"]; pas = creds["password"]
         headers = self._headers(include_auth=True)
@@ -3329,6 +3355,10 @@ class StalkerPortalClient:
         self._all_series_raw = []
         creds = await self.parse_xtream_info()
         if not creds or creds.get("type") != "xtream":
+            _ct = creds.get("type") if creds else None
+            _cu = creds.get("username", "") if creds else ""
+            _cp = creds.get("password", "") if creds else ""
+            self.log(f"[MAC] get_series: creds type={_ct!r} user={_cu!r} pass={_cp!r} → skipping")
             return self._all_series_raw
         base = creds["base"]; user = creds["username"]; pas = creds["password"]
         headers = self._headers(include_auth=True)
