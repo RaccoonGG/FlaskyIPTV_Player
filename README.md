@@ -522,8 +522,6 @@ All settings are saved in browser localStorage and persist across sessions.
 ## Known Limitations
 
 - MKV download resume (`-ss` seek) can be unreliable on live IPTV streams — ffmpeg may not seek accurately on some stream types
-- Large external EPG files load into RAM in full; very large lists (30k+ channels) will use significant memory
-- Recording and downloading run as background threads — closing the browser tab does not stop them; use the Stop button first
 - AirPlay via `pyatv` bypasses the stream proxy (pyatv does not support custom HTTP headers); auth must be embedded in the resolved stream URL for AirPlay to work
 - Multi-View requires MSE support in the browser — older or restricted WebViews may not support it
 - Each Multi-View tile runs one ffmpeg process; 9 simultaneous tiles = 9 ffmpeg processes. On low-end hardware (e.g. older Android phones) this may be demanding. Use fewer tiles or lower-bitrate channels if you experience performance issues.
@@ -532,5 +530,4 @@ All settings are saved in browser localStorage and persist across sessions.
 - DVR timeshift (watch while recording) transcodes on the fly via ffmpeg — on low-end hardware this may be slow to start or choppy. Timeshift works best on the same machine running the Flask server.
 - If the app is stopped while a recording is in progress, ffmpeg is killed and the partial `.ts` file is kept. On next startup the job is recovered as completed (if the file has content) or error (if the file is empty/missing).
 - Radio station discovery requires internet access to the RadioBrowser API and Shoutcast directory; only the ~30 built-in hardcoded streams work without network access
-- Large M3U radio playlists (e.g. the iptv-org all-radio list at ~20k stations) may take several seconds to load on first access; repeat loads within 24 hours are served from disk cache
 - Stream verification in the radio panel is a lightweight HEAD/GET check — it confirms the server is reachable but does not guarantee the audio stream is free of buffering or quality issues
