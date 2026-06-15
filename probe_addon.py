@@ -612,6 +612,7 @@ _PROBE_UI_JS = r"""
 #si-panel .si-br     { color:#64748b; font-size:9.5px; margin-left:3px; }
 #si-panel .si-abr    { color:#64748b; font-size:9px; margin-left:3px; font-style:italic; }
 #si-panel .si-tx     { color:#fb923c; font-size:9px; margin-left:4px; }
+#si-panel .si-reason { color:#fb923c; font-size:8.5px; opacity:.72; font-style:italic; }
 #si-panel .si-divider{ height:1px; background:rgba(255,255,255,.07); margin:3px 0 2px; }
 
 /* Track selector section */
@@ -1110,6 +1111,40 @@ _PROBE_UI_JS = r"""
     });
   }
 
+  /* ── Transcode reason formatter ────────────────────────────────────── */
+  // Returns a concise, human-readable explanation for the → transcode reason row.
+  function _fmtTranscodeReason(r){
+    r = (r || '').trim();
+    if(!r) return '';
+    // "hevc video (hevc)" / "hevc by extension" / "hevc (ts probe)"
+    if(r.startsWith('hevc'))
+      return 'HEVC \u2192 H.264';
+    // "interlaced video (tt)" / "interlaced video (bb)" etc.
+    if(r.startsWith('interlaced')){
+      const m = r.match(/\(([^)]+)\)/);
+      const fo = m ? ' [' + m[1] + ']' : '';
+      return 'interlaced' + fo + ' \u2192 deinterlace + H.264';
+    }
+    // "incompatible audio (ac3)" / "incompatible audio (ac3) (ts probe)"
+    if(r.startsWith('incompatible audio')){
+      const m = r.match(/incompatible audio \(([^)]+)\)/);
+      const codec = m ? m[1].toUpperCase() : '';
+      return (codec ? codec + ' ' : '') + '\u2192 AAC';
+    }
+    // "audio track selection (track 2)"
+    if(r.startsWith('audio track selection')){
+      const m = r.match(/track (\d+)/);
+      return 'audio track' + (m ? ' ' + m[1] : '') + ' selected';
+    }
+    // "subtitle burn-in (track N)"
+    if(r.startsWith('subtitle burn-in')){
+      const m = r.match(/track (\d+)/);
+      return 'subtitle burn-in' + (m ? ' [track ' + m[1] + ']' : '');
+    }
+    // Fallback: show raw reason, but cap length for panel width
+    return r.length > 38 ? r.slice(0, 36) + '\u2026' : r;
+  }
+
   /* ── Build panel HTML ───────────────────────────────────────────────── */
   function _buildPanel(info){
     let html = '';
@@ -1161,6 +1196,20 @@ _PROBE_UI_JS = r"""
       html += '<div class="si-row"><span class="si-label">A</span>'
             + '<span class="si-codec' + (bad?' si-bad':'') + '">' + info.acodec + '</span>'
             + abr + tx + '</div>';
+    }
+
+    // ── Transcode reason ──────────────────────────────────────────────
+    // Show a concise human-readable explanation for why transcoding was
+    // triggered: "interlaced [tt] → deinterlace + H.264", "HEVC → H.264",
+    // "AC3 → AAC", etc.  Only rendered when a transcode proxy is active.
+    if(info.transcode && info.transcode_reason){
+      const reasonText = _fmtTranscodeReason(info.transcode_reason);
+      if(reasonText){
+        html += '<div class="si-row" style="margin-top:2px">'
+              + '<span class="si-label">\u2699</span>'
+              + '<span class="si-reason">' + reasonText + '</span>'
+              + '</div>';
+      }
     }
 
     // Audio track selector — always shown when track data is present,
