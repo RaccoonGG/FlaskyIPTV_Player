@@ -67,9 +67,13 @@ RADIO_BROWSER_SERVERS: List[str] = [
 ]
 
 # Named M3U playlist sources (visible to the UI via /api/radio/sources)
+# NOTE (June 2026): a former "🌍 iptv-org Radio (all — ~20k stations)" entry
+# pointing at https://iptv-org.github.io/iptv/index.radio.m3u was removed.
+# That path 404s and is NOT part of iptv-org/iptv's published playlist set —
+# verified against their PLAYLISTS.md, which lists category/language/country
+# playlists but has no "Radio" category and no index.radio.m3u anywhere.
+# RadioBrowser (the #1 source above, ~35k stations) already covers this.
 M3U_SOURCES: Dict[str, str] = {
-    "🌍 iptv-org Radio (all — ~20k stations)":
-        "https://iptv-org.github.io/iptv/index.radio.m3u",
     "🎵 iptv-org Music":
         "https://iptv-org.github.io/iptv/categories/music.m3u",
     "📰 iptv-org News":
@@ -79,7 +83,7 @@ M3U_SOURCES: Dict[str, str] = {
     "🇮🇹 Italia (Free-TV)":
         "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlists/playlist_italy.m3u8",
     "🇬🇧 UK (Free-TV)":
-        "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlists/playlist_unitedkingdom.m3u8",
+        "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlists/playlist_uk.m3u8",
     "🇺🇸 USA (Free-TV)":
         "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlists/playlist_usa.m3u8",
     "🇫🇷 France (Free-TV)":
@@ -498,12 +502,15 @@ class RadioBrowserClient:
         )
 
     def trending(self, limit: int = 50) -> List[Dict]:
-        """Stations clicked in the last hour — 'what's hot right now'.
+        """Stations clicked recently — 'what's hot right now'.
 
         Distinct from top_stations() which reflects all-time click totals.
+        Uses RadioBrowser's `stations/lastclick` endpoint (NOT
+        `stations/clicked`, which does not exist and always returns
+        nothing — see https://docs.radio-browser.info/#stations-by-recent-clicks).
         """
         data = self._request(
-            "stations/clicked",
+            "stations/lastclick",
             {"limit": limit, "hidebroken": "true"},
         )
         return [self._normalize(s) for s in data if self._valid(s)]
@@ -1259,8 +1266,8 @@ def register_radio_addon(app: Any) -> Any:
     # Blocks until load completes (max 70 s) — M3U hits disk cache on repeat
     # calls so only the first call per 24 h is slow.
     # `limit` caps the returned list (default 500, max 5000) — large playlists
-    # like iptv-org ~20k are truncated; `total` and `truncated` fields tell
-    # the client how many stations exist overall.
+    # like the Free-TV per-country lists can still be truncated; `total` and
+    # `truncated` fields tell the client how many stations exist overall.
 
     @app.route("/api/radio/load_source", methods=["POST"])
     def radio_load_source():
@@ -1277,7 +1284,10 @@ def register_radio_addon(app: Any) -> Any:
         holder: Dict = {}
 
         def _load():
-            holder["data"] = m3u_ldr.load(name)
+            msgs: List[str] = []
+            holder["data"] = m3u_ldr.load(name, progress_cb=msgs.append)
+            if msgs:
+                holder["last_msg"] = msgs[-1]
 
         t = threading.Thread(target=_load, daemon=True)
         t.start()
@@ -1287,16 +1297,14 @@ def register_radio_addon(app: Any) -> Any:
         total        = len(all_stations)
         stations     = all_stations[:limit]
 
-        if not total:
-            url = M3U_SOURCES.get(name, "")
-            note = (
-                f"No stations parsed from {url}. "
-                "The host may be blocking automated requests (HTTP 403). "
-                "Try again — on success the result is cached for 24 h."
-            )
-        else:
-            note = (f"Showing {len(stations)} of {total} stations."
-                    if total > limit else "")
+        note = _load_source_note(
+            url            = M3U_SOURCES.get(name, ""),
+            total          = total,
+            limit          = limit,
+            stations_shown = len(stations),
+            last_msg       = holder.get("last_msg", ""),
+            still_running  = t.is_alive(),
+        )
 
         _mark_favorites(stations, favs)
         return jsonify({
@@ -1553,6 +1561,61 @@ def _mark_favorites(stations: List[Dict], favs: RadioFavorites) -> None:
             s["_is_favorite"] = favs.contains(s)
         except Exception:
             s["_is_favorite"] = False
+
+
+def _load_source_note(
+    url:            str,
+    total:          int,
+    limit:          int,
+    stations_shown: int,
+    last_msg:       str = "",
+    still_running:  bool = False,
+) -> str:
+    """Build the human-readable `note` field for /api/radio/load_source.
+
+    Pure function (no I/O) so the diagnostic messaging can be unit-tested
+    without spinning up threads or a Flask app.
+
+    - `total > 0`            → normal "Showing X of Y" (or "" if not
+                                truncated).
+    - `still_running`        → background load exceeded the 70 s budget;
+                                tell the user it may still finish & cache.
+    - `last_msg` starts with
+      "Error loading"         → the fallback parser captured a real
+                                exception (status code, network error,
+                                timeout, ...) — surface it verbatim rather
+                                than guessing.
+    - otherwise               → honest generic message. Does NOT assert a
+                                specific HTTP status code we never actually
+                                observed (e.g. previously this always
+                                claimed "HTTP 403", even for a plain 404 or
+                                a network timeout).
+    """
+    if total:
+        return (f"Showing {stations_shown} of {total} stations."
+                if total > limit else "")
+
+    if still_running:
+        return (
+            f"Still loading {url} after 70 s — large playlists can "
+            "take a while on a slow connection. Try again in a "
+            "moment; once it finishes the result is cached for 24 h."
+        )
+
+    if last_msg.startswith("Error loading"):
+        detail = last_msg.split(":", 1)[-1].strip()
+        return (
+            f"No stations parsed from {url}. {detail} "
+            "Try again — on success the result is cached for 24 h."
+        )
+
+    return (
+        f"No stations parsed from {url}. The source returned no "
+        "usable entries — it may be temporarily unreachable, the "
+        "playlist URL may have changed, or the host may be "
+        "rate-limiting automated requests. Try again — on "
+        "success the result is cached for 24 h."
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2392,8 +2455,17 @@ class _RdioViz {
   }
 
   _setLogo(src){
-    if(!src || src === this._logoSrc) return;
-    this._logoSrc = src; this._logoLoaded = false;
+    src = (src || '').trim();
+    if(src === this._logoSrc) return;
+    this._logoSrc = src;
+    if(!src){
+      // This station has no logo — clear any previously-loaded image so
+      // the 📻 fallback renders instead of a stale logo from the last
+      // station that did have one.
+      this._logoImg = null; this._logoLoaded = false;
+      return;
+    }
+    this._logoLoaded = false;
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload  = () => { this._logoImg = img; this._logoLoaded = true; };
