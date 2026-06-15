@@ -348,6 +348,53 @@ def _safe_fname(name: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Watchdog abort helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _abort_all_dvr() -> None:
+    """Kill every active DVR recording and mark jobs completed.
+
+    Called by the DLM watchdog in download_addon.py when the client tab closes
+    or the browser crashes.  Mirrors the per-job logic in dvr_stop_job() but
+    operates on all active recordings at once under a single lock acquisition.
+    """
+    with _active_lock:
+        items = list(_active_recordings.items())
+        _active_recordings.clear()
+
+    if not items:
+        return
+
+    for job_id, proc in items:
+        # Terminate ffmpeg — same escalation used by dvr_stop_job / dvr_cancel_job
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+        # Mark completed so the recording appears in the history / file is kept
+        with _jobs_lock:
+            jobs = _load_jobs()
+            for j in jobs:
+                if j["id"] == job_id:
+                    j["status"] = "completed"
+                    fp = j.get("filePath", "")
+                    if fp and os.path.exists(fp):
+                        try:
+                            j["fileSizeBytes"] = os.path.getsize(fp)
+                        except Exception:
+                            pass
+                    break
+            _save_jobs(jobs)
+
+        LOG.info("[DVR] ⏹ Recording %s aborted (client disconnected)", job_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Route registration
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -385,6 +432,16 @@ def register_dvr_routes(app, state=None) -> None:
     _scheduler_stop.clear()
     _scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True, name="dvr-scheduler")
     _scheduler_thread.start()
+
+    # ── Register lifecycle hooks with the DLM watchdog ────────────────────────
+    # download_addon.py's watchdog checks addon_active_checks every 5 s and
+    # calls addon_abort_hooks when the heartbeat goes stale.
+    # _active_recordings is only non-empty while ffmpeg is actually running,
+    # so scheduled-but-not-yet-started jobs do NOT prevent tab closure.
+    if state is not None and hasattr(state, "addon_active_checks"):
+        state.addon_active_checks.append(lambda: bool(_active_recordings))
+        state.addon_abort_hooks.append(_abort_all_dvr)
+        LOG.info("[DVR] Lifecycle hooks registered with DLM watchdog")
 
     # ── POST /api/dvr/set_folder  (persist DVR output folder) ─────────────────
     @app.route("/api/dvr/set_folder", methods=["POST"])
