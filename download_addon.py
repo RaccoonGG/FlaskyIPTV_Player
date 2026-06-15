@@ -542,6 +542,7 @@ def register_download_routes(flask_app, state, run_async, run_worker, _make_clie
             state.log("DONE.")
 
         run_worker(worker())
+        state.last_client_heartbeat = time.time()  # watchdog: fresh grace on job start
         return jsonify({"ok": True, "message": f"Download started → {out_path}"})
 
     # ── /api/download/mkv ─────────────────────────────────────────────────────
@@ -834,6 +835,7 @@ def register_download_routes(flask_app, state, run_async, run_worker, _make_clie
             state.log("DONE.")
 
         run_worker(worker())
+        state.last_client_heartbeat = time.time()  # watchdog: fresh grace on job start
         return jsonify({"ok": True, "message": f"MKV download started → {out_dir}"})
 
     # ── /api/record/start ─────────────────────────────────────────────────────
@@ -878,6 +880,7 @@ def register_download_routes(flask_app, state, run_async, run_worker, _make_clie
         _rec_jid = str(uuid.uuid4())
         state.record_job_id = _rec_jid
         _dlm_add_job(_rec_jid, "recording", stream_name, out_path, state.record_start_time)
+        state.last_client_heartbeat = time.time()  # watchdog: fresh grace on job start
         return jsonify({"ok": True, "file": out_path, "filename": fname})
 
     # ── /api/record/stop ──────────────────────────────────────────────────────
@@ -1713,10 +1716,21 @@ document.getElementById('dlm-overlay').addEventListener('click', e=>{
       .catch(function(){}); // swallow — network errors are harmless here
   }
 
-  // Fire once immediately so _flaskyActive is populated before user could
-  // trigger beforeunload (otherwise the first 5 s window is blind).
+  // Fire once immediately so _flaskyActive is populated and last_client_heartbeat
+  // is refreshed regardless of idle state (handles already-running jobs on load).
   _heartbeat();
-  setInterval(_heartbeat, 5000);
+
+  // Thereafter only fire while active jobs exist — avoids log spam on the server
+  // console when the user is simply watching without recording or downloading.
+  // _flaskyActive is updated by each response so it remains accurate.
+  // Server-side: job-start routes reset last_client_heartbeat, so the watchdog
+  // grace starts fresh even if heartbeats were paused during idle.
+  setInterval(function(){
+    var recActive = (typeof isRec !== 'undefined' && isRec) || _flaskyActive.recording;
+    var dvrActive = typeof _dvrJobs !== 'undefined' && _dvrJobs.length > 0;
+    var dlActive  = _dlmActive.length > 0 || _flaskyActive.downloading;
+    if(recActive || dvrActive || dlActive){ _heartbeat(); }
+  }, 5000);
 
   // ── beforeunload confirmation ──────────────────────────────────────────
   // Shows the browser's native "Leave site?" dialog when anything is active.
