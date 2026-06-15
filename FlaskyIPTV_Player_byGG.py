@@ -274,7 +274,19 @@ class AppState:
         # api_connect() when connecting to MAC/Stalker/Xtream portals; None for
         # pure M3U connections.  Torn down and recreated on each reconnect.
         self.portal_mgr: Optional[PortalSessionManager] = None
-        
+        # ── Lifecycle heartbeat ────────────────────────────────────────────
+        # Updated by POST /api/heartbeat from the frontend every 5 s.
+        # The DLM watchdog uses this to abort active recordings/downloads
+        # when the client tab closes or the browser crashes.
+        # Initialised to now so the watchdog never fires on startup.
+        self.last_client_heartbeat: float = time.time()
+        # ── Addon lifecycle hooks ──────────────────────────────────────────
+        # Any addon appends callables here to participate in lifecycle mgmt.
+        # addon_active_checks: list[() -> bool]  — True when addon has active jobs
+        # addon_abort_hooks:   list[() -> None]  — called to kill addon procs
+        self.addon_active_checks: list = []
+        self.addon_abort_hooks:   list = []
+
     def log(self, msg: str):
         try:
             self.log_queue.put_nowait(str(msg).rstrip())
