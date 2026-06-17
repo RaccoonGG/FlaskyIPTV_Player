@@ -2394,8 +2394,9 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 #np{font-size:14px;font-weight:600;color:var(--txt);overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap;margin-bottom:2px}
 #pu{font-size:11px;color:var(--acc);overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap;cursor:pointer;transition:var(--tr)}
-#pu:hover{color:var(--cyan)}
+  white-space:nowrap;cursor:pointer;transition:var(--tr);
+  filter:blur(4px);-webkit-filter:blur(4px)}
+#pu:hover,#pu:active,#pu.pu-reveal{color:var(--cyan);filter:blur(0);-webkit-filter:blur(0)}
 
 .pctrl{background:var(--s2);padding:8px 14px;display:flex;flex-direction:row;
   align-items:flex-start;gap:10px;flex-shrink:0;border-bottom:1px solid var(--bdr)}
@@ -3386,7 +3387,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <div id="pctrl-body" style="overflow:hidden;transition:max-height .25s ease;max-height:0">
         <div class="pinfo">
           <div id="np">No stream loaded</div>
-          <div id="pu" onclick="cpyUrl()" title="Tap to copy stream URL">—</div>
+          <div id="pu" onclick="cpyUrl()" title="Hover or hold to reveal • tap to copy stream URL">—</div>
         </div>
         <div class="pctrl">
           <div style="display:flex;flex-direction:column;gap:4px;align-self:flex-start;flex-shrink:0" class="pctrl-desktop-only">
@@ -7735,6 +7736,32 @@ document.addEventListener('DOMContentLoaded',()=>{
   // Player controls expanded by default
   const pc = document.getElementById('pctrl-panel');
   if(pc) pc.classList.add('expanded');
+
+  // ── Stream URL privacy blur ────────────────────────────────────────────
+  // #pu (the resolved stream URL under the now-playing title) is blurred by
+  // default so it isn't readable at a glance — handy when screen-sharing or
+  // streaming. Desktop reveals it via plain CSS :hover (and :active covers
+  // most mobile browsers too). This listener pair is a robust fallback/
+  // primary path for touch devices: press-and-hold reveals immediately, and
+  // a short grace period after lifting the finger keeps it legible for a
+  // beat instead of snapping back to blur the instant contact ends. The
+  // existing onclick="cpyUrl()" copy-to-clipboard behavior is untouched —
+  // a tap still copies, it just also gets a brief reveal around the copy.
+  const puEl = document.getElementById('pu');
+  if(puEl){
+    let _puHideT = null;
+    const _puReveal = () => {
+      if(_puHideT){ clearTimeout(_puHideT); _puHideT = null; }
+      puEl.classList.add('pu-reveal');
+    };
+    const _puHide = (delay) => {
+      if(_puHideT) clearTimeout(_puHideT);
+      _puHideT = setTimeout(()=>{ puEl.classList.remove('pu-reveal'); _puHideT = null; }, delay);
+    };
+    puEl.addEventListener('touchstart', _puReveal, {passive:true});
+    puEl.addEventListener('touchend',    ()=>_puHide(700), {passive:true});
+    puEl.addEventListener('touchcancel', ()=>_puHide(0),   {passive:true});
+  }
   try{const sv=localStorage.getItem('mkv_folder');
     if(sv) document.getElementById('o-dir').value=sv;
     else document.getElementById('o-dir').value='/sdcard/Download/';}catch(e){}
