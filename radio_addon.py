@@ -382,24 +382,42 @@ class RadioBrowserClient:
 
     @staticmethod
     def _normalize(raw: Dict) -> Dict:
-        url = (raw.get("url_resolved") or raw.get("url") or "").strip()
+        url      = (raw.get("url_resolved") or raw.get("url") or "").strip()
+        homepage = raw.get("homepage", "").strip()
+        # Derive a favicon-service fallback from the station's homepage URL.
+        # DuckDuckGo's icon service requires only the bare host name, is free,
+        # doesn't need auth, and doesn't log personal data. The favicon is only
+        # fetched if the primary logo (RadioBrowser's `favicon` field) fails to
+        # load, so there's no extra network cost for stations that already have
+        # a good logo.
+        icon_fallback = ""
+        if homepage:
+            try:
+                from urllib.parse import urlparse as _up
+                host = _up(homepage).hostname or ""
+                if host:
+                    icon_fallback = f"https://icons.duckduckgo.com/ip3/{host}.ico"
+            except Exception:
+                pass
         return {
-            "name":        raw.get("name", "").strip(),
-            "url":         url,
-            "url_resolved":raw.get("url_resolved", "").strip() or url,
-            "logo":        raw.get("favicon", "").strip(),
-            "bitrate":     raw.get("bitrate", 0),
-            "codec":       raw.get("codec", ""),
-            "countrycode": raw.get("countrycode", "").upper(),
-            "country":     raw.get("country", ""),
-            "language":    raw.get("language", ""),
-            "tags":        raw.get("tags", ""),
-            "votes":       raw.get("votes", 0),
-            "clickcount":  raw.get("clickcount", 0),
-            "stationuuid": raw.get("stationuuid", ""),
-            "lastcheckok": raw.get("lastcheckok", 0),
-            "source":      "radiobrowser",
-            "_relevance":  0.0,
+            "name":          raw.get("name", "").strip(),
+            "url":           url,
+            "url_resolved":  raw.get("url_resolved", "").strip() or url,
+            "logo":          raw.get("favicon", "").strip(),
+            "icon_fallback": icon_fallback,
+            "homepage":      homepage,
+            "bitrate":       raw.get("bitrate", 0),
+            "codec":         raw.get("codec", ""),
+            "countrycode":   raw.get("countrycode", "").upper(),
+            "country":       raw.get("country", ""),
+            "language":      raw.get("language", ""),
+            "tags":          raw.get("tags", ""),
+            "votes":         raw.get("votes", 0),
+            "clickcount":    raw.get("clickcount", 0),
+            "stationuuid":   raw.get("stationuuid", ""),
+            "lastcheckok":   raw.get("lastcheckok", 0),
+            "source":        "radiobrowser",
+            "_relevance":    0.0,
         }
 
     @staticmethod
@@ -1664,6 +1682,15 @@ let _curTab       = 'search';
 let _favs         = [];
 let _ctriesLoaded = false;
 let _curRadioUrl  = '';      // URL of currently playing radio station
+// Full station info object (logo, icon_fallback, tags, bitrate, name,
+// countrycode, stationuuid, ...) for whatever _curRadioUrl points at —
+// the exact object passed to radioPlayStation()'s `st`. Kept alongside
+// _curRadioUrl (set/cleared together) so the visualizer toggle's
+// re-enable path can restart with the COMPLETE original info instead of
+// reconstructing a partial approximation from the favorites list (which
+// silently lost the logo/tags/bitrate for any non-favorited station —
+// see _rdioVizToggle below).
+let _curRadioInfo = null;
 let _rdioNpTimer  = null;    // setInterval handle for now-playing polling
 let _rdioLastNp   = '';      // last known StreamTitle from ICY stream
 
@@ -1914,16 +1941,23 @@ async function _loadHistory(){
       const name = _esc(s.name || 'Unknown Station');
       const cc   = (s.countrycode || '').toUpperCase();
       const rel  = _esc(_rdioRelTime(s._played_at || ''));
-      const logo = (s.logo || '').trim();
+      const logo     = (s.logo          || '').trim();
+      const iconFb   = (s.icon_fallback || '').trim();
       const uuid = s.stationuuid || '';
       const fav  = _isFav(url, uuid);
+      // Logo chain: primary logo → homepage favicon → 📻
       const logoH = logo
         ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(logo)}"
-             onerror="this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'">`
-        : `<div class="rdio-item-logo" style="font-size:18px">📻</div>`;
+             onerror="${iconFb
+               ? `"this.src='${_esc(iconFb)}';this.onerror=function(){this.outerHTML='<div class=rdio-item-logo style=\\\\'font-size:18px\\\\'>📻</div>'}"`
+               : `"this.outerHTML='<div class=rdio-item-logo style=\\\\'font-size:18px\\\\'>📻</div>'"` }>">`
+        : iconFb
+          ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(iconFb)}"
+               onerror="this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'">`
+          : `<div class="rdio-item-logo" style="font-size:18px">📻</div>`;
       const stEnc  = encodeURIComponent(JSON.stringify({
         name:s.name||'Unknown',url,url_resolved:s.url_resolved||url,
-        logo,countrycode:cc,tags:s.tags||'',bitrate:s.bitrate||0,stationuuid:uuid}));
+        logo,icon_fallback:iconFb,countrycode:cc,tags:s.tags||'',bitrate:s.bitrate||0,stationuuid:uuid}));
       const urlEnc  = encodeURIComponent(url);
       const uuidEnc = encodeURIComponent(uuid);
       h += `<li class="rdio-item">
@@ -2041,7 +2075,8 @@ function _rdioNpStart(url){
 }
 
 function _rdioNpStop(){
-  _curRadioUrl = '';
+  _curRadioUrl  = '';
+  _curRadioInfo = null;
   _rdioLastNp  = '';
   if(_rdioNpTimer){ clearInterval(_rdioNpTimer); _rdioNpTimer = null; }
   _rdioNpBarShow('');
@@ -2145,20 +2180,26 @@ function _renderList(stations, queryOrLabel, showBack){
     const tags = (s.tags || '').split(',').slice(0,2).map(t=>t.trim()).filter(Boolean).join(' · ');
     const br   = s.bitrate ? s.bitrate + ' kbps' : '';
     const meta = [cc, tags, br].filter(Boolean).join('  ·  ');
-    const logo = (s.logo || '').trim();
-    const uuid = s.stationuuid || '';
-    const fav  = _isFav(url, uuid);
+    const logo   = (s.logo          || '').trim();
+    const iconFb = (s.icon_fallback || '').trim();
+    const uuid  = s.stationuuid || '';
+    const fav   = _isFav(url, uuid);
 
-    // Logo or placeholder emoji
+    // Logo chain: primary logo → homepage favicon → 📻
     const logoH = logo
       ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(logo)}"
-           onerror="this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'">`
-      : `<div class="rdio-item-logo" style="font-size:18px">📻</div>`;
+           onerror="${iconFb
+             ? `"this.src='${_esc(iconFb)}';this.onerror=function(){this.outerHTML='<div class=rdio-item-logo style=\\\\'font-size:18px\\\\'>📻</div>'}"`
+             : `"this.outerHTML='<div class=rdio-item-logo style=\\\\'font-size:18px\\\\'>📻</div>'"` }>">`
+      : iconFb
+        ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(iconFb)}"
+             onerror="this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'">`
+        : `<div class="rdio-item-logo" style="font-size:18px">📻</div>`;
 
     // Encode station data for fav callback without inline JSON
     const stEnc = encodeURIComponent(JSON.stringify({
       name: s.name || 'Unknown', url, url_resolved: s.url_resolved || url,
-      logo, countrycode: cc, tags: s.tags || '',
+      logo, icon_fallback: iconFb, countrycode: cc, tags: s.tags || '',
       bitrate: s.bitrate || 0, stationuuid: uuid,
     }));
     const urlEnc  = encodeURIComponent(url);
@@ -2187,6 +2228,7 @@ window.radioPlayStation = function(urlEnc, stEnc){
   let st = {name: url, url};
   if(stEnc){ try{ st = JSON.parse(decodeURIComponent(stEnc)); }catch(e){} }
   st.url = url;   // always trust the passed URL
+  _curRadioInfo = st;   // remember the FULL info for _rdioVizToggle's re-enable path
   radioClose();
   _rdioVizStart(st);
 
@@ -2306,13 +2348,38 @@ class _RdioViz {
     this._source    = null;   this._audioOk   = false;
     this._info      = {};     this._dpr        = 1;
     this._simT      = 0;
+    this._freqBuf   = new Uint8Array(256);   // reused every frame
     this._particles = this._mkParticles();
-    this._logoImg   = null;   this._logoLoaded = false;
-    this._logoSrc   = '';
+    this._particleSprites = this._mkParticleSprites();
+    this._logoImg   = null;   this._logoLoaded  = false;
+    this._logoSrc   = '';     this._logoFallback = '';
+    this._logoGen   = 0;
+    // Snapshot of <video id="vid">'s style.display from just before we
+    // hid it in start() (see start()/stop() and the comment there for why
+    // we hide the video element outright rather than composite its live
+    // frames into the circle).
+    this._vidPrevDisplay = null;
+    // Cached, resize-only gradient for the bottom info scrim (L8)
+    this._scrimGrad = null;   this._scrimH      = 0;
     // Layout tracking
     this._lastRect  = null;
     // Modal observer
     this._modalObs  = null;
+    // True while _loop() has stopped scheduling frames because the canvas
+    // is visibility:hidden behind another modal. Resumed by _startModalObs().
+    this._paused    = false;
+    // Frame-rate throttle: cap actual _draw() calls to ~30fps regardless
+    // of the display's native refresh rate. requestAnimationFrame still
+    // fires at 60/120/144Hz, but _loop() skips the draw on ticks that
+    // arrive sooner than _frameInterval ms after the last one — canvas
+    // work (gradients, particle sprites, bar strokes) costs the same
+    // per call whether invoked at 30fps or 60fps, and this ambient
+    // background visualizer doesn't need 60 to read as smooth, so this
+    // roughly halves total canvas-rendering CPU. -Infinity guarantees
+    // the very first frame after start() always draws immediately
+    // rather than waiting out a full interval first.
+    this._frameInterval = 1000 / 30;
+    this._lastDrawTs     = -Infinity;
     // Window resize (canvas pixel dimensions)
     this._onResize  = null;
   }
@@ -2323,9 +2390,36 @@ class _RdioViz {
     this._info = info || {};
     this._ensureCanvas();
     if(!this._canvas) return;
-    this._setLogo(this._info.logo || '');
+    const logo     = (this._info.logo || '').trim();
+    const fallback = (this._info.icon_fallback || '').trim();
+    this._setLogo(logo || fallback, logo ? fallback : '');
     this._canvas.style.cssText += ';display:block;visibility:visible';
     this._lastRect = null;          // force initial position update
+    this._paused    = false;
+    this._lastDrawTs = -Infinity;   // always draw the first frame immediately
+    // Hide the underlying <video> element while the visualizer is showing.
+    // Some radio stations (e.g. a station that pushes its logo as a
+    // baked-in HLS video feed) carry a real video track, which the
+    // browser keeps decoding for paint as long as the element is visible
+    // — even though our opaque canvas sits on top and nothing of it is
+    // ever actually seen. display:none lets the browser skip that
+    // decode-for-paint work entirely (audio is untouched: the
+    // MediaElementSourceNode taps the element's audio output independent
+    // of its CSS display state). We previously tried compositing the
+    // live video frame INTO the circle instead — that made things worse,
+    // not better: drawImage(videoElement) every frame bypasses the
+    // browser's cheap hardware video-compositor path, forcing a software
+    // readback+recomposite at 60fps on top of the decode that was
+    // already happening (measured: ~70% CPU for decode alone, ~99% with
+    // that compositing added). Snapshot the prior display value so we
+    // can restore it exactly in stop() — the same <video> element is
+    // shared with normal (non-radio) channel playback elsewhere in the
+    // app, which needs it visible again afterward.
+    const vidEl = document.getElementById('vid');
+    if(vidEl){
+      if(this._vidPrevDisplay === null) this._vidPrevDisplay = vidEl.style.display;
+      vidEl.style.display = 'none';
+    }
     this._resize();
     this._setupAudio();
     this._running   = true;
@@ -2340,6 +2434,13 @@ class _RdioViz {
     if(this._animId){ cancelAnimationFrame(this._animId); this._animId = null; }
     if(this._onResize){ window.removeEventListener('resize', this._onResize); this._onResize = null; }
     this._stopModalObs();
+    // Restore the video element to whatever display value it had before
+    // start() hid it (see start()'s comment for why we hide it at all).
+    if(this._vidPrevDisplay !== null){
+      const vidEl = document.getElementById('vid');
+      if(vidEl) vidEl.style.display = this._vidPrevDisplay;
+      this._vidPrevDisplay = null;
+    }
     if(this._canvas) this._canvas.style.display = 'none';
   }
 
@@ -2371,7 +2472,10 @@ class _RdioViz {
   // Called from _draw() every frame (position) and _resize() (dimensions).
   _applyRect(r){
     if(!this._canvas || !r || !r.width || !r.height) return;
-    const dpr  = window.devicePixelRatio || 1;
+    // Cap the backing-store resolution at 2x — on 3x phones this cuts the
+    // pixel count (and every fill/gradient/arc's cost) to ~4/9, with no
+    // visible loss for a soft/glow-heavy visualizer.
+    const dpr  = Math.min(window.devicePixelRatio || 1, 2);
     this._dpr  = dpr;
     const c    = this._canvas;
     // CSS position (cheap, no canvas buffer change)
@@ -2395,15 +2499,6 @@ class _RdioViz {
     }
   }
 
-  // Called by _rdioVizStart() after stream has had time to decode
-  checkVideoContent(){
-    const vid = document.getElementById('vid');
-    if(!vid || !this._canvas) return;
-    // >=120x60: Chrome audio-player UI can report small non-zero dims
-    if(vid.videoWidth >= 120 && vid.videoHeight >= 60)
-      this._canvas.style.display = 'none';
-  }
-
   // ── modal observer ───────────────────────────────────────────────
   // Hides canvas (visibility:hidden) when any modal is open so modals
   // always appear above the canvas regardless of GPU layer order.
@@ -2420,8 +2515,18 @@ class _RdioViz {
       const styleOpen = ['item-menu','profile-modal']
         .some(id => { const el = document.getElementById(id);
                       return el && el.style.display && el.style.display !== 'none'; });
-      const vis = (classOpen || styleOpen) ? 'hidden' : 'visible';
-      if(this._canvas.style.visibility !== vis) this._canvas.style.visibility = vis;
+      const hidden = classOpen || styleOpen;
+      this._canvas.style.visibility = hidden ? 'hidden' : 'visible';
+      // Pause the RAF loop while the canvas is invisible — zero GPU/CPU cost
+      // while another modal is open. Resume it (with a fresh RAF to avoid
+      // double-starting) when the canvas becomes visible again.
+      if(hidden && !this._paused){
+        this._paused = true;
+        if(this._animId){ cancelAnimationFrame(this._animId); this._animId = null; }
+      } else if(!hidden && this._paused && this._running){
+        this._paused = false;
+        this._loop();   // kick the loop back off
+      }
     };
     this._modalObs = new MutationObserver(update);
     ['pl-overlay','vf-overlay','radio-overlay','vod-expand-overlay','vod-expand-detail']
@@ -2439,6 +2544,7 @@ class _RdioViz {
   _stopModalObs(){
     if(this._modalObs){ this._modalObs.disconnect(); this._modalObs = null; }
     if(this._canvas) this._canvas.style.visibility = 'visible';
+    this._paused = false;
   }
 
   // ── audio ────────────────────────────────────────────────────────
@@ -2466,23 +2572,63 @@ class _RdioViz {
     }catch(e){ this._audioOk = false; }
   }
 
-  _setLogo(src){
-    src = (src || '').trim();
-    if(src === this._logoSrc) return;
-    this._logoSrc = src;
-    if(!src){
-      // This station has no logo — clear any previously-loaded image so
-      // the 📻 fallback renders instead of a stale logo from the last
-      // station that did have one.
+  _setLogo(src, fallback){
+    src      = (src      || '').trim();
+    fallback = (fallback || '').trim();
+    if(src === this._logoSrc && fallback === this._logoFallback) return;
+    this._logoSrc      = src;
+    this._logoFallback = fallback;
+    // Increment generation so any in-flight async callback from a previous
+    // call is recognised as stale and discarded.
+    const gen = ++this._logoGen;
+    if(!src && !fallback){
       this._logoImg = null; this._logoLoaded = false;
       return;
     }
     this._logoLoaded = false;
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload  = () => { this._logoImg = img; this._logoLoaded = true; };
-    img.onerror = () => { this._logoImg = null; this._logoLoaded = false; };
-    img.src = src;
+    const self = this;
+    function tryLoad(url, nextUrl){
+      const img = new Image();
+      // NOTE: deliberately NOT setting img.crossOrigin. This canvas never
+      // calls getImageData/toDataURL/toBlob, so a CORS-clean (untainted)
+      // image is never required — only drawImage(), which works fine for
+      // cross-origin images regardless of CORS headers. Setting
+      // crossOrigin='anonymous' here previously forced the browser to
+      // require an Access-Control-Allow-Origin header from the image
+      // server, and most small radio-station sites (and the DuckDuckGo
+      // icon-fallback service) don't send one — so the load failed
+      // outright instead of just losing pixel-read access. That's why
+      // logos that displayed fine in the station list (whose <img> tags
+      // never set crossOrigin) were failing here specifically.
+      img.onload = () => {
+        if(gen !== self._logoGen) return;   // stale — newer call won
+        self._logoImg = img; self._logoLoaded = true;
+      };
+      img.onerror = () => {
+        if(gen !== self._logoGen) return;
+        if(nextUrl){ tryLoad(nextUrl, ''); return; }
+        self._logoImg = null; self._logoLoaded = false;
+      };
+      img.src = url;
+    }
+    tryLoad(src || fallback, src ? fallback : '');
+  }
+
+  _mkParticleSprites(){
+    // Pre-render one offscreen canvas per color group so the blur is computed
+    // once at startup, not once-per-particle every frame (~36 shadowBlur passes
+    // eliminated). Each sprite is a 20x20 canvas holding a soft glowing disc.
+    const C = [['#7c3aed','#a855f7'],['#06b6d4','#22d3ee'],['#22c55e','#4ade80']];
+    return C.map(([fill, glow]) => {
+      const sz = 20, r = sz/2;
+      const oc = document.createElement('canvas');
+      oc.width = oc.height = sz;
+      const ox = oc.getContext('2d');
+      ox.shadowColor = glow; ox.shadowBlur = 7;
+      ox.fillStyle   = fill;
+      ox.beginPath(); ox.arc(r, r, r*0.52, 0, Math.PI*2); ox.fill();
+      return oc;
+    });
   }
 
   _mkParticles(){
@@ -2493,22 +2639,57 @@ class _RdioViz {
       vx:(Math.random() - 0.5) * 0.00022,
       vy:-(0.00007 + Math.random() * 0.00017),
       a: 0.12 + Math.random() * 0.34,
+      ci: Math.floor(Math.random()*3),      // index into sprite/color array
       clr: C[Math.floor(Math.random()*3)],
     }));
   }
 
+  // ── center-circle image compositing ─────────────────────────────
+  // Draws `source` (an <img> or <video> element) into a circle of radius
+  // `r` centered at (cx, cy), cropping a centered square out of the
+  // source first (CSS object-fit:cover semantics) so non-square sources
+  // — a wide logo banner, a 16:9 video frame — fill the circle without
+  // being squished by a naive stretch-to-fit.
+  _drawCoverImage(ctx, source, srcW, srcH, cx, cy, r){
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.clip();
+    if(!srcW || !srcH){
+      // Defensive fallback: unknown source dimensions — stretch rather
+      // than throw/divide-by-zero. Shouldn't normally happen (img.onload
+      // and a "videoWidth>0" check both guarantee real dimensions).
+      ctx.drawImage(source, cx-r, cy-r, r*2, r*2);
+      ctx.restore();
+      return;
+    }
+    const side = Math.min(srcW, srcH);
+    const sx   = (srcW - side) / 2;
+    const sy   = (srcH - side) / 2;
+    ctx.drawImage(source, sx, sy, side, side, cx-r, cy-r, r*2, r*2);
+    ctx.restore();
+  }
+
   // ── animation loop ───────────────────────────────────────────────
 
-  _loop(){
-    if(!this._running) return;
-    this._animId = requestAnimationFrame(() => this._loop());
+  _loop(now){
+    if(!this._running || this._paused) return;
+    this._animId = requestAnimationFrame((ts) => this._loop(ts));
+    // Throttle to ~30fps (see constructor comment). If `now` is
+    // undefined (no timestamp supplied — e.g. start()'s own initial
+    // kick-off call, or the modal-resume path), `now - this._lastDrawTs`
+    // is NaN, and NaN < anything is always false — so the skip never
+    // triggers and this draws immediately, which is exactly what we
+    // want right after (re)starting. We deliberately do NOT record
+    // `undefined` into _lastDrawTs in that case — doing so would poison
+    // the NEXT call's comparison too (undefined - x is also NaN),
+    // letting an extra frame or two slip through unthrottled before a
+    // real timestamp ever seeds the window.
+    if((now - this._lastDrawTs) < this._frameInterval) return;
+    if(now !== undefined) this._lastDrawTs = now;
     this._draw();
   }
 
   _draw(){
     // ── Per-frame layout tracking ────────────────────────────────────
-    // getBoundingClientRect() is ~0.01 ms; doing it every frame is negligible
-    // but catches every layout shift: cpanel transitions, sidebar changes, etc.
     const vwrap = document.getElementById('vwrap');
     if(vwrap){
       const r  = vwrap.getBoundingClientRect();
@@ -2517,6 +2698,7 @@ class _RdioViz {
         if(!lr || r.left!==lr.left || r.top!==lr.top || r.width!==lr.width || r.height!==lr.height){
           this._lastRect = {left:r.left, top:r.top, width:r.width, height:r.height};
           this._applyRect(r);
+          this._scrimGrad = null;  // invalidate cached scrim on resize
         }
       }
     }
@@ -2532,11 +2714,21 @@ class _RdioViz {
     const t    = Date.now() / 1000;
     const freq = this._getFreq();
     const N    = freq.length;
-    const avgAmp  = freq.reduce((s,v) => s+v, 0) / N / 255;
-    const bEnd    = Math.floor(N * 0.12);
-    const mEnd    = Math.floor(N * 0.45);
-    const bassAmp = freq.slice(0, bEnd).reduce((s,v) => s+v, 0) / bEnd / 255;
-    const midAmp  = freq.slice(bEnd, mEnd).reduce((s,v) => s+v, 0) / (mEnd-bEnd) / 255;
+
+    // ── Band energy — single-pass, zero allocations ──────────────────
+    const bEnd = Math.floor(N * 0.12);
+    const mEnd = Math.floor(N * 0.45);
+    let sumAll = 0, sumBass = 0, sumMid = 0;
+    for(let i=0; i<N; i++){
+      const v = freq[i];
+      sumAll += v;
+      if(i < bEnd)      sumBass += v;
+      else if(i < mEnd) sumMid  += v;
+    }
+    const avgAmp  = sumAll  / N / 255;
+    const bassAmp = sumBass / bEnd / 255;
+    const midAmp  = sumMid  / (mEnd - bEnd) / 255;
+
     const cx = W/2, cy = H/2;
     const innerR = Math.min(W,H) * 0.13;
     const maxBar = Math.min(W,H) * 0.27;
@@ -2564,26 +2756,34 @@ class _RdioViz {
     for(let y=(t*3)%gs-gs; y<H+gs; y+=gs){ ctx.moveTo(0,y); ctx.lineTo(W,y); }
     ctx.stroke();
 
-    // L3: 128-bar radial spectrum
-    const numBars = 128, rot = t * 0.13;
-    ctx.lineCap = 'round';
-    for(let i=0; i<numBars; i++){
-      const angle  = (i/numBars)*Math.PI*2 - Math.PI/2 + rot;
-      const amp    = freq[Math.floor((i/numBars)*N*0.68)] / 255;
-      const barLen = innerR*0.08 + amp*maxBar;
-      const frac   = i/numBars;
-      let r,g,b;
-      if(frac<0.34){ const p=frac/0.34; r=Math.round(124+p*(6-124)); g=Math.round(58+p*(182-58));   b=Math.round(237+p*(212-237)); }
-      else if(frac<0.67){ const p=(frac-0.34)/0.33; r=Math.round(6+p*(34-6));   g=Math.round(182+p*(197-182)); b=Math.round(212+p*(94-212)); }
-      else{ const p=(frac-0.67)/0.33; r=Math.round(34+p*(124-34)); g=Math.round(197+p*(58-197)); b=Math.round(94+p*(237-94)); }
-      const alpha = 0.42 + amp*0.58;
-      const x1=cx+Math.cos(angle)*innerR,          y1=cy+Math.sin(angle)*innerR;
-      const x2=cx+Math.cos(angle)*(innerR+barLen),  y2=cy+Math.sin(angle)*(innerR+barLen);
-      const bg = ctx.createLinearGradient(x1,y1,x2,y2);
-      bg.addColorStop(0, `rgba(${r},${g},${b},${alpha.toFixed(2)})`);
-      bg.addColorStop(1, `rgba(${r},${g},${b},0)`);
-      ctx.strokeStyle = bg; ctx.lineWidth = 2.4;
-      ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+    // L3: radial spectrum — 96 bars, batched into 3 colour-segment paths
+    //     (was 128 individual gradient+stroke calls → now 3 stroke calls)
+    {
+      const numBars = 96, rot = t * 0.13;
+      const seg0 = Math.floor(numBars * 0.34);
+      const seg1 = Math.floor(numBars * 0.67);
+      const alpha = (0.42 + avgAmp * 0.40).toFixed(2);
+      // [startIdx, count, r, g, b]
+      const zones = [
+        [0,        seg0,             124, 58,  237],
+        [seg0,     seg1 - seg0,      6,   182, 212],
+        [seg1,     numBars - seg1,   34,  197, 94 ],
+      ];
+      ctx.lineCap = 'round'; ctx.lineWidth = 2.4;
+      for(const [start, count, r, g, b] of zones){
+        ctx.strokeStyle = `rgba(${r},${g},${b},${alpha})`;
+        ctx.beginPath();
+        for(let k=0; k<count; k++){
+          const i     = start + k;
+          const angle = (i/numBars)*Math.PI*2 - Math.PI/2 + rot;
+          const amp   = freq[Math.floor((i/numBars)*N*0.68)] / 255;
+          const len   = innerR*0.08 + amp*maxBar;
+          const ca = Math.cos(angle), sa = Math.sin(angle);
+          ctx.moveTo(cx + ca*innerR,       cy + sa*innerR);
+          ctx.lineTo(cx + ca*(innerR+len), cy + sa*(innerR+len));
+        }
+        ctx.stroke();
+      }
     }
 
     // L4: inner bass ring
@@ -2604,11 +2804,9 @@ class _RdioViz {
     ctx.fillStyle = '#060612';
     ctx.beginPath(); ctx.arc(cx, cy, innerR*0.98, 0, Math.PI*2); ctx.fill();
     if(this._logoLoaded && this._logoImg){
-      const lr = innerR * 0.84;
-      ctx.save();
-      ctx.beginPath(); ctx.arc(cx, cy, lr, 0, Math.PI*2); ctx.clip();
-      ctx.drawImage(this._logoImg, cx-lr, cy-lr, lr*2, lr*2);
-      ctx.restore();
+      const iw = this._logoImg.naturalWidth  || this._logoImg.width  || 0;
+      const ih = this._logoImg.naturalHeight || this._logoImg.height || 0;
+      this._drawCoverImage(ctx, this._logoImg, iw, ih, cx, cy, innerR*0.84);
     } else {
       const es = Math.round(innerR * 0.78);
       ctx.font = es + 'px serif';
@@ -2618,19 +2816,20 @@ class _RdioViz {
       ctx.globalAlpha = 1;
     }
 
-    // L7: particles
+    // L7: particles — pre-rendered glow sprites (no per-particle shadowBlur)
+    const sprites = this._particleSprites;
+    const spSz    = 20;
     for(const p of this._particles){
       p.x += p.vx + (Math.random()-0.5)*0.00014;
       p.y += p.vy * (1 + bassAmp*2.4);
       if(p.y < -0.04){ p.y = 1.04; p.x = Math.random(); }
+      const sz = p.r * (1 + bassAmp*1.9) * 2.4;
       ctx.globalAlpha = p.a * (0.5 + avgAmp*0.55);
-      ctx.shadowColor = p.clr[1]; ctx.shadowBlur = 5;
-      ctx.fillStyle   = p.clr[0];
-      ctx.beginPath(); ctx.arc(p.x*W, p.y*H, p.r*(1+bassAmp*1.9), 0, Math.PI*2); ctx.fill();
+      ctx.drawImage(sprites[p.ci], p.x*W - sz/2, p.y*H - sz/2, sz, sz);
     }
-    ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
 
-    // L8: bottom station info scrim
+    // L8: bottom station info scrim — gradient cached, rebuilt only on resize
     const name = (this._info.name    || '').trim();
     const cc   = (this._info.countrycode || '').toUpperCase();
     const tags = (this._info.tags    || '').split(',').slice(0,3).map(s=>s.trim()).filter(Boolean).join(' \u00B7 ');
@@ -2638,9 +2837,13 @@ class _RdioViz {
     const sub  = [cc, tags, br].filter(Boolean).join('  \u00B7  ');
     if(name || sub){
       const sh = Math.max(56, H*0.20);
-      const sc = ctx.createLinearGradient(0, H-sh, 0, H);
-      sc.addColorStop(0,'rgba(0,0,0,0)'); sc.addColorStop(1,'rgba(0,0,0,0.80)');
-      ctx.fillStyle = sc; ctx.fillRect(0, H-sh, W, sh);
+      if(!this._scrimGrad || this._scrimH !== H){
+        this._scrimH    = H;
+        this._scrimGrad = ctx.createLinearGradient(0, H-sh, 0, H);
+        this._scrimGrad.addColorStop(0,'rgba(0,0,0,0)');
+        this._scrimGrad.addColorStop(1,'rgba(0,0,0,0.80)');
+      }
+      ctx.fillStyle = this._scrimGrad; ctx.fillRect(0, H-sh, W, sh);
       if(name){
         const fz = Math.max(12, Math.min(22, W*0.028));
         ctx.font = `600 ${fz}px "Segoe UI",system-ui,sans-serif`;
@@ -2671,19 +2874,21 @@ class _RdioViz {
 
   _getFreq(){
     if(this._audioOk && this._analyser){
-      const buf = new Uint8Array(this._analyser.frequencyBinCount);
+      // Reuse the persistent buffer — avoids one Uint8Array allocation per frame
+      const buf = this._freqBuf;
       this._analyser.getByteFrequencyData(buf);
-      if(buf.some(v => v > 0)) return buf;
+      for(let i=0; i<buf.length; i++){ if(buf[i] > 0) return buf; }
     }
-    // Simulation: three-layer sine waves producing realistic music energy
+    // Simulation: three-layer sine waves producing realistic music energy.
+    // Writes into the persistent buffer so type is always Uint8Array.
     this._simT += 0.022;
-    const st=this._simT, N=256, buf=new Uint8Array(N);
+    const st=this._simT, buf=this._freqBuf, N=buf.length;
     for(let i=0; i<N; i++){
       const f    = i/N;
       const bass = Math.pow(Math.max(0, Math.sin(st*0.88+i*0.11)), 2) * 200 * (1-f*0.78);
       const mid  = Math.abs(Math.sin(st*2.14+i*0.27)) * 125 * (f<0.55?1:0.35);
       const hi   = Math.abs(Math.sin(st*5.40+i*0.74)) * 52 * f;
-      buf[i]     = Math.min(255, Math.round(bass + mid + hi + Math.random()*14));
+      buf[i]     = Math.min(255, bass + mid + hi + Math.random()*14) | 0;
     }
     return buf;
   }
@@ -2702,12 +2907,16 @@ window._rdioVizToggle = function(){
   try{ localStorage.setItem('rdio_viz_en', _rdioVizEnabled ? '1' : '0'); }catch(e){}
   _rdioVizSyncBtn();
   if(!_rdioVizEnabled && _rdioVizActive){
-    _rdioVizStop();
+    _rdioVizStop(false);   // viz-only stop — radio keeps playing, keep _curRadioUrl alive
   } else if(_rdioVizEnabled && !_rdioVizActive && _curRadioUrl){
-    // User turned viz on while radio is already playing — start it now
-    // using the info from the currently-playing station, if available.
-    const info = (_favs.find(s => (s.url_resolved||s.url) === _curRadioUrl)) || {url: _curRadioUrl};
-    _rdioVizStart(info);
+    // User turned viz on while radio is already playing — restart it
+    // with the COMPLETE original station info (logo, tags, bitrate, ...)
+    // captured in radioPlayStation(), not a partial reconstruction.
+    // (Previously this looked the station up in favorites, which only
+    // had full data if it happened to be favorited — for any other
+    // station it fell back to a bare {url: ...}, which silently cleared
+    // the loaded logo and dropped to the 📻 fallback on re-enable.)
+    _rdioVizStart(_curRadioInfo || {url: _curRadioUrl});
   }
   if(typeof toast === 'function') toast(_rdioVizEnabled ? 'Visualizer on' : 'Visualizer off', 'k');
 };
@@ -2732,15 +2941,25 @@ function _rdioVizStart(stInfo){
   _rdioVizActive  = true;
   _rdioVizStartTs = Date.now();
   _rdioViz.start(stInfo || {});
-  // After stream decodes first frames, hide canvas if station has real video
-  setTimeout(() => { if(_rdioVizActive) _rdioViz.checkVideoContent(); }, 2800);
 }
 
-function _rdioVizStop(){
+// stopNowPlaying=true (default): also stop now-playing polling and clear
+// _curRadioUrl — used when we're truly leaving radio playback (switching
+// to a non-radio stream; see the loadstart/emptied handler below).
+// stopNowPlaying=false: viz-overlay-only stop — the radio station keeps
+// playing, so _curRadioUrl must stay set. This distinction is the fix for
+// a real bug: toggling the visualizer off used to ALSO clear
+// _curRadioUrl (via the unconditional _rdioNpStop() call below), which
+// silently broke the toggle's own "turn back on" guard
+// (_rdioVizEnabled && !_rdioVizActive && _curRadioUrl) — so turning the
+// visualizer off then back on did nothing until the station was replayed
+// from scratch, which is exactly what re-set _curRadioUrl as a side
+// effect and masked the bug.
+function _rdioVizStop(stopNowPlaying = true){
   _rdioVizActive  = false;
   _rdioVizStartTs = 0;
   _rdioViz.stop();
-  _rdioNpStop();   // stop now-playing polling when non-radio stream plays
+  if(stopNowPlaying) _rdioNpStop();
 }
 
 // Stop viz when user plays a non-radio stream.
@@ -2754,15 +2973,10 @@ function _rdioVizStop(){
   const _onLoad = () => {
     if(!_rdioVizActive) return;
     if((Date.now() - _rdioVizStartTs) < _RDIO_GUARD_MS) return;
-    _rdioVizStop();
+    _rdioVizStop();   // truly leaving radio — default stopNowPlaying=true is correct here
   };
   vid.addEventListener('loadstart', _onLoad, {passive:true});
   vid.addEventListener('emptied',   _onLoad, {passive:true});
-  // Secondary video-content check for slow HLS streams
-  vid.addEventListener('playing', () => {
-    if(_rdioVizActive)
-      setTimeout(() => { if(_rdioVizActive) _rdioViz.checkVideoContent(); }, 500);
-  }, {passive:true});
 })();
 
 // ── tab bar drag-to-scroll (desktop mouse) ───────────────────────────────
