@@ -1693,6 +1693,17 @@ let _curRadioUrl  = '';      // URL of currently playing radio station
 let _curRadioInfo = null;
 let _rdioNpTimer  = null;    // setInterval handle for now-playing polling
 let _rdioLastNp   = '';      // last known StreamTitle from ICY stream
+// Last country/genre drilled into, so reopening the radio browser (e.g.
+// after playing a station, which closes it) can jump straight back to
+// that view instead of resetting to the top-level grid. {cc, label} /
+// tag string respectively; null when nothing's been drilled into (or
+// after the user explicitly presses ← Back — see _rdioBackToGrid).
+// Scoped ONLY to radioOpen()'s re-entry path: manually clicking the
+// Country/Genre tab button always shows the top-level grid regardless
+// of these — a tab click means "go to the top of this section", not
+// "resume my session".
+let _lastCountrySel = null;
+let _lastGenreSel   = null;
 
 // ── open / close ──────────────────────────────────────────────────────────
 window.radioOpen = function(){
@@ -1701,10 +1712,11 @@ window.radioOpen = function(){
   _rdioVizSyncBtn();
   _favsLoad();
   if(!_ctriesLoaded) _loadCountryDropdown();
-  // activate the current tab (re-entering keeps previous tab selected)
+  // activate the current tab (re-entering keeps previous tab selected,
+  // and restores a country/genre drill-down if one was left active)
   const activeTab = document.querySelector('.rdio-tab.active');
   const tabName   = activeTab ? activeTab.dataset.tab : 'search';
-  _activateTab(tabName, activeTab);
+  _activateTab(tabName, activeTab, true);
 };
 
 window.radioClose = function(){
@@ -1720,7 +1732,7 @@ window.radioTab = function(btn, name){
   _activateTab(name, btn);
 };
 
-function _activateTab(name, btn){
+function _activateTab(name, btn, restoreDrillDown){
   _curTab = name;
   const searchRow = document.getElementById('rdio-search-row');
   searchRow.style.display = (name === 'search') ? '' : 'none';
@@ -1728,8 +1740,14 @@ function _activateTab(name, btn){
     case 'search':    _setBody(_emptyHtml('🔍', 'Type a query and press Search')); break;
     case 'top':       _loadTop();       break;
     case 'builtin':   _loadBuiltin();   break;
-    case 'country':   _loadCountryGrid(); break;
-    case 'genre':     _loadGenreGrid(); break;
+    case 'country':
+      if(restoreDrillDown && _lastCountrySel) _rdioByCountry(_lastCountrySel.cc, _lastCountrySel.label);
+      else _loadCountryGrid();
+      break;
+    case 'genre':
+      if(restoreDrillDown && _lastGenreSel) _rdioByGenre(_lastGenreSel);
+      else _loadGenreGrid();
+      break;
     case 'favorites': _renderFavs();    break;
     case 'sources':   _loadSources();   break;
     case 'trending':  _loadTrending();  break;
@@ -1835,6 +1853,7 @@ async function _loadCountryGrid(){
 }
 
 window._rdioByCountry = async function(cc, label){
+  _lastCountrySel = {cc, label};
   _setBody(_loadingHtml('Loading ' + _esc(label) + '…'));
   try{
     const d = await _api(`/api/radio/country/${encodeURIComponent(cc)}?limit=200`);
@@ -1861,6 +1880,7 @@ async function _loadGenreGrid(){
 }
 
 window._rdioByGenre = async function(tag){
+  _lastGenreSel = tag;
   _setBody(_loadingHtml('Loading ' + _esc(tag) + '…'));
   try{
     const d = await _api(`/api/radio/genre/${encodeURIComponent(tag)}?limit=200`);
@@ -1949,8 +1969,8 @@ async function _loadHistory(){
       const logoH = logo
         ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(logo)}"
              onerror="${iconFb
-               ? `"this.src='${_esc(iconFb)}';this.onerror=function(){this.outerHTML='<div class=rdio-item-logo style=\\\\'font-size:18px\\\\'>📻</div>'}"`
-               : `"this.outerHTML='<div class=rdio-item-logo style=\\\\'font-size:18px\\\\'>📻</div>'"` }>">`
+               ? `this.src='${_esc(iconFb)}';this.onerror=function(){this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'}`
+               : `this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'` }">`
         : iconFb
           ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(iconFb)}"
                onerror="this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'">`
@@ -2165,13 +2185,20 @@ function _renderList(stations, queryOrLabel, showBack){
   }
   let h = '';
   if(showBack){
-    const tabName = _curTab;
-    h += `<button class="btn-ghost rdio-back-btn"
-      onclick="radioTab(document.querySelector('.rdio-tab[data-tab=&quot;${tabName}&quot;]'),'${tabName}')">
-      ← Back
-    </button>`;
+    const tabName     = _curTab;
+    const filterLabel = _esc(queryOrLabel || 'stations');
+    h += `<div class="rdio-cat-header" style="display:flex;align-items:center;gap:8px;padding:8px 12px;flex-shrink:0">
+      <input type="text" id="rdio-cat-filter" placeholder="Filter ${filterLabel}…"
+        oninput="_rdioFilterCategory(this)" autocomplete="off"
+        style="flex:1;min-width:0;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);
+               border-radius:8px;color:#fff;padding:7px 12px;font-size:12px;outline:none">
+      <button class="btn-ghost rdio-back-btn" style="flex-shrink:0"
+        onclick="_rdioBackToGrid('${tabName}')">
+        ← Back
+      </button>
+    </div>`;
   }
-  h += '<ul class="rdio-list">';
+  h += '<ul class="rdio-list" id="rdio-list-ul">';
   for(const s of stations){
     const url  = (s.url_resolved || s.url || '').trim();
     if(!url) continue;
@@ -2189,8 +2216,8 @@ function _renderList(stations, queryOrLabel, showBack){
     const logoH = logo
       ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(logo)}"
            onerror="${iconFb
-             ? `"this.src='${_esc(iconFb)}';this.onerror=function(){this.outerHTML='<div class=rdio-item-logo style=\\\\'font-size:18px\\\\'>📻</div>'}"`
-             : `"this.outerHTML='<div class=rdio-item-logo style=\\\\'font-size:18px\\\\'>📻</div>'"` }>">`
+             ? `this.src='${_esc(iconFb)}';this.onerror=function(){this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'}`
+             : `this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'` }">`
       : iconFb
         ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(iconFb)}"
              onerror="this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'">`
@@ -2218,8 +2245,40 @@ function _renderList(stations, queryOrLabel, showBack){
     </li>`;
   }
   h += '</ul>';
+  if(showBack){
+    h += `<div id="rdio-cat-empty" class="rdio-empty" style="display:none"><span>🔍</span>No matches</div>`;
+  }
   _setBody(h);
 }
+
+// Pressing ← Back is an unambiguous "I'm done with this drill-down"
+// signal — clear the remembered country/genre selection so a LATER
+// reopen of the radio browser shows the top-level grid, not this view
+// again (see _lastCountrySel/_lastGenreSel and radioOpen() above).
+window._rdioBackToGrid = function(tabName){
+  if(tabName === 'country') _lastCountrySel = null;
+  else if(tabName === 'genre') _lastGenreSel = null;
+  radioTab(document.querySelector(`.rdio-tab[data-tab="${tabName}"]`), tabName);
+};
+
+// Live, client-side filter over the already-loaded country/genre list —
+// all ~200 stations are already sitting in the DOM from one batch fetch,
+// so filtering is instant with no network round-trip per keystroke.
+// Matches against each item's full visible text (name + country/tags/
+// bitrate meta line) for maximum flexibility without extra complexity.
+window._rdioFilterCategory = function(inputEl){
+  const q  = (inputEl.value || '').trim().toLowerCase();
+  const ul = document.getElementById('rdio-list-ul');
+  if(!ul) return;
+  let visibleCount = 0;
+  ul.querySelectorAll('li.rdio-item').forEach(li => {
+    const match = !q || li.textContent.toLowerCase().includes(q);
+    li.style.display = match ? '' : 'none';
+    if(match) visibleCount++;
+  });
+  const emptyEl = document.getElementById('rdio-cat-empty');
+  if(emptyEl) emptyEl.style.display = (visibleCount === 0) ? '' : 'none';
+};
 
 // ── play ──────────────────────────────────────────────────────────────────
 window.radioPlayStation = function(urlEnc, stEnc){
