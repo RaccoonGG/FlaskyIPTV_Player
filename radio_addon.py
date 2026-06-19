@@ -503,6 +503,20 @@ class RadioBrowserClient:
         )
         return [self._normalize(s) for s in data if self._valid(s)]
 
+    def by_language(self, language: str, limit: int = 200) -> List[Dict]:
+        """Stations broadcasting in `language`, ordered by click count."""
+        data = self._request(
+            "stations/search",
+            {
+                "language":   language.lower(),
+                "limit":      limit,
+                "hidebroken": "true",
+                "order":      "clickcount",
+                "reverse":    "true",
+            },
+        )
+        return [self._normalize(s) for s in data if self._valid(s)]
+
     def by_tag(self, tag: str, limit: int = 200) -> List[Dict]:
         data = self._request(
             f"stations/bytag/{urllib.parse.quote(tag)}",
@@ -529,6 +543,13 @@ class RadioBrowserClient:
         return self._request(
             "tags",
             {"limit": limit, "order": "stationcount", "reverse": "true", "hidebroken": "true"},
+        )
+
+    def languages(self, limit: int = 100) -> List[Dict]:
+        """Language list with station counts, ordered by popularity."""
+        return self._request(
+            "languages",
+            {"order": "stationcount", "reverse": "true", "limit": limit},
         )
 
     def trending(self, limit: int = 50) -> List[Dict]:
@@ -1274,6 +1295,28 @@ def register_radio_addon(app: Any) -> Any:
         data  = rb.genres(limit=limit)
         return jsonify({"status": "ok", "data": data, "count": len(data)})
 
+    # ── /api/radio/languages ──────────────────────────────────────────────────
+
+    @app.route("/api/radio/languages")
+    def radio_languages():
+        limit = _clamp(request.args.get("limit", 100), 1, 300)
+        data  = rb.languages(limit=limit)
+        return jsonify({"status": "ok", "data": data, "count": len(data)})
+
+    # ── /api/radio/language/<lang> ────────────────────────────────────────────
+
+    @app.route("/api/radio/language/<lang>")
+    def radio_language(lang: str):
+        limit   = _clamp(request.args.get("limit", 200), 1, 500)
+        results = rb.by_language(lang, limit=limit)
+        _mark_favorites(results, favs)
+        return jsonify({
+            "status":   "ok",
+            "language": lang,
+            "data":     results,
+            "count":    len(results),
+        })
+
     # ── /api/radio/shoutcast ──────────────────────────────────────────────────
     # Explicit Shoutcast directory search (distinct from RB search fallback).
     # ?q=jazz  [&limit=100]
@@ -1676,11 +1719,52 @@ _RADIO_UI_JS = r"""
 (function(){
 'use strict';
 
+// ── inject addon CSS (once, idempotent) ───────────────────────────────────
+;(function(){
+  if(document.getElementById('rdio-addon-css')) return;
+  const el = document.createElement('style');
+  el.id = 'rdio-addon-css';
+  el.textContent =
+    '.rdio-badge{display:inline-block;margin-left:4px;padding:1px 5px;' +
+    'border-radius:3px;font-size:10px;background:rgba(255,255,255,.1);' +
+    'vertical-align:middle;line-height:1.4}' +
+    '#rdio-sleep-btn,#rdio-shuffle-btn{background:none;border:none;cursor:pointer;' +
+    'color:var(--tx1,#fff);opacity:.55;font-size:11px;padding:0 6px;' +
+    'line-height:1;flex-shrink:0;transition:opacity .15s,color .15s}' +
+    '#rdio-sleep-btn:hover,#rdio-shuffle-btn:hover{opacity:.9}' +
+    '#rdio-sleep-btn.active{opacity:1;color:var(--acc,#a78bfa)}' +
+    '#rdio-shuffle-btn.spinning{animation:rdio-spin .6s linear infinite;opacity:.9}' +
+    // Bug fix: the now-playing bar must show for EVERY playing station, not
+    // just ones whose stream sends ICY metadata (see _rdioNpBarShow below).
+    // The bar's own markup/base CSS lives in the main page template, which
+    // may rest at '#rdio-np-bar{display:none}' with normal (non-!important)
+    // specificity. Setting el.style.display='' from JS only *removes* an
+    // inline override — if the hidden state instead comes from a stylesheet
+    // rule, that does nothing and the bar silently never appears. This
+    // !important rule guarantees the bar becomes visible the instant we add
+    // the 'rdio-np-visible' class, regardless of how the template's own CSS
+    // happens to hide it.
+    '#rdio-np-bar.rdio-np-visible{display:flex !important}' +
+    '@keyframes rdio-spin{to{transform:rotate(360deg)}}';
+  document.head.appendChild(el);
+})();
+
 // ── state ─────────────────────────────────────────────────────────────────
 const _FAV_KEY = 'rdio_favs_v1';
 let _curTab       = 'search';
 let _favs         = [];
 let _ctriesLoaded = false;
+// Flat array of station objects for the currently visible list.
+// List-item onclicks use an index into this instead of a serialised JSON
+// blob per element — shrinks generated HTML ~70% and eliminates the
+// nested-quote escaping that caused "}"> to appear as visible text.
+let _currentList  = [];
+// Sleep timer
+const _SLEEP_MINS   = [15, 30, 45, 60];
+let _rdioSleepIdx   = -1;    // -1 = off; 0-3 = active step
+let _rdioSleepEnd   = 0;     // Date.now() ms when the timer fires
+let _rdioSleepTimer = null;  // setTimeout handle
+let _rdioSleepTick  = null;  // setInterval for countdown label
 let _curRadioUrl  = '';      // URL of currently playing radio station
 // Full station info object (logo, icon_fallback, tags, bitrate, name,
 // countrycode, stationuuid, ...) for whatever _curRadioUrl points at —
@@ -1704,6 +1788,7 @@ let _rdioLastNp   = '';      // last known StreamTitle from ICY stream
 // "resume my session".
 let _lastCountrySel = null;
 let _lastGenreSel   = null;
+let _lastLangSel    = null;   // last language drilled into (mirrors country/genre)
 
 // ── open / close ──────────────────────────────────────────────────────────
 window.radioOpen = function(){
@@ -1712,6 +1797,7 @@ window.radioOpen = function(){
   _rdioVizSyncBtn();
   _favsLoad();
   if(!_ctriesLoaded) _loadCountryDropdown();
+  _rdioInjectLangTab();   // idempotent — adds Language tab if not already present
   // activate the current tab (re-entering keeps previous tab selected,
   // and restores a country/genre drill-down if one was left active)
   const activeTab = document.querySelector('.rdio-tab.active');
@@ -1753,6 +1839,10 @@ function _activateTab(name, btn, restoreDrillDown){
     case 'trending':  _loadTrending();  break;
     case 'history':   _loadHistory();   break;
     case 'nearby':    _loadNearby();    break;
+    case 'language':
+      if(restoreDrillDown && _lastLangSel) _rdioByLanguage(_lastLangSel.lang, _lastLangSel.label);
+      else _loadLanguageGrid();
+      break;
   }
 }
 
@@ -1830,7 +1920,8 @@ async function _loadCountryGrid(){
     if(!raw.length){ _setBody(_emptyHtml('🌍','No country data available')); return; }
 
     const sorted = _sortCountries(raw);
-    let h = '<div class="rdio-tag-grid">';
+    let h = _filterHeaderHtml('countries');
+    h += '<div class="rdio-tag-grid">';
     for(const c of sorted){
       const cc    = (c.iso_3166_1 || c.name).toUpperCase();
       const label = _esc(c.name);
@@ -1848,6 +1939,7 @@ async function _loadCountryGrid(){
       h += `<button class="rdio-tag" onclick="_rdioByCountry('${_esc(cc)}','${label}')"${extra}>${label}${count}</button>`;
     }
     h += '</div>';
+    h += _filterEmptyHtml();
     _setBody(h);
   }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
 }
@@ -1868,13 +1960,15 @@ async function _loadGenreGrid(){
     const d = await _api('/api/radio/genres?limit=80');
     const ts = (d.data || []).filter(t => t.name && (t.stationcount||0) > 0);
     if(!ts.length){ _setBody(_emptyHtml('🎵','No genre data available')); return; }
-    let h = '<div class="rdio-tag-grid">';
+    let h = _filterHeaderHtml('genres');
+    h += '<div class="rdio-tag-grid">';
     for(const t of ts){
       const name  = _esc(t.name);
       const count = t.stationcount ? `<span style="font-size:9px;opacity:.45;margin-left:3px">${t.stationcount}</span>` : '';
       h += `<button class="rdio-tag" onclick="_rdioByGenre('${name}')">${name}${count}</button>`;
     }
     h += '</div>';
+    h += _filterEmptyHtml();
     _setBody(h);
   }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
 }
@@ -1888,6 +1982,113 @@ window._rdioByGenre = async function(tag){
   }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
 };
 
+// ── language grid → stations ──────────────────────────────────────────────
+
+// Inject the Language tab button into #rdio-tabs alongside existing tabs.
+// Called from radioOpen() — idempotent so repeated opens are safe.
+function _rdioInjectLangTab(){
+  if(document.querySelector('.rdio-tab[data-tab="language"]')) return;
+  const tabs = document.getElementById('rdio-tabs');
+  if(!tabs) return;
+  const btn = document.createElement('button');
+  btn.className    = 'rdio-tab';
+  btn.dataset.tab  = 'language';
+  btn.textContent  = '🗣 Language';
+  btn.onclick      = () => radioTab(btn, 'language');
+  // Insert before Nearby tab so ordering stays logical, or append at end
+  const nearby = tabs.querySelector('[data-tab="nearby"]');
+  if(nearby) tabs.insertBefore(btn, nearby);
+  else       tabs.appendChild(btn);
+}
+
+async function _loadLanguageGrid(){
+  _setBody(_loadingHtml());
+  try{
+    const d  = await _api('/api/radio/languages?limit=100');
+    const ls = (d.data || []).filter(l => l.name && (l.stationcount||0) > 0);
+    if(!ls.length){ _setBody(_emptyHtml('🗣','No language data available')); return; }
+    let h = _filterHeaderHtml('languages');
+    h += '<div class="rdio-tag-grid">';
+    for(const l of ls){
+      // Capitalise first letter for display; keep original lowercase for API
+      const display = _esc(l.name.charAt(0).toUpperCase() + l.name.slice(1));
+      const apiName = _esc(l.name);   // lowercase — what RadioBrowser expects
+      const count   = l.stationcount
+        ? `<span style="font-size:9px;opacity:.45;margin-left:3px">${l.stationcount}</span>`
+        : '';
+      h += `<button class="rdio-tag" onclick="_rdioByLanguage('${apiName}','${display}')">${display}${count}</button>`;
+    }
+    h += '</div>';
+    h += _filterEmptyHtml();
+    _setBody(h);
+  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
+}
+
+window._rdioByLanguage = async function(lang, label){
+  _lastLangSel = {lang, label};
+  _setBody(_loadingHtml('Loading ' + _esc(label) + '…'));
+  try{
+    const d = await _api(`/api/radio/language/${encodeURIComponent(lang)}?limit=200`);
+    _renderList(d.data || [], label, true);
+  }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
+};
+
+// ── shuffle / "more like this" ────────────────────────────────────────────
+// 🎲 button in #rdio-np-bar. Picks a random station that shares a tag with
+// the currently playing station and auto-plays it.
+
+window._rdioShuffle = async function(){
+  if(!_curRadioInfo) return;
+  const btn = document.getElementById('rdio-shuffle-btn');
+
+  // Collect up to 3 genre tags from the playing station; pick one at random
+  const tags = (_curRadioInfo.tags || '')
+    .split(',').map(t => t.trim()).filter(Boolean);
+  if(!tags.length){
+    if(typeof toast === 'function') toast('No genre tags for this station', 'w');
+    return;
+  }
+  const tag = tags[Math.floor(Math.random() * Math.min(tags.length, 3))];
+
+  // Spinner while fetching
+  if(btn){ btn.classList.add('spinning'); btn.title = 'Finding a station…'; }
+  try{
+    const d    = await _api(`/api/radio/genre/${encodeURIComponent(tag)}?limit=100`);
+    const pool = (d.data || [])
+      .filter(s => (s.stationuuid || s.url) !== (_curRadioInfo.stationuuid || _curRadioInfo.url));
+    if(!pool.length){
+      if(typeof toast === 'function') toast('No results for tag: ' + tag, 'w');
+      return;
+    }
+    const pick = pool[Math.floor(Math.random() * pool.length)];
+    radioPlayStation(
+      encodeURIComponent(pick.url_resolved || pick.url),
+      encodeURIComponent(JSON.stringify(pick))
+    );
+    if(typeof toast === 'function') toast(`🎲 ${pick.name}`, 'k');
+  }catch(e){
+    if(typeof toast === 'function') toast('Shuffle failed', 'w');
+  }finally{
+    if(btn){ btn.classList.remove('spinning'); btn.title = 'Shuffle — play similar station'; }
+  }
+};
+
+// Lazily append the 🎲 button to #rdio-np-bar on first bar show.
+function _rdioShuffleEnsureBtn(){
+  if(document.getElementById('rdio-shuffle-btn')) return;
+  const bar = document.getElementById('rdio-np-bar');
+  if(!bar) return;
+  const btn       = document.createElement('button');
+  btn.id          = 'rdio-shuffle-btn';
+  btn.textContent = '🎲';
+  btn.title       = 'Shuffle — play similar station';
+  btn.onclick     = _rdioShuffle;
+  // Insert before sleep button so order is: [♫ title] [🎲] [⏱]
+  const sleep = document.getElementById('rdio-sleep-btn');
+  if(sleep) bar.insertBefore(btn, sleep);
+  else      bar.appendChild(btn);
+}
+
 // ── M3U sources ───────────────────────────────────────────────────────────
 async function _loadSources(){
   _setBody(_loadingHtml());
@@ -1895,7 +2096,8 @@ async function _loadSources(){
     const d = await _api('/api/radio/sources');
     const srcs = d.sources || [];
     if(!srcs.length){ _setBody(_emptyHtml('📂','No M3U sources configured')); return; }
-    let h = '<ul class="rdio-list">';
+    let h = _filterHeaderHtml('sources');
+    h += '<ul class="rdio-list">';
     for(const s of srcs){
       h += `<li class="rdio-src-item">
         <span class="rdio-src-name">${_esc(s)}</span>
@@ -1904,6 +2106,7 @@ async function _loadSources(){
       </li>`;
     }
     h += '</ul>';
+    h += _filterEmptyHtml();
     _setBody(h);
   }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
 }
@@ -1951,20 +2154,22 @@ async function _loadHistory(){
       _setBody(_emptyHtml('🕐','No recently played stations yet'));
       return;
     }
-    let h = '<div style="display:flex;justify-content:flex-end;padding:6px 12px;flex-shrink:0">'
-          + '<button class="btn-ghost" style="height:26px;padding:0 12px;font-size:11px"'
-          + ' onclick="_rdioHistoryClear()">🗑 Clear</button></div>';
+    let h = _filterHeaderHtml('history', `<button class="btn-ghost" style="height:26px;padding:0 12px;font-size:11px;flex-shrink:0"
+        onclick="_rdioHistoryClear()">🗑 Clear</button>`);
     h += '<ul class="rdio-list">';
-    for(const s of items){
+    _currentList = items;
+    for(let idx = 0; idx < items.length; idx++){
+      const s = items[idx];
       const url  = (s.url_resolved || s.url || '').trim();
       if(!url) continue;
-      const name = _esc(s.name || 'Unknown Station');
-      const cc   = (s.countrycode || '').toUpperCase();
-      const rel  = _esc(_rdioRelTime(s._played_at || ''));
-      const logo     = (s.logo          || '').trim();
-      const iconFb   = (s.icon_fallback || '').trim();
-      const uuid = s.stationuuid || '';
-      const fav  = _isFav(url, uuid);
+      const name   = _esc(s.name || 'Unknown Station');
+      const cc     = (s.countrycode || '').toUpperCase();
+      const rel    = _esc(_rdioRelTime(s._played_at || ''));
+      const logo   = (s.logo          || '').trim();
+      const iconFb = (s.icon_fallback || '').trim();
+      const codec  = (s.codec || '').toUpperCase().replace('MPEG','MP3');
+      const uuid   = s.stationuuid || '';
+      const fav    = _isFav(url, uuid);
       // Logo chain: primary logo → homepage favicon → 📻
       const logoH = logo
         ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(logo)}"
@@ -1975,24 +2180,22 @@ async function _loadHistory(){
           ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(iconFb)}"
                onerror="this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'">`
           : `<div class="rdio-item-logo" style="font-size:18px">📻</div>`;
-      const stEnc  = encodeURIComponent(JSON.stringify({
-        name:s.name||'Unknown',url,url_resolved:s.url_resolved||url,
-        logo,icon_fallback:iconFb,countrycode:cc,tags:s.tags||'',bitrate:s.bitrate||0,stationuuid:uuid}));
-      const urlEnc  = encodeURIComponent(url);
-      const uuidEnc = encodeURIComponent(uuid);
+      const badges = [codec, s.bitrate ? s.bitrate + ' kbps' : '']
+        .filter(Boolean).map(t => `<span class="rdio-badge">${_esc(t)}</span>`).join('');
       h += `<li class="rdio-item">
         ${logoH}
         <div class="rdio-item-info">
           <div class="rdio-item-name">${name}</div>
-          <div class="rdio-item-meta">${rel}${cc ? '  ·  ' + _esc(cc) : ''}</div>
+          <div class="rdio-item-meta">${rel}${cc ? '  ·  ' + _esc(cc) : ''}${badges}</div>
         </div>
         <button class="rdio-item-fav${fav?' active':''}"
-          onclick="_rdioToggleFav(this,'${urlEnc}','${uuidEnc}','${stEnc}')">${fav?'★':'☆'}</button>
+          onclick="_rdioFavIdx(this,${idx})">${fav?'★':'☆'}</button>
         <button class="rdio-item-play"
-          onclick="radioPlayStation('${urlEnc}','${stEnc}')">▶</button>
+          onclick="_rdioPlayIdx(${idx})">▶</button>
       </li>`;
     }
     h += '</ul>';
+    h += _filterEmptyHtml();
     _setBody(h);
   }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
 }
@@ -2080,6 +2283,85 @@ window._rdioExportM3U = function(){
   if(typeof toast==='function') toast(`Exported ${n} station${n!==1?'s':''} 💾`,'k');
 };
 
+// ── _currentList index helpers ─────────────────────────────────────────────
+// Called by list-item onclick. Reads station object from _currentList by
+// index so the HTML only needs a small integer instead of a full JSON blob.
+window._rdioPlayIdx = function(i){
+  const s = _currentList[i];
+  if(!s) return;
+  radioPlayStation(
+    encodeURIComponent(s.url_resolved || s.url),
+    encodeURIComponent(JSON.stringify(s))
+  );
+};
+window._rdioFavIdx = function(btn, i){
+  const s = _currentList[i];
+  if(!s) return;
+  _rdioToggleFav(
+    btn,
+    encodeURIComponent(s.url_resolved || s.url),
+    encodeURIComponent(s.stationuuid || ''),
+    encodeURIComponent(JSON.stringify(s))
+  );
+};
+
+// ── sleep timer ────────────────────────────────────────────────────────────
+// Cycle: off → 15 → 30 → 45 → 60 → off → …  Button lives in #rdio-np-bar,
+// injected lazily on first bar show. Fully client-side, zero backend.
+function _rdioSleepNext(){
+  _rdioSleepClear();
+  _rdioSleepIdx = (_rdioSleepIdx + 1) % (_SLEEP_MINS.length + 1);
+  if(_rdioSleepIdx >= _SLEEP_MINS.length){ _rdioSleepIdx = -1; return; }
+  const ms = _SLEEP_MINS[_rdioSleepIdx] * 60_000;
+  _rdioSleepEnd   = Date.now() + ms;
+  _rdioSleepTimer = setTimeout(_rdioSleepFire, ms);
+  _rdioSleepTick  = setInterval(_rdioSleepSyncBtn, 15_000);
+  _rdioSleepSyncBtn();
+  if(typeof toast === 'function') toast(`Sleep timer: ${_SLEEP_MINS[_rdioSleepIdx]} min`, 'k');
+}
+
+function _rdioSleepFire(){
+  _rdioSleepClear();
+  const vid = document.getElementById('vid');
+  if(vid) vid.pause();
+  if(typeof toast === 'function') toast('Sleep timer — radio stopped ✓', 'k');
+}
+
+function _rdioSleepClear(){
+  _rdioSleepIdx = -1; _rdioSleepEnd = 0;
+  if(_rdioSleepTimer){ clearTimeout(_rdioSleepTimer);  _rdioSleepTimer = null; }
+  if(_rdioSleepTick) { clearInterval(_rdioSleepTick);  _rdioSleepTick  = null; }
+  _rdioSleepSyncBtn();
+}
+
+function _rdioSleepSyncBtn(){
+  const btn = document.getElementById('rdio-sleep-btn');
+  if(!btn) return;
+  if(_rdioSleepEnd > 0){
+    const remMin = Math.max(1, Math.ceil((_rdioSleepEnd - Date.now()) / 60_000));
+    btn.textContent = `⏱ ${remMin}m`;
+    btn.title       = `Sleep in ${remMin} min — click to cancel`;
+    btn.classList.add('active');
+  } else {
+    btn.textContent = '⏱';
+    btn.title       = 'Sleep timer  (15 / 30 / 45 / 60 min)';
+    btn.classList.remove('active');
+  }
+}
+
+// Lazily append the ⏱ button to #rdio-np-bar on first bar show.
+function _rdioSleepEnsureBtn(){
+  if(document.getElementById('rdio-sleep-btn')) return;
+  const bar = document.getElementById('rdio-np-bar');
+  if(!bar) return;
+  const btn     = document.createElement('button');
+  btn.id        = 'rdio-sleep-btn';
+  btn.textContent = '⏱';
+  btn.title     = 'Sleep timer  (15 / 30 / 45 / 60 min)';
+  btn.onclick   = _rdioSleepNext;
+  bar.appendChild(btn);
+}
+
 // ── now-playing bar (ICY StreamTitle polling) ─────────────────────────────
 // Polls /api/radio/nowplaying every 20 s after a station starts playing.
 // The server caches ICY reads for 20 s — cheap after the first call.
@@ -2117,11 +2399,26 @@ function _rdioNpBarShow(title){
   const bar  = document.getElementById('rdio-np-bar');
   const text = document.getElementById('rdio-np-text');
   if(!bar||!text) return;
-  if(title && _curRadioUrl){
-    text.textContent = '♫  ' + title;
-    bar.style.display = '';
+  if(_curRadioUrl){
+    // Show bar immediately when a station is playing — use station name as
+    // fallback text until the first ICY StreamTitle arrives (or forever, for
+    // stations that don't send ICY metadata). Bug fix: the bar (and the
+    // sleep/shuffle buttons that live inside it) must NOT depend on ICY
+    // metadata ever arriving — both branches below run unconditionally.
+    text.textContent = title
+      ? ('♫  ' + title)
+      : ('♫  ' + ((_curRadioInfo && _curRadioInfo.name) || '…'));
+    // Belt-and-braces visibility: an inline style AND an !important CSS
+    // class (see injected stylesheet above). Whichever one the template's
+    // own CSS can't override, the other one wins — see the comment on
+    // '#rdio-np-bar.rdio-np-visible' above for why this is necessary.
+    bar.style.display = 'flex';
+    bar.classList.add('rdio-np-visible');
+    _rdioShuffleEnsureBtn();  // 🎲 inserted before ⏱ — independent of ICY
+    _rdioSleepEnsureBtn();    // ⏱ always last — independent of ICY
   } else {
     bar.style.display = 'none';
+    bar.classList.remove('rdio-np-visible');
   }
 }
 
@@ -2177,6 +2474,29 @@ function _renderFavs(){
   }
 }
 
+// ── shared filter-bar header ───────────────────────────────────────────────
+// Used by every list/grid view (Top, Builtin, Trending, Favorites, History,
+// Nearby, Sources, Search results, and the Country/Genre/Language grids AND
+// their drilldowns) so the "filter within this view" input is consistent
+// and never accidentally missing from a tab. The ONE place that does NOT
+// use this is the bare Search tab's empty state ("Type a query…") — there's
+// nothing to filter yet since no list has been loaded.
+// extraHtml: optional markup appended after the input inside the same row
+// (e.g. a ← Back button on drilldowns, or 🗑 Clear on History).
+function _filterHeaderHtml(label, extraHtml){
+  const filterLabel = _esc(label || 'stations');
+  return `<div class="rdio-cat-header" style="display:flex;align-items:center;gap:8px;padding:8px 12px;flex-shrink:0">
+    <input type="text" id="rdio-cat-filter" placeholder="Filter ${filterLabel}…"
+      oninput="_rdioFilterCategory(this)" autocomplete="off"
+      style="flex:1;min-width:0;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);
+             border-radius:8px;color:#fff;padding:7px 12px;font-size:12px;outline:none">
+    ${extraHtml || ''}
+  </div>`;
+}
+function _filterEmptyHtml(){
+  return `<div id="rdio-cat-empty" class="rdio-empty" style="display:none"><span>🔍</span>No matches</div>`;
+}
+
 // ── render station list ───────────────────────────────────────────────────
 function _renderList(stations, queryOrLabel, showBack){
   if(!stations || !stations.length){
@@ -2184,35 +2504,28 @@ function _renderList(stations, queryOrLabel, showBack){
     return;
   }
   let h = '';
-  if(showBack){
-    const tabName     = _curTab;
-    const filterLabel = _esc(queryOrLabel || 'stations');
-    h += `<div class="rdio-cat-header" style="display:flex;align-items:center;gap:8px;padding:8px 12px;flex-shrink:0">
-      <input type="text" id="rdio-cat-filter" placeholder="Filter ${filterLabel}…"
-        oninput="_rdioFilterCategory(this)" autocomplete="off"
-        style="flex:1;min-width:0;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);
-               border-radius:8px;color:#fff;padding:7px 12px;font-size:12px;outline:none">
-      <button class="btn-ghost rdio-back-btn" style="flex-shrink:0"
-        onclick="_rdioBackToGrid('${tabName}')">
-        ← Back
-      </button>
-    </div>`;
-  }
+  const tabName = _curTab;
+  // Filter input always present — useful on every list (Trending, Top, Favorites,
+  // Nearby, …) not just drilldown views. Back button only on drilldown.
+  h += _filterHeaderHtml(queryOrLabel, showBack
+    ? `<button class="btn-ghost rdio-back-btn" style="flex-shrink:0"
+        onclick="_rdioBackToGrid('${tabName}')">← Back</button>`
+    : '');
   h += '<ul class="rdio-list" id="rdio-list-ul">';
-  for(const s of stations){
+  _currentList = stations;
+  for(let idx = 0; idx < stations.length; idx++){
+    const s    = stations[idx];
     const url  = (s.url_resolved || s.url || '').trim();
     if(!url) continue;
-    const name = _esc(s.name || 'Unknown Station');
-    const cc   = (s.countrycode || '').toUpperCase();
-    const tags = (s.tags || '').split(',').slice(0,2).map(t=>t.trim()).filter(Boolean).join(' · ');
-    const br   = s.bitrate ? s.bitrate + ' kbps' : '';
-    const meta = [cc, tags, br].filter(Boolean).join('  ·  ');
+    const name  = _esc(s.name || 'Unknown Station');
+    const cc    = (s.countrycode || '').toUpperCase();
+    const tags  = (s.tags || '').split(',').slice(0,2).map(t=>t.trim()).filter(Boolean).join(' · ');
+    const codec = (s.codec || '').toUpperCase().replace('MPEG','MP3');
+    const meta  = [cc, tags].filter(Boolean).join('  ·  ');
     const logo   = (s.logo          || '').trim();
     const iconFb = (s.icon_fallback || '').trim();
     const uuid  = s.stationuuid || '';
     const fav   = _isFav(url, uuid);
-
-    // Logo chain: primary logo → homepage favicon → 📻
     const logoH = logo
       ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(logo)}"
            onerror="${iconFb
@@ -2222,32 +2535,28 @@ function _renderList(stations, queryOrLabel, showBack){
         ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(iconFb)}"
              onerror="this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'">`
         : `<div class="rdio-item-logo" style="font-size:18px">📻</div>`;
-
-    // Encode station data for fav callback without inline JSON
-    const stEnc = encodeURIComponent(JSON.stringify({
-      name: s.name || 'Unknown', url, url_resolved: s.url_resolved || url,
-      logo, icon_fallback: iconFb, countrycode: cc, tags: s.tags || '',
-      bitrate: s.bitrate || 0, stationuuid: uuid,
-    }));
-    const urlEnc  = encodeURIComponent(url);
-    const uuidEnc = encodeURIComponent(uuid);
+    const badges = [codec, s.bitrate ? s.bitrate + ' kbps' : '']
+      .filter(Boolean).map(t => `<span class="rdio-badge">${_esc(t)}</span>`).join('');
 
     h += `<li class="rdio-item">
       ${logoH}
       <div class="rdio-item-info">
         <div class="rdio-item-name">${name}</div>
-        ${meta ? `<div class="rdio-item-meta">${_esc(meta)}</div>` : ''}
+        ${(meta || badges) ? `<div class="rdio-item-meta">${meta ? _esc(meta) : ''}${badges}</div>` : ''}
       </div>
       <button class="rdio-item-fav${fav?' active':''}" title="${fav?'Remove from favorites':'Add to favorites'}"
-        onclick="_rdioToggleFav(this,'${urlEnc}','${uuidEnc}','${stEnc}')">${fav?'★':'☆'}</button>
+        onclick="_rdioFavIdx(this,${idx})">${fav?'★':'☆'}</button>
       <button class="rdio-item-play" title="Play ${_esc(s.name||'')}"
-        onclick="radioPlayStation('${urlEnc}','${stEnc}')">▶</button>
+        onclick="_rdioPlayIdx(${idx})">▶</button>
     </li>`;
   }
   h += '</ul>';
-  if(showBack){
-    h += `<div id="rdio-cat-empty" class="rdio-empty" style="display:none"><span>🔍</span>No matches</div>`;
-  }
+  // Empty-state ("No matches") for the live filter above — always included
+  // now, not just on drilldown views, since the filter input itself is now
+  // always present too (previously this only existed when showBack was
+  // true, so filtering Top/Builtin/Trending/Favorites/Nearby down to zero
+  // results showed a blank list with no explanation).
+  h += _filterEmptyHtml();
   _setBody(h);
 }
 
@@ -2261,19 +2570,23 @@ window._rdioBackToGrid = function(tabName){
   radioTab(document.querySelector(`.rdio-tab[data-tab="${tabName}"]`), tabName);
 };
 
-// Live, client-side filter over the already-loaded country/genre list —
-// all ~200 stations are already sitting in the DOM from one batch fetch,
-// so filtering is instant with no network round-trip per keystroke.
-// Matches against each item's full visible text (name + country/tags/
-// bitrate meta line) for maximum flexibility without extra complexity.
+// Live, client-side filter over whatever is currently in #rdio-body —
+// station rows (li.rdio-item), M3U source rows (li.rdio-src-item), or
+// category grid buttons (button.rdio-tag for Country/Genre/Language). All
+// of it is already sitting in the DOM from one batch fetch, so filtering is
+// instant with no network round-trip per keystroke. Matches against each
+// item's full visible text (name + meta line, or tag label + count) for
+// maximum flexibility without extra complexity.
 window._rdioFilterCategory = function(inputEl){
-  const q  = (inputEl.value || '').trim().toLowerCase();
-  const ul = document.getElementById('rdio-list-ul');
-  if(!ul) return;
+  const q    = (inputEl.value || '').trim().toLowerCase();
+  const body = document.getElementById('rdio-body');
+  if(!body) return;
+  const items = body.querySelectorAll('li.rdio-item, li.rdio-src-item, button.rdio-tag');
+  if(!items.length) return;
   let visibleCount = 0;
-  ul.querySelectorAll('li.rdio-item').forEach(li => {
-    const match = !q || li.textContent.toLowerCase().includes(q);
-    li.style.display = match ? '' : 'none';
+  items.forEach(el => {
+    const match = !q || el.textContent.toLowerCase().includes(q);
+    el.style.display = match ? '' : 'none';
     if(match) visibleCount++;
   });
   const emptyEl = document.getElementById('rdio-cat-empty');
