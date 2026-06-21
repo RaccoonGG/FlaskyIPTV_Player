@@ -330,6 +330,23 @@ class RadioCache:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Shared field sanitizer — used by every station-data source below
+# (RadioBrowser, M3U playlists) to strip stringified-null artifacts. Some
+# upstream entries have the literal text "null"/"undefined" in a field that
+# should be empty (a leftover from whatever pipeline first imported that
+# station) rather than a real value. Left alone, a value like that used as
+# an <img src> resolves as a RELATIVE URL against OUR OWN server (not the
+# real image host), producing a confusing, unexplained `GET /null 404`.
+# ══════════════════════════════════════════════════════════════════════════════
+_JUNK_FIELD_STRINGS = {"null", "undefined", "none", "nan", "n/a"}
+
+
+def _clean_field(value: Any) -> str:
+    v = (value or "").strip()
+    return "" if v.lower() in _JUNK_FIELD_STRINGS else v
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # RADIO BROWSER CLIENT
 # Implements the full RadioBrowser REST API surface needed by the addon.
 # Multi-server failover from Radio-Reveil + multi-strategy search from
@@ -380,10 +397,10 @@ class RadioBrowserClient:
 
     # ── normalisation ────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _normalize(raw: Dict) -> Dict:
-        url      = (raw.get("url_resolved") or raw.get("url") or "").strip()
-        homepage = raw.get("homepage", "").strip()
+    @classmethod
+    def _normalize(cls, raw: Dict) -> Dict:
+        url      = _clean_field(raw.get("url_resolved")) or _clean_field(raw.get("url"))
+        homepage = _clean_field(raw.get("homepage"))
         # Derive a favicon-service fallback from the station's homepage URL.
         # DuckDuckGo's icon service requires only the bare host name, is free,
         # doesn't need auth, and doesn't log personal data. The favicon is only
@@ -400,10 +417,10 @@ class RadioBrowserClient:
             except Exception:
                 pass
         return {
-            "name":          raw.get("name", "").strip(),
+            "name":          _clean_field(raw.get("name")),
             "url":           url,
-            "url_resolved":  raw.get("url_resolved", "").strip() or url,
-            "logo":          raw.get("favicon", "").strip(),
+            "url_resolved":  _clean_field(raw.get("url_resolved")) or url,
+            "logo":          _clean_field(raw.get("favicon")),
             "icon_fallback": icon_fallback,
             "homepage":      homepage,
             "bitrate":       raw.get("bitrate", 0),
@@ -419,6 +436,8 @@ class RadioBrowserClient:
             "source":        "radiobrowser",
             "_relevance":    0.0,
         }
+
+
 
     @staticmethod
     def _valid(st: Dict) -> bool:
@@ -496,20 +515,22 @@ class RadioBrowserClient:
                 break
         return unique
 
-    def by_country(self, country_code: str, limit: int = 200) -> List[Dict]:
+    def by_country(self, country_code: str, limit: int = 200, offset: int = 0) -> List[Dict]:
         data = self._request(
             f"stations/bycountrycodeexact/{country_code.upper()}",
-            {"limit": limit, "hidebroken": "true", "order": "clickcount", "reverse": "true"},
+            {"limit": limit, "offset": offset, "hidebroken": "true",
+             "order": "clickcount", "reverse": "true"},
         )
         return [self._normalize(s) for s in data if self._valid(s)]
 
-    def by_language(self, language: str, limit: int = 200) -> List[Dict]:
+    def by_language(self, language: str, limit: int = 200, offset: int = 0) -> List[Dict]:
         """Stations broadcasting in `language`, ordered by click count."""
         data = self._request(
             "stations/search",
             {
                 "language":   language.lower(),
                 "limit":      limit,
+                "offset":     offset,
                 "hidebroken": "true",
                 "order":      "clickcount",
                 "reverse":    "true",
@@ -517,17 +538,19 @@ class RadioBrowserClient:
         )
         return [self._normalize(s) for s in data if self._valid(s)]
 
-    def by_tag(self, tag: str, limit: int = 200) -> List[Dict]:
+    def by_tag(self, tag: str, limit: int = 200, offset: int = 0) -> List[Dict]:
         data = self._request(
             f"stations/bytag/{urllib.parse.quote(tag)}",
-            {"limit": limit, "hidebroken": "true", "order": "votes", "reverse": "true"},
+            {"limit": limit, "offset": offset, "hidebroken": "true",
+             "order": "votes", "reverse": "true"},
         )
         return [self._normalize(s) for s in data if self._valid(s)]
 
-    def top_stations(self, limit: int = 100) -> List[Dict]:
+    def top_stations(self, limit: int = 100, offset: int = 0) -> List[Dict]:
         data = self._request(
             "stations",
-            {"limit": limit, "hidebroken": "true", "order": "clickcount", "reverse": "true"},
+            {"limit": limit, "offset": offset, "hidebroken": "true",
+             "order": "clickcount", "reverse": "true"},
         )
         return [self._normalize(s) for s in data if self._valid(s)]
 
@@ -816,9 +839,9 @@ def _parse_m3u_text(text: str, source: str) -> List[Dict]:
                     "name":        name,
                     "url":         url,
                     "url_resolved":url,
-                    "logo":        attrs.get("tvg-logo", attrs.get("tvg_logo", "")),
-                    "countrycode": attrs.get("tvg-country", attrs.get("tvg_country", "")),
-                    "tags":        attrs.get("group-title", attrs.get("group_title", "")),
+                    "logo":        _clean_field(attrs.get("tvg-logo", attrs.get("tvg_logo", ""))),
+                    "countrycode": _clean_field(attrs.get("tvg-country", attrs.get("tvg_country", ""))),
+                    "tags":        _clean_field(attrs.get("group-title", attrs.get("group_title", ""))),
                     "bitrate":     0,
                     "votes":       0,
                     "clickcount":  0,
@@ -836,7 +859,7 @@ def _channel_to_dict(ch: Any, source: str) -> Dict:
         "name":        getattr(ch, "name", "") or "",
         "url":         url,
         "url_resolved":url,
-        "logo":        getattr(ch, "logo", "") or "",
+        "logo":        _clean_field(getattr(ch, "logo", "")),
         "countrycode": "",
         "tags":        getattr(ch, "group", "") or "",
         "bitrate":     0,
@@ -1155,6 +1178,8 @@ _favs:       Optional[RadioFavorites]      = None
 _verifier:   Optional[RadioStreamVerifier] = None
 _history:    Optional[RadioHistory]        = None
 _nowplaying: Optional[RadioNowPlaying]     = None
+# Simple in-memory artwork cache: track_string → url | None (max 300 entries)
+_artwork_cache: Dict[str, Optional[str]]   = {}
 
 
 def _instances():
@@ -1247,38 +1272,69 @@ def register_radio_addon(app: Any) -> Any:
         })
 
     # ── /api/radio/top ────────────────────────────────────────────────────────
-    # ?limit=100
+    # ?limit=100&offset=0 — paginated like the other browse-by-category routes
+    # below. `truncated` uses the standard "got a full page back" heuristic
+    # (no separate count query against RadioBrowser): if we received >=
+    # `limit` results, there MIGHT be more; a partial page means we've
+    # reached the end. This can occasionally under-report (a station or two
+    # filtered out as broken mid-page could make a true "there's more" page
+    # come back just under `limit`) but is the standard, cheap approach and
+    # errs toward stopping pagination rather than looping forever.
 
     @app.route("/api/radio/top")
     def radio_top():
         limit   = _clamp(request.args.get("limit", 100), 1, 500)
-        results = rb.top_stations(limit)
+        offset  = max(0, int(request.args.get("offset", 0) or 0))
+        results = rb.top_stations(limit, offset=offset)
         _mark_favorites(results, favs)
-        return jsonify({"status": "ok", "data": results, "count": len(results)})
+        return jsonify({
+            "status":    "ok",
+            "data":      results,
+            "count":     len(results),
+            "offset":    offset,
+            "limit":     limit,
+            "truncated": len(results) >= limit,
+        })
 
     # ── /api/radio/country/<cc> ───────────────────────────────────────────────
-    # ?limit=200
+    # ?limit=200&offset=0
 
     @app.route("/api/radio/country/<cc>")
     def radio_country(cc: str):
         limit   = _clamp(request.args.get("limit", 200), 1, 500)
-        results = rb.by_country(cc, limit=limit)
+        offset  = max(0, int(request.args.get("offset", 0) or 0))
+        results = rb.by_country(cc, limit=limit, offset=offset)
         _mark_favorites(results, favs)
         return jsonify({
             "status":      "ok",
             "countrycode": cc.upper(),
             "data":        results,
             "count":       len(results),
+            "offset":      offset,
+            "limit":       limit,
+            "truncated":   len(results) >= limit,
         })
 
     # ── /api/radio/genre/<tag> ────────────────────────────────────────────────
+    # ?limit=200&offset=0 — this is the route behind the Genre tab's
+    # drilldown; genres like "pop" can have several thousand matching
+    # stations, so pagination here matters most of the four.
 
     @app.route("/api/radio/genre/<tag>")
     def radio_genre(tag: str):
         limit   = _clamp(request.args.get("limit", 200), 1, 500)
-        results = rb.by_tag(tag, limit=limit)
+        offset  = max(0, int(request.args.get("offset", 0) or 0))
+        results = rb.by_tag(tag, limit=limit, offset=offset)
         _mark_favorites(results, favs)
-        return jsonify({"status": "ok", "tag": tag, "data": results, "count": len(results)})
+        return jsonify({
+            "status":    "ok",
+            "tag":       tag,
+            "data":      results,
+            "count":     len(results),
+            "offset":    offset,
+            "limit":     limit,
+            "truncated": len(results) >= limit,
+        })
 
     # ── /api/radio/countries ──────────────────────────────────────────────────
 
@@ -1304,17 +1360,22 @@ def register_radio_addon(app: Any) -> Any:
         return jsonify({"status": "ok", "data": data, "count": len(data)})
 
     # ── /api/radio/language/<lang> ────────────────────────────────────────────
+    # ?limit=200&offset=0
 
     @app.route("/api/radio/language/<lang>")
     def radio_language(lang: str):
         limit   = _clamp(request.args.get("limit", 200), 1, 500)
-        results = rb.by_language(lang, limit=limit)
+        offset  = max(0, int(request.args.get("offset", 0) or 0))
+        results = rb.by_language(lang, limit=limit, offset=offset)
         _mark_favorites(results, favs)
         return jsonify({
-            "status":   "ok",
-            "language": lang,
-            "data":     results,
-            "count":    len(results),
+            "status":    "ok",
+            "language":  lang,
+            "data":      results,
+            "count":     len(results),
+            "offset":    offset,
+            "limit":     limit,
+            "truncated": len(results) >= limit,
         })
 
     # ── /api/radio/shoutcast ──────────────────────────────────────────────────
@@ -1335,18 +1396,23 @@ def register_radio_addon(app: Any) -> Any:
     def radio_sources():
         return jsonify({"status": "ok", "sources": list(M3U_SOURCES.keys())})
 
-    # ── /api/radio/load_source  POST {source: "name", limit?: 500} ───────────
+    # ── /api/radio/load_source  POST {source: "name", limit?: 500, offset?: 0}
     # Blocks until load completes (max 70 s) — M3U hits disk cache on repeat
-    # calls so only the first call per 24 h is slow.
-    # `limit` caps the returned list (default 500, max 5000) — large playlists
-    # like the Free-TV per-country lists can still be truncated; `total` and
-    # `truncated` fields tell the client how many stations exist overall.
+    # calls so only the first call per 24 h is slow; subsequent calls for
+    # later pages of the SAME source within that window just re-slice the
+    # already-cached list, so paging through a huge playlist is cheap.
+    # `limit` caps the page size (default 500, max 5000). `offset` selects
+    # where the page starts — the client-side IntersectionObserver "load
+    # more" sentinel advances this on each subsequent page. `total` and
+    # `truncated` (= more stations remain after this page) tell the client
+    # whether to keep paging.
 
     @app.route("/api/radio/load_source", methods=["POST"])
     def radio_load_source():
-        body  = request.get_json(force=True, silent=True) or {}
-        name  = body.get("source", "").strip()
-        limit = _clamp(body.get("limit", 500), 1, 5000)
+        body   = request.get_json(force=True, silent=True) or {}
+        name   = body.get("source", "").strip()
+        limit  = _clamp(body.get("limit", 500), 1, 5000)
+        offset = max(0, int(body.get("offset", 0) or 0))
         if not name or name not in M3U_SOURCES:
             return jsonify({
                 "status":  "error",
@@ -1368,7 +1434,8 @@ def register_radio_addon(app: Any) -> Any:
 
         all_stations = holder.get("data") or []
         total        = len(all_stations)
-        stations     = all_stations[:limit]
+        stations     = all_stations[offset:offset + limit]
+        truncated    = (offset + len(stations)) < total
 
         note = _load_source_note(
             url            = M3U_SOURCES.get(name, ""),
@@ -1377,6 +1444,7 @@ def register_radio_addon(app: Any) -> Any:
             stations_shown = len(stations),
             last_msg       = holder.get("last_msg", ""),
             still_running  = t.is_alive(),
+            offset         = offset,
         )
 
         _mark_favorites(stations, favs)
@@ -1386,7 +1454,9 @@ def register_radio_addon(app: Any) -> Any:
             "data":      stations,
             "count":     len(stations),
             "total":     total,
-            "truncated": total > limit,
+            "offset":    offset,
+            "limit":     limit,
+            "truncated": truncated,
             "note":      note,
         })
 
@@ -1461,6 +1531,44 @@ def register_radio_addon(app: Any) -> Any:
             return jsonify({"status": "error", "message": "url parameter required"}), 400
         result = nowplaying.get(url, timeout=8)
         return jsonify({"status": "ok", "result": result})
+
+    # ── /api/radio/artwork  GET ?track=Artist+%2D+Title ───────────────────────
+    # Looks up album art for a track string (typically "Artist - Title" from ICY
+    # StreamTitle) via the iTunes Search API.  Free, no auth, rate-limit friendly.
+    # Results are cached in-memory for the session; the iTunes CDN URLs are stable
+    # enough that disk persistence adds no real value here.
+    #
+    # artworkUrl100 → artworkUrl600 via string substitution (same CDN file, bigger
+    # thumbnail) is a documented iTunes API pattern.
+
+    @app.route("/api/radio/artwork")
+    def radio_artwork():
+        track = request.args.get("track", "").strip()[:200]
+        if not track:
+            return jsonify({"url": None})
+        if track in _artwork_cache:
+            return jsonify({"url": _artwork_cache[track]})
+        url: Optional[str] = None
+        if _HAS_REQUESTS:
+            try:
+                resp = requests.get(
+                    "https://itunes.apple.com/search",
+                    params={"term": track, "media": "song", "limit": 1, "country": "US"},
+                    timeout=4,
+                    headers={"User-Agent": "FlaskyIPTV/1.0"},
+                )
+                items = resp.json().get("results", [])
+                if items:
+                    raw = items[0].get("artworkUrl100", "")
+                    if raw:
+                        url = raw.replace("100x100bb", "600x600bb")
+            except Exception:
+                pass
+        # Evict oldest entry when cache is full
+        if len(_artwork_cache) >= 300:
+            _artwork_cache.pop(next(iter(_artwork_cache)), None)
+        _artwork_cache[track] = url
+        return jsonify({"url": url})
 
     # ── /api/radio/click  POST ────────────────────────────────────────────────
     # Called when the user starts playing a station.  Does two things:
@@ -1643,14 +1751,18 @@ def _load_source_note(
     stations_shown: int,
     last_msg:       str = "",
     still_running:  bool = False,
+    offset:         int = 0,
 ) -> str:
     """Build the human-readable `note` field for /api/radio/load_source.
 
     Pure function (no I/O) so the diagnostic messaging can be unit-tested
     without spinning up threads or a Flask app.
 
-    - `total > 0`            → normal "Showing X of Y" (or "" if not
-                                truncated).
+    - `total > 0` and more remain after this page → "Showing X-Y of Z"
+      using `offset` so page 2+ reports the correct range (not just
+      page 1's range repeated).
+    - `total > 0` and this page reaches the end → "" (nothing more to
+      load, no need to tell the user about a cap that isn't binding).
     - `still_running`        → background load exceeded the 70 s budget;
                                 tell the user it may still finish & cache.
     - `last_msg` starts with
@@ -1665,8 +1777,11 @@ def _load_source_note(
                                 a network timeout).
     """
     if total:
-        return (f"Showing {stations_shown} of {total} stations."
-                if total > limit else "")
+        end = offset + stations_shown
+        if end >= total:
+            return ""   # this page reaches the end of the list — nothing more to load
+        start = offset + 1 if stations_shown else offset
+        return f"Showing {start}-{end} of {total} stations."
 
     if still_running:
         return (
@@ -1725,9 +1840,10 @@ _RADIO_UI_JS = r"""
   const el = document.createElement('style');
   el.id = 'rdio-addon-css';
   el.textContent =
-    '.rdio-badge{display:inline-block;margin-left:4px;padding:1px 5px;' +
-    'border-radius:3px;font-size:10px;background:rgba(255,255,255,.1);' +
-    'vertical-align:middle;line-height:1.4}' +
+    '.rdio-badge{display:inline-block;margin-left:4px;padding:1px 6px;' +
+    'border-radius:3px;font-size:10px;font-weight:600;line-height:1.4;' +
+    'vertical-align:middle;background:rgba(124,58,237,.18);' +
+    'color:#c4b5fd;border:1px solid rgba(124,58,237,.25)}' +
     '#rdio-sleep-btn,#rdio-shuffle-btn{background:none;border:none;cursor:pointer;' +
     'color:var(--tx1,#fff);opacity:.55;font-size:11px;padding:0 6px;' +
     'line-height:1;flex-shrink:0;transition:opacity .15s,color .15s}' +
@@ -1745,6 +1861,31 @@ _RADIO_UI_JS = r"""
     // the 'rdio-np-visible' class, regardless of how the template's own CSS
     // happens to hide it.
     '#rdio-np-bar.rdio-np-visible{display:flex !important}' +
+    // Idle state — bar is visible but no station is playing (e.g. modal
+    // freshly opened this session). Dim it and stop the pulse so it reads
+    // as "nothing happening yet" rather than implying live audio.
+    '#rdio-np-bar.rdio-np-idle .rdio-np-icon{animation:none;opacity:.3}' +
+    '#rdio-np-bar.rdio-np-idle #rdio-np-text{opacity:.5;font-style:italic}' +
+    '#rdio-gain-btn{background:none;border:none;cursor:pointer;' +
+    'color:var(--tx1,#fff);opacity:.55;font-size:11px;padding:0 6px;' +
+    'line-height:1;flex-shrink:0;transition:opacity .15s,color .15s}' +
+    '#rdio-gain-btn:hover{opacity:.9}' +
+    '#rdio-gain-btn.active{opacity:1;color:var(--acc,#a78bfa)}' +
+    // Blurred album-art background — painted BELOW the modal's own content
+    // (negative z-index) but ABOVE the modal's solid base background.
+    // #radio-modal needs an explicit z-index (not just position:relative)
+    // so it establishes its own stacking context — otherwise a negative
+    // z-index child can escape behind #radio-modal entirely and end up
+    // behind the dark page backdrop instead of just behind this modal's
+    // own UI.
+    '#radio-modal{position:relative;z-index:0}' +
+    '#radio-modal::before{content:"";position:absolute;inset:0;z-index:-1;' +
+    'background-image:var(--rdio-art-bg,none);background-size:cover;background-position:center;' +
+    'filter:blur(60px) brightness(.32) saturate(1.4);opacity:0;' +
+    'transition:opacity .8s ease;pointer-events:none;border-radius:inherit}' +
+    '#radio-modal.rdio-has-art-bg::before{opacity:1}' +
+    '.rdio-load-more{display:flex;align-items:center;justify-content:center;' +
+    'padding:14px;font-size:11px;color:var(--txt3,#888);list-style:none}' +
     '@keyframes rdio-spin{to{transform:rotate(360deg)}}';
   document.head.appendChild(el);
 })();
@@ -1759,6 +1900,22 @@ let _ctriesLoaded = false;
 // blob per element — shrinks generated HTML ~70% and eliminates the
 // nested-quote escaping that caused "}"> to appear as visible text.
 let _currentList  = [];
+// "Load more" pagination state for whichever view is currently paginated
+// (Top, Country/Genre/Language drilldowns, M3U sources) — null whenever
+// the visible list ISN'T paginated (Search, Trending, History, Favorites,
+// Nearby, Builtin: see the comment above _rdioStartPagination for why each
+// of those is intentionally excluded).
+// Shape: { fetchMore(offset)=>Promise<{data,truncated}>, limit, offset, hasMore, loading }.
+let _rdioLoadMore         = null;
+let _rdioLoadMoreObserver = null;  // IntersectionObserver watching the sentinel <li>, or null
+// Prev/Next navigation context — the list + index a station was played
+// from (see _rdioPlayIdx), so the main player's prev/next buttons can
+// step through THAT list while a radio station is playing. null/-1 when
+// nothing has been played from a list yet, or after a shuffle (see
+// _rdioShuffle — shuffling intentionally clears this rather than silently
+// resuming an unrelated, possibly-stale list/index).
+let _rdioNavList  = null;
+let _rdioNavIndex = -1;
 // Sleep timer
 const _SLEEP_MINS   = [15, 30, 45, 60];
 let _rdioSleepIdx   = -1;    // -1 = off; 0-3 = active step
@@ -1777,6 +1934,10 @@ let _curRadioUrl  = '';      // URL of currently playing radio station
 let _curRadioInfo = null;
 let _rdioNpTimer  = null;    // setInterval handle for now-playing polling
 let _rdioLastNp   = '';      // last known StreamTitle from ICY stream
+let _rdioArtworkTimer = null; // debounce handle for iTunes artwork lookup
+// Gain presets cycled by the 🔊 button — index into the array
+const _GAIN_STEPS = [1.0, 1.5, 2.0, 0.5];
+let   _rdioGainIdx = 0;
 // Last country/genre drilled into, so reopening the radio browser (e.g.
 // after playing a station, which closes it) can jump straight back to
 // that view instead of resetting to the top-level grid. {cc, label} /
@@ -1795,6 +1956,7 @@ window.radioOpen = function(){
   document.getElementById('radio-overlay').classList.add('open');
   document.getElementById('radio-open-btn').classList.add('active');
   _rdioVizSyncBtn();
+  _rdioNpBarShow();   // always visible now — show it (idle state if nothing playing yet)
   _favsLoad();
   if(!_ctriesLoaded) _loadCountryDropdown();
   _rdioInjectLangTab();   // idempotent — adds Language tab if not already present
@@ -1820,6 +1982,7 @@ window.radioTab = function(btn, name){
 
 function _activateTab(name, btn, restoreDrillDown){
   _curTab = name;
+  _rdioLoadMoreTeardown();   // leaving whatever view was paginating — stop watching its sentinel
   const searchRow = document.getElementById('rdio-search-row');
   searchRow.style.display = (name === 'search') ? '' : 'none';
   switch(name){
@@ -1863,9 +2026,13 @@ window.radioSearch = async function(){
 // ── top 100 ───────────────────────────────────────────────────────────────
 async function _loadTop(){
   _setBody(_loadingHtml());
+  const LIMIT = 100;
+  const fetchPage = (offset) => _api(`/api/radio/top?limit=${LIMIT}&offset=${offset}`)
+    .then(r => ({ data: r.data || [], truncated: !!r.truncated }));
   try{
-    const d = await _api('/api/radio/top?limit=100');
-    _renderList(d.data || []);
+    const d = await fetchPage(0);
+    _renderList(d.data);
+    _rdioStartPagination(fetchPage, LIMIT, d.data.length, d.truncated);
   }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
 }
 
@@ -1947,9 +2114,13 @@ async function _loadCountryGrid(){
 window._rdioByCountry = async function(cc, label){
   _lastCountrySel = {cc, label};
   _setBody(_loadingHtml('Loading ' + _esc(label) + '…'));
+  const LIMIT = 200;
+  const fetchPage = (offset) => _api(`/api/radio/country/${encodeURIComponent(cc)}?limit=${LIMIT}&offset=${offset}`)
+    .then(r => ({ data: r.data || [], truncated: !!r.truncated }));
   try{
-    const d = await _api(`/api/radio/country/${encodeURIComponent(cc)}?limit=200`);
-    _renderList(d.data || [], label, true);
+    const d = await fetchPage(0);
+    _renderList(d.data, label, true);
+    _rdioStartPagination(fetchPage, LIMIT, d.data.length, d.truncated);
   }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
 };
 
@@ -1976,9 +2147,13 @@ async function _loadGenreGrid(){
 window._rdioByGenre = async function(tag){
   _lastGenreSel = tag;
   _setBody(_loadingHtml('Loading ' + _esc(tag) + '…'));
+  const LIMIT = 200;
+  const fetchPage = (offset) => _api(`/api/radio/genre/${encodeURIComponent(tag)}?limit=${LIMIT}&offset=${offset}`)
+    .then(r => ({ data: r.data || [], truncated: !!r.truncated }));
   try{
-    const d = await _api(`/api/radio/genre/${encodeURIComponent(tag)}?limit=200`);
-    _renderList(d.data || [], tag, true);
+    const d = await fetchPage(0);
+    _renderList(d.data, tag, true);
+    _rdioStartPagination(fetchPage, LIMIT, d.data.length, d.truncated);
   }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
 };
 
@@ -2027,9 +2202,13 @@ async function _loadLanguageGrid(){
 window._rdioByLanguage = async function(lang, label){
   _lastLangSel = {lang, label};
   _setBody(_loadingHtml('Loading ' + _esc(label) + '…'));
+  const LIMIT = 200;
+  const fetchPage = (offset) => _api(`/api/radio/language/${encodeURIComponent(lang)}?limit=${LIMIT}&offset=${offset}`)
+    .then(r => ({ data: r.data || [], truncated: !!r.truncated }));
   try{
-    const d = await _api(`/api/radio/language/${encodeURIComponent(lang)}?limit=200`);
-    _renderList(d.data || [], label, true);
+    const d = await fetchPage(0);
+    _renderList(d.data, label, true);
+    _rdioStartPagination(fetchPage, LIMIT, d.data.length, d.truncated);
   }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
 };
 
@@ -2038,7 +2217,10 @@ window._rdioByLanguage = async function(lang, label){
 // the currently playing station and auto-plays it.
 
 window._rdioShuffle = async function(){
-  if(!_curRadioInfo) return;
+  if(!_curRadioInfo){
+    if(typeof toast === 'function') toast('Select a station first', 'w');
+    return;
+  }
   const btn = document.getElementById('rdio-shuffle-btn');
 
   // Collect up to 3 genre tags from the playing station; pick one at random
@@ -2061,6 +2243,11 @@ window._rdioShuffle = async function(){
       return;
     }
     const pick = pool[Math.floor(Math.random() * pool.length)];
+    // Shuffle picks an arbitrary station outside any list the user was
+    // browsing — clear nav context rather than leaving prev/next pointing
+    // at a now-unrelated, increasingly stale list/index.
+    _rdioNavList  = null;
+    _rdioNavIndex = -1;
     radioPlayStation(
       encodeURIComponent(pick.url_resolved || pick.url),
       encodeURIComponent(JSON.stringify(pick))
@@ -2071,6 +2258,39 @@ window._rdioShuffle = async function(){
   }finally{
     if(btn){ btn.classList.remove('spinning'); btn.title = 'Shuffle — play similar station'; }
   }
+};
+
+// Called by the main player's playerPrev()/playerNext() (via
+// window._rdioPlayRelative, checked there against _curIsRadio) when a
+// radio station is the active media — steps to the next/previous PLAYABLE
+// station in whatever list the user was browsing when they pressed play
+// (see _rdioPlayIdx), wrapping around at either end so there's no dead
+// end. direction is -1 (prev) or +1 (next).
+//
+// Deliberately does NOT auto-fetch additional "load more" pages when
+// stepping past the end of an already-paginated list (Genre/Country/
+// Language/M3U/Top) — that pagination state may belong to a since-
+// abandoned view by the time this fires, and silently issuing a network
+// request from a prev/next button press is more surprising than just
+// wrapping back to the start of what's already loaded.
+window._rdioPlayRelative = function(direction){
+  if(!_rdioNavList || !_rdioNavList.length || _rdioNavIndex < 0){
+    if(typeof toast === 'function') toast('No station list to navigate \u2014 pick a station from a list first', 'w');
+    return;
+  }
+  const n = _rdioNavList.length;
+  let idx = _rdioNavIndex;
+  for(let tries = 0; tries < n; tries++){
+    idx = (idx + direction + n) % n;
+    const s   = _rdioNavList[idx];
+    const url = s && (s.url_resolved || s.url || '').trim();
+    if(url){
+      _rdioNavIndex = idx;
+      radioPlayStation(encodeURIComponent(url), encodeURIComponent(JSON.stringify(s)));
+      return;
+    }
+  }
+  if(typeof toast === 'function') toast('No other playable stations in this list', 'w');
 };
 
 // Lazily append the 🎲 button to #rdio-np-bar on first bar show.
@@ -2112,22 +2332,26 @@ async function _loadSources(){
 }
 
 window._rdioLoadM3U = async function(name){
+  _rdioLoadMoreTeardown();   // abandon any previous source's pagination state
   _setBody(_loadingHtml('Fetching ' + _esc(name) + ' — may take a moment for large playlists…'));
+  const PAGE_SIZE = 500;
+  const fetchPage = (offset) => _api('/api/radio/load_source', {
+    method:  'POST',
+    headers: {'Content-Type':'application/json'},
+    body:    JSON.stringify({ source: name, limit: PAGE_SIZE, offset }),
+  }, 80000);
   try{
-    const d = await _api('/api/radio/load_source', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({source: name, limit: 500}),
-    }, 80000);
-    if(!d.data || !d.data.length){
-      const note = d.note || 'No stations found';
-      _setBody(_emptyHtml('📂', note));
+    const first = await fetchPage(0);
+    if(!first.data || !first.data.length){
+      _setBody(_emptyHtml('📂', first.note || 'No stations found'));
       return;
     }
-    const label = d.truncated
-      ? `${_esc(name)} (showing ${d.count} of ${d.total})`
-      : _esc(name);
-    _renderList(d.data, label, true);
+    const label = first.truncated ? `${_esc(name)} (loading more as you scroll)` : _esc(name);
+    _renderList(first.data, label, true);
+    _rdioStartPagination(
+      (offset) => fetchPage(offset).then(r => ({ data: r.data || [], truncated: !!r.truncated })),
+      PAGE_SIZE, first.data.length, !!first.truncated
+    );
   }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
 };
 
@@ -2289,6 +2513,17 @@ window._rdioExportM3U = function(){
 window._rdioPlayIdx = function(i){
   const s = _currentList[i];
   if(!s) return;
+  // Remember WHERE this station was played from — the list itself (a
+  // snapshot reference; later _rdioAppendStations() pagination reassigns
+  // _currentList to a NEW array via .concat(), so this reference stays
+  // frozen at exactly what was visible/loaded at play time) and the
+  // index within it. playerPrev()/playerNext() in the main script use
+  // this via _rdioPlayRelative() to step through the SAME list the user
+  // was browsing — Trending, a Genre drilldown, an M3U source, Favorites,
+  // search results, wherever — instead of doing nothing or something
+  // unrelated.
+  _rdioNavList  = _currentList;
+  _rdioNavIndex = i;
   radioPlayStation(
     encodeURIComponent(s.url_resolved || s.url),
     encodeURIComponent(JSON.stringify(s))
@@ -2362,6 +2597,123 @@ function _rdioSleepEnsureBtn(){
   bar.appendChild(btn);
 }
 
+// ── album art + MediaSession ───────────────────────────────────────────────
+// Fires on every ICY StreamTitle change. Updates MediaSession immediately
+// (so the OS lock screen reflects the new track), then waits 5 s before
+// hitting /api/radio/artwork — a brief debounce so a flaky feed that
+// stutters between two titles doesn't spam the iTunes Search API.
+
+function _rdioOnTrackChange(title){
+  if(_rdioArtworkTimer){ clearTimeout(_rdioArtworkTimer); _rdioArtworkTimer = null; }
+  // Live track text now lives in the MAIN player (next to the station
+  // name), not just inside the radio modal — updates immediately so it
+  // tracks every title change in real time, independent of the modal
+  // being open/closed.
+  if(typeof setNPTrack === 'function') setNPTrack(title);
+  // Immediate MediaSession update with whatever we have now (no artwork yet)
+  _rdioSetMediaSession(title, _rdioViz._artworkUrl || null);
+  _rdioArtworkTimer = setTimeout(async () => {
+    _rdioArtworkTimer = null;
+    if(title !== _rdioLastNp) return;   // title changed while we were waiting
+    try{
+      const d = await _api(`/api/radio/artwork?track=${encodeURIComponent(title)}`);
+      if(title !== _rdioLastNp) return; // stale by response time
+      const artUrl = d.url || null;
+      // Push into visualizer as highest-priority center-circle image
+      if(_rdioViz) _rdioViz.setLogoOverride(artUrl);
+      // ...and into the radio modal's own blurred background
+      _rdioModalArtBg(artUrl);
+      // Re-update MediaSession now that we have (or confirmed lack of) artwork
+      _rdioSetMediaSession(title, artUrl);
+    }catch(e){}
+  }, 5000);
+}
+
+// Blurred album-art background for the radio modal itself — the ONLY
+// place artwork is shown outside the visualizer's center circle (no
+// thumbnail next to the now-playing title elsewhere — see setNPTrack).
+// Quotes are stripped from the URL before embedding in a CSS string value
+// (defense in depth — iTunes URLs never contain one, but custom-property
+// values aren't HTML-escaped the way innerHTML content is).
+function _rdioModalArtBg(url){
+  const modal = document.getElementById('radio-modal');
+  if(!modal) return;
+  if(url){
+    modal.style.setProperty('--rdio-art-bg', `url("${String(url).replace(/"/g, '%22')}")`);
+    modal.classList.add('rdio-has-art-bg');
+  } else {
+    modal.classList.remove('rdio-has-art-bg');
+  }
+}
+
+function _rdioSetMediaSession(title, artworkUrl){
+  if(!('mediaSession' in navigator)) return;
+  const info   = _curRadioInfo || {};
+  // ICY titles are usually "Artist - Track"; split on first " - "
+  const sepIdx = title ? title.indexOf(' - ') : -1;
+  const artist = sepIdx >= 0 ? title.slice(0, sepIdx).trim() : (info.name || '');
+  const track  = sepIdx >= 0 ? title.slice(sepIdx + 3).trim() : (title || info.name || 'Radio');
+  const artwork = [];
+  if(artworkUrl)  artwork.push({ src: artworkUrl, sizes: '600x600', type: 'image/jpeg' });
+  else if(info.logo) artwork.push({ src: info.logo });
+  try{
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title:  track,
+      artist: artist,
+      album:  info.name || '',
+      artwork,
+    });
+  }catch(e){}
+}
+
+// ── gain (volume normalization) ────────────────────────────────────────────
+// Cycles through _GAIN_STEPS via the 🔊 button in #rdio-np-bar.
+// The GainNode lives on _rdioViz; gain persists across station changes
+// because _gainNode is only created once per AudioContext lifetime.
+
+function _rdioGainNext(){
+  _rdioGainIdx = (_rdioGainIdx + 1) % _GAIN_STEPS.length;
+  const v = _GAIN_STEPS[_rdioGainIdx];
+  if(_rdioViz && _rdioViz._gainNode) _rdioViz._gainNode.gain.value = v;
+  localStorage.setItem('rdio_gain', v);
+  _rdioGainSyncBtn();
+  if(typeof toast === 'function'){
+    const labels = ['Normal','Loud','Boost','Soft'];
+    toast(`Volume: ${labels[_rdioGainIdx]}`, 'k');
+  }
+}
+
+function _rdioGainSyncBtn(){
+  const btn = document.getElementById('rdio-gain-btn');
+  if(!btn) return;
+  const v = _GAIN_STEPS[_rdioGainIdx];
+  if(v === 1.0){
+    btn.textContent = '🔊';
+    btn.title = 'Volume: Normal — click to boost';
+    btn.classList.remove('active');
+  } else {
+    const labels = {0.5:'Soft', 1.5:'Loud', 2.0:'Boost'};
+    btn.textContent = `🔊 ${v}×`;
+    btn.title = `Volume: ${labels[v]||v+'×'} — click to change`;
+    btn.classList.add('active');
+  }
+}
+
+function _rdioGainEnsureBtn(){
+  if(document.getElementById('rdio-gain-btn')) return;
+  const bar = document.getElementById('rdio-np-bar');
+  if(!bar) return;
+  // Restore saved gain index on first show
+  const saved = parseFloat(localStorage.getItem('rdio_gain') || '1');
+  const idx   = _GAIN_STEPS.findIndex(v => Math.abs(v - saved) < 0.05);
+  if(idx >= 0) _rdioGainIdx = idx;
+  const btn = document.createElement('button');
+  btn.id      = 'rdio-gain-btn';
+  btn.onclick = _rdioGainNext;
+  bar.insertBefore(btn, bar.firstChild.nextSibling || null); // after np-text
+  _rdioGainSyncBtn();
+}
+
 // ── now-playing bar (ICY StreamTitle polling) ─────────────────────────────
 // Polls /api/radio/nowplaying every 20 s after a station starts playing.
 // The server caches ICY reads for 20 s — cheap after the first call.
@@ -2370,7 +2722,17 @@ function _rdioSleepEnsureBtn(){
 function _rdioNpStart(url){
   _curRadioUrl = url;
   _rdioLastNp  = '';
-  _rdioNpBarShow('');
+  // Cancel any pending artwork lookup from the previous station
+  if(_rdioArtworkTimer){ clearTimeout(_rdioArtworkTimer); _rdioArtworkTimer = null; }
+  if(_rdioViz) _rdioViz.setLogoOverride(null);
+  // Defensive clear of the main player's track display — doPlay() in the
+  // main script also clears this at the start of every playback session,
+  // but clearing here too means this still works correctly even if
+  // radio_addon.py is ever paired with a main script that doesn't
+  // (belt-and-braces, same philosophy as the bar-visibility fix above).
+  if(typeof setNPTrack === 'function') setNPTrack('');
+  _rdioModalArtBg(null);
+  _rdioNpBarShow();
   if(_rdioNpTimer){ clearInterval(_rdioNpTimer); _rdioNpTimer = null; }
   setTimeout(()  => _rdioNpFetch(url), 4000);           // first fetch after 4 s
   _rdioNpTimer = setInterval(() => _rdioNpFetch(url), 20000);
@@ -2380,8 +2742,12 @@ function _rdioNpStop(){
   _curRadioUrl  = '';
   _curRadioInfo = null;
   _rdioLastNp  = '';
+  _rdioNavList  = null;
+  _rdioNavIndex = -1;
   if(_rdioNpTimer){ clearInterval(_rdioNpTimer); _rdioNpTimer = null; }
-  _rdioNpBarShow('');
+  if(typeof setNPTrack === 'function') setNPTrack('');
+  _rdioModalArtBg(null);
+  _rdioNpBarShow();
 }
 
 async function _rdioNpFetch(url){
@@ -2390,36 +2756,39 @@ async function _rdioNpFetch(url){
     const r = await _api(`/api/radio/nowplaying?url=${encodeURIComponent(url)}`,{},12000);
     if(url !== _curRadioUrl) return;
     const title = (r.result && r.result.stream_title) || '';
+    if(title === _rdioLastNp) return;   // no change — skip update + artwork lookup
     _rdioLastNp = title;
-    _rdioNpBarShow(title);
+    if(title) _rdioOnTrackChange(title);
+    else if(typeof setNPTrack === 'function') setNPTrack('');  // ICY title cleared upstream
   }catch(e){}
 }
 
-function _rdioNpBarShow(title){
+function _rdioNpBarShow(){
   const bar  = document.getElementById('rdio-np-bar');
   const text = document.getElementById('rdio-np-text');
   if(!bar||!text) return;
+  // Belt-and-braces visibility: an inline style AND an !important CSS
+  // class (see injected stylesheet above). Whichever one the template's
+  // own CSS can't override, the other one wins — see the comment on
+  // '#rdio-np-bar.rdio-np-visible' above for why this is necessary.
+  // The bar is now ALWAYS visible whenever the radio modal is open — it's
+  // the sleep/gain/shuffle CONTROL strip, no longer gated on a station
+  // currently playing. The live track title moved to the main player (see
+  // setNPTrack) since it reflects what's actually *audible* right now,
+  // independent of whether this modal happens to be open — duplicating
+  // that here would just be a second, laggier copy.
+  bar.style.display = 'flex';
+  bar.classList.add('rdio-np-visible');
   if(_curRadioUrl){
-    // Show bar immediately when a station is playing — use station name as
-    // fallback text until the first ICY StreamTitle arrives (or forever, for
-    // stations that don't send ICY metadata). Bug fix: the bar (and the
-    // sleep/shuffle buttons that live inside it) must NOT depend on ICY
-    // metadata ever arriving — both branches below run unconditionally.
-    text.textContent = title
-      ? ('♫  ' + title)
-      : ('♫  ' + ((_curRadioInfo && _curRadioInfo.name) || '…'));
-    // Belt-and-braces visibility: an inline style AND an !important CSS
-    // class (see injected stylesheet above). Whichever one the template's
-    // own CSS can't override, the other one wins — see the comment on
-    // '#rdio-np-bar.rdio-np-visible' above for why this is necessary.
-    bar.style.display = 'flex';
-    bar.classList.add('rdio-np-visible');
-    _rdioShuffleEnsureBtn();  // 🎲 inserted before ⏱ — independent of ICY
-    _rdioSleepEnsureBtn();    // ⏱ always last — independent of ICY
+    text.textContent = '♫  ' + ((_curRadioInfo && _curRadioInfo.name) || '…');
+    bar.classList.remove('rdio-np-idle');
   } else {
-    bar.style.display = 'none';
-    bar.classList.remove('rdio-np-visible');
+    text.textContent = 'Select a station to play';
+    bar.classList.add('rdio-np-idle');
   }
+  _rdioGainEnsureBtn();     // 🔊 right after title text
+  _rdioShuffleEnsureBtn();  // 🎲 before ⏱
+  _rdioSleepEnsureBtn();    // ⏱ always last
 }
 
 // ── favorites ─────────────────────────────────────────────────────────────
@@ -2497,8 +2866,55 @@ function _filterEmptyHtml(){
   return `<div id="rdio-cat-empty" class="rdio-empty" style="display:none"><span>🔍</span>No matches</div>`;
 }
 
+// Builds the <li> markup for ONE station at a given GLOBAL index into
+// _currentList. Shared by _renderList's initial render and
+// _rdioAppendStations' "load more" append so both produce identical rows.
+// Returns '' for a station with no usable URL (caller should skip it).
+function _stationLiHtml(s, idx){
+  const url = (s.url_resolved || s.url || '').trim();
+  if(!url) return '';
+  const name  = _esc(s.name || 'Unknown Station');
+  const cc    = (s.countrycode || '').toUpperCase();
+  const tags  = (s.tags || '').split(',').slice(0,2).map(t=>t.trim()).filter(Boolean).join(' · ');
+  const codec = (s.codec || '').toUpperCase().replace('MPEG','MP3');
+  const meta  = [cc, tags].filter(Boolean).join('  ·  ');
+  const logo   = (s.logo          || '').trim();
+  const iconFb = (s.icon_fallback || '').trim();
+  const uuid  = s.stationuuid || '';
+  const fav   = _isFav(url, uuid);
+  const logoH = logo
+    ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(logo)}"
+         onerror="${iconFb
+           ? `this.src='${_esc(iconFb)}';this.onerror=function(){this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'}`
+           : `this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'` }">`
+    : iconFb
+      ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(iconFb)}"
+           onerror="this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'">`
+      : `<div class="rdio-item-logo" style="font-size:18px">📻</div>`;
+  const badges = [codec, s.bitrate ? s.bitrate + ' kbps' : '']
+    .filter(Boolean).map(t => `<span class="rdio-badge">${_esc(t)}</span>`).join('');
+
+  return `<li class="rdio-item">
+    ${logoH}
+    <div class="rdio-item-info">
+      <div class="rdio-item-name">${name}</div>
+      ${(meta || badges) ? `<div class="rdio-item-meta">${meta ? _esc(meta) : ''}${badges}</div>` : ''}
+    </div>
+    <button class="rdio-item-fav${fav?' active':''}" title="${fav?'Remove from favorites':'Add to favorites'}"
+      onclick="_rdioFavIdx(this,${idx})">${fav?'★':'☆'}</button>
+    <button class="rdio-item-play" title="Play ${_esc(s.name||'')}"
+      onclick="_rdioPlayIdx(${idx})">▶</button>
+  </li>`;
+}
+
 // ── render station list ───────────────────────────────────────────────────
 function _renderList(stations, queryOrLabel, showBack){
+  // A fresh render replaces #rdio-body entirely, so any sentinel/observer
+  // from a previous "load more" view is about to become a dangling
+  // reference — tear it down before rebuilding (idempotent no-op if there
+  // wasn't one). _rdioLoadM3U sets _rdioLoadMore again AFTER calling this,
+  // if its own response says there's more to page through.
+  _rdioLoadMoreTeardown();
   if(!stations || !stations.length){
     _setBody(_emptyHtml('📭', 'No stations found'));
     return;
@@ -2514,41 +2930,7 @@ function _renderList(stations, queryOrLabel, showBack){
   h += '<ul class="rdio-list" id="rdio-list-ul">';
   _currentList = stations;
   for(let idx = 0; idx < stations.length; idx++){
-    const s    = stations[idx];
-    const url  = (s.url_resolved || s.url || '').trim();
-    if(!url) continue;
-    const name  = _esc(s.name || 'Unknown Station');
-    const cc    = (s.countrycode || '').toUpperCase();
-    const tags  = (s.tags || '').split(',').slice(0,2).map(t=>t.trim()).filter(Boolean).join(' · ');
-    const codec = (s.codec || '').toUpperCase().replace('MPEG','MP3');
-    const meta  = [cc, tags].filter(Boolean).join('  ·  ');
-    const logo   = (s.logo          || '').trim();
-    const iconFb = (s.icon_fallback || '').trim();
-    const uuid  = s.stationuuid || '';
-    const fav   = _isFav(url, uuid);
-    const logoH = logo
-      ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(logo)}"
-           onerror="${iconFb
-             ? `this.src='${_esc(iconFb)}';this.onerror=function(){this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'}`
-             : `this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'` }">`
-      : iconFb
-        ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(iconFb)}"
-             onerror="this.outerHTML='<div class=rdio-item-logo style=\\'font-size:18px\\'>📻</div>'">`
-        : `<div class="rdio-item-logo" style="font-size:18px">📻</div>`;
-    const badges = [codec, s.bitrate ? s.bitrate + ' kbps' : '']
-      .filter(Boolean).map(t => `<span class="rdio-badge">${_esc(t)}</span>`).join('');
-
-    h += `<li class="rdio-item">
-      ${logoH}
-      <div class="rdio-item-info">
-        <div class="rdio-item-name">${name}</div>
-        ${(meta || badges) ? `<div class="rdio-item-meta">${meta ? _esc(meta) : ''}${badges}</div>` : ''}
-      </div>
-      <button class="rdio-item-fav${fav?' active':''}" title="${fav?'Remove from favorites':'Add to favorites'}"
-        onclick="_rdioFavIdx(this,${idx})">${fav?'★':'☆'}</button>
-      <button class="rdio-item-play" title="Play ${_esc(s.name||'')}"
-        onclick="_rdioPlayIdx(${idx})">▶</button>
-    </li>`;
+    h += _stationLiHtml(stations[idx], idx);
   }
   h += '</ul>';
   // Empty-state ("No matches") for the live filter above — always included
@@ -2558,6 +2940,115 @@ function _renderList(stations, queryOrLabel, showBack){
   // results showed a blank list with no explanation).
   h += _filterEmptyHtml();
   _setBody(h);
+}
+
+// Appends additional stations to the END of the currently-rendered list
+// WITHOUT touching the existing rows or resetting scroll position — the
+// opposite of _renderList, which replaces #rdio-body wholesale (and would
+// jump the user back to the top of the list on every "load more" page).
+// Used exclusively by the M3U source pagination flow.
+function _rdioAppendStations(newStations){
+  const ul = document.getElementById('rdio-list-ul');
+  if(!ul || !newStations || !newStations.length) return;
+  const startIdx = _currentList.length;
+  _currentList = _currentList.concat(newStations);
+  let h = '';
+  for(let i = 0; i < newStations.length; i++){
+    h += _stationLiHtml(newStations[i], startIdx + i);
+  }
+  // Insert before the sentinel (if present) rather than at the very end,
+  // so the sentinel <li> stays the last child for the IntersectionObserver
+  // to keep watching.
+  const sentinel = document.getElementById('rdio-load-more-sentinel');
+  if(sentinel) sentinel.insertAdjacentHTML('beforebegin', h);
+  else         ul.insertAdjacentHTML('beforeend', h);
+  // Re-apply whatever filter text is currently typed so newly-appended
+  // rows are immediately subject to it too, instead of all showing up
+  // regardless of an active filter.
+  const filterInput = document.getElementById('rdio-cat-filter');
+  if(filterInput && filterInput.value) window._rdioFilterCategory(filterInput);
+}
+
+// ── "load more" pagination via IntersectionObserver ────────────────────────
+// Generalized over a `fetchMore(offset) => Promise<{data, truncated}>`
+// closure so the SAME mechanism drives every browse-by-category view that
+// can run into thousands of results — M3U sources, and Top/Country/Genre/
+// Language (RadioBrowser-backed). Search/Trending/History/Favorites/Nearby
+// intentionally aren't wired up: those are either inherently small
+// (favorites, history, nearby) or a curated fixed-size list by design
+// (trending), or a multi-strategy aggregated/ranked query that doesn't map
+// onto simple offset pagination (search) — see radio_search().
+
+// Called by each loader right after rendering its first page. No-ops if
+// that first page wasn't truncated (nothing more to load).
+function _rdioStartPagination(fetchMore, limit, firstPageCount, truncated){
+  if(!truncated || firstPageCount === 0){ _rdioLoadMore = null; return; }
+  _rdioLoadMore = { fetchMore, limit, offset: firstPageCount, hasMore: true, loading: false };
+  _rdioSetupLoadMoreSentinel();
+}
+
+// Appends a sentinel <li> after the last row and watches it with an
+// IntersectionObserver; scrolling it into view triggers the next page
+// fetch. Safe to call repeatedly — always tears down any previous
+// sentinel/observer first. No-ops (silently caps the list at page one) on
+// browsers without IntersectionObserver support.
+function _rdioSetupLoadMoreSentinel(){
+  // Clear any stale sentinel/observer left over in the DOM (defensive —
+  // shouldn't normally exist at this point) WITHOUT touching _rdioLoadMore
+  // itself, which the caller (_rdioStartPagination) just set — calling the
+  // full _rdioLoadMoreTeardown() here would immediately null that state
+  // right back out before it's ever used.
+  if(_rdioLoadMoreObserver){ _rdioLoadMoreObserver.disconnect(); _rdioLoadMoreObserver = null; }
+  const old = document.getElementById('rdio-load-more-sentinel');
+  if(old) old.remove();
+  if(!_rdioLoadMore || !_rdioLoadMore.hasMore) return;
+  const ul = document.getElementById('rdio-list-ul');
+  if(!ul) return;
+  const sentinel      = document.createElement('li');
+  sentinel.id         = 'rdio-load-more-sentinel';
+  sentinel.className  = 'rdio-load-more';
+  sentinel.textContent = 'Loading more…';
+  ul.appendChild(sentinel);
+  if(typeof IntersectionObserver !== 'function') return;
+  _rdioLoadMoreObserver = new IntersectionObserver((entries) => {
+    if(entries.some(e => e.isIntersecting)) _rdioLoadMoreFetch();
+  }, { root: null, rootMargin: '400px', threshold: 0 });
+  _rdioLoadMoreObserver.observe(sentinel);
+}
+
+// Fetches the next page via whatever fetchMore() closure the current view
+// set up, and appends it. Guards against overlapping calls (the observer
+// can fire again before a slow fetch resolves) and against firing for a
+// view that's since moved on (_rdioLoadMore would be null/replaced by then).
+async function _rdioLoadMoreFetch(){
+  if(!_rdioLoadMore || _rdioLoadMore.loading || !_rdioLoadMore.hasMore) return;
+  _rdioLoadMore.loading = true;
+  const sentinel = document.getElementById('rdio-load-more-sentinel');
+  if(sentinel) sentinel.textContent = 'Loading more…';
+  try{
+    const { data, truncated } = await _rdioLoadMore.fetchMore(_rdioLoadMore.offset);
+    if(!_rdioLoadMore) return;   // view changed while this fetch was in flight
+    const newStations = data || [];
+    _rdioLoadMore.offset += newStations.length;
+    _rdioLoadMore.hasMore = !!truncated && newStations.length > 0;
+    if(newStations.length) _rdioAppendStations(newStations);
+    if(!_rdioLoadMore.hasMore) _rdioLoadMoreTeardown();
+  }catch(e){
+    if(sentinel) sentinel.textContent = 'Couldn\u2019t load more \u2014 scroll to retry';
+  }finally{
+    if(_rdioLoadMore) _rdioLoadMore.loading = false;
+  }
+}
+
+// Disconnects the observer and removes the sentinel <li> (if present) and
+// clears the pagination state. Idempotent — safe to call when there's
+// nothing to tear down (the common case, since callers invoke this
+// defensively on every tab switch / fresh render).
+function _rdioLoadMoreTeardown(){
+  if(_rdioLoadMoreObserver){ _rdioLoadMoreObserver.disconnect(); _rdioLoadMoreObserver = null; }
+  const sentinel = document.getElementById('rdio-load-more-sentinel');
+  if(sentinel) sentinel.remove();
+  _rdioLoadMore = null;
 }
 
 // Pressing ← Back is an unambiguous "I'm done with this drill-down"
@@ -2615,7 +3106,7 @@ window.radioPlayStation = function(urlEnc, stEnc){
   _rdioNpStart(url);
 
   if(typeof doPlay === 'function'){
-    doPlay(url, st.name || url, {isLive: true});
+    doPlay(url, st.name || url, {isLive: true, isRadio: true});
   } else {
     const v = document.getElementById('vid');
     if(v){ v.src = url; v.play().catch(()=>{}); }
@@ -2718,6 +3209,9 @@ class _RdioViz {
     this._animId    = null;   this._running   = false;
     this._audioCtx  = null;   this._analyser  = null;
     this._source    = null;   this._audioOk   = false;
+    this._gainNode  = null;   // GainNode between source and analyser
+    // Album art override — highest priority tier, set by now-playing poller
+    this._artworkImg = null;  this._artworkUrl = null;
     this._info      = {};     this._dpr        = 1;
     this._simT      = 0;
     this._freqBuf   = new Uint8Array(256);   // reused every frame
@@ -2765,6 +3259,9 @@ class _RdioViz {
     const logo     = (this._info.logo || '').trim();
     const fallback = (this._info.icon_fallback || '').trim();
     this._setLogo(logo || fallback, logo ? fallback : '');
+    // Clear album-art override from the previous station so we show the
+    // new station's own logo until the poller resolves artwork for this track.
+    this._artworkImg = null; this._artworkUrl = null;
     this._canvas.style.cssText += ';display:block;visibility:visible';
     this._lastRect = null;          // force initial position update
     this._paused    = false;
@@ -2814,6 +3311,19 @@ class _RdioViz {
       this._vidPrevDisplay = null;
     }
     if(this._canvas) this._canvas.style.display = 'none';
+  }
+
+  // Called by the now-playing poller when a new track resolves album art.
+  // Highest-priority tier: artwork > station logo > 📻 emoji.
+  // Pass null to revert to station logo (e.g. on station change).
+  setLogoOverride(url){
+    if(!url){ this._artworkImg = null; this._artworkUrl = null; return; }
+    if(url === this._artworkUrl) return;
+    const img = new Image();
+    const self = this;
+    img.onload  = () => { self._artworkImg = img; self._artworkUrl = url; };
+    img.onerror = () => {};
+    img.src = url;
   }
 
   // ── canvas setup ─────────────────────────────────────────────────
@@ -2935,9 +3445,18 @@ class _RdioViz {
         this._analyser.minDecibels           = -88;
         this._analyser.maxDecibels           = -10;
       }
+      // GainNode: created once, survives stop/start cycles so the user's
+      // gain preference is preserved across station changes.
+      if(!this._gainNode){
+        this._gainNode = this._audioCtx.createGain();
+        const stored = parseFloat(localStorage.getItem('rdio_gain') || '1');
+        this._gainNode.gain.value = isNaN(stored) ? 1 : Math.max(0.1, Math.min(4, stored));
+      }
       if(!this._source){
+        // Graph: source → gainNode → analyser → destination
         this._source = this._audioCtx.createMediaElementSource(vid);
-        this._source.connect(this._analyser);
+        this._source.connect(this._gainNode);
+        this._gainNode.connect(this._analyser);
         this._analyser.connect(this._audioCtx.destination);
       }
       this._audioOk = true;
@@ -3172,13 +3691,17 @@ class _RdioViz {
     ctx.beginPath(); ctx.arc(cx, cy, innerR*1.72+midAmp*innerR*0.55, 0, Math.PI*2); ctx.stroke();
     ctx.shadowBlur = 0;
 
-    // L6: center circle (black fill erases bars crossing center, then logo/emoji)
+    // L6: center circle — black fill, then artwork > station logo > 📻 emoji
     ctx.fillStyle = '#060612';
     ctx.beginPath(); ctx.arc(cx, cy, innerR*0.98, 0, Math.PI*2); ctx.fill();
-    if(this._logoLoaded && this._logoImg){
-      const iw = this._logoImg.naturalWidth  || this._logoImg.width  || 0;
-      const ih = this._logoImg.naturalHeight || this._logoImg.height || 0;
-      this._drawCoverImage(ctx, this._logoImg, iw, ih, cx, cy, innerR*0.84);
+    // Artwork (from iTunes lookup) takes priority; station logo is fallback.
+    const drawImg = (this._artworkImg && this._artworkUrl)
+      ? this._artworkImg
+      : (this._logoLoaded && this._logoImg) ? this._logoImg : null;
+    if(drawImg){
+      const iw = drawImg.naturalWidth  || drawImg.width  || 0;
+      const ih = drawImg.naturalHeight || drawImg.height || 0;
+      this._drawCoverImage(ctx, drawImg, iw, ih, cx, cy, innerR*0.84);
     } else {
       const es = Math.round(innerR * 0.78);
       ctx.font = es + 'px serif';
