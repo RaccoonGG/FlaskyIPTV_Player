@@ -2390,9 +2390,17 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 #vph-ico{font-size:52px;opacity:.18}
 
 .pinfo{background:linear-gradient(180deg,var(--s1),var(--s2));padding:11px 14px;
-  border-bottom:1px solid var(--bdr);flex-shrink:0}
+  border-bottom:1px solid var(--bdr);flex-shrink:0;
+  display:flex;align-items:center;gap:10px}
+.pinfo-text{flex:1;min-width:0}
 #np{font-size:14px;font-weight:600;color:var(--txt);overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap;margin-bottom:2px}
+/* Live "now playing" track — radio only, set via setNPTrack(). Hidden
+   whenever there's no track to show (non-radio playback, or a radio
+   station that sends no ICY metadata) so it never displaces #np/#pu. */
+#np-track{font-size:11px;font-weight:600;color:var(--cyan);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;margin-bottom:2px;display:none}
+#np-track.show{display:block}
 #pu{font-size:11px;color:var(--acc);overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap;cursor:pointer;transition:var(--tr);
   filter:blur(4px);-webkit-filter:blur(4px)}
@@ -2561,7 +2569,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 #vf-btn:hover{background:var(--s3);color:var(--txt)}
 
 /* ── Radio open button (toolbar) ─────────────────────────────── */
-#radio-open-btn{height:26px;width:26px;padding:0;font-size:14px;
+#radio-open-btn{height:26px;padding:0 10px;font-size:12px;font-weight:700;
   border-radius:var(--rss);background:var(--s4);color:var(--txt2);
   border:1px solid var(--bdr2);transition:var(--tr);display:inline-flex;
   align-items:center;justify-content:center;flex-shrink:0}
@@ -2617,7 +2625,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .rdio-item-info{flex:1;min-width:0}
 .rdio-item-name{font-size:12px;font-weight:600;color:var(--txt);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rdio-item-meta{font-size:10px;color:var(--txt3);margin-top:1px;
+.rdio-item-meta{font-size:10px;color:var(--txt2);margin-top:1px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .rdio-item-play{height:28px;width:28px;padding:0;font-size:13px;flex-shrink:0;
   border-radius:50%;background:rgba(124,58,237,.14);color:var(--acc);
@@ -2637,7 +2645,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 /* tag / country grid */
 .rdio-tag-grid{display:flex;flex-wrap:wrap;gap:6px;padding:12px}
 .rdio-tag{height:28px;padding:0 13px;font-size:11px;border-radius:20px;cursor:pointer;
-  background:var(--s4);color:var(--txt2);border:1px solid var(--bdr);
+  background:var(--s4);color:var(--txt);border:1px solid var(--bdr);
   transition:all .15s;white-space:nowrap}
 .rdio-tag:hover{background:rgba(124,58,237,.15);color:var(--acc);
   border-color:rgba(124,58,237,.35)}
@@ -3343,7 +3351,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
             <button id="vf-btn"
               onclick="event.stopPropagation();toggleVfPanel()"
               title="Video Filters">
-              🎨 Filters
+              🎨 
             </button>
 
             <button id="pctrl-act-btn"
@@ -3386,8 +3394,11 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       </div>
       <div id="pctrl-body" style="overflow:hidden;transition:max-height .25s ease;max-height:0">
         <div class="pinfo">
-          <div id="np">No stream loaded</div>
-          <div id="pu" onclick="cpyUrl()" title="Hover or hold to reveal • tap to copy stream URL">—</div>
+          <div class="pinfo-text">
+            <div id="np">No stream loaded</div>
+            <div id="np-track"></div>
+            <div id="pu" onclick="cpyUrl()" title="Hover or hold to reveal • tap to copy stream URL">—</div>
+          </div>
         </div>
         <div class="pctrl">
           <div style="display:flex;flex-direction:column;gap:4px;align-self:flex-start;flex-shrink:0" class="pctrl-desktop-only">
@@ -3771,7 +3782,14 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
     </div>
 
     <!-- scrollable content area -->
-    <div id="rdio-np-bar" style="display:none">
+    <!-- Sleep / gain / shuffle control strip — always visible whenever the
+         radio modal is open (not gated on a station currently playing).
+         The live track title lives in the main player's #np-track (see
+         setNPTrack) since it reflects what's actually audible right now,
+         independent of whether this modal happens to be open. Album art
+         appears only as this modal's own blurred background — see
+         _rdioModalArtBg — not duplicated as a thumbnail elsewhere. -->
+    <div id="rdio-np-bar">
       <span class="rdio-np-icon">♫</span>
       <span id="rdio-np-text"></span>
     </div>
@@ -3812,6 +3830,12 @@ let allCats=[], catsCache={}, selCats=new Map();
 let categoryItemsCache = {};   // <-- add this (mode -> { key: items[] })
 let allItems=[], filtItems=[], navStack=[], selSet=new Set();
 let pUrl='', pName='', pIdx=-1;
+// True while the currently-playing media is a radio station (set from
+// doPlay()'s opts.isRadio, which radioPlayStation() in radio_addon.py
+// passes). playerPrev()/playerNext() check this to delegate to the radio
+// module's own list-aware navigation instead of the TV-channel filtItems
+// list, which radio stations were never part of.
+let _curIsRadio=false;
 let isStalker=false;  // true when connected to a stalker_portal MAC portal
 let _dlActive=false, _dlTaskType='', _dlItemNames=[];
 let hlsObj=null, mpegtsObj=null, recTmr=null, isRec=false, logEs=null, cpOpen=false;
@@ -6237,6 +6261,7 @@ function _destroyPlayers(){
 
 function doPlay(url, name, opts={}){
   pUrl=url; pName=name||url;
+  _curIsRadio = !!opts.isRadio;
   const dlb=document.getElementById('dl-now-btn'); if(dlb) dlb.disabled=false;
   const dlbm=document.getElementById('dl-now-btn-mob'); if(dlbm) dlbm.disabled=false;
   // Capture this invocation's epoch so all async callbacks can detect when a
@@ -6260,6 +6285,11 @@ function doPlay(url, name, opts={}){
   // ─────────────────────────────────────────────────────────────────────────
   setNP('▶ '+pName);
   document.getElementById('pu').textContent=url;
+  // Clear any leftover radio track title from a PREVIOUS station before
+  // this session's own state (if it's radio) starts arriving — otherwise
+  // a stale track title would briefly carry over onto whatever is about
+  // to play next, radio or not.
+  setNPTrack('');
   document.getElementById('ppbtn').textContent='⏸';
   document.getElementById('vph').style.opacity='0';
   forceTab('p-player','t-player');
@@ -7134,15 +7164,27 @@ vid.addEventListener('canplay',()=>document.getElementById('vph').style.opacity=
 function playerPP(){vid.paused||vid.ended?vid.play().catch(()=>{}):vid.pause();}
 function playerStop(){
   _playerStopped = true;
+  _curIsRadio = false;
   _destroyPlayers();
   pUrl=''; setNP('⏹ Stopped'); document.getElementById('pu').textContent='—';
+  setNPTrack('');
   document.getElementById('ppbtn').textContent='▶';
   document.getElementById('vph').style.opacity='1';
   const dlb=document.getElementById('dl-now-btn'); if(dlb) dlb.disabled=true;
   const dlbm=document.getElementById('dl-now-btn-mob'); if(dlbm) dlbm.disabled=true;
 }
-function playerPrev(){if(!filtItems.length)return; playItem(pIdx<=0?filtItems.length-1:pIdx-1);}
-function playerNext(){if(!filtItems.length)return; playItem(pIdx<0||pIdx>=filtItems.length-1?0:pIdx+1);}
+// Radio stations aren't part of filtItems (the TV-channel list) — when the
+// currently-playing media is radio, delegate entirely to the radio
+// module's own list-aware prev/next (the station list the user was
+// browsing when they started playback), set up by radio_addon.py.
+function playerPrev(){
+  if(_curIsRadio && typeof window._rdioPlayRelative === 'function'){ window._rdioPlayRelative(-1); return; }
+  if(!filtItems.length)return; playItem(pIdx<=0?filtItems.length-1:pIdx-1);
+}
+function playerNext(){
+  if(_curIsRadio && typeof window._rdioPlayRelative === 'function'){ window._rdioPlayRelative(1); return; }
+  if(!filtItems.length)return; playItem(pIdx<0||pIdx>=filtItems.length-1?0:pIdx+1);
+}
 function setVol(v){document.getElementById('vlbl').textContent=v; vid.volume=v/100;}
 
 // ══════════════════════════════════════════════════════════════
@@ -7336,6 +7378,18 @@ function toggleVfPanel(){
 
 
 function setNP(t){document.getElementById('np').textContent=t;}
+// Live "now playing" track text, set by the radio addon as ICY metadata
+// arrives. Generic-named (not radio-specific) so any future addon with
+// similar "currently playing sub-item" metadata can reuse it; today only
+// radio_addon.py calls this. (Album art is intentionally NOT mirrored
+// here — it lives only as the radio modal's own blurred background via
+// _rdioModalArtBg, to avoid showing the same artwork in two places.)
+function setNPTrack(t){
+  const el = document.getElementById('np-track');
+  if(!el) return;
+  if(t){ el.textContent = '♫ ' + t; el.classList.add('show'); }
+  else  { el.textContent = '';      el.classList.remove('show'); }
+}
 function togglePlayerControls(){
   const panel = document.getElementById('pctrl-panel');
   if(!panel) return;
