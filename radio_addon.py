@@ -1551,7 +1551,7 @@ def register_radio_addon(app: Any) -> Any:
         url: Optional[str] = None
         if _HAS_REQUESTS:
             try:
-                resp = requests.get(
+                resp = _requests.get(
                     "https://itunes.apple.com/search",
                     params={"term": track, "media": "song", "limit": 1, "country": "US"},
                     timeout=4,
