@@ -1162,7 +1162,19 @@ class RadioNowPlaying:
             return ""   # truncated buffer
         raw = buf[metaint + 1 : end].rstrip(b"\x00").decode("utf-8", errors="replace")
         m   = re.search(r"StreamTitle='([^']*)'", raw)
-        return m.group(1).strip() if m else ""
+        if not m:
+            return ""
+        title = m.group(1).strip()
+        # ICY StreamTitle fields are padded to a fixed byte-width with spaces,
+        # and some streams concatenate multiple metadata sections (artist, album,
+        # etc.) within a single StreamTitle, separated by long runs of spaces.
+        # Example raw value:
+        #   "Carman - Shine Through Me                          Carman - Single"
+        # Splitting on 3+ consecutive spaces keeps legitimate two-space gaps
+        # (rare but possible in real track names) while reliably stripping
+        # the fixed-width padding that causes garbage iTunes queries.
+        parts = [p.strip() for p in re.split(r' {3,}', title) if p.strip()]
+        return parts[0] if parts else title
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1540,10 +1552,29 @@ def register_radio_addon(app: Any) -> Any:
     #
     # artworkUrl100 → artworkUrl600 via string substitution (same CDN file, bigger
     # thumbnail) is a documented iTunes API pattern.
+    #
+    # Search strategy notes:
+    #   • ICY StreamTitle is normally "Artist - Title". iTunes returns better
+    #     results when queried as "Title Artist" (no " - " separator) because
+    #     that order matches how iTunes weights song vs artist fields internally.
+    #   • media="music" + entity="musicTrack" is the correct API combination for
+    #     audio tracks. The previously used media="song" is not a valid iTunes
+    #     API value and caused silent fallback to an unintended result set.
 
     @app.route("/api/radio/artwork")
     def radio_artwork():
-        track = request.args.get("track", "").strip()[:200]
+        track = request.args.get("track", "").strip()
+        if not track:
+            return jsonify({"url": None})
+        # ── defensive ICY cleanup ─────────────────────────────────────────────
+        # _parse_stream_title() already strips ICY fixed-width padding for
+        # display, but callers may arrive here from other paths (M3U metadata,
+        # manual calls). Split on 3+ consecutive spaces and take the first
+        # segment to be safe.
+        parts = [p.strip() for p in re.split(r' {3,}', track) if p.strip()]
+        track = parts[0] if parts else track
+        # Collapse any residual internal whitespace and enforce length cap.
+        track = re.sub(r' {2,}', ' ', track).strip()[:200]
         if not track:
             return jsonify({"url": None})
         if track in _artwork_cache:
@@ -1551,11 +1582,27 @@ def register_radio_addon(app: Any) -> Any:
         url: Optional[str] = None
         if _HAS_REQUESTS:
             try:
+                # Build the search term. ICY format is "Artist - Title";
+                # querying as "Title Artist" (no separator) hits iTunes
+                # more reliably than the raw " - " form.
+                sep_idx = track.find(' - ')
+                if sep_idx > 0:
+                    artist      = track[:sep_idx].strip()
+                    song_title  = track[sep_idx + 3:].strip()
+                    search_term = f"{song_title} {artist}"
+                else:
+                    search_term = track
                 resp = _requests.get(
                     "https://itunes.apple.com/search",
-                    params={"term": track, "media": "song", "limit": 1, "country": "US"},
-                    timeout=4,
-                    headers={"User-Agent": "FlaskyIPTV/1.0"},
+                    params={
+                        "term":    search_term,
+                        "media":   "music",        # "song" is invalid; correct value is "music"
+                        "entity":  "musicTrack",   # narrows results to audio tracks
+                        "limit":   1,
+                        "country": "US",
+                    },
+                    timeout=5,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; FlaskyIPTV/1.0)"},
                 )
                 items = resp.json().get("results", [])
                 if items:
