@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse, quote, quote_plus, unquote, parse_qs
 import asyncio
+import webbrowser
 import requests as _requests_lib
 
 from flask import Flask, request, jsonify, Response, render_template_string, stream_with_context
@@ -8713,11 +8714,36 @@ if __name__ == "__main__":
     host = "0.0.0.0"
     port = int(os.environ.get("PORT", 5000))
     print(f"🚀  IPTV Portal Builder starting on http://{host}:{port}")
-    print(f"    Open this address in your browser or WebView.")
     print(f"    ffmpeg: {'found ✓' if _FFMPEG_AVAILABLE else 'NOT FOUND ✗'}")
     print(f"    yt-dlp: {'found ✓' if YTDLP_AVAILABLE else 'not available'}")
     # Silence urllib3 InsecureRequestWarning — we use verify=False intentionally
     # for IPTV portals that have self-signed certs.
     warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+    # Auto-open browser after Flask has had time to bind the port.
+    _on_android = bool(os.environ.get("ANDROID_ROOT") or os.environ.get("TERMUX_VERSION"))
+    _open_url = f"http://127.0.0.1:{port}"
+    if not _on_android:
+        threading.Timer(1.5, lambda: webbrowser.open(_open_url)).start()
+    else:
+        # Android 10+ blocks background activity launches (am start is unreliable).
+        # termux-open-url bypasses this via the Termux:API foreground bridge app.
+        # Falls back to a clearly printed tappable URL (long-press in Termux).
+        # Print URL isolated on its own line — Termux detects it as a link.
+        # Long-press the URL → "Open URL" (one tap, no copy-paste needed).
+        print()
+        print(f"  {_open_url}")
+        print()
+        def _android_open():
+            for _cmd in (
+                ["termux-open-url", _open_url],                                                        # best: needs termux-api pkg + Termux:API app
+                ["/system/bin/am", "start", "--user", "0", "-a", "android.intent.action.VIEW", "-d", _open_url],  # may work on older Android
+                ["/system/bin/am", "start",               "-a", "android.intent.action.VIEW", "-d", _open_url],
+            ):
+                try:
+                    if subprocess.run(_cmd, timeout=5, capture_output=True).returncode == 0:
+                        return
+                except Exception:
+                    continue
+        threading.Timer(1.5, _android_open).start()
     # Use threaded=True for SSE support
     flask_app.run(host=host, port=port, threaded=True, debug=False)
