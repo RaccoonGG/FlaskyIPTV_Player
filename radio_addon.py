@@ -3238,16 +3238,20 @@ async function _api(url, opts, timeout){
 //   Falls back to simulated sine-wave if CORS-blocked or unavailable.
 //
 // Layers (bottom → top):
-//   0  Dark trail (motion blur)
-//   1  Drifting nebula gradient (purple/cyan/green, bass-reactive)
-//   2  Scrolling perspective grid
-//   3  128-bar radial spectrum (rotates, color-coded by freq)
-//   4  Inner bass ring (purple glow)
-//   5  Outer mid ring (cyan)
-//   6  Center circle (station logo or 📻 emoji)
-//   7  36 floating particles (bass-reactive)
-//   8  Bottom scrim with station name / country / tags / bitrate
-//   9  ● RADIO badge top-right
+//   0   Dark trail (motion blur — alpha surges on beat for punchy crispness)
+//   1   Drifting nebula gradient (bass+beat-reactive intensity)
+//   2   Scrolling grid (beat-reactive speed via accumulated offsets)
+//   3   96-bar radial spectrum (accumulated-angle rotation speed surges on beat;
+//          per-bar height boosted on beat; energy heat-map: cool purple/cyan/green
+//          → hot pink/sky/lime at high energy)
+//   4   Inner bass ring (beat-reactive radius + glow)
+//   4b  Expanding ring waves (spawned on beat detection, travel outward + fade)
+//   5   Outer mid ring (cyan)
+//   6   Center circle (logo/artwork breathes on beat; 📻 fallback)
+//   7   36 ambient particles (bass-reactive speed + size)
+//   7b  Burst particles (on-beat radial explosion from center, 4–8 per beat)
+//   8   Bottom scrim with station name / country / tags / bitrate
+//   9   ● RADIO badge top-right
 // ══════════════════════════════════════════════════════════════════
 
 class _RdioViz {
@@ -3293,6 +3297,26 @@ class _RdioViz {
     // rather than waiting out a full interval first.
     this._frameInterval = 1000 / 30;
     this._lastDrawTs     = -Infinity;
+    // ── Beat-reactive dynamics ────────────────────────────────────────
+    // _beatPulse: [0-1] fast-attack / slow-decay envelope fired on transients.
+    //   Drives rotation speed surge, ring wave spawning, color heat, burst
+    //   particles, trail punch, logo scale, bar height boost, nebula flare.
+    // _bassAvg: slow running average of bass amplitude used as the baseline
+    //   for onset detection (current bass / baseline > 1.62 → beat fires).
+    // _rotAngle / _gridOffX / _gridOffY: accumulated rather than t-multiplied
+    //   so their speed can vary frame-to-frame without position jumps.
+    // _rings: pool of expanding ring waves [{r, alpha}] (max 7).
+    // _burstParts: pool of on-beat burst particles [{fx,fy,vx,vy,life,r}]
+    //   using normalised canvas coordinates (max 24).
+    // _lastT: previous frame's Date.now()/1000, used for dt computation.
+    this._beatPulse  = 0;
+    this._bassAvg    = 0.15;
+    this._rotAngle   = 0;
+    this._gridOffX   = 0;
+    this._gridOffY   = 0;
+    this._rings      = [];
+    this._burstParts = [];
+    this._lastT      = 0;
     // Window resize (canvas pixel dimensions)
     this._onResize  = null;
   }
@@ -3313,6 +3337,11 @@ class _RdioViz {
     this._lastRect = null;          // force initial position update
     this._paused    = false;
     this._lastDrawTs = -Infinity;   // always draw the first frame immediately
+    // Reset beat dynamics — don't carry over stale pulse/rings/particles from
+    // the previous station; a fresh start() is always a clean slate.
+    this._beatPulse = 0; this._bassAvg = 0.15;
+    this._rotAngle  = 0; this._gridOffX = 0; this._gridOffY = 0;
+    this._rings.length = 0; this._burstParts.length = 0; this._lastT = 0;
     // Hide the underlying <video> element while the visualizer is showing.
     // Some radio stations (e.g. a station that pushes its logo as a
     // baked-in HLS video feed) carry a real video track, which the
@@ -3347,6 +3376,7 @@ class _RdioViz {
 
   stop(){
     this._running = false;
+    this._lastT   = 0;   // reset dt so next start() opens with a clean 0.033 frame
     if(this._animId){ cancelAnimationFrame(this._animId); this._animId = null; }
     if(this._onResize){ window.removeEventListener('resize', this._onResize); this._onResize = null; }
     this._stopModalObs();
@@ -3649,7 +3679,12 @@ class _RdioViz {
     const H    = c.height / dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    const t    = Date.now() / 1000;
+    const t  = Date.now() / 1000;
+    // dt: capped at 100 ms so a backgrounded tab can't cause huge position jumps.
+    // Falls back to 33 ms on the very first frame (this._lastT === 0).
+    const dt = (this._lastT > 0) ? Math.min(0.10, t - this._lastT) : 0.033;
+    this._lastT = t;
+
     const freq = this._getFreq();
     const N    = freq.length;
 
@@ -3671,42 +3706,120 @@ class _RdioViz {
     const innerR = Math.min(W,H) * 0.13;
     const maxBar = Math.min(W,H) * 0.27;
 
-    // L0: dark persistent trail (motion blur)
-    ctx.fillStyle = 'rgba(6,6,18,0.32)';
+    // ── Beat detection & dynamics ─────────────────────────────────────
+    // Smoothed bass baseline (~8 s half-life @ 30 fps) — adapts to the
+    // genre's general energy so beats are detected relative to context,
+    // not absolute volume.
+    this._bassAvg = this._bassAvg * 0.968 + bassAmp * 0.032;
+    const energyRatio = bassAmp / Math.max(this._bassAvg, 0.05);
+    // beatPulse < 0.5 holdoff: prevents double-firing within one beat's
+    // decay window (~5 frames → ~0.17 s at 30 fps).
+    const onBeat = energyRatio > 1.62 && bassAmp > 0.13 && this._beatPulse < 0.50;
+    if(onBeat){
+      this._beatPulse = Math.min(1, this._beatPulse + 0.72);
+      // Spawn expanding ring wave (capped pool — max 7)
+      if(this._rings.length < 7)
+        this._rings.push({r: 0, alpha: 0.70});
+      // Spawn radial burst particles from canvas center (capped pool — max 24)
+      if(this._burstParts.length < 24){
+        const np = 4 + Math.floor(bassAmp * 4);   // 4–8 per beat
+        for(let k=0; k<np; k++){
+          const ang = Math.random() * Math.PI * 2;
+          const spd = 0.005 + Math.random() * 0.009;
+          this._burstParts.push({
+            fx: 0.5, fy: 0.5,          // normalised canvas coords (center)
+            vx: Math.cos(ang) * spd,
+            vy: Math.sin(ang) * spd,
+            life: 1.0,
+            r: 0.004 + Math.random() * 0.005,  // radius as fraction of min(W,H)
+          });
+        }
+      }
+    }
+    // Decay beat pulse (half-life ~5 frames @ 30 fps → ~0.17 s)
+    this._beatPulse *= 0.87;
+
+    // Accumulated rotation: idle 0.10 rad/s, surges to ~0.70 rad/s on beat
+    this._rotAngle += (0.10 + this._beatPulse * 0.60) * dt;
+
+    // Accumulated grid offsets — beat-reactive speed, no jump on speed change
+    const gs = 44;
+    const gSpeedX = 6  + avgAmp * 22 + this._beatPulse * 22;
+    const gSpeedY = 3  + avgAmp * 11 + this._beatPulse * 11;
+    this._gridOffX = (this._gridOffX + gSpeedX * dt) % gs;
+    this._gridOffY = (this._gridOffY + gSpeedY * dt) % gs;
+
+    // Update ring waves — advance outward and compact in-place (zero allocations).
+    // Speed is proportional to innerR so rings travel the same fractional distance
+    // on any canvas size (small phone → large monitor).
+    { let j = 0;
+      for(let i=0; i<this._rings.length; i++){
+        const rg = this._rings[i];
+        rg.r     += innerR * (0.022 + bassAmp * 0.055) * dt * 30;
+        rg.alpha -= 0.022;
+        if(rg.alpha > 0.008) this._rings[j++] = rg;
+      }
+      this._rings.length = j;
+    }
+    // Update burst particles — apply drag and compact in-place
+    { let j = 0;
+      for(let i=0; i<this._burstParts.length; i++){
+        const p = this._burstParts[i];
+        p.fx   += p.vx;
+        p.fy   += p.vy;
+        p.vx   *= 0.91;
+        p.vy   *= 0.91;
+        p.life -= 0.038;
+        if(p.life > 0) this._burstParts[j++] = p;
+      }
+      this._burstParts.length = j;
+    }
+
+    // L0: dark persistent trail — opacity surges on beat for punchy feel
+    const trailAlpha = 0.28 + this._beatPulse * 0.18;
+    ctx.fillStyle = `rgba(6,6,18,${trailAlpha.toFixed(2)})`;
     ctx.fillRect(0, 0, W, H);
 
-    // L1: drifting nebula gradient
+    // L1: drifting nebula gradient — intensity flares on beat
     const gx = cx + Math.sin(t*0.19)*W*0.20;
     const gy = cy + Math.cos(t*0.14)*H*0.14;
     const gr = ctx.createRadialGradient(gx,gy,0,cx,cy,Math.max(W,H)*0.72);
-    gr.addColorStop(0,    `rgba(124,58,237,${+(0.12+bassAmp*0.15).toFixed(3)})`);
-    gr.addColorStop(0.38, `rgba(6,182,212,${+(0.05+midAmp*0.08).toFixed(3)})`);
+    const bpFlare = this._beatPulse * 0.20;
+    gr.addColorStop(0,    `rgba(124,58,237,${+(0.12+bassAmp*0.15+bpFlare).toFixed(3)})`);
+    gr.addColorStop(0.38, `rgba(6,182,212,${+(0.05+midAmp*0.08+bpFlare*0.5).toFixed(3)})`);
     gr.addColorStop(0.75, `rgba(34,197,94,${+(0.01+avgAmp*0.03).toFixed(3)})`);
     gr.addColorStop(1,    'rgba(0,0,0,0)');
     ctx.fillStyle = gr;
     ctx.fillRect(0, 0, W, H);
 
-    // L2: scrolling perspective grid
-    const gs = 44;
-    ctx.strokeStyle = `rgba(124,58,237,${+(0.030+avgAmp*0.038).toFixed(3)})`;
+    // L2: scrolling perspective grid — speed driven by accumulated beat-reactive offsets
+    ctx.strokeStyle = `rgba(124,58,237,${+(0.030+avgAmp*0.038+this._beatPulse*0.028).toFixed(3)})`;
     ctx.lineWidth = 0.5; ctx.beginPath();
-    for(let x=(t*6)%gs-gs; x<W+gs; x+=gs){ ctx.moveTo(x,0); ctx.lineTo(x,H); }
-    for(let y=(t*3)%gs-gs; y<H+gs; y+=gs){ ctx.moveTo(0,y); ctx.lineTo(W,y); }
+    for(let x=this._gridOffX-gs; x<W+gs; x+=gs){ ctx.moveTo(x,0); ctx.lineTo(x,H); }
+    for(let y=this._gridOffY-gs; y<H+gs; y+=gs){ ctx.moveTo(0,y); ctx.lineTo(W,y); }
     ctx.stroke();
 
-    // L3: radial spectrum — 96 bars, batched into 3 colour-segment paths
-    //     (was 128 individual gradient+stroke calls → now 3 stroke calls)
+    // L3: radial spectrum — 96 bars
+    //   • Rotation driven by accumulated _rotAngle (not t*const) so it surges on beat
+    //   • All bars get a beatBoost height multiplier on beat hits
+    //   • Zone colors lerp toward "hot" variants at high energy:
+    //       Zone 0  purple (260°)  →  hot pink (328°)
+    //       Zone 1  cyan   (186°)  →  sky blue (208°)
+    //       Zone 2  green  (142°)  →  lime     ( 84°)
     {
-      const numBars = 96, rot = t * 0.13;
+      const numBars = 96, rot = this._rotAngle;
       const seg0 = Math.floor(numBars * 0.34);
       const seg1 = Math.floor(numBars * 0.67);
       const alpha = (0.42 + avgAmp * 0.40).toFixed(2);
-      // [startIdx, count, r, g, b]
+      // energy: 0 = default cool palette, 1 = fully hot-shifted palette
+      const e = Math.min(1, avgAmp * 1.5 + this._beatPulse * 0.55);
       const zones = [
-        [0,        seg0,             124, 58,  237],
-        [seg0,     seg1 - seg0,      6,   182, 212],
-        [seg1,     numBars - seg1,   34,  197, 94 ],
+        // [startIdx, count, R, G, B]
+        [0,    seg0,       (124+(236-124)*e)|0, (58 +(72 -58) *e)|0, (237+(153-237)*e)|0],
+        [seg0, seg1-seg0,  (6  +(96 -6)  *e)|0, (182+(175-182)*e)|0, (212+(250-212)*e)|0],
+        [seg1, numBars-seg1,(34 +(190-34) *e)|0, (197+(242-197)*e)|0, (94 +(100-94) *e)|0],
       ];
+      const beatBoost = 1 + this._beatPulse * 0.32;
       ctx.lineCap = 'round'; ctx.lineWidth = 2.4;
       for(const [start, count, r, g, b] of zones){
         ctx.strokeStyle = `rgba(${r},${g},${b},${alpha})`;
@@ -3715,7 +3828,7 @@ class _RdioViz {
           const i     = start + k;
           const angle = (i/numBars)*Math.PI*2 - Math.PI/2 + rot;
           const amp   = freq[Math.floor((i/numBars)*N*0.68)] / 255;
-          const len   = innerR*0.08 + amp*maxBar;
+          const len   = (innerR*0.08 + amp*maxBar) * beatBoost;
           const ca = Math.cos(angle), sa = Math.sin(angle);
           ctx.moveTo(cx + ca*innerR,       cy + sa*innerR);
           ctx.lineTo(cx + ca*(innerR+len), cy + sa*(innerR+len));
@@ -3724,12 +3837,26 @@ class _RdioViz {
       }
     }
 
-    // L4: inner bass ring
-    ctx.shadowColor = '#7c3aed'; ctx.shadowBlur = 7 + bassAmp*20;
-    ctx.strokeStyle = `rgba(124,58,237,${+(0.42+bassAmp*0.52).toFixed(2)})`;
+    // L4: inner bass ring — radius and glow surge on beat
+    const bassRingR = innerR * (1 + bassAmp*0.38 + this._beatPulse*0.22);
+    ctx.shadowColor = '#7c3aed';
+    ctx.shadowBlur  = 7 + bassAmp*20 + this._beatPulse*20;
+    ctx.strokeStyle = `rgba(124,58,237,${+(0.42+bassAmp*0.52+this._beatPulse*0.18).toFixed(2)})`;
     ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(cx, cy, innerR*(1+bassAmp*0.38), 0, Math.PI*2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx, cy, bassRingR, 0, Math.PI*2); ctx.stroke();
     ctx.shadowBlur = 0;
+
+    // L4b: expanding ring waves — spawned on beat, travel outward and fade
+    if(this._rings.length > 0){
+      ctx.lineWidth = 1.5;
+      for(const ring of this._rings){
+        ctx.shadowColor = '#7c3aed';
+        ctx.shadowBlur  = 5;
+        ctx.strokeStyle = `rgba(148,79,255,${ring.alpha.toFixed(2)})`;
+        ctx.beginPath(); ctx.arc(cx, cy, innerR + ring.r, 0, Math.PI*2); ctx.stroke();
+      }
+      ctx.shadowBlur = 0;
+    }
 
     // L5: outer mid ring
     ctx.shadowColor = '#06b6d4'; ctx.shadowBlur = 3 + midAmp*9;
@@ -3738,29 +3865,30 @@ class _RdioViz {
     ctx.beginPath(); ctx.arc(cx, cy, innerR*1.72+midAmp*innerR*0.55, 0, Math.PI*2); ctx.stroke();
     ctx.shadowBlur = 0;
 
-    // L6: center circle — black fill, then artwork > station logo > 📻 emoji
+    // L6: center circle — black fill (fixed size), then artwork/logo scaled
+    // by beat pulse for a subtle breathing effect; clamped so it never
+    // overflows the black fill circle.
     ctx.fillStyle = '#060612';
     ctx.beginPath(); ctx.arc(cx, cy, innerR*0.98, 0, Math.PI*2); ctx.fill();
-    // Artwork (from iTunes lookup) takes priority; station logo is fallback.
+    const logoR  = Math.min(innerR*0.96, innerR*(0.84 + this._beatPulse*0.09));
     const drawImg = (this._artworkImg && this._artworkUrl)
       ? this._artworkImg
       : (this._logoLoaded && this._logoImg) ? this._logoImg : null;
     if(drawImg){
       const iw = drawImg.naturalWidth  || drawImg.width  || 0;
       const ih = drawImg.naturalHeight || drawImg.height || 0;
-      this._drawCoverImage(ctx, drawImg, iw, ih, cx, cy, innerR*0.84);
+      this._drawCoverImage(ctx, drawImg, iw, ih, cx, cy, logoR);
     } else {
       const es = Math.round(innerR * 0.78);
       ctx.font = es + 'px serif';
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.globalAlpha = 0.70 + Math.sin(t*1.8)*0.14;
+      ctx.globalAlpha = 0.70 + Math.sin(t*1.8)*0.14 + this._beatPulse*0.16;
       ctx.fillText('\uD83D\uDCFB', cx, cy + es*0.04);
       ctx.globalAlpha = 1;
     }
 
-    // L7: particles — pre-rendered glow sprites (no per-particle shadowBlur)
+    // L7: ambient particles — pre-rendered glow sprites (no per-particle shadowBlur)
     const sprites = this._particleSprites;
-    const spSz    = 20;
     for(const p of this._particles){
       p.x += p.vx + (Math.random()-0.5)*0.00014;
       p.y += p.vy * (1 + bassAmp*2.4);
@@ -3770,6 +3898,22 @@ class _RdioViz {
       ctx.drawImage(sprites[p.ci], p.x*W - sz/2, p.y*H - sz/2, sz, sz);
     }
     ctx.globalAlpha = 1;
+
+    // L7b: burst particles — radial explosion from center on beat.
+    // Normalised coords: fx=0.5 → cx, fy=0.5 → cy. Radius is a fraction
+    // of min(W,H). Particles travel ~80–120 px outward then fade.
+    if(this._burstParts.length > 0){
+      ctx.shadowColor = '#a78bfa'; ctx.shadowBlur = 4;
+      for(const p of this._burstParts){
+        const px = p.fx * W;
+        const py = p.fy * H;
+        const pr = Math.max(1.2, p.r * Math.min(W, H));
+        ctx.globalAlpha = p.life * 0.85;
+        ctx.fillStyle   = p.life > 0.55 ? '#c4b5fd' : '#7c3aed';
+        ctx.beginPath(); ctx.arc(px, py, pr, 0, Math.PI*2); ctx.fill();
+      }
+      ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+    }
 
     // L8: bottom station info scrim — gradient cached, rebuilt only on resize
     const name = (this._info.name    || '').trim();
