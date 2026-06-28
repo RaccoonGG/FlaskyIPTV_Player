@@ -76,7 +76,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from flask import jsonify, request, Response
 
@@ -105,6 +105,23 @@ LAYOUTS_FILE: str = os.path.join(
 
 # Suppress a new console window on Windows (same flag used in cast_addon.py)
 _NO_WINDOW: int = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 1b — RESOLVE_URL RATE LIMITING
+#
+# /api/multiview/resolve_url spawns a yt-dlp subprocess that can block a
+# Flask worker thread for up to 15 s (socket_timeout).  Two guards prevent
+# abuse or accidental rapid-fire calls:
+#
+#   _ydl_semaphore  — hard cap on concurrent yt-dlp processes.
+#   _ydl_cooldown   — per-client_id minimum interval between calls.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_ydl_semaphore: threading.Semaphore = threading.Semaphore(3)  # max 3 concurrent yt-dlp calls
+_ydl_last_call: Dict[str, float]    = {}                      # client_id -> last call epoch
+_ydl_rate_lock: threading.Lock      = threading.Lock()
+_YDL_COOLDOWN_SECS: float           = 2.0  # minimum seconds between calls per client_id
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -185,7 +202,7 @@ class StreamBroadcaster:
         self._stopped:    bool  = False
 
         self._lock:          threading.Lock      = threading.Lock()
-        self._client_queues: List[queue.Queue]   = []
+        self._client_queues: Set[queue.Queue]    = set()
 
         self.process: Optional[subprocess.Popen] = self._spawn()
 
@@ -307,7 +324,7 @@ class StreamBroadcaster:
                     # ffmpeg exited or pipe closed
                     break
                 with self._lock:
-                    for q in list(self._client_queues):
+                    for q in set(self._client_queues):
                         try:
                             q.put_nowait(chunk)
                         except queue.Full:
@@ -338,7 +355,7 @@ class StreamBroadcaster:
         """
         q: queue.Queue = queue.Queue(maxsize=_CLIENT_QUEUE_MAXSIZE)
         with self._lock:
-            self._client_queues.append(q)
+            self._client_queues.add(q)
             self.references += 1
             self.last_access = time.time()
         LOG.info('[MV] Client added  key=%s  refs=%d', self.stream_key, self.references)
@@ -357,8 +374,7 @@ class StreamBroadcaster:
             }
         """
         with self._lock:
-            if q in self._client_queues:
-                self._client_queues.remove(q)
+            self._client_queues.discard(q)   # O(1); no-op if already gone
             self.references = max(0, self.references - 1)
             self.last_access = time.time()
         LOG.info('[MV] Client removed  key=%s  refs=%d', self.stream_key, self.references)
@@ -450,27 +466,51 @@ def _get_or_create_broadcaster(stream_key: str, channel_url: str,
                                 audio_url: str = '') -> Optional[StreamBroadcaster]:
     """
     Return existing broadcaster for stream_key (if alive) or create a new one.
+
+    LOCKING STRATEGY — three phases so Popen never blocks the global lock:
+
+    Phase 1 (under lock): check for an alive existing broadcaster and return it,
+        or remove a dead one from the registry.
+    Phase 2 (outside lock): spawn the new StreamBroadcaster / ffmpeg process.
+        subprocess.Popen can take 50-300 ms; holding the lock during this call
+        would freeze every concurrent stream start, stop, and status check.
+    Phase 3 (under lock again): insert the new broadcaster, but first re-check
+        that no other thread created one for the same key while we were spawning
+        (race window between phase 1 and phase 2).  If another thread won the
+        race we discard ours and return theirs.
     """
+    # -- Phase 1: check registry under lock -----------------------------------
     with _mv_streams_lock:
         existing = _mv_streams.get(stream_key)
-
         if existing:
             if existing.is_alive():
-                LOG.info('[MV] Reusing existing broadcaster  key=%s  refs=%d', stream_key, existing.references)
+                LOG.info('[MV] Reusing existing broadcaster  key=%s  refs=%d',
+                         stream_key, existing.references)
                 return existing
-            LOG.warning('[MV] Dead broadcaster found in registry  key=%s  — replacing',
+            LOG.warning('[MV] Dead broadcaster found in registry  key=%s  -- replacing',
                         stream_key)
             existing.stop()
             del _mv_streams[stream_key]
 
-        broadcaster = StreamBroadcaster(stream_key, channel_url, user_agent,
-                                        transcode=transcode, audio_only=audio_only,
-                                        audio_url=audio_url)
-        if broadcaster.process:
-            _mv_streams[stream_key] = broadcaster
-            return broadcaster
-
+    # -- Phase 2: spawn ffmpeg OUTSIDE the lock -------------------------------
+    broadcaster = StreamBroadcaster(stream_key, channel_url, user_agent,
+                                    transcode=transcode, audio_only=audio_only,
+                                    audio_url=audio_url)
+    if not broadcaster.process:
         return None
+
+    # -- Phase 3: insert under lock, handle the race --------------------------
+    with _mv_streams_lock:
+        winner = _mv_streams.get(stream_key)
+        if winner and winner.is_alive():
+            # Another thread beat us to it -- discard ours, return theirs.
+            LOG.warning('[MV] Race resolved: discarding duplicate broadcaster  key=%s',
+                        stream_key)
+            broadcaster.stop()
+            return winner
+        # We own the slot -- commit.
+        _mv_streams[stream_key] = broadcaster
+        return broadcaster
 
 
 def _stop_broadcaster(stream_key: str, force: bool = False) -> str:
@@ -563,7 +603,11 @@ def _janitor() -> None:
 
         # Stop outside the lock — stop() blocks during process.wait()
         for broadcaster in to_stop:
-            broadcaster.stop()
+            try:
+                broadcaster.stop()
+            except Exception as exc:
+                LOG.warning('[MV][JANITOR] stop() raised for key=%s: %s',
+                            broadcaster.stream_key, exc)
 
         if to_stop:
             LOG.info('[MV][JANITOR] Removed %d stale broadcaster(s)', len(to_stop))
@@ -626,8 +670,6 @@ _mv_state = None
 
 
 def register_multiview_routes(app, state=None) -> None:
-    global _mv_state
-    _mv_state = state
     """
     Register all multiview API routes on the Flask app instance.
 
@@ -639,6 +681,8 @@ def register_multiview_routes(app, state=None) -> None:
         DELETE /api/multiview/layouts/<id>   — delete a layout
         GET  /api/multiview/status           — debug: active stream info
     """
+    global _mv_state
+    _mv_state = state
 
     # ── GET /api/multiview/stream ─────────────────────────────────────────────
     #
@@ -746,8 +790,23 @@ def register_multiview_routes(app, state=None) -> None:
         if not channel_url:
             return jsonify({'error': 'url is required'}), 400
 
-        stream_key = _build_stream_key(client_id, channel_url)
-        result     = _stop_broadcaster(stream_key)
+        # The start endpoint appends ::transcode / ::audio_only / ::merged to the
+        # base key depending on which ffmpeg mode was used.  The JS stop request
+        # does not carry those flags, so we try the base key first and then each
+        # suffixed variant.  The first match wins; at most one can be active per
+        # (client_id, url) pair.
+        base_key = _build_stream_key(client_id, channel_url)
+        stream_key = base_key
+        result     = 'no_active_stream'
+        for candidate in (base_key,
+                          base_key + '::transcode',
+                          base_key + '::audio_only',
+                          base_key + '::merged'):
+            r = _stop_broadcaster(candidate)
+            if r != 'no_active_stream':
+                stream_key = candidate
+                result     = r
+                break
 
         # Response messages mirror server.js POST /api/stream/stop exactly
         if result == 'no_active_stream':
@@ -794,10 +853,14 @@ def register_multiview_routes(app, state=None) -> None:
 
         layouts = _load_layouts()
 
-        # Use millisecond timestamp as ID, matching server.js behaviour where
-        # SQLite AUTOINCREMENT lastID is used — timestamp is unique enough here
+        # Auto-increment ID: find the current max and add 1.
+        # Avoids the millisecond-collision risk of int(time.time()*1000) when
+        # two layouts are saved in rapid succession.
+        existing_ids = {lay.get('id', 0) for lay in layouts if isinstance(lay.get('id'), int)}
+        new_id = max(existing_ids, default=0) + 1
+
         new_layout: dict = {
-            'id':          int(time.time() * 1000),
+            'id':          new_id,
             'name':        name,
             'layout_data': layout_data,
         }
@@ -873,170 +936,197 @@ def register_multiview_routes(app, state=None) -> None:
         if not raw_url:
             return jsonify({'error': 'url is required'}), 400
 
-        # ── Build yt-dlp format selector from quality hint ────────────────────
-        def _fmt_selector(q: str) -> str:
-            """Translate a simple quality label to a yt-dlp format string.
-            Force H.264 video (vcodec:h264) so the browser can decode it.
-            YouTube's higher qualities often use VP9/AV1 which mpegts.js can't play.
-            """
-            if q in ('best', '', None):
-                return (
-                    'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]'
-                    '/bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]'
-                    '/best[ext=mp4]/best'
-                )
-            try:
-                h = int(q)
-            except ValueError:
-                return 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-            return (
-                f'bestvideo[height<={h}][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]'
-                f'/bestvideo[height<={h}][vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]'
-                f'/best[height<={h}][ext=mp4]'
-                f'/best[height<={h}]'
-                f'/best'
-            )
+        # ── Rate-limit guard ──────────────────────────────────────────────────
+        # Use client_id from the request body as the throttle key; fall back to
+        # remote IP so browsers without a client_id are still protected.
+        throttle_key = (data.get('client_id') or '').strip() or (
+            request.headers.get('X-Forwarded-For', request.remote_addr) or 'unknown'
+        )
+        now = time.time()
+        with _ydl_rate_lock:
+            last = _ydl_last_call.get(throttle_key, 0.0)
+            if now - last < _YDL_COOLDOWN_SECS:
+                remaining = round(_YDL_COOLDOWN_SECS - (now - last), 1)
+                return jsonify({'error': f'Rate limit: wait {remaining}s before resolving again'}), 429
+            _ydl_last_call[throttle_key] = now
+            # Prune stale entries (keep dict small)
+            if len(_ydl_last_call) > 500:
+                cutoff = now - _YDL_COOLDOWN_SECS * 10
+                for k in [k for k, v in _ydl_last_call.items() if v < cutoff]:
+                    del _ydl_last_call[k]
 
-        # ── Attempt yt-dlp resolution ─────────────────────────────────────────
-        try:
-            import yt_dlp  # type: ignore
-        except ImportError:
-            # yt-dlp not installed — return the URL as-is for direct playback
-            LOG.info('[MV][resolve_url] yt-dlp not available, returning raw URL')
-            return jsonify({
-                'url':     raw_url,
-                'title':   '',
-                'is_live': False,
-                'via':     'direct',
-            })
+        # ── Concurrency cap: max _ydl_semaphore simultaneous yt-dlp calls ────
+        if not _ydl_semaphore.acquire(blocking=False):
+            return jsonify({'error': 'Server busy: too many concurrent resolve requests'}), 429
 
         try:
-            ydl_opts = {
-                'quiet':            True,
-                'no_warnings':      True,
-                'skip_download':    True,
-                'no_cache_dir':     True,   # force fresh URLs, not cached signed URLs
-                # Format selector respects user's quality choice.
-                # For live streams the HLS lookup below takes precedence anyway.
-                'format':           _fmt_selector(quality),
-                # Hard timeout so the endpoint never hangs indefinitely
-                'socket_timeout':   15,
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(raw_url, download=False)
-
-            if not info:
-                return jsonify({'error': 'yt-dlp returned no info'}), 502
-
-            title   = info.get('title') or info.get('id') or ''
-            is_live = bool(info.get('is_live'))
-
-            # Prefer an HLS manifest for live streams (mpegts.js handles it natively)
-            # then fall back to the best direct URL.
-            resolved       = None
-            resolved_audio = None
-            formats        = info.get('formats') or []
-
-            if is_live:
-                # For live streams, select an HLS manifest that matches the
-                # requested height. yt-dlp exposes per-quality HLS URLs in
-                # the formats list — iterate highest-first and pick the best
-                # one that fits within the requested height cap.
+            # ── Build yt-dlp format selector from quality hint ─────────────────
+            def _fmt_selector(q: str) -> str:
+                """Translate a simple quality label to a yt-dlp format string.
+                Force H.264 video (vcodec:h264) so the browser can decode it.
+                YouTube's higher qualities often use VP9/AV1 which mpegts.js can't play.
+                """
+                if q in ('best', '', None):
+                    return (
+                        'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]'
+                        '/bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]'
+                        '/best[ext=mp4]/best'
+                    )
                 try:
-                    h_cap = int(quality) if quality not in ('best', '', None) else 99999
-                except (ValueError, TypeError):
-                    h_cap = 99999
-
-                def _hls_formats(fmts):
-                    """All HLS formats sorted best (highest height) first."""
-                    return sorted(
-                        [f for f in fmts
-                         if f.get('protocol') in ('m3u8', 'm3u8_native') and f.get('url')],
-                        key=lambda f: f.get('height') or 0,
-                        reverse=True,
-                    )
-
-                hls_fmts = _hls_formats(formats)
-                # Pick the best HLS that fits within h_cap
-                hls_picked = next(
-                    (f for f in hls_fmts if (f.get('height') or 99999) <= h_cap),
-                    hls_fmts[0] if hls_fmts else None,   # fallback: best available
+                    h = int(q)
+                except ValueError:
+                    return 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+                return (
+                    f'bestvideo[height<={h}][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]'
+                    f'/bestvideo[height<={h}][vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]'
+                    f'/best[height<={h}][ext=mp4]'
+                    f'/best[height<={h}]'
+                    f'/best'
                 )
-                hls = hls_picked.get('url') if hls_picked else None
 
-                # Last resort: info.get('url') may itself be an HLS manifest
-                resolved = hls or info.get('url') or (formats[-1].get('url') if formats else None)
-                actual_h = hls_picked.get('height') if hls_picked else None
-            else:
-                # For VOD: extract video URL and optional separate audio URL
-                video_url = None
-                audio_url_out = None
-                actual_h = None
+            # ── Attempt yt-dlp resolution ──────────────────────────────────────
+            try:
+                import yt_dlp  # type: ignore
+            except ImportError:
+                # yt-dlp not installed — return the URL as-is for direct playback
+                LOG.info('[MV][resolve_url] yt-dlp not available, returning raw URL')
+                return jsonify({
+                    'url':     raw_url,
+                    'title':   '',
+                    'is_live': False,
+                    'via':     'direct',
+                })
 
-                # requested_formats: separate video+audio (merged format selection)
-                req_fmts = info.get('requested_formats') or []
-                if len(req_fmts) >= 2:
-                    for rf in req_fmts:
-                        vcodec = rf.get('vcodec', 'none')
-                        acodec = rf.get('acodec', 'none')
-                        if vcodec != 'none' and not video_url:
-                            video_url = rf.get('url')
-                            actual_h  = rf.get('height')
-                        elif acodec != 'none' and not audio_url_out:
-                            audio_url_out = rf.get('url')
-                elif req_fmts:
-                    video_url = req_fmts[0].get('url')
-                    actual_h  = req_fmts[0].get('height')
+            try:
+                ydl_opts = {
+                    'quiet':            True,
+                    'no_warnings':      True,
+                    'skip_download':    True,
+                    'no_cache_dir':     True,   # force fresh URLs, not cached signed URLs
+                    # Format selector respects user's quality choice.
+                    # For live streams the HLS lookup below takes precedence anyway.
+                    'format':           _fmt_selector(quality),
+                    # Hard timeout so the endpoint never hangs indefinitely
+                    'socket_timeout':   15,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(raw_url, download=False)
 
-                # requested_downloads: pre-muxed single file
-                if not video_url:
-                    req_dl = info.get('requested_downloads') or []
-                    if req_dl and req_dl[0].get('url'):
-                        video_url = req_dl[0]['url']
-                        actual_h  = req_dl[0].get('height') or info.get('height')
+                if not info:
+                    return jsonify({'error': 'yt-dlp returned no info'}), 502
 
-                # Direct url field (pre-muxed)
-                if not video_url:
-                    video_url = info.get('url')
-                    actual_h  = info.get('height')
+                title   = info.get('title') or info.get('id') or ''
+                is_live = bool(info.get('is_live'))
 
-                # Last resort: best format from the formats list
-                if not video_url and formats:
-                    by_height = sorted(
-                        [f for f in formats if f.get('url') and f.get('vcodec','none')!='none'],
-                        key=lambda f: f.get('height') or 0, reverse=True
+                # Prefer an HLS manifest for live streams (mpegts.js handles it natively)
+                # then fall back to the best direct URL.
+                resolved       = None
+                resolved_audio = None
+                formats        = info.get('formats') or []
+
+                if is_live:
+                    # For live streams, select an HLS manifest that matches the
+                    # requested height. yt-dlp exposes per-quality HLS URLs in
+                    # the formats list — iterate highest-first and pick the best
+                    # one that fits within the requested height cap.
+                    try:
+                        h_cap = int(quality) if quality not in ('best', '', None) else 99999
+                    except (ValueError, TypeError):
+                        h_cap = 99999
+
+                    def _hls_formats(fmts):
+                        """All HLS formats sorted best (highest height) first."""
+                        return sorted(
+                            [f for f in fmts
+                             if f.get('protocol') in ('m3u8', 'm3u8_native') and f.get('url')],
+                            key=lambda f: f.get('height') or 0,
+                            reverse=True,
+                        )
+
+                    hls_fmts = _hls_formats(formats)
+                    # Pick the best HLS that fits within h_cap
+                    hls_picked = next(
+                        (f for f in hls_fmts if (f.get('height') or 99999) <= h_cap),
+                        hls_fmts[0] if hls_fmts else None,   # fallback: best available
                     )
-                    if by_height:
-                        video_url = by_height[0]['url']
-                        actual_h  = by_height[0].get('height')
+                    hls = hls_picked.get('url') if hls_picked else None
 
-                resolved      = video_url
-                resolved_audio = audio_url_out
+                    # Last resort: info.get('url') may itself be an HLS manifest
+                    resolved = hls or info.get('url') or (formats[-1].get('url') if formats else None)
+                    actual_h = hls_picked.get('height') if hls_picked else None
+                else:
+                    # For VOD: extract video URL and optional separate audio URL
+                    video_url = None
+                    audio_url_out = None
+                    actual_h = None
 
-            if not resolved:
-                return jsonify({'error': 'yt-dlp could not extract a stream URL'}), 502
+                    # requested_formats: separate video+audio (merged format selection)
+                    req_fmts = info.get('requested_formats') or []
+                    if len(req_fmts) >= 2:
+                        for rf in req_fmts:
+                            vcodec = rf.get('vcodec', 'none')
+                            acodec = rf.get('acodec', 'none')
+                            if vcodec != 'none' and not video_url:
+                                video_url = rf.get('url')
+                                actual_h  = rf.get('height')
+                            elif acodec != 'none' and not audio_url_out:
+                                audio_url_out = rf.get('url')
+                    elif req_fmts:
+                        video_url = req_fmts[0].get('url')
+                        actual_h  = req_fmts[0].get('height')
 
-            duration_secs = None if is_live else info.get('duration')
+                    # requested_downloads: pre-muxed single file
+                    if not video_url:
+                        req_dl = info.get('requested_downloads') or []
+                        if req_dl and req_dl[0].get('url'):
+                            video_url = req_dl[0]['url']
+                            actual_h  = req_dl[0].get('height') or info.get('height')
 
-            LOG.info('[MV][resolve_url] resolved  title=%r  live=%s  quality=%s  height=%s  merged=%s  via=yt-dlp',
-                     title, is_live, quality, actual_h, 'yes' if (not is_live and resolved_audio) else 'no')
-            resp = {
-                'url':      resolved,
-                'title':    title,
-                'is_live':  is_live,
-                'quality':  quality,
-                'height':   actual_h,
-                'duration': duration_secs,
-                'via':      'yt-dlp',
-            }
-            # Include separate audio URL for merged formats (e.g. YouTube 720p+)
-            if not is_live and resolved_audio:
-                resp['audio_url'] = resolved_audio
-            return jsonify(resp)
+                    # Direct url field (pre-muxed)
+                    if not video_url:
+                        video_url = info.get('url')
+                        actual_h  = info.get('height')
 
-        except Exception as exc:
-            LOG.error('[MV][resolve_url] yt-dlp error: %s', exc)
-            return jsonify({'error': str(exc)}), 502
+                    # Last resort: best format from the formats list
+                    if not video_url and formats:
+                        by_height = sorted(
+                            [f for f in formats if f.get('url') and f.get('vcodec','none')!='none'],
+                            key=lambda f: f.get('height') or 0, reverse=True
+                        )
+                        if by_height:
+                            video_url = by_height[0]['url']
+                            actual_h  = by_height[0].get('height')
+
+                    resolved      = video_url
+                    resolved_audio = audio_url_out
+
+                if not resolved:
+                    return jsonify({'error': 'yt-dlp could not extract a stream URL'}), 502
+
+                duration_secs = None if is_live else info.get('duration')
+
+                LOG.info('[MV][resolve_url] resolved  title=%r  live=%s  quality=%s  height=%s  merged=%s  via=yt-dlp',
+                         title, is_live, quality, actual_h, 'yes' if (not is_live and resolved_audio) else 'no')
+                resp = {
+                    'url':      resolved,
+                    'title':    title,
+                    'is_live':  is_live,
+                    'quality':  quality,
+                    'height':   actual_h,
+                    'duration': duration_secs,
+                    'via':      'yt-dlp',
+                }
+                # Include separate audio URL for merged formats (e.g. YouTube 720p+)
+                if not is_live and resolved_audio:
+                    resp['audio_url'] = resolved_audio
+                return jsonify(resp)
+
+            except Exception as exc:
+                LOG.error('[MV][resolve_url] yt-dlp error: %s', exc)
+                return jsonify({'error': str(exc)}), 502
+
+        finally:
+            _ydl_semaphore.release()
 
     _register_mv_ui_route(app)
     LOG.info('[MV] Multiview routes registered  '
@@ -1549,7 +1639,14 @@ _MV_UI_JS = r"""
   </div>
 </div>
 `;
-  while(d.firstChild) document.body.appendChild(d.firstChild);
+  // Append into #app (not document.body) so #p-mv and its overlays sit inside
+  // the same stacking context as all main-app overlays (#pl-overlay z-500,
+  // #radio-overlay z-700, etc.).  #app has position:relative;z-index:1 which
+  // creates its own stacking context — anything appended to document.body at
+  // z-200 would beat every element inside #app regardless of their z-index,
+  // causing those panels to appear under the multiview grid.
+  const _mvAppRoot = document.getElementById('app') || document.body;
+  while(d.firstChild) _mvAppRoot.appendChild(d.firstChild);
 })();
 
 // ── STATE  (mirrors multiview.js top-level variables exactly) ────────────────
@@ -1652,6 +1749,13 @@ function _mvUpdatePortalBadges(){
     }
   }
 }
+// Debounce: rapid play/stop sequences (e.g. loading a saved layout) fire many
+// badge updates in the same tick.  Coalesce them into a single DOM pass.
+(function(){
+  const _impl = _mvUpdatePortalBadges;
+  let _t = null;
+  _mvUpdatePortalBadges = ()=>{ clearTimeout(_t); _t = setTimeout(_impl, 50); };
+})();
 
 // ── URL / YouTube play helper ─────────────────────────────────────────────────
 
@@ -1821,8 +1925,9 @@ function _mvUpdateTop(){
   };
 })();
 
-// Keep top in sync on window resize too
-window.addEventListener('resize', ()=>{ _mvUpdateTop(); _mvFitCellHeight(); });
+// Keep top in sync on window resize too.
+// _mvUpdateTop internally calls _mvFitCellHeight so no separate call is needed here.
+window.addEventListener('resize', ()=>{ _mvUpdateTop(); });
 
 // Show/hide the desktop multiview button (only meaningful on desktop ≥900px)
 function _mvSyncDesktopBtn(){
@@ -1890,8 +1995,10 @@ function mvOpen(){
     mvGrid.commit();
   }
 
-  // Fit cell height AFTER widgets are in DOM so offsetHeight is accurate
-  setTimeout(_mvFitCellHeight, 50);
+  // Fit cell height AFTER widgets are in DOM so offsetHeight is accurate.
+  // Use the scheduler so this initial call coalesces with the ResizeObserver
+  // callback that fires right after the grid finishes laying out.
+  _mvScheduleFitCellHeight();
 
   // ResizeObserver on the grid wrapper fires whenever the wrapper's rendered
   // size changes — after CSS transitions finish, after toolbar collapse,
@@ -1983,6 +2090,15 @@ function _mvFitCellHeight(){
   if(available <= 0) return;
   const cellH = Math.max(40, Math.floor(available / _MV_TARGET_ROWS));
   mvGrid.cellHeight(cellH, true);
+}
+
+// Single debounced scheduler — replaces scattered setTimeout(_mvFitCellHeight, 50)
+// calls so only one recomputation fires even when several grid commits happen in
+// the same tick (e.g. loading a multi-widget saved layout).
+let _mvFitCellHeightTimer = null;
+function _mvScheduleFitCellHeight(){
+  clearTimeout(_mvFitCellHeightTimer);
+  _mvFitCellHeightTimer = setTimeout(_mvFitCellHeight, 50);
 }
 
 // ── WIDGET ───────────────────────────────────────────────────────────────────
@@ -2324,8 +2440,13 @@ function _mvAttachListeners(cEl, wid){
       try{ const p=new URLSearchParams(url.split('?')[1]||''); url=p.get('url')||url; }catch(e_){}
     }
     if(recBtn.classList.contains('mv-recording')){
-      // Stop
-      await fetch('/api/record/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+      // Stop — pass back whatever the start response gave us (session_id, job_id,
+      // url, etc.) so the stop endpoint can target exactly this recording instead
+      // of stopping all active recordings.
+      const stopBody = Object.assign({ url }, cEl._mvRecSession || {});
+      await fetch('/api/record/stop',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(stopBody)}).catch(()=>{});
+      cEl._mvRecSession = null;
       recBtn.classList.remove('mv-recording');
       recBtn.textContent='⏺ Record';
       toast('Recording stopped','ok');
@@ -2336,6 +2457,8 @@ function _mvAttachListeners(cEl, wid){
         body:JSON.stringify({url, name, out_dir:od})});
       const d2 = await r2.json();
       if(d2.ok){
+        // Persist the full start response so the stop call can identify this job
+        cEl._mvRecSession = d2;
         recBtn.classList.add('mv-recording');
         recBtn.textContent='⏹ Stop';
         toast('⏺ Recording: '+name,'ok');
@@ -2365,6 +2488,22 @@ function _mvAttachListeners(cEl, wid){
 // mirrors multiview.js playChannelInWidget(widgetId, channel, gridstackItemContentEl)
 async function _mvPlayChannel(wid, channel, cEl){
   if(!cEl) return;
+
+  // ── Auto-reconnect state management ────────────────────────────────────────
+  // Build a stable ref for this channel so error handlers from a previous play
+  // can detect that the user has since switched to a different channel and abort
+  // their scheduled retries rather than restarting the old one.
+  const _mvChannelRef = (channel.id || '') + '::' + (channel._direct_url || channel.url || '');
+
+  // If this is a user-initiated channel change (not a retry), reset the counter.
+  // _mvIsRetrying is set to true by the retry setTimeout before it calls us.
+  if(!cEl._mvIsRetrying){
+    cEl._mvRetries        = 0;
+    cEl._mvLastChannelRef = null;
+    if(cEl._mvRetryTimer){ clearTimeout(cEl._mvRetryTimer); cEl._mvRetryTimer = null; }
+  }
+  cEl._mvIsRetrying     = false;   // consume the flag
+  cEl._mvLastChannelRef = _mvChannelRef;
 
   // mirrors: await stopAndCleanupPlayer(widgetId, false)  ← cleanup without UI reset
   await _mvStopCleanup(wid, false);
@@ -2545,9 +2684,32 @@ async function _mvPlayChannel(wid, channel, cEl){
       liveBufferLatencyMinRemain:  _hlsIsLive ? 2 : undefined,
     });
     player.on(mpegts.Events.ERROR, (errType, errDetail)=>{
-      if(document.getElementById('p-mv').classList.contains('mv-active'))
-        toast('Stream error: '+(channel.name||wid),'err');
-      _mvStopCleanup(wid, true);
+      // Ignore stale handlers after channel switch or panel close
+      if(cEl._mvLastChannelRef !== _mvChannelRef) return;
+      if(!document.getElementById('p-mv').classList.contains('mv-active')) return;
+
+      const MAX_RETRIES   = 3;
+      const RETRY_DELAYS  = [2000, 5000, 10000];
+      const attempt       = cEl._mvRetries || 0;
+
+      if(attempt < MAX_RETRIES){
+        cEl._mvRetries = attempt + 1;
+        const delay    = RETRY_DELAYS[attempt];
+        toast(`\u26a0 ${channel.name||'Stream'} error \u2014 retry ${cEl._mvRetries}/${MAX_RETRIES} in ${delay/1000}s`, 'wrn');
+        if(cEl._mvRetryTimer) clearTimeout(cEl._mvRetryTimer);
+        cEl._mvRetryTimer = setTimeout(async ()=>{
+          cEl._mvRetryTimer = null;
+          if(!document.getElementById('mwc-' + wid)) return;
+          if(cEl._mvLastChannelRef !== _mvChannelRef) return;
+          cEl._mvIsRetrying = true;
+          await _mvStopCleanup(wid, false);
+          await _mvPlayChannel(wid, channel, cEl);
+        }, delay);
+      } else {
+        cEl._mvRetries = 0;
+        toast('\u2715 Stream failed: ' + (channel.name||wid), 'err');
+        _mvStopCleanup(wid, true);
+      }
     });
     mvPlayers.set(wid, player);
     player.attachMediaElement(videoEl);
@@ -2604,10 +2766,33 @@ async function _mvPlayChannel(wid, channel, cEl){
 
   // mirrors multiview.js player.on(mpegts.Events.ERROR ...)
   player.on(mpegts.Events.ERROR, (errType, errDetail)=>{
-    // Only toast if the panel is still open (don't spam after mvClose)
-    if(document.getElementById('p-mv').classList.contains('mv-active'))
-      toast('Stream error: ' + (channel.name||wid), 'err');
-    _mvStopCleanup(wid, true);
+    // Ignore errors after the panel has been closed or the channel changed
+    if(cEl._mvLastChannelRef !== _mvChannelRef) return;
+    if(!document.getElementById('p-mv').classList.contains('mv-active')) return;
+
+    const MAX_RETRIES   = 3;
+    const RETRY_DELAYS  = [2000, 5000, 10000];  // ms: 2 s, 5 s, 10 s
+    const attempt       = cEl._mvRetries || 0;
+
+    if(attempt < MAX_RETRIES){
+      cEl._mvRetries = attempt + 1;
+      const delay    = RETRY_DELAYS[attempt];
+      toast(`\u26a0 ${channel.name||'Stream'} error \u2014 retry ${cEl._mvRetries}/${MAX_RETRIES} in ${delay/1000}s`, 'wrn');
+      if(cEl._mvRetryTimer) clearTimeout(cEl._mvRetryTimer);
+      cEl._mvRetryTimer = setTimeout(async ()=>{
+        cEl._mvRetryTimer = null;
+        // Abort if widget was removed or user already changed the channel
+        if(!document.getElementById('mwc-' + wid)) return;
+        if(cEl._mvLastChannelRef !== _mvChannelRef) return;
+        cEl._mvIsRetrying = true;
+        await _mvStopCleanup(wid, false);
+        await _mvPlayChannel(wid, channel, cEl);
+      }, delay);
+    } else {
+      cEl._mvRetries = 0;
+      toast('\u2715 Stream failed: ' + (channel.name||wid), 'err');
+      _mvStopCleanup(wid, true);
+    }
   });
 
   // mirrors multiview.js: players.set(widgetId, player)
@@ -2709,6 +2894,11 @@ async function _mvStopCleanup(wid, resetUI){
       if(titleEl) titleEl.textContent = 'No Channel';
       if(portalBadge){ portalBadge.textContent=''; portalBadge.className='mv-hdr-portal'; }
       cEl.classList.remove('mv-active-player');
+      // Clear auto-reconnect state so a manually stopped widget starts fresh
+      cEl._mvIsRetrying    = false;
+      cEl._mvRetries       = 0;
+      cEl._mvLastChannelRef = null;
+      if(cEl._mvRetryTimer){ clearTimeout(cEl._mvRetryTimer); cEl._mvRetryTimer = null; }
     }
     if(mvActiveId === wid) mvActiveId = null;
   }
@@ -2841,7 +3031,7 @@ function _mvApplyPreset(name){
 
     mvGrid.batchUpdate();
     try { layout.forEach(ld => _mvAddWidget(null, ld)); }
-    finally { mvGrid.commit(); setTimeout(_mvFitCellHeight, 50); }
+    finally { mvGrid.commit(); _mvScheduleFitCellHeight(); }
   };
 
   if(numPlayers > 0){
@@ -2892,6 +3082,11 @@ function _mvSelSetMode(mode){
   _mvRenderSel();
 }
 
+// Debounce timer for the channel selector search box.
+// Without this, _mvRenderSel rebuilds the full item list (innerHTML) on
+// every keystroke — visible jank with 1000+ channels per category.
+let _mvSearchTimer = null;
+
 function _mvPopulateSelector(){
   _mvSelNavMode = 'cats';
   _mvSelCat = null; _mvSelItems = []; _mvSelShowItem = null; _mvSelEpisodes = [];
@@ -2901,7 +3096,10 @@ function _mvPopulateSelector(){
   });
   _mvCloseCtxMenu();
   _mvRenderSel();
-  document.getElementById('mv-sel-search').oninput = ()=> _mvRenderSel();
+  document.getElementById('mv-sel-search').oninput = ()=>{
+    clearTimeout(_mvSearchTimer);
+    _mvSearchTimer = setTimeout(_mvRenderSel, 150);
+  };
 }
 
 // ── tiny inline context menu helpers ─────────────────────────────────────────
@@ -2970,9 +3168,13 @@ function _mvBuildItemRow(it, i, forEpisodes){
   const epCount = isGroup ? (it._episodes||[]).length : 0;
   const isSeries = _mvSelContentMode === 'series' || _mvSelContentMode === 'vod';
 
+  // Transparent 1×1 GIF used when a logo URL 404s — keeps the column width
+  // stable so rows don't misalign (same pattern as the main channel browser).
+  const _BLANK_GIF = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+
   const logoHtml = logoSrc
-    ? `<img class="mv-ch-logo" src="${esc(logoSrc)}" loading="lazy" onerror="this.style.display='none'">`
-    : `<span class="mv-ch-logo" style="background:var(--s4);display:flex;align-items:center;justify-content:center;font-size:13px">${isShow?'📺':'🎬'}</span>`;
+    ? `<img class="mv-ch-logo" src="${esc(logoSrc)}" loading="lazy" onerror="this.onerror=null;this.src='${_BLANK_GIF}'">`
+    : `<span class="mv-ch-logo"></span>`;
 
   // Action buttons (visible on hover)
   let btns = '';
@@ -3259,6 +3461,57 @@ async function _mvSelDrillShow(i){
 let _mvSelFilteredItems = [];
 let _mvSelEpisodesFiltered = [];
 
+// ── Lazy-load infrastructure (mirrors main browser's _ITEMS_BATCH pattern) ────
+// Render the first N items immediately, then use IntersectionObserver to
+// append the next batch when the user scrolls near the bottom.  Without this,
+// a 2000-channel category dumps every row into the DOM at once.
+const _MV_ITEMS_BATCH = 75;
+let _mvRenderToken = 0;  // incremented on every render; stale observers self-abort
+
+// Shared click-handler wiring for newly inserted .mv-ch-row elements.
+// Used by both the initial render and the IntersectionObserver batches.
+function _mvWireRows(container, items, forEpisodes){
+  container.querySelectorAll('.mv-ch-row').forEach(row=>{
+    row.addEventListener('click', e=>{
+      if(e.target.closest('.mv-item-btns')) return;
+      const idx = parseInt(row.dataset.ii);
+      if(forEpisodes){ _mvSelPickItem(idx); return; }
+      const it = items[idx];
+      if(!it) return;
+      const isShow   = it._is_show_item || it._is_series_group;
+      const isSeries = _mvSelContentMode === 'series' || _mvSelContentMode === 'vod';
+      if(it._is_series_group){ _mvSelDrillGrp(idx); return; }
+      if(isShow && isSeries){ _mvSelDrillShow(idx); return; }
+      _mvSelPickItem(idx);
+    });
+  });
+}
+
+// Attach a sentinel div + IntersectionObserver to listEl that progressively
+// appends rows as the user scrolls down.  No-ops when all items already fit.
+function _mvAppendSentinel(listEl, items, forEpisodes, token){
+  if(items.length <= _MV_ITEMS_BATCH) return;
+  let offset = _MV_ITEMS_BATCH;
+  const sentinel = document.createElement('div');
+  sentinel.style.cssText = 'height:1px;flex-shrink:0';
+  listEl.appendChild(sentinel);
+
+  const obs = new IntersectionObserver(entries=>{
+    if(_mvRenderToken !== token){ obs.disconnect(); sentinel.remove(); return; }
+    if(!entries[0].isIntersecting) return;
+    if(offset >= items.length){ obs.disconnect(); sentinel.remove(); return; }
+    const end = Math.min(offset + _MV_ITEMS_BATCH, items.length);
+    const tmp = document.createElement('div');
+    tmp.innerHTML = items.slice(offset, end).map((it,j)=> _mvBuildItemRow(it, offset+j, forEpisodes)).join('');
+    _mvWireRows(tmp, items, forEpisodes);
+    while(tmp.firstChild) listEl.insertBefore(tmp.firstChild, sentinel);
+    offset = end;
+    if(offset >= items.length){ obs.disconnect(); sentinel.remove(); }
+  }, {root: listEl, rootMargin:'200px'});
+
+  obs.observe(sentinel);
+}
+
 function _mvRenderSel(){
   const listEl  = document.getElementById('mv-sel-list');
   const titleEl = document.getElementById('mv-sel-title');
@@ -3284,13 +3537,10 @@ function _mvRenderSel(){
         + (_mvSelEpisodes.length ? 'No episodes match' : 'Loading…') + '</div>';
       return;
     }
-    listEl.innerHTML = eps.map((ep,i)=> _mvBuildItemRow(ep, i, true)).join('');
-    listEl.querySelectorAll('.mv-ch-row').forEach(row=>{
-      row.addEventListener('click', e=>{
-        if(e.target.closest('.mv-item-btns')) return; // buttons handle their own clicks
-        _mvSelPickItem(parseInt(row.dataset.ii));
-      });
-    });
+    const _epsTok = ++_mvRenderToken;
+    listEl.innerHTML = eps.slice(0, _MV_ITEMS_BATCH).map((ep,i)=> _mvBuildItemRow(ep, i, true)).join('');
+    _mvWireRows(listEl, eps, true);
+    _mvAppendSentinel(listEl, eps, true, _epsTok);
     return;
   }
 
@@ -3311,19 +3561,10 @@ function _mvRenderSel(){
         + (_mvSelItems.length ? 'No items match' : 'Loading…') + '</div>';
       return;
     }
-    listEl.innerHTML = filtered.map((it,i)=> _mvBuildItemRow(it, i, false)).join('');
-    listEl.querySelectorAll('.mv-ch-row').forEach(row=>{
-      row.addEventListener('click', e=>{
-        if(e.target.closest('.mv-item-btns')) return;
-        const it = filtered[parseInt(row.dataset.ii)];
-        if(!it) return;
-        const isShow  = it._is_show_item || it._is_series_group;
-        const isSeries = _mvSelContentMode === 'series' || _mvSelContentMode === 'vod';
-        if(it._is_series_group){ _mvSelDrillGrp(parseInt(row.dataset.ii)); return; }
-        if(isShow && isSeries){  _mvSelDrillShow(parseInt(row.dataset.ii)); return; }
-        _mvSelPickItem(parseInt(row.dataset.ii));
-      });
-    });
+    const _itmTok = ++_mvRenderToken;
+    listEl.innerHTML = filtered.slice(0, _MV_ITEMS_BATCH).map((it,i)=> _mvBuildItemRow(it, i, false)).join('');
+    _mvWireRows(listEl, filtered, false);
+    _mvAppendSentinel(listEl, filtered, false, _itmTok);
     return;
   }
 
@@ -3469,9 +3710,7 @@ async function _mvAutoRestoreLayout(){
         const toRestore = snapshot.slice(0, MV_MAX); // cap to max
         mvGrid.batchUpdate();
         try { toRestore.forEach(ld => _mvAddWidget(null, ld)); }
-        finally { mvGrid.commit(); setTimeout(_mvFitCellHeight, 50); }
-        _mvTbCollapseIfMobile();
-        return;
+        finally { mvGrid.commit(); _mvScheduleFitCellHeight(); }
       }
     }
     // Fallback: last manually loaded named layout
@@ -3483,7 +3722,7 @@ async function _mvAutoRestoreLayout(){
     const toRestore = (layout.layout_data||[]).slice(0, MV_MAX);
     mvGrid.batchUpdate();
     try { toRestore.forEach(ld => _mvAddWidget(null, ld)); }
-    finally { mvGrid.commit(); setTimeout(_mvFitCellHeight, 50); }
+    finally { mvGrid.commit(); _mvScheduleFitCellHeight(); }
     const sel = document.getElementById('mv-layouts-sel');
     if(sel) sel.value = lastId;
     _mvTbCollapseIfMobile();
@@ -3541,7 +3780,7 @@ function _mvLoadSelected(){
 
       mvGrid.batchUpdate();
       try { layout.layout_data.forEach(ld => _mvAddWidget(null, ld)); }
-      finally { mvGrid.commit(); setTimeout(_mvFitCellHeight, 50); }
+      finally { mvGrid.commit(); _mvScheduleFitCellHeight(); }
       // Remember this layout so it auto-restores on next open
       try { localStorage.setItem('mv_last_layout_id', layout.id); } catch(e){}
       _mvTbCollapseIfMobile();
