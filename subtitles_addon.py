@@ -13,9 +13,9 @@
 """
 subtitles_addon.py  —  Subtitle support for FlaskyIPTV_Player_byGG.py
 =============================================================================
-Provides OpenSubtitles.com search/download, local subtitle file loading,
-mobile directory browser, and the full subtitle player UI (TextTrack-based,
-supports SRT / VTT / ASS / SSA with live delay control).
+Provides OpenSubtitles.com search/download, SubDL,
+local subtitle file loading, mobile directory browser, and the full subtitle
+player UI (TextTrack-based, supports SRT / VTT / ASS / SSA).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 INTEGRATION  (three small changes to FlaskyIPTV_Player_byGG.py)
@@ -41,6 +41,17 @@ STEP 3 — add one script tag inside HTML_TEMPLATE, just before </body>:
 That's it — no other files required. This file is fully self-contained.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONFIGURATION  (optional — embed once, search works for everyone)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  OPENSUBTITLES_APP_KEY  — register free at opensubtitles.com/en/consumers
+                           Enables search for all users without a personal key.
+                           Downloads: 5/day anon; users can login for 20/day.
+
+  SUBDL_APP_KEY          — free from subdl.com → Profile → API Key.
+                           Enables SubDL provider (2000 searches/day).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 GLOBALS USED FROM MAIN SCRIPT (via window.*)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   vid          — the <video> element
@@ -50,28 +61,221 @@ GLOBALS USED FROM MAIN SCRIPT (via window.*)
   alog()       — activity log helper
   esc()        — HTML escape helper
   _isMobile    — mobile detection flag
-  _getSubKey() — reads opensubtitles API key from localStorage (in settings)
+  _getSubKey() — reads opensubtitles API key from localStorage (optional)
 """
 
+import io
 import os
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests as _requests_lib
 from flask import request, jsonify, Response
 
 
-# ===================== OPENSUBTITLES API =====================
+# ===================== CONSTANTS =====================
 
-OPENSUBTITLES_BASE = "https://api.opensubtitles.com/api/v1"
-OPENSUBTITLES_UA   = "IPTVPortalPlayer v1.0"
+# ── OpenSubtitles ──────────────────────────────────────────────────────────
+# Register your own consumer key (free) at opensubtitles.com/en/consumers
+# Embed it here so search works for all users without them needing their own key.
+# Download quota: 5/day anonymous; 20/day after user logs in with username+password.
+OPENSUBTITLES_APP_KEY = ""           # ← paste your registered consumer key here
+OPENSUBTITLES_BASE    = "https://api.opensubtitles.com/api/v1"
+OPENSUBTITLES_UA      = "IPTVPortalPlayer v1.0"
+
+# ── SubDL ──────────────────────────────────────────────────────────────────
+# Free API key from subdl.com → sign in → Profile → API Key.
+# Enables SubDL provider: 2000 searches/day, 300 anon downloads/day per IP.
+SUBDL_APP_KEY = ""                   # ← paste your free SubDL key here
+SUBDL_BASE    = "https://api.subdl.com/api/v1"
+SUBDL_DL_BASE = "https://dl.subdl.com"
+
+# SubDL uses uppercase ISO codes; a few need remapping
+SUBDL_LANG_REMAP = {"sr": "SB", "zh": "ZH", "pt": "PT"}
 
 
-def _os_headers(api_key: str = ""):
-    return {
-        "Api-Key":      api_key.strip(),
+def _subdl_lang(iso_code: str) -> str:
+    return SUBDL_LANG_REMAP.get(iso_code, iso_code.upper())
+
+
+# ===================== HELPERS =====================
+
+def _os_headers(api_key: str = "", jwt: str = "") -> dict:
+    """Build OpenSubtitles request headers.  jwt is optional (user session token)."""
+    h = {
+        "Api-Key":      (api_key or OPENSUBTITLES_APP_KEY or "").strip(),
         "User-Agent":   OPENSUBTITLES_UA,
         "Content-Type": "application/json",
         "Accept":       "application/json",
     }
+    if jwt:
+        h["Authorization"] = f"Bearer {jwt.strip()}"
+    return h
+
+
+def _extract_sub_from_zip(zip_bytes: bytes, season=None, episode=None):
+    """Extract the best subtitle file from a zip archive.
+    Returns (content_str, filename, mime_type) or (None, None, None)."""
+    sub_exts = {".srt", ".vtt", ".ass", ".ssa", ".sub"}
+    mime_map  = {".srt": "text/srt", ".vtt": "text/vtt",
+                 ".ass": "text/x-ssa", ".ssa": "text/x-ssa"}
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            all_names = zf.namelist()
+            sub_names = [
+                n for n in all_names
+                if os.path.splitext(n)[1].lower() in sub_exts
+                and not n.startswith("__MACOSX")
+                and not os.path.basename(n).startswith(".")
+            ]
+            if not sub_names:
+                return None, None, None
+
+            # Prefer episode-matching file when S/E context is available
+            chosen = None
+            if season and episode:
+                pat = f"s{int(season):02d}e{int(episode):02d}"
+                for name in sub_names:
+                    if pat in name.lower():
+                        chosen = name
+                        break
+
+            if not chosen:
+                srt = [n for n in sub_names if n.lower().endswith(".srt")]
+                chosen = srt[0] if srt else sub_names[0]
+
+            raw = zf.read(chosen)
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                content = raw.decode("latin-1", errors="replace")
+
+            ext  = os.path.splitext(chosen)[1].lower()
+            mime = mime_map.get(ext, "text/srt")
+            return content, os.path.basename(chosen), mime
+
+    except zipfile.BadZipFile:
+        # Not a zip — treat as raw subtitle text
+        try:
+            return zip_bytes.decode("utf-8"), "subtitle.srt", "text/srt"
+        except UnicodeDecodeError:
+            return zip_bytes.decode("latin-1", errors="replace"), "subtitle.srt", "text/srt"
+
+
+def _search_os_provider(query, lang, season, episode, sub_type, max_r, api_key="", jwt=""):
+    """Search OpenSubtitles; returns list of normalised result dicts."""
+    effective_key = (api_key or OPENSUBTITLES_APP_KEY or "").strip()
+    if not effective_key:
+        return []
+    params = {"query": query, "languages": lang, "per_page": min(max_r, 40)}
+    if sub_type in ("movie", "episode"):
+        params["type"] = sub_type
+    if season:
+        params["season_number"] = int(season)
+    if episode:
+        params["episode_number"] = int(episode)
+    r = _requests_lib.get(
+        f"{OPENSUBTITLES_BASE}/subtitles",
+        headers=_os_headers(effective_key, jwt),
+        params=params, timeout=15,
+    )
+    r.raise_for_status()
+    results = []
+    for item in r.json().get("data", [])[:max_r]:
+        a    = item.get("attributes", {})
+        feat = a.get("feature_details", {})
+        files = a.get("files", [])
+        if not files:
+            continue
+        results.append({
+            "file_id":      files[0].get("file_id"),
+            "file_name":    files[0].get("file_name", "subtitle.srt"),
+            "title":        feat.get("movie_name") or feat.get("title", "Unknown"),
+            "year":         feat.get("year", ""),
+            "season":       feat.get("season_number"),
+            "episode":      feat.get("episode_number"),
+            "feature_type": feat.get("feature_type", ""),
+            "lang":         a.get("language", "?"),
+            "rating":       a.get("ratings", "?"),
+            "downloads":    a.get("download_count", 0),
+            "uploader":     a.get("uploader", {}).get("name", "anonymous"),
+            "release":      a.get("release", ""),
+            "provider":     "os",
+        })
+    return results
+
+
+
+
+def _search_subdl_provider(query, lang, season, episode, sub_type, max_r, subdl_key=""):
+    """Search SubDL (requires SUBDL_APP_KEY or per-request subdl_key); returns normalised result dicts."""
+    effective_key = (subdl_key or SUBDL_APP_KEY or "").strip()
+    if not effective_key:
+        return []
+    lang_codes = ",".join(_subdl_lang(c.strip()) for c in lang.split(","))
+    params = {
+        "api_key":       effective_key,
+        "film_name":     query,
+        "type":          "tv" if sub_type == "episode" else "movie",
+        "languages":     lang_codes,
+        "subs_per_page": min(max_r, 20),
+    }
+    if season:
+        params["season_number"]  = int(season)
+    if episode:
+        params["episode_number"] = int(episode)
+    r = _requests_lib.get(
+        f"{SUBDL_BASE}/subtitles",
+        params=params,
+        headers={"User-Agent": OPENSUBTITLES_UA, "Accept": "application/json"},
+        timeout=12,
+    )
+    r.raise_for_status()
+    results = []
+    for sub in r.json().get("subtitles", [])[:max_r]:
+        sub_url  = sub.get("url", "")
+        sub_name = sub.get("name") or (sub_url.split("/")[-1] if sub_url else "subtitle.srt")
+        results.append({
+            "file_id":   sub_url,
+            "file_name": sub_name,
+            "title":     sub.get("film_name") or query,
+            "year":      sub.get("year") or "",
+            "season":    sub.get("season"),
+            "episode":   sub.get("episode"),
+            "lang":      (sub.get("language") or lang.split(",")[0]).lower(),
+            "rating":    "?",
+            "downloads": 0,
+            "uploader":  "subdl",
+            "release":   sub.get("release_name") or sub_name,
+            "provider":  "subdl",
+        })
+    return results
+
+
+# ===================== ERROR HELPERS =====================
+
+def _net_err_msg(exc: Exception, provider: str = "provider") -> str:
+    """Condense a network/requests exception into a short user-friendly string."""
+    raw = str(exc)
+    checks = (
+        (("NameResolutionError", "getaddrinfo", "Failed to resolve", "NXDOMAIN",
+          "Errno 11001", "Errno -2", "Errno -3"),
+         f"Cannot reach {provider} \u2014 DNS lookup failed (check your internet connection)"),
+        (("ConnectTimeout", "ReadTimeout", "TimeoutError", "timed out"),
+         f"{provider} search timed out \u2014 try again"),
+        (("ConnectionRefused", "Connection refused", "BrokenPipe"),
+         f"{provider} connection refused \u2014 may be temporarily down"),
+        (("SSLError", "CERTIFICATE_VERIFY_FAILED"),
+         f"{provider} SSL certificate error"),
+        (("ProxyError",),
+         f"Proxy error reaching {provider}"),
+        (("Max retries exceeded",),
+         f"Cannot reach {provider} after retries \u2014 check your internet connection"),
+    )
+    for keywords, msg in checks:
+        if any(k in raw for k in keywords):
+            return msg
+    return raw.split("\n")[0][:200]
 
 
 # ===================== REGISTRATION =====================
@@ -111,8 +315,8 @@ def register_subtitles_routes(flask_app, state=None):
     @flask_app.route("/api/browse_dir", methods=["POST"])
     def api_browse_dir():
         """List directory contents for the mobile subtitle file browser."""
-        data     = request.get_json(force=True)
-        path     = (data.get("path") or "/sdcard/Download").rstrip("/") or "/"
+        data      = request.get_json(force=True)
+        path      = (data.get("path") or "/sdcard/Download").rstrip("/") or "/"
         dirs_only = data.get("dirs_only", False)
         try:
             entries = os.listdir(path)
@@ -160,110 +364,193 @@ def register_subtitles_routes(flask_app, state=None):
         except Exception as e:
             return jsonify({"path": "", "error": str(e)})
 
+    # ── /api/subtitles/login ─────────────────────────────────────────────────
+    @flask_app.route("/api/subtitles/login", methods=["POST"])
+    def api_subtitles_login():
+        """Login with OS username+password → JWT token (24h, 20 downloads/day)."""
+        data     = request.get_json(force=True)
+        username = (data.get("username") or "").strip()
+        password = (data.get("password") or "").strip()
+        if not username or not password:
+            return jsonify({"error": "Username and password required"}), 400
+        effective_key = (OPENSUBTITLES_APP_KEY or "").strip()
+        if not effective_key:
+            return jsonify({"error": "Server has no OpenSubtitles app key configured — add OPENSUBTITLES_APP_KEY to subtitles_addon.py"}), 503
+        try:
+            r = _requests_lib.post(
+                f"{OPENSUBTITLES_BASE}/login",
+                headers=_os_headers(effective_key),
+                json={"username": username, "password": password},
+                timeout=15,
+            )
+            if r.status_code == 401:
+                return jsonify({"error": "Invalid username or password"}), 401
+            r.raise_for_status()
+            body = r.json()
+            user = body.get("user", {})
+            return jsonify({
+                "token":     body.get("token"),
+                "base_url":  body.get("base_url", OPENSUBTITLES_BASE),
+                "user":      user,
+                "remaining": user.get("remaining_downloads"),
+            })
+        except _requests_lib.HTTPError as e:
+            return jsonify({"error": f"OpenSubtitles error: {e}"}), 502
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     # ── /api/subtitles/search ─────────────────────────────────────────────────
     @flask_app.route("/api/subtitles/search", methods=["POST"])
     def api_subtitles_search():
+        """Search OpenSubtitles. Uses user key > embedded app key."""
         data        = request.get_json(force=True)
         query       = (data.get("query") or "").strip()
         lang        = (data.get("lang") or "en").strip()
         season      = data.get("season")
         episode     = data.get("episode")
-        sub_type    = (data.get("type") or "").strip()   # "movie" or "episode"
+        sub_type    = (data.get("type") or "").strip()
         max_results = int(data.get("max_results") or 20)
         api_key     = (data.get("api_key") or "").strip()
+        jwt         = (data.get("jwt") or "").strip()
 
         if not query:
             return jsonify({"error": "No query provided", "results": []}), 400
-        if not api_key:
-            if state:
-                state.log("[SUBS] ✗ No OpenSubtitles API key configured")
-            return jsonify({"error": "No OpenSubtitles API key set — add it in ⚙ Settings.", "results": []}), 400
 
-        params = {"query": query, "languages": lang, "per_page": min(max_results, 40)}
-        if sub_type in ("movie", "episode"):
-            params["type"] = sub_type
-        if season:
-            params["season_number"] = int(season)
-        if episode:
-            params["episode_number"] = int(episode)
+        effective_key = api_key or OPENSUBTITLES_APP_KEY or ""
+        if not effective_key:
+            return jsonify({
+                "error": "No OpenSubtitles API key configured. Paste your key in the field above, "
+                         "or ask the server admin to set OPENSUBTITLES_APP_KEY in subtitles_addon.py.",
+                "results": [],
+            }), 400
 
         try:
-            r = _requests_lib.get(
-                f"{OPENSUBTITLES_BASE}/subtitles",
-                headers=_os_headers(api_key),
-                params=params,
-                timeout=15,
-            )
-            r.raise_for_status()
-            raw = r.json().get("data", [])
-            results = []
-            for item in raw:
-                a    = item.get("attributes", {})
-                feat = a.get("feature_details", {})
-                files = a.get("files", [])
-                if not files:
-                    continue
-                results.append({
-                    "file_id":      files[0].get("file_id"),
-                    "file_name":    files[0].get("file_name", "subtitle"),
-                    "title":        feat.get("movie_name") or feat.get("title", "Unknown"),
-                    "year":         feat.get("year", ""),
-                    "season":       feat.get("season_number"),
-                    "episode":      feat.get("episode_number"),
-                    "feature_type": feat.get("feature_type", ""),
-                    "lang":         a.get("language", "?"),
-                    "rating":       a.get("ratings", "?"),
-                    "downloads":    a.get("download_count", 0),
-                    "uploader":     a.get("uploader", {}).get("name", "anonymous"),
-                    "release":      a.get("release", ""),
-                })
+            results = _search_os_provider(query, lang, season, episode, sub_type, max_results, api_key, jwt)
             return jsonify({"results": results, "count": len(results)})
-        except _requests_lib.HTTPError as e:
-            return jsonify({"error": f"OpenSubtitles HTTP error: {e}", "results": []}), 502
+        except _requests_lib.exceptions.RequestException as e:
+            return jsonify({"error": _net_err_msg(e, "OpenSubtitles"), "results": []}), 503
         except Exception as e:
-            return jsonify({"error": str(e), "results": []}), 500
+            return jsonify({"error": _net_err_msg(e, "OpenSubtitles"), "results": []}), 500
+
+    # ── /api/subtitles/search/subdl ───────────────────────────────────────────
+    @flask_app.route("/api/subtitles/search/subdl", methods=["POST"])
+    def api_subtitles_search_subdl():
+        """Search SubDL — uses per-request subdl_key first, then SUBDL_APP_KEY constant."""
+        data        = request.get_json(force=True)
+        query       = (data.get("query") or "").strip()
+        if not query:
+            return jsonify({"error": "No query", "results": []}), 400
+        subdl_key   = (data.get("subdl_key") or "").strip()
+        effective_key = subdl_key or SUBDL_APP_KEY or ""
+        if not effective_key:
+            return jsonify({
+                "error": "SubDL not configured — paste your key in ⚙ Account panel "
+                         "or set SUBDL_APP_KEY in subtitles_addon.py (free at subdl.com → Profile → API Key)",
+                "results": [],
+            }), 503
+        lang        = (data.get("lang") or "en").strip()
+        season      = data.get("season")
+        episode     = data.get("episode")
+        sub_type    = (data.get("type") or "").strip()
+        max_results = int(data.get("max_results") or 20)
+        try:
+            results = _search_subdl_provider(query, lang, season, episode, sub_type, max_results, subdl_key)
+            return jsonify({"results": results, "count": len(results)})
+        except _requests_lib.exceptions.RequestException as e:
+            return jsonify({"error": _net_err_msg(e, "SubDL"), "results": []}), 503
+        except Exception as e:
+            return jsonify({"error": _net_err_msg(e, "SubDL"), "results": []}), 500
+
+    # ── /api/subtitles/search/all ────────────────────────────────────────────
+    @flask_app.route("/api/subtitles/search/all", methods=["POST"])
+    def api_subtitles_search_all():
+        """Search all providers in parallel; merge and rank by downloads."""
+        data        = request.get_json(force=True)
+        query       = (data.get("query") or "").strip()
+        if not query:
+            return jsonify({"error": "No query", "results": []}), 400
+        lang        = (data.get("lang") or "en").strip()
+        season      = data.get("season")
+        episode     = data.get("episode")
+        sub_type    = (data.get("type") or "").strip()
+        max_results = int(data.get("max_results") or 20)
+        api_key     = (data.get("api_key") or "").strip()
+        jwt         = (data.get("jwt") or "").strip()
+        subdl_key   = (data.get("subdl_key") or "").strip()
+
+        all_results: list = []
+        errors: dict      = {}
+
+        def _run_os():
+            return _search_os_provider(query, lang, season, episode, sub_type, max_results, api_key, jwt)
+
+        def _run_subdl():
+            return _search_subdl_provider(query, lang, season, episode, sub_type, max_results, subdl_key)
+
+        futures_map = {}
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            futures_map[ex.submit(_run_os)]    = "os"
+            futures_map[ex.submit(_run_subdl)] = "subdl"
+            for fut in as_completed(futures_map, timeout=16):
+                provider = futures_map[fut]
+                try:
+                    all_results.extend(fut.result())
+                except Exception as exc:
+                    errors[provider] = _net_err_msg(exc, provider)
+
+        # Sort by download count descending, deduplicate by (lang, normalised filename)
+        all_results.sort(key=lambda x: int(x.get("downloads") or 0), reverse=True)
+        seen:    set  = set()
+        deduped: list = []
+        for item in all_results:
+            key = (item.get("lang", ""), (item.get("file_name") or "").lower())
+            if key not in seen:
+                seen.add(key)
+                deduped.append(item)
+
+        return jsonify({"results": deduped[:max_results * 2], "count": len(deduped), "errors": errors})
 
     # ── /api/subtitles/download ───────────────────────────────────────────────
     @flask_app.route("/api/subtitles/download", methods=["POST"])
     def api_subtitles_download():
-        """Fetch subtitle file from OpenSubtitles and return its content."""
-        data    = request.get_json(force=True)
-        file_id = data.get("file_id")
-        api_key = (data.get("api_key") or "").strip()
+        """Fetch subtitle file from OpenSubtitles and return its text content."""
+        data         = request.get_json(force=True)
+        file_id      = data.get("file_id")
+        api_key      = (data.get("api_key") or "").strip()
+        jwt          = (data.get("jwt")     or "").strip()
+        effective_key = api_key or OPENSUBTITLES_APP_KEY or ""
+
         if not file_id:
             return jsonify({"error": "No file_id provided"}), 400
-        if not api_key:
-            if state:
-                state.log("[SUBS] ✗ No OpenSubtitles API key configured")
-            return jsonify({"error": "No OpenSubtitles API key set — add it in ⚙ Settings."}), 400
+        if not effective_key:
+            return jsonify({"error": "No OpenSubtitles API key configured."}), 400
+
         try:
             r = _requests_lib.post(
                 f"{OPENSUBTITLES_BASE}/download",
-                headers=_os_headers(api_key),
+                headers=_os_headers(effective_key, jwt),
                 json={"file_id": int(file_id)},
                 timeout=15,
             )
 
             if r.status_code == 406:
                 try:
-                    info       = r.json()
-                    remaining  = info.get("remaining", 0)
-                    reset_time = info.get("reset_time", "")
-                    reset_str  = f"  Resets: {reset_time}" if reset_time else ""
-                    requests_  = info.get("requests", "?")
+                    info      = r.json()
+                    remaining = info.get("remaining", 0)
+                    reset_str = f"  Resets: {info['reset_time']}" if info.get("reset_time") else ""
+                    requests_ = info.get("requests", "?")
                 except Exception:
                     remaining, reset_str, requests_ = 0, "", "?"
                 return jsonify({
                     "error": (
                         f"Daily download quota reached ({requests_} used, {remaining} remaining).{reset_str}  "
-                        f"Free accounts get 5 downloads/day — register at opensubtitles.com for 20/day."
+                        f"Free accounts get 5/day anonymous or 20/day logged in.  "
+                        f"Try SubDL instead — it has no strict per-user download limit."
                     )
                 }), 429
 
             if r.status_code in (401, 403):
-                if state:
-                    state.log("[SUBS] ✗ Invalid OpenSubtitles API key")
-                return jsonify({"error": "Invalid OpenSubtitles API key — check your key in ⚙ Settings."}), 401
+                return jsonify({"error": "Invalid OpenSubtitles API key — check your key in Settings."}), 401
 
             r.raise_for_status()
             info   = r.json()
@@ -273,7 +560,6 @@ def register_subtitles_routes(flask_app, state=None):
 
             sub = _requests_lib.get(dl_url, timeout=30)
             sub.raise_for_status()
-
             content_bytes = sub.content
             try:
                 content_text = content_bytes.decode("utf-8")
@@ -281,29 +567,54 @@ def register_subtitles_routes(flask_app, state=None):
                 content_text = content_bytes.decode("latin-1", errors="replace")
 
             fname = info.get("file_name", dl_url.split("?")[0].split("/")[-1])
-            if fname.endswith(".ass") or fname.endswith(".ssa"):
-                mime = "text/x-ssa"
-            elif fname.endswith(".vtt"):
-                mime = "text/vtt"
-            else:
-                mime = "text/srt"
-
+            mime  = ("text/x-ssa" if fname.endswith((".ass", ".ssa"))
+                     else "text/vtt" if fname.endswith(".vtt")
+                     else "text/srt")
             return jsonify({
                 "content":   content_text,
                 "file_name": fname,
                 "mime":      mime,
-                "remaining": info.get("remaining", "?"),
+                "remaining": info.get("remaining"),
             })
-        except _requests_lib.HTTPError as e:
-            return jsonify({"error": f"OpenSubtitles HTTP error: {e}"}), 502
+        except _requests_lib.exceptions.RequestException as e:
+            return jsonify({"error": _net_err_msg(e, "OpenSubtitles")}), 503
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
+            return jsonify({"error": _net_err_msg(e, "OpenSubtitles")}), 500
+
+    # ── /api/subtitles/download/subdl ─────────────────────────────────────────
+    @flask_app.route("/api/subtitles/download/subdl", methods=["POST"])
+    def api_subtitles_download_subdl():
+        """Download a subtitle from SubDL by zip URL; returns text content."""
+        data    = request.get_json(force=True)
+        dl_path = (data.get("file_id") or "").strip()   # e.g. /subtitle/123-456.zip
+        if not dl_path:
+            return jsonify({"error": "No download URL provided"}), 400
+        full_url = f"{SUBDL_DL_BASE}{dl_path}" if dl_path.startswith("/") else dl_path
+        season   = data.get("season")
+        episode  = data.get("episode")
+        try:
+            r = _requests_lib.get(
+                full_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; FlaskyIPTV/1.0)",
+                    "Accept":     "*/*",
+                },
+                timeout=20,
+                allow_redirects=True,
+            )
+            r.raise_for_status()
+            content, fname, mime = _extract_sub_from_zip(r.content, season, episode)
+            if content is None:
+                return jsonify({"error": "No subtitle file found in SubDL download"}), 502
+            return jsonify({"content": content, "file_name": fname, "mime": mime, "remaining": None})
+        except _requests_lib.exceptions.RequestException as e:
+            return jsonify({"error": _net_err_msg(e, "SubDL")}), 503
+        except Exception as e:
+            return jsonify({"error": _net_err_msg(e, "SubDL")}), 500
 
     # ── /api/subtitles/ui.js ─────────────────────────────────────────────────
     # Serves the complete subtitle UI: CSS + HTML modal + JS — injected into
     # the main page via <script src="/api/subtitles/ui.js"></script>.
-    # Globals used from main script: vid, pName, toast, alog, esc,
-    #   _isMobile, _getSubKey (all available as window.* in the same page).
     _SUBTITLES_UI_JS_BYTES = _SUBTITLES_UI_JS.encode("utf-8")
 
     @flask_app.route("/api/subtitles/ui.js")
@@ -315,7 +626,12 @@ def register_subtitles_routes(flask_app, state=None):
         )
 
     if state:
-        state.log("[SUBS] Routes registered: /api/subtitles/search  /api/subtitles/download  /api/subtitles/ui.js  /api/browse_dir  /api/load_subtitle_path  /api/browse_subtitle")
+        state.log(
+            "[SUBS] Routes registered: /api/subtitles/{search,search/all,"
+            "search/subdl,download,download/subdl,login,ui.js} "
+            "/api/browse_{dir,subtitle}  /api/load_subtitle_path"
+        )
+
 
 
 # ===================== FRONTEND (CSS + HTML + JS) =====================
@@ -374,6 +690,10 @@ _SUBTITLES_UI_JS = r"""
 .sub-meta-dl{background:rgba(34,197,94,.1);color:var(--green);border:1px solid rgba(34,197,94,.15)}
 .sub-meta-rat{background:rgba(245,158,11,.1);color:var(--orange);border:1px solid rgba(245,158,11,.15)}
 .sub-meta-ep{background:rgba(124,58,237,.12);color:#a78bfa;border:1px solid rgba(124,58,237,.2)}
+/* provider badges on results */
+.sub-meta-prov{font-size:9px;letter-spacing:.3px;font-weight:800}
+.sub-meta-prov.p-os{background:rgba(234,88,12,.1);color:#fb923c;border:1px solid rgba(234,88,12,.25)}
+.sub-meta-prov.p-subdl{background:rgba(14,165,233,.1);color:#38bdf8;border:1px solid rgba(14,165,233,.25)}
 .sub-result-release{font-size:10px;color:var(--txt3);margin-top:3px;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sub-load-btn{flex-shrink:0;height:34px;padding:0 12px;font-size:12px;align-self:center}
@@ -400,16 +720,40 @@ _SUBTITLES_UI_JS = r"""
 .sub-delay-row button:hover{background:var(--s4);border-color:var(--acc)}
 #sub-delay-val{min-width:52px;text-align:center;font-weight:700;color:var(--acc);font-size:12px;
   font-variant-numeric:tabular-nums}
-/* subtitle tab row */
-.sub-tab-row{display:flex;gap:6px;flex-shrink:0;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--bdr);padding-bottom:8px;margin-bottom:2px}
-.sub-api-key-wrap{display:flex;gap:6px;align-items:center;flex:1;min-width:0}
+/* ── tab row ─────────────────────────────────────────────────── */
+.sub-tab-row{display:flex;gap:6px;flex-shrink:0;align-items:center;flex-wrap:wrap;
+  border-bottom:1px solid var(--bdr);padding-bottom:8px;margin-bottom:2px}
+.sub-api-key-wrap{display:flex;gap:5px;align-items:center;flex:1;min-width:0}
 .sub-tab-btn{height:30px;padding:0 14px;font-size:12px;font-weight:700;border-radius:var(--rss);
   border:1px solid var(--bdr2);background:var(--s3);color:var(--txt2);cursor:pointer;transition:var(--tr)}
 .sub-tab-btn.active{background:var(--acc);border-color:var(--acc);color:#fff}
 .sub-tab-btn:hover:not(.active){background:var(--s4);color:var(--txt)}
-/* On mobile: API key + icon take full first row; divider hidden; tabs share second row */
+/* logged-in account strip (tab row) */
+.sub-logged-strip{display:none;align-items:center;gap:5px;height:28px;
+  background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);border-radius:var(--rss);
+  padding:0 8px;font-size:11px;overflow:hidden;white-space:nowrap}
+#sub-acc-name{font-weight:700;color:var(--txt);flex-shrink:0}
+#sub-acc-quota{color:var(--txt3);font-size:10px;flex-shrink:0}
+/* auth panel */
+#sub-auth-panel{background:var(--s3);border:1px solid var(--bdr);border-radius:var(--rsm);
+  padding:8px 10px;display:flex;flex-direction:column;gap:5px;margin-bottom:-4px}
+.sub-auth-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.sub-auth-row input{flex:1;height:28px;font-size:12px;min-width:100px}
+.sub-auth-lbl{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.8px;
+  color:var(--txt3);margin-bottom:2px}
+.sub-auth-lbl.sep{border-top:1px solid var(--bdr);padding-top:7px;margin-top:5px}
+#sub-login-status{font-size:11px;min-height:16px}
+/* ── provider chips ──────────────────────────────────────────── */
+.sub-provider-row{display:flex;gap:4px;align-items:center;flex-wrap:wrap;
+  padding-bottom:8px;border-bottom:1px solid var(--bdr)}
+.sub-prov-chip{height:24px;padding:0 10px;font-size:11px;font-weight:700;border-radius:20px;
+  border:1px solid var(--bdr2);background:var(--s3);color:var(--txt2);
+  cursor:pointer;transition:all .15s;white-space:nowrap;flex-shrink:0;user-select:none}
+.sub-prov-chip.active{background:rgba(124,58,237,.2);border-color:var(--acc);color:var(--txt)}
+.sub-prov-chip:hover:not(.active){background:var(--s4);color:var(--txt)}
+/* mobile: wrap API key to its own row */
 @media(max-width:599px){
-  .sub-api-key-wrap{flex:1 1 100%;order:-1;display:flex;gap:6px;align-items:center}
+  .sub-api-key-wrap{flex:1 1 100%;order:-1;display:flex;gap:5px;align-items:center}
   .sub-tab-divider-v{display:none!important}
   .sub-tab-btn{flex:1}
 }
@@ -441,76 +785,147 @@ _SUBTITLES_UI_JS = r"""
     <div class="sub-hdr">
       <h3>&#x1F4AC; Subtitle Search</h3>
       <div id="sub-active-info" style="display:none" class="sub-active-strip">
-        <span>&#x2713;</span><span id="sub-active-name" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+        <span>&#x2713;</span>
+        <span id="sub-active-name" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
         <button onclick="clearSubtitle()" style="background:none;border:none;color:var(--green);cursor:pointer;padding:0;font-size:12px;margin-left:2px" title="Remove subtitle">&#x2715;</button>
       </div>
       <button class="btn-ghost" onclick="closeSubSearch()" style="height:28px;padding:0 10px;font-size:12px;margin-left:6px">&#x2715;</button>
     </div>
     <div class="sub-body">
+      <!-- ── Tab row: account toggle + tab switcher ── -->
       <div class="sub-tab-row" id="sub-tab-row">
-        <div class="sub-api-key-wrap">
-          <span style="position:relative;display:inline-flex;align-items:center;flex:1;min-width:0">
-            <input id="sub-apikey" type="password"
-              placeholder="OpenSubtitles API key &mdash; get one free at opensubtitles.com"
-              autocomplete="new-password" autocorrect="off" spellcheck="false"
-              oninput="saveSubKey()" title="Your OpenSubtitles Consumer API key"
-              style="width:100%;height:30px;font-size:12px;padding-right:28px">
-            <button type="button" onclick="(function(b){var i=document.getElementById('sub-apikey');i.type=i.type==='password'?'text':'password';b.textContent=i.type==='password'?'👁':'🙈'})(this)" style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:13px;line-height:1;color:var(--txt2)" tabindex="-1">👁</button>
-          </span>
-          <a href="https://www.opensubtitles.com/en/consumers" target="_blank" rel="noopener"
-            class="btn-ghost"
-            style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;
-                   border-radius:var(--rss);text-decoration:none;font-size:13px;flex-shrink:0;
-                   border:1px solid var(--bdr);background:var(--s3);color:var(--txt2)"
-            title="Get a free API key at opensubtitles.com/en/consumers">&#x1F511;</a>
+        <button id="sub-login-toggle" class="btn-ghost" onclick="subToggleLogin()"
+          style="height:28px;padding:0 10px;font-size:11px;flex-shrink:0;white-space:nowrap"
+          title="API keys and account settings">&#x2699; Account</button>
+        <!-- Shown when logged in to OpenSubtitles -->
+        <div class="sub-logged-strip" id="sub-logged-strip">
+          <span style="color:var(--green);font-size:13px;flex-shrink:0">&#x2713;</span>
+          <span id="sub-acc-name"></span>
+          <span id="sub-acc-quota"></span>
+          <button onclick="subLogout()" style="margin-left:4px;background:none;border:none;color:var(--txt3);cursor:pointer;font-size:11px;padding:0;white-space:nowrap;flex-shrink:0" title="Logout">Logout</button>
         </div>
+        <div style="flex:1"></div>
         <div class="sub-tab-divider-v" style="width:1px;background:var(--bdr);align-self:stretch;flex-shrink:0"></div>
         <button class="sub-tab-btn active" id="sub-tab-online" onclick="subSwitchTab('online')">&#x1F50D; Online Search</button>
         <button class="sub-tab-btn" id="sub-tab-local" onclick="subSwitchTab('local')">&#x1F4C2; Local File</button>
       </div>
-      <!-- ONLINE SEARCH PANEL -->
+      <!-- ── Account panel (collapsible) ── -->
+      <div id="sub-auth-panel" style="display:none">
+
+        <!-- ① OpenSubtitles API key (optional — enables search; 5 anon downloads/day) -->
+        <div class="sub-auth-lbl">OpenSubtitles API key <span style="font-weight:400;text-transform:none;letter-spacing:0">(optional &bull; 5 anon downloads/day)</span></div>
+        <div class="sub-auth-row">
+          <span style="position:relative;display:inline-flex;align-items:center;flex:1;min-width:0">
+            <input id="sub-apikey" type="password"
+              placeholder="Consumer key — opensubtitles.com/en/consumers"
+              autocomplete="off" oninput="saveSubKey()"
+              style="width:100%;height:28px;font-size:12px;padding-right:28px">
+            <button type="button"
+              onclick="(function(b){var i=document.getElementById('sub-apikey');i.type=i.type==='password'?'text':'password';b.textContent=i.type==='password'?'\uD83D\uDC41':'\uD83D\uDE48'})(this)"
+              style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:12px;color:var(--txt2)" tabindex="-1">&#x1F441;</button>
+          </span>
+          <a href="https://www.opensubtitles.com/en/consumers" target="_blank" rel="noopener"
+            style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;
+                   border-radius:var(--rss);text-decoration:none;font-size:13px;flex-shrink:0;
+                   border:1px solid var(--bdr);background:var(--s3);color:var(--txt2)"
+            title="Get free consumer key at opensubtitles.com/en/consumers">&#x1F511;</a>
+        </div>
+        <div id="sub-oskey-status" style="font-size:11px;min-height:14px;color:var(--txt3)"></div>
+
+        <!-- ② OpenSubtitles login (username+password → JWT → 20 downloads/day) -->
+        <div class="sub-auth-lbl sep">OpenSubtitles login <span style="font-weight:400;text-transform:none;letter-spacing:0">(20 downloads/day)</span></div>
+        <!-- Login form — hidden when already logged in -->
+        <div id="sub-os-login-form">
+          <div class="sub-auth-row">
+            <input id="sub-login-user" type="text" placeholder="Username" autocomplete="username">
+            <input id="sub-login-pass" type="password" placeholder="Password" autocomplete="current-password"
+              onkeydown="if(event.key==='Enter')subDoLogin()">
+            <button class="btn-acc" onclick="subDoLogin()" style="height:28px;padding:0 12px;font-size:12px;flex-shrink:0">Login</button>
+          </div>
+          <div id="sub-login-status" style="font-size:11px;min-height:14px"></div>
+        </div>
+        <!-- Logged-in state — shown when JWT present -->
+        <div id="sub-os-loggedin-row" style="display:none;align-items:center;gap:8px;padding:5px 8px;
+          background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);border-radius:var(--rss)">
+          <span style="color:var(--green);font-size:14px">&#x2713;</span>
+          <span style="font-size:12px;color:var(--txt)">Logged in as <b id="sub-acc-name-p"></b></span>
+          <span id="sub-acc-quota-p" style="font-size:11px;color:var(--txt3)"></span>
+          <button onclick="subLogout()" style="margin-left:auto;background:none;border:none;
+            color:var(--txt3);cursor:pointer;font-size:11px;padding:0;flex-shrink:0">Logout</button>
+        </div>
+
+        <!-- ③ SubDL API key (free — 300 downloads/day) -->
+        <div class="sub-auth-lbl sep">SubDL API key <span style="font-weight:400;text-transform:none;letter-spacing:0">(free &bull; 300 downloads/day &bull; no login needed)</span></div>
+        <div class="sub-auth-row">
+          <span style="position:relative;display:inline-flex;align-items:center;flex:1;min-width:0">
+            <input id="sub-subdl-key" type="password"
+              placeholder="Paste your SubDL key here"
+              autocomplete="off" oninput="saveSubdlKey()"
+              style="width:100%;height:28px;font-size:12px;padding-right:28px">
+            <button type="button"
+              onclick="(function(b){var i=document.getElementById('sub-subdl-key');i.type=i.type==='password'?'text':'password';b.textContent=i.type==='password'?'\uD83D\uDC41':'\uD83D\uDE48'})(this)"
+              style="position:absolute;right:4px;background:none;border:none;cursor:pointer;padding:0;font-size:12px;color:var(--txt2)" tabindex="-1">&#x1F441;</button>
+          </span>
+          <a href="https://subdl.com/profile" target="_blank" rel="noopener"
+            style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;
+                   border-radius:var(--rss);text-decoration:none;font-size:13px;flex-shrink:0;
+                   border:1px solid var(--bdr);background:var(--s3);color:var(--txt2)"
+            title="Get free SubDL API key — subdl.com/profile (free account required)">&#x1F511;</a>
+        </div>
+        <div id="sub-subdl-status" style="font-size:11px;min-height:14px;color:var(--txt3)"></div>
+
+      </div>
+      <!-- ── ONLINE SEARCH PANEL ── -->
       <div id="sub-panel-online">
-      <div class="sub-search-row">
-        <input id="sub-query" type="search" placeholder="Title (auto-filled from player)&hellip;"
-          autocomplete="new-password" autocorrect="off" spellcheck="false"
-          onkeydown="if(event.key==='Enter')subSearch()">
-        <button class="btn-acc" onclick="subSearch()" id="sub-search-btn">&#x1F50D; Search</button>
-      </div>
-      <div class="sub-filters">
-        <div class="sub-filter-group" style="flex:1;min-width:200px">
-          <label class="grp-lbl">Language</label>
-          <div class="sub-lang-grid" id="sub-lang-grid"></div>
+        <!-- Provider chips -->
+        <div class="sub-provider-row">
+          <button class="sub-prov-chip active" data-prov="all"       onclick="subSetProvider('all')">&#x1F310; All Sources</button>
+          <button class="sub-prov-chip"         data-prov="os"        onclick="subSetProvider('os')">OpenSubtitles</button>
+          <button class="sub-prov-chip"         data-prov="subdl"     onclick="subSetProvider('subdl')">SubDL</button>
         </div>
-        <div class="sub-filter-group" style="min-width:180px">
-          <label class="grp-lbl">Type</label>
-          <div class="sub-type-row">
-            <label class="sub-type-chip"><input type="radio" name="sub-type" value="movie" id="sub-type-movie" checked onchange="subToggleEp()"> &#x1F3AC; Movie</label>
-            <label class="sub-type-chip"><input type="radio" name="sub-type" value="series" id="sub-type-series" onchange="subToggleEp()"> &#x1F4FA; Series</label>
+        <!-- Search row -->
+        <div class="sub-search-row">
+          <input id="sub-query" type="search" placeholder="Title (auto-filled from player)&hellip;"
+            autocomplete="new-password" autocorrect="off" spellcheck="false"
+            onkeydown="if(event.key==='Enter')subSearch()">
+          <button class="btn-acc" onclick="subSearch()" id="sub-search-btn">&#x1F50D; Search</button>
+        </div>
+        <!-- Filters -->
+        <div class="sub-filters">
+          <div class="sub-filter-group" style="flex:1;min-width:200px">
+            <label class="grp-lbl">Language</label>
+            <div class="sub-lang-grid" id="sub-lang-grid"></div>
           </div>
-          <div class="sub-ep-row" id="sub-ep-row" style="display:none;margin-top:6px">
-            <label>Season</label>
-            <input id="sub-season" type="number" min="1" placeholder="S#" oninput="subSeasonChange()">
-            <label>Episode</label>
-            <input id="sub-episode" type="number" min="1" placeholder="Ep#">
+          <div class="sub-filter-group" style="min-width:180px">
+            <label class="grp-lbl">Type</label>
+            <div class="sub-type-row">
+              <label class="sub-type-chip"><input type="radio" name="sub-type" value="movie" id="sub-type-movie" checked onchange="subToggleEp()"> &#x1F3AC; Movie</label>
+              <label class="sub-type-chip"><input type="radio" name="sub-type" value="series" id="sub-type-series" onchange="subToggleEp()"> &#x1F4FA; Series</label>
+            </div>
+            <div class="sub-ep-row" id="sub-ep-row" style="display:none;margin-top:6px">
+              <label>Season</label>
+              <input id="sub-season" type="number" min="1" placeholder="S#" oninput="subSeasonChange()">
+              <label>Episode</label>
+              <input id="sub-episode" type="number" min="1" placeholder="Ep#">
+            </div>
+          </div>
+          <div class="sub-filter-group" style="min-width:80px">
+            <label class="grp-lbl">Max results</label>
+            <select id="sub-maxresults" style="height:28px;font-size:12px;background:var(--s4);color:var(--txt);border:1px solid var(--bdr2);border-radius:var(--rss);padding:0 8px">
+              <option value="10">10</option>
+              <option value="20" selected>20</option>
+              <option value="40">40</option>
+            </select>
           </div>
         </div>
-        <div class="sub-filter-group" style="min-width:80px">
-          <label class="grp-lbl">Max results</label>
-          <select id="sub-maxresults" style="height:28px;font-size:12px;background:var(--s4);color:var(--txt);border:1px solid var(--bdr2);border-radius:var(--rss);padding:0 8px">
-            <option value="10">10</option>
-            <option value="20" selected>20</option>
-            <option value="40">40</option>
-          </select>
+        <div id="sub-results-wrap">
+          <div class="sub-empty" id="sub-placeholder">
+            <span>&#x1F4AC;</span>
+            Search for subtitles &mdash; title is auto-filled from what&apos;s playing.
+          </div>
         </div>
-      </div>
-      <div id="sub-results-wrap">
-        <div class="sub-empty" id="sub-placeholder">
-          <span>&#x1F4AC;</span>
-          Search for subtitles &mdash; title is auto-filled from what&apos;s playing.
-        </div>
-      </div>
       </div><!-- /sub-panel-online -->
-      <!-- LOCAL FILE PANEL -->
+      <!-- ── LOCAL FILE PANEL ── -->
       <div id="sub-panel-local" style="display:none;padding:10px 0 4px 0">
         <div id="sub-local-desktop">
           <div style="margin-bottom:8px;font-size:12px;color:var(--txt2);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px">
@@ -546,7 +961,7 @@ _SUBTITLES_UI_JS = r"""
         </div>
         <div id="sub-local-status" style="font-size:11px;color:var(--txt2);margin-top:4px"></div>
       </div>
-    </div>
+    </div><!-- /sub-body -->
     <div class="sub-status-bar">
       <div class="sub-sbar-r1">
         <span id="sub-status-msg">Ready</span>
@@ -593,10 +1008,192 @@ let _subActiveFile = null;
 let _subCuesBase   = [];
 let subDelayMs     = 0;
 let _subTrackObj   = null;
+let _subProvider   = 'all';   // 'all' | 'os' | 'subdl'
 
-// ── Native TextTrack helpers ────────────────────────────────
+// ── saveSubKey / _getSubKey fallbacks ──────────────────────────────
+// These may also be defined in the main script; the guard ensures no conflicts.
+if(typeof saveSubKey === 'undefined'){
+  window.saveSubKey = function(){
+    try{
+      const k = document.getElementById('sub-apikey');
+      if(k) localStorage.setItem('opensubtitles_key', k.value.trim());
+      _subUpdateOsKeyStatus();
+    }catch(e){}
+  };
+}
+if(typeof _getSubKey === 'undefined'){
+  window._getSubKey = function(){
+    try{ return localStorage.getItem('opensubtitles_key')||''; }catch(e){ return ''; }
+  };
+}
+
+// ── SubDL key helpers ──────────────────────────────────────────────
+function saveSubdlKey(){
+  try{
+    const k = document.getElementById('sub-subdl-key');
+    if(k) localStorage.setItem('subdl_key', k.value.trim());
+    _subUpdateSubdlStatus();
+  }catch(e){}
+}
+function _getSubdlKey(){
+  try{ return localStorage.getItem('subdl_key')||''; }catch(e){ return ''; }
+}
+function _subUpdateSubdlStatus(){
+  const st  = document.getElementById('sub-subdl-status');
+  const key = _getSubdlKey();
+  if(!st) return;
+  if(key){
+    st.style.color = 'var(--green)';
+    st.textContent = '\u2713 SubDL key saved (' + key.slice(0,4) + '\u2026)';
+  } else {
+    st.style.color = 'var(--txt3)';
+    st.textContent = 'No key — SubDL will be skipped in search results.';
+  }
+}
+
+// ── JWT / account helpers ───────────────────────────────────────────
+function _getSubJwt(){
+  try{ return localStorage.getItem('os_jwt')||''; }catch(e){ return ''; }
+}
+function _saveSubJwt(token, username, remaining){
+  try{
+    localStorage.setItem('os_jwt', token||'');
+    localStorage.setItem('os_user', JSON.stringify({user: username, remaining, ts: Date.now()}));
+  }catch(e){}
+}
+function _clearSubJwt(){
+  try{
+    localStorage.removeItem('os_jwt');
+    localStorage.removeItem('os_user');
+  }catch(e){}
+}
+function _getSubUser(){
+  try{ return JSON.parse(localStorage.getItem('os_user')||'null'); }catch(e){ return null; }
+}
+
+function _subUpdateOsKeyStatus(){
+  const st  = document.getElementById('sub-oskey-status');
+  const key = _getSubKey();
+  if(!st) return;
+  if(key){
+    st.style.color = 'var(--green)';
+    st.textContent = '\u2713 OS key saved (' + key.slice(0,4) + '\u2026)';
+  } else {
+    st.style.color = 'var(--txt3)';
+    st.textContent = 'No key — anonymous search uses the server app key if configured.';
+  }
+}
+
+function _subUpdateAccountUI(){
+  const user     = _getSubUser();
+  const jwt      = _getSubJwt();
+  const loggedIn = !!(jwt && user);
+
+  // Tab row: logged-in chip
+  const strip = document.getElementById('sub-logged-strip');
+  if(strip) strip.style.display = loggedIn ? 'flex' : 'none';
+  if(loggedIn){
+    const nameEl  = document.getElementById('sub-acc-name');
+    const quotaEl = document.getElementById('sub-acc-quota');
+    if(nameEl)  nameEl.textContent  = user.user || 'User';
+    if(quotaEl && user.remaining != null)
+      quotaEl.textContent = '(' + user.remaining + ' left)';
+  }
+
+  // Auth panel: swap login form ↔ logged-in row
+  const loginForm    = document.getElementById('sub-os-login-form');
+  const loggedInRow  = document.getElementById('sub-os-loggedin-row');
+  if(loginForm)   loginForm.style.display   = loggedIn ? 'none' : '';
+  if(loggedInRow) loggedInRow.style.display = loggedIn ? 'flex'  : 'none';
+  if(loggedIn){
+    const np = document.getElementById('sub-acc-name-p');
+    const qp = document.getElementById('sub-acc-quota-p');
+    if(np) np.textContent = user.user || 'User';
+    if(qp && user.remaining != null)
+      qp.textContent = '(' + user.remaining + ' downloads left today)';
+  }
+
+  // Restore saved keys into fields (safe when panel is closed)
+  const ak = document.getElementById('sub-apikey');
+  if(ak && !ak.value) ak.value = _getSubKey();
+  const sk = document.getElementById('sub-subdl-key');
+  if(sk && !sk.value) sk.value = _getSubdlKey();
+  _subUpdateOsKeyStatus();
+  _subUpdateSubdlStatus();
+}
+
+// ── Auth panel toggle ──────────────────────────────────────────────
+function subToggleLogin(){
+  const panel = document.getElementById('sub-auth-panel');
+  if(!panel) return;
+  const nowOpen = panel.style.display !== 'none';
+  panel.style.display = nowOpen ? 'none' : '';
+  if(!nowOpen){
+    // Restore saved keys into fields
+    const ak = document.getElementById('sub-apikey');
+    if(ak && !ak.value) ak.value = _getSubKey();
+    const sk = document.getElementById('sub-subdl-key');
+    if(sk && !sk.value) sk.value = _getSubdlKey();
+    _subUpdateOsKeyStatus();
+    _subUpdateSubdlStatus();
+    _subUpdateAccountUI();
+    const st = document.getElementById('sub-login-status');
+    if(st) st.textContent = '';
+    setTimeout(()=>{ const u = document.getElementById('sub-login-user'); if(u) u.focus(); }, 80);
+  }
+}
+
+async function subDoLogin(){
+  const userEl = document.getElementById('sub-login-user');
+  const passEl = document.getElementById('sub-login-pass');
+  const stEl   = document.getElementById('sub-login-status');
+  const btn    = document.querySelector('#sub-auth-panel .btn-acc');
+  const u = (userEl ? userEl.value : '').trim();
+  const p = (passEl ? passEl.value : '').trim();
+  if(!u || !p){ if(stEl){ stEl.style.color='var(--orange)'; stEl.textContent='Enter username and password.'; } return; }
+  if(btn){ btn.disabled=true; btn.textContent='Logging in\u2026'; }
+  if(stEl){ stEl.textContent=''; stEl.style.color='var(--txt2)'; }
+  try{
+    const r = await fetch('/api/subtitles/login',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username: u, password: p}),
+    });
+    const d = await r.json();
+    if(d.error){
+      if(stEl){ stEl.style.color='#f87171'; stEl.textContent='\u2717 '+d.error; }
+    } else {
+      _saveSubJwt(d.token, d.user && (d.user.name || d.user.username || u), d.remaining);
+      _subUpdateAccountUI();
+      document.getElementById('sub-auth-panel').style.display = 'none';
+      if(passEl) passEl.value = '';
+      toast('Logged in to OpenSubtitles','ok');
+    }
+  } catch(e){
+    if(stEl){ stEl.style.color='#f87171'; stEl.textContent='\u2717 Network error: '+e; }
+  } finally {
+    if(btn){ btn.disabled=false; btn.textContent='Login'; }
+  }
+}
+
+function subLogout(){
+  _clearSubJwt();
+  _subUpdateAccountUI();
+  toast('Logged out of OpenSubtitles','info');
+}
+
+// ── Provider chip selection ────────────────────────────────────────
+function subSetProvider(p){
+  _subProvider = p;
+  document.querySelectorAll('.sub-prov-chip').forEach(c=>{
+    c.classList.toggle('active', c.dataset.prov === p);
+  });
+}
+
+// ── Native TextTrack helpers ────────────────────────────────────────
 function _subGetOrCreateTrack(){
   if(_subTrackObj) return _subTrackObj;
+  const vid = document.getElementById('vid');
+  if(!vid) return null;
   _subTrackObj = vid.addTextTrack('subtitles', 'Subtitle', 'und');
   return _subTrackObj;
 }
@@ -610,6 +1207,7 @@ function _subClearNativeTrack(){
 
 function _subLoadCuesToTrack(cues){
   const track = _subGetOrCreateTrack();
+  if(!track) return;
   const list = track.cues;
   while(list && list.length){ try{ track.removeCue(list[0]); }catch(e){ break; } }
   const offsetSec = subDelayMs / 1000;
@@ -621,7 +1219,7 @@ function _subLoadCuesToTrack(cues){
   track.mode = 'showing';
 }
 
-// ── Parse any format into cues ──────────────────────────────
+// ── Parse any format into cues ──────────────────────────────────────
 function _subParseCues(content, mime, fileName){
   const lower = (fileName||'').toLowerCase();
   if(lower.endsWith('.ass') || lower.endsWith('.ssa')) return _parseAssCues(content);
@@ -686,7 +1284,7 @@ function _parseAssCues(ass){
   return cues;
 }
 
-// ── Apply subtitle (called from both online + local paths) ──
+// ── Apply subtitle (called from both online + local paths) ──────────
 function _subApplyToPlayer(content, fileName, mime){
   _subCuesBase = _subParseCues(content, mime, fileName);
   subDelayMs   = 0;
@@ -734,7 +1332,7 @@ function subSyncToMovieTime(){
   if(!raw){ toast('Enter the movie time shown on screen (e.g. 34:31)','wrn'); return; }
   const parts = raw.split(':').map(Number);
   if(parts.some(isNaN) || parts.length < 2){
-    toast('Invalid format — use MM:SS or H:MM:SS','err'); return;
+    toast('Invalid format \u2014 use MM:SS or H:MM:SS','err'); return;
   }
   const movieSecs = parts.length === 3
     ? parts[0]*3600 + parts[1]*60 + parts[2]
@@ -746,8 +1344,8 @@ function subSyncToMovieTime(){
   const dv = document.getElementById('sub-delay-val');
   if(dv) dv.textContent = (subDelayMs>=0?'+':'') + (subDelayMs/1000).toFixed(1) + 's';
   const ss = document.getElementById('sub-sync-status');
-  if(ss){ ss.textContent = '✓ Synced to ' + raw; ss.style.display='inline'; setTimeout(()=>{ ss.style.display='none'; }, 3000); }
-  toast('✓ Subtitles synced to ' + raw, 'ok');
+  if(ss){ ss.textContent = '\u2713 Synced to ' + raw; ss.style.display='inline'; setTimeout(()=>{ ss.style.display='none'; }, 3000); }
+  toast('\u2713 Subtitles synced to ' + raw, 'ok');
   if(inp) inp.value = '';
 }
 
@@ -776,8 +1374,7 @@ function clearSubtitle(){
   toast('Subtitle removed','info');
 }
 
-// ── SUBTITLE TAB SWITCHER ──────────────────────────────────
-// Auto-detect mobile on first use (includes 900px width emulation)
+// ── SUBTITLE TAB SWITCHER ───────────────────────────────────────────
 let _subFbMode = (typeof _isMobile !== 'undefined' && _isMobile) || window.innerWidth <= 900;
 function subForceFileBrowser(){ _subFbMode=false; subToggleFileBrowser(); }
 function subToggleFileBrowser(){
@@ -785,7 +1382,6 @@ function subToggleFileBrowser(){
   document.getElementById('sub-local-desktop').style.display = _subFbMode ? 'none' : '';
   document.getElementById('sub-local-mobile').style.display  = _subFbMode ? ''     : 'none';
   document.getElementById('sub-local-status').textContent = '';
-  // Update both toggle buttons
   const label = _subFbMode ? '\uD83D\uDCC1 File browser: On' : '\uD83D\uDCC1 File browser: Off';
   const b1 = document.getElementById('sub-fb-toggle-btn');
   const b2 = document.getElementById('sub-fb-toggle-btn2');
@@ -797,7 +1393,6 @@ function subToggleFileBrowser(){
     b2.style.background=_subFbMode?'rgba(124,58,237,.2)':'';
     b2.style.borderColor=_subFbMode?'var(--acc)':'';
     b2.style.color=_subFbMode?'var(--txt)':''; }
-  // On mobile there is no tkinter picker — keep switch buttons hidden
   if(typeof _isMobile !== 'undefined' && _isMobile){
     if(b1) b1.style.display='none';
     if(b2) b2.style.display='none';
@@ -812,11 +1407,9 @@ function subSwitchTab(tab){
   document.getElementById('sub-tab-online').classList.toggle('active', isOnline);
   document.getElementById('sub-tab-local').classList.toggle('active', !isOnline);
   if(!isOnline){
-    // Use _isMobile (includes width<=900) or user's forced browser mode
     const _subUseMobile = _subFbMode || (typeof _isMobile!=='undefined' && _isMobile) || window.innerWidth<=900;
     document.getElementById('sub-local-desktop').style.display = _subUseMobile ? 'none' : '';
     document.getElementById('sub-local-mobile').style.display  = _subUseMobile ? ''     : 'none';
-    // Sync button states
     const _subLabel = _subUseMobile ? '\uD83D\uDCC1 File browser: On' : '\uD83D\uDCC1 File browser: Off';
     [document.getElementById('sub-fb-toggle-btn'),document.getElementById('sub-fb-toggle-btn2')].forEach(b=>{
       if(!b) return;
@@ -825,7 +1418,6 @@ function subSwitchTab(tab){
       b.style.borderColor=_subUseMobile?'var(--acc)':'';
       b.style.color=_subUseMobile?'var(--txt)':'';
     });
-    // On mobile there is no tkinter picker — hide switch buttons entirely
     if(typeof _isMobile !== 'undefined' && _isMobile){
       [document.getElementById('sub-fb-toggle-btn'),document.getElementById('sub-fb-toggle-btn2')].forEach(b=>{
         if(b) b.style.display='none';
@@ -842,7 +1434,7 @@ function subSwitchTab(tab){
   }
 }
 
-// ── DESKTOP: tkinter file picker ───────────────────────────
+// ── DESKTOP: tkinter file picker ────────────────────────────────────
 async function subBrowseDesktop(){
   const stEl = document.getElementById('sub-local-status');
   stEl.textContent = 'Opening file picker\u2026';
@@ -860,7 +1452,7 @@ async function subBrowseDesktop(){
   }
 }
 
-// ── MOBILE: inline file browser ────────────────────────────
+// ── MOBILE: inline file browser ─────────────────────────────────────
 let _subFbCurrentPath = '/sdcard/Download';
 
 function subFbUp(){
@@ -902,7 +1494,7 @@ async function subFbNav(path){
       </div>`);
     }
     if(!rows.length){
-      rows.push('<div style="padding:10px;font-size:12px;color:var(--txt3)">No subtitle files here. Tap a folder to browse.</div>');
+      rows.push('<div style="padding:10px;font-size:12px;color:var(--txt3)">No subtitle files here.</div>');
     }
     listEl.innerHTML = rows.join('');
   } catch(e){
@@ -940,7 +1532,7 @@ async function _subLoadFromServerPath(path, stEl){
   }
 }
 
-// ── BROWSER FILE INPUT (desktop fallback / direct pick) ────
+// ── BROWSER FILE INPUT (desktop fallback / direct pick) ─────────────
 function subLoadLocalFile(input){
   const file = input.files && input.files[0];
   if(!file){ return; }
@@ -971,6 +1563,7 @@ function subLoadLocalFile(input){
   reader.readAsText(file, 'utf-8');
 }
 
+// ── Language grid init ──────────────────────────────────────────────
 function _subInitLangGrid(){
   const grid = document.getElementById('sub-lang-grid');
   if(!grid || grid.children.length) return;
@@ -982,26 +1575,33 @@ function _subInitLangGrid(){
     </label>`).join('');
 }
 
+// ── Open/close modal ────────────────────────────────────────────────
 function openSubSearch(){
   _subInitLangGrid();
-  // Populate API key field from localStorage each time modal opens
+  _subUpdateAccountUI();
+  // Restore API keys from localStorage each time modal opens
   try{
     const ak = document.getElementById('sub-apikey');
-    if(ak && !ak.value) ak.value = localStorage.getItem('opensubtitles_key')||'';
+    if(ak && !ak.value) ak.value = _getSubKey();
+    const sk = document.getElementById('sub-subdl-key');
+    if(sk && !sk.value) sk.value = _getSubdlKey();
   }catch(e){}
+  // Auto-fill query from current stream name
   const q = document.getElementById('sub-query');
-  if(pName && !q.value){
+  if(typeof pName !== 'undefined' && pName && !q.value){
     let cleaned = pName
       .replace(/\bS\d{1,2}E\d{1,2}\b/gi,'')
-      .replace(/\b(720p|1080p|4k|hevc|h264|h265|hd|sd|fhd|uhd|bluray|webrip|web-dl|xvid|x264|x265)\b/gi,'')
+      .replace(/\b(720p|1080p|4k|2160p|hevc|h264|h265|hd|sd|fhd|uhd|bluray|webrip|web-dl|xvid|x264|x265|avc)\b/gi,'')
+      .replace(/\(\d{4}\)/g,'')
       .replace(/[._\-\[\]()]+/g,' ')
       .replace(/\s{2,}/g,' ').trim();
     q.value = cleaned;
-    const epMatch = pName.match(/[Ss](\d{1,2})[Ee](\d{1,2})/);
+    // Detect S/E patterns: S01E02, 1x02, S01.E02
+    const epMatch = pName.match(/(?:[Ss](\d{1,2})[Ee](\d{1,2}))|(?:(\d{1,2})[xX](\d{1,2}))/);
     if(epMatch){
       document.getElementById('sub-type-series').checked = true;
-      document.getElementById('sub-season').value  = epMatch[1];
-      document.getElementById('sub-episode').value = epMatch[2];
+      document.getElementById('sub-season').value  = epMatch[1] || epMatch[3];
+      document.getElementById('sub-episode').value = epMatch[2] || epMatch[4];
       subToggleEp();
     }
   }
@@ -1032,104 +1632,205 @@ function subSeasonChange(){
 
 function _subGetLangs(){
   const checks = document.querySelectorAll('#sub-lang-grid input[type=checkbox]:checked');
-  const codes = Array.from(checks).map(c=>c.value);
+  const codes  = Array.from(checks).map(c=>c.value);
   return codes.length ? codes.join(',') : 'en';
 }
 
+// ── Online search ───────────────────────────────────────────────────
 async function subSearch(){
   const query = document.getElementById('sub-query').value.trim();
   if(!query){ toast('Enter a title to search','err'); return; }
   const isSeries = document.getElementById('sub-type-series').checked;
-  const season   = isSeries ? (document.getElementById('sub-season').value||null) : null;
+  const season   = isSeries ? (document.getElementById('sub-season').value||null)  : null;
   const episode  = isSeries ? (document.getElementById('sub-episode').value||null) : null;
   const lang     = _subGetLangs();
   const maxR     = document.getElementById('sub-maxresults').value;
   const btn  = document.getElementById('sub-search-btn');
   const wrap = document.getElementById('sub-results-wrap');
   const msg  = document.getElementById('sub-status-msg');
+
+  const PROV_LABELS = {all:'All Sources', os:'OpenSubtitles', subdl:'SubDL'};
+  const ENDPOINTS   = {
+    all:       '/api/subtitles/search/all',
+    os:        '/api/subtitles/search',
+    subdl:     '/api/subtitles/search/subdl',
+  };
+  const endpoint = ENDPOINTS[_subProvider] || ENDPOINTS.all;
+
   btn.disabled = true;
   btn.textContent = '\u23f3 Searching\u2026';
-  msg.textContent = 'Searching OpenSubtitles\u2026';
-  wrap.innerHTML = '<div class="sub-empty"><span class="spin" style="font-size:28px;display:block;margin-bottom:12px"></span>Searching\u2026</div>';
+  msg.textContent = 'Searching ' + (PROV_LABELS[_subProvider]||_subProvider) + '\u2026';
+  wrap.innerHTML  = '<div class="sub-empty"><span class="spin" style="font-size:28px;display:block;margin-bottom:12px"></span>Searching\u2026</div>';
+
+  const body = {
+    query, lang, season, episode,
+    type:        isSeries ? 'episode' : 'movie',
+    max_results: parseInt(maxR),
+    api_key:     _getSubKey(),
+    jwt:         _getSubJwt(),
+    subdl_key:   _getSubdlKey(),
+  };
+
   try{
-    const r = await fetch('/api/subtitles/search',{
+    const r = await fetch(endpoint,{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({query, lang, season, episode, type: isSeries ? 'episode' : 'movie', max_results: parseInt(maxR), api_key: _getSubKey()}),
+      body: JSON.stringify(body),
     });
     const d = await r.json();
-    if(d.error){ toast('Search error: '+d.error,'err'); wrap.innerHTML=_subEmpty('Search failed: '+esc(d.error)); return; }
+    if(d.error){
+      const _fe = _subFriendlyErr(d.error);
+      toast(_fe, 'err');
+      wrap.innerHTML = _subErrBlock(_fe, d.error);
+      msg.textContent = 'Search failed.';
+      return;
+    }
     if(!d.results || !d.results.length){
       wrap.innerHTML = _subEmpty('No subtitles found. Try a different title or language.');
       msg.textContent = 'No results.';
       return;
     }
-    msg.textContent = d.count + ' result(s) found';
+    const errNote = d.errors && Object.keys(d.errors).length
+      ? ' \u2022 unavailable: ' + Object.keys(d.errors).join(', ')
+      : '';
+    msg.textContent = d.count + ' result(s)' + errNote;
     _subRenderResults(d.results);
   } catch(e){
-    wrap.innerHTML = _subEmpty('Network error: '+esc(String(e)));
+    const _fe2 = _subFriendlyErr(String(e));
+    wrap.innerHTML  = _subErrBlock(_fe2, String(e));
     msg.textContent = 'Error.';
   } finally {
-    btn.disabled = false;
+    btn.disabled    = false;
     btn.textContent = '\u1F50D Search';
   }
 }
 
-function _subEmpty(msg){
-  return `<div class="sub-empty"><span>&#x1F4AC;</span>${msg}</div>`;
+function _subFriendlyErr(raw){
+  if(!raw) return 'Unknown error';
+  if(/NameResolution|getaddrinfo|Failed to resolve|Errno 11001|DNS/i.test(raw))
+    return 'Cannot reach provider \u2014 DNS lookup failed. Check your internet connection.';
+  if(/ConnectTimeout|ReadTimeout|TimeoutError|timed out/i.test(raw))
+    return 'Connection timed out \u2014 try again.';
+  if(/ConnectionRefused|Connection refused|BrokenPipe/i.test(raw))
+    return 'Provider connection refused \u2014 may be temporarily down.';
+  if(/SSLError|CERTIFICATE/i.test(raw))
+    return 'SSL certificate error.';
+  if(/Max retries exceeded/i.test(raw))
+    return 'Cannot reach provider after multiple retries \u2014 check your internet connection.';
+  return raw.split('\n')[0].slice(0, 150);
 }
 
+function _subErrBlock(friendly, detail){
+  const isConfig = /not configured|API key|no key/i.test(friendly);
+  const hint = isConfig
+    ? '<div style="font-size:11px;color:var(--txt3);margin-top:4px">Open <b>\u2699 Account</b> to set your keys.</div>'
+    : '<div style="font-size:11px;color:var(--txt3);margin-top:4px">Try <b>All Sources</b> or another provider.</div>';
+  const detailHtml = (detail && detail !== friendly && detail.length > friendly.length)
+    ? '<details style="margin-top:6px;text-align:left;cursor:pointer">'
+      + '<summary style="font-size:10px;color:var(--txt3);user-select:none">Technical details</summary>'
+      + '<pre style="margin-top:4px;font-size:9px;font-family:monospace;white-space:pre-wrap;word-break:break-all;'
+      + 'background:var(--s4);padding:6px;border-radius:4px;overflow:auto;max-height:72px;color:var(--txt3)">'
+      + esc(detail) + '</pre></details>'
+    : '';
+  return '<div class="sub-empty">'
+    + '<span style="font-size:28px;display:block;margin-bottom:8px;opacity:.6">\u26A0</span>'
+    + '<div style="color:var(--orange,#fb923c);font-size:13px;font-weight:700;margin-bottom:2px">'
+    + esc(friendly) + '</div>'
+    + hint + detailHtml + '</div>';
+}
+
+function _subEmpty(msg){
+  return '<div class="sub-empty"><span>&#x1F4AC;</span>'+msg+'</div>';
+}
+
+// ── Render results ──────────────────────────────────────────────────
 function _subRenderResults(results){
   const wrap = document.getElementById('sub-results-wrap');
+  const PROV_LABELS = {os:'OS', subdl:'SubDL'};
+  const PROV_CLASS  = {os:'p-os', subdl:'p-subdl'};
+
   const parts = results.map((item, i) => {
     const epStr = (item.season && item.episode)
-      ? ` <span class="sub-meta-badge sub-meta-ep">S${String(item.season).padStart(2,'0')}E${String(item.episode).padStart(2,'0')}</span>`
+      ? '<span class="sub-meta-badge sub-meta-ep">S'+String(item.season).padStart(2,'0')+'E'+String(item.episode).padStart(2,'0')+'</span>'
       : '';
-    const yearStr = item.year ? ` (${item.year})` : '';
-    return `<div class="sub-result-item">
-      <div class="sub-result-info">
-        <div class="sub-result-title">${esc(item.title)}${yearStr}</div>
-        <div class="sub-result-meta">
-          <span class="sub-meta-badge sub-meta-lang">${esc(item.lang)}</span>
-          ${epStr}
-          <span class="sub-meta-badge sub-meta-dl">&#x2B07; ${item.downloads}</span>
-          <span class="sub-meta-badge sub-meta-rat">&#x2605; ${item.rating}</span>
-        </div>
-        <div class="sub-result-release">${esc(item.file_name || '')} &bull; ${esc(item.uploader)}</div>
-      </div>
-      <button class="btn-ghost sub-load-btn" id="sub-load-${i}"
-        onclick="subLoadSubtitle(${item.file_id}, '${esc(item.file_name||'subtitle')}', ${i})"
-        title="Load into player">&#x25B6; Load</button>
-    </div>`;
+    const yearStr  = item.year ? ' ('+item.year+')' : '';
+    const prov     = item.provider || 'os';
+    const provLbl  = PROV_LABELS[prov]  || prov.toUpperCase();
+    const provCls  = PROV_CLASS[prov]   || 'p-os';
+    const dlsStr   = item.downloads > 0
+      ? '<span class="sub-meta-badge sub-meta-dl">\u2193 '+item.downloads+'</span>'
+      : '';
+    const ratStr   = (item.rating && item.rating !== '?')
+      ? '<span class="sub-meta-badge sub-meta-rat">\u2605 '+item.rating+'</span>'
+      : '';
+    // Encode file_id safely for onclick; it may be a URL path string for subdl
+    const fidJson  = JSON.stringify(String(item.file_id));
+    const fnJson   = JSON.stringify(item.file_name || 'subtitle.srt');
+    const seasJson = JSON.stringify(item.season || null);
+    const epJson   = JSON.stringify(item.episode || null);
+    return '<div class="sub-result-item">'
+      +'<div class="sub-result-info">'
+      +'<div class="sub-result-title">'+esc(item.title)+yearStr+'</div>'
+      +'<div class="sub-result-meta">'
+      +'<span class="sub-meta-badge sub-meta-prov '+provCls+'">'+provLbl+'</span>'
+      +'<span class="sub-meta-badge sub-meta-lang">'+esc(item.lang)+'</span>'
+      +epStr+dlsStr+ratStr
+      +'</div>'
+      +'<div class="sub-result-release">'+esc(item.file_name||'')+'&bull; '+esc(item.uploader||'')+'</div>'
+      +'</div>'
+      +'<button class="btn-ghost sub-load-btn" id="sub-load-'+i+'"'
+      +' onclick="subLoadSubtitle('+fidJson+','+fnJson+','+i+','+JSON.stringify(prov)+','+seasJson+','+epJson+')"'
+      +' title="Load into player">&#x25B6; Load</button>'
+      +'</div>';
   });
-  wrap.innerHTML = `<div class="sub-results">${parts.join('')}</div>`;
+  wrap.innerHTML = '<div class="sub-results">'+parts.join('')+'</div>';
 }
 
-async function subLoadSubtitle(fileId, fileName, btnIdx){
+// ── Download + apply to player ───────────────────────────────────────
+async function subLoadSubtitle(fileId, fileName, btnIdx, provider, season, episode){
+  provider = provider || 'os';
   const btn = document.getElementById('sub-load-'+btnIdx);
   const msg = document.getElementById('sub-status-msg');
   if(btn){ btn.disabled=true; btn.textContent='\u23f3\u2026'; }
   msg.textContent = 'Downloading subtitle\u2026';
+
+  let endpoint, body;
+  if(provider === 'subdl'){
+    endpoint = '/api/subtitles/download/subdl';
+    body = {file_id: fileId, file_name: fileName, season, episode};
+  } else {
+    endpoint = '/api/subtitles/download';
+    body = {file_id: parseInt(fileId), api_key: _getSubKey(), jwt: _getSubJwt()};
+  }
+
   try{
-    const r = await fetch('/api/subtitles/download',{
+    const r = await fetch(endpoint,{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({file_id: fileId, api_key: _getSubKey()}),
+      body: JSON.stringify(body),
     });
     const d = await r.json();
-    if(d.error){ toast('Download failed: '+d.error,'err'); if(btn){btn.disabled=false;btn.textContent='\u25b6 Load';} return; }
-    _subApplyToPlayer(d.content, d.file_name || fileName, d.mime || 'text/srt');
-    _subActiveFile = {name: d.file_name || fileName};
-    document.getElementById('sub-active-name').textContent = _subActiveFile.name;
+    if(d.error){
+      toast(_subFriendlyErr(d.error),'err');
+      if(btn){ btn.disabled=false; btn.textContent='\u25b6 Load'; }
+      msg.textContent = 'Download failed.';
+      return;
+    }
+    const loadedName = d.file_name || fileName;
+    _subApplyToPlayer(d.content, loadedName, d.mime || 'text/srt');
+    _subActiveFile = {name: loadedName};
+    document.getElementById('sub-active-name').textContent = loadedName;
     document.getElementById('sub-active-info').style.display = 'flex';
     if(btn){ btn.textContent='\u2713 Loaded'; btn.classList.add('loaded'); }
-    msg.textContent = 'Loaded: ' + (d.file_name||fileName) + (d.remaining!==undefined ? ' | Quota left: '+d.remaining : '');
+    const quotaStr = (d.remaining != null) ? ' \u2022 OS quota: '+d.remaining+' left' : '';
+    msg.textContent = 'Loaded: ' + loadedName + quotaStr;
     const subBtn = document.getElementById('subbtn');
     if(subBtn) subBtn.style.opacity='1';
     toast('Subtitle loaded','ok');
   } catch(e){
     toast('Error: '+e,'err');
     if(btn){ btn.disabled=false; btn.textContent='\u25b6 Load'; }
+    msg.textContent = 'Error.';
   }
 }
 
