@@ -61,6 +61,7 @@ It is a local player interface — a front-end that connects to IPTV portals and
 | `multiview_addon.py` | optional | Multi-View grid player |
 | `dvr_addon.py` | optional | DVR — scheduled and manual recordings |
 | `radio_addon.py` | optional | Internet radio — RadioBrowser API, Shoutcast directory, M3U playlists, favourites |
+| `m3u_proxy_addon.py` | optional | M3U URL proxy — convert any portal into a permanent token-refreshing M3U URL for TiviMate / VLC / Kodi |
 | `multiview_layouts.json` | auto-created | Saved Multi-View layouts (created on first save) |
 | `dvr_jobs.json` | auto-created | Saved DVR job list (created on first scheduled recording) |
 
@@ -85,6 +86,7 @@ The installer will:
 - **Detect `multiview_addon.py`** and verify its dependencies (ffmpeg + yt-dlp)
 - **Detect `dvr_addon.py`** and verify its dependencies (ffmpeg required)
 - **Detect `radio_addon.py`** and confirm `requests` (already a core requirement) is available
+- **Detect `m3u_proxy_addon.py`** and confirm it requires no extra packages (stdlib + flask only)
 - On **Android/Termux** — automatically installs `ffmpeg` via `pkg install ffmpeg` if missing
 - On **Windows/macOS/Linux** — prints install instructions for your platform if ffmpeg is missing
 - Check that port 5000 is free
@@ -305,6 +307,42 @@ pip install pyatv                 # AirPlay
 - **Download MKV** — download VOD/series items to MKV; yt-dlp is used as a fallback for YouTube/Twitch URLs
 - **Download Manager** — a persistent job list tracks all active and completed downloads across the session. Each job shows name, progress bar, file size, speed, and a Stop button. Completed downloads are split into Recordings and MKV tabs. The manager auto-opens when a new download or quick-record starts.
 
+### M3U URL Proxy (`m3u_proxy_addon.py`)
+
+Converts any connected portal into a **permanent M3U URL** that can be added directly to TiviMate, VLC, Kodi, or any IPTV player. The URL never expires — stream tokens are resolved fresh on every channel click.
+
+**Requires:** `m3u_proxy_addon.py` in the same directory. No additional Python packages needed.
+
+#### How it works
+- Select any categories or channels in the Browse panel, then tap **🔗 Get M3U URL** in the actions drawer (the ⚡ FAB menu)
+- FlaskyIPTV builds a proxy playlist pointing back to its own built-in server and shows a copy dialog
+- Add that URL to TiviMate, VLC, Kodi, or any IPTV player as an M3U playlist source
+- When the player opens a channel, the proxy calls the portal's `create_link` API in real time, gets a fresh short-lived token URL, and issues a `302` redirect — the playlist URL itself never changes
+
+#### Token refresh by portal type
+
+| Portal type | Stream URL behaviour |
+|---|---|
+| **MAC / Stalker** | `create_link` called on every channel click — always a fresh token, never expires |
+| **Xtream** | Stable credential-in-path URL (`/live/user/pass/id.m3u8`) — no token needed |
+| **M3U source** | Source URL written directly into the playlist — no proxy layer used |
+
+Generation is fast for MAC/Stalker live channels because the raw `cmd` value is read from the already-cached item list without calling `create_link`. Token resolution only happens at play time.
+
+#### LAN access
+The proxy dialog automatically detects the server's LAN IP when FlaskyIPTV is opened via a loopback address (`127.0.0.1` / `localhost`) and shows two URLs:
+
+- **Same device** — `http://127.0.0.1:5000/…` (for TiviMate on the same phone or PC as the server)
+- **Over local network** 📡 — `http://192.168.1.X:5000/…` (for TiviMate / Kodi on a TV or any device on the same WiFi)
+
+If the browser is opened directly via the LAN IP (e.g. `http://192.168.1.100:5000`), only the single LAN-accessible URL is shown. Stream links inside the playlist are also generated dynamically from `request.host`, so replacing the IP in the playlist URL is sufficient — all stream links inside automatically follow.
+
+#### Playlist management
+- The **Active Proxy Playlists** panel in the dialog lists all generated playlists with channel count, age, and active/stale status. A stale indicator (grey dot) means the portal has changed since that playlist was generated.
+- Each playlist has a **📋 copy** and **🗑 delete** button
+- Up to 50 playlists are stored simultaneously; the oldest is evicted automatically when the cap is reached
+- Playlists live in RAM — they are cleared when FlaskyIPTV restarts. Players receive a descriptive `503` response with instructions to regenerate from FlaskyIPTV.
+
 ### Stalker / MAC Portal Advanced Overrides
 For MAC/Stalker portals, an expandable **Stalker overrides** section in the connect panel lets you supply hardcoded device identity values instead of the auto-computed ones:
 
@@ -502,7 +540,7 @@ All settings are saved in browser localStorage and persist across sessions.
 ## Architecture Notes
 
 - The app is split across multiple files — the main `.py` entry point plus required and optional addon modules, all in the same directory
-- `cast_addon.py`, `multiview_addon.py`, `dvr_addon.py`, and `radio_addon.py` are fully self-contained drop-in modules; the main app degrades gracefully if any of them are absent
+- `cast_addon.py`, `multiview_addon.py`, `dvr_addon.py`, `radio_addon.py`, and `m3u_proxy_addon.py` are fully self-contained drop-in modules; the main app degrades gracefully if any of them are absent
 - `portal_clients.py`, `proxy_addon.py`, `download_addon.py`, `probe_addon.py`, `epg_addon.py`, and `subtitles_addon.py` are required — the app will not function correctly without them
 - The HTML is a Jinja2 template rendered by Flask's `render_template_string`
 - HLS playback uses **HLS.js** loaded from CDN
@@ -516,12 +554,15 @@ All settings are saved in browser localStorage and persist across sessions.
 - Multi-View stream proxy (`/api/multiview/stream`) runs one ffmpeg process per unique stream URL, shared across all tiles showing the same channel. A background janitor thread cleans up idle streams after 30 seconds.
 - DVR scheduler runs as a background daemon thread, waking every 5 seconds to fire any due jobs. Job state persists to `dvr_jobs.json`. On startup, any job stuck in `recording` state (ffmpeg died while the app was stopped) is recovered — completed if the file exists and has size, otherwise marked as error.
 - Radio addon uses a two-tier cache (10-minute memory + 24-hour disk) stored at `~/.flasky_radio_cache/`. RadioBrowser queries rotate across five geographically distributed API servers with automatic failover. Favourites persist at `~/.flasky_radio_cache/radio_favorites.json`.
+- M3U URL proxy (`m3u_proxy_addon.py`) stores up to 50 proxy playlists in an in-memory dict keyed by a 12-char UUID. Playlist content is generated dynamically per-request from `request.host` so stream links automatically reflect the correct IP for both localhost and LAN access. All state is lost on server restart.
 
 ---
 
 ## Known Limitations
 
 - MKV download resume (`-ss` seek) can be unreliable on live IPTV streams — ffmpeg may not seek accurately on some stream types
+- Large external EPG files load into RAM in full; very large lists (30k+ channels) will use significant memory
+- Recording and downloading run as background threads — closing the browser tab does not stop them; use the Stop button first
 - AirPlay via `pyatv` bypasses the stream proxy (pyatv does not support custom HTTP headers); auth must be embedded in the resolved stream URL for AirPlay to work
 - Multi-View requires MSE support in the browser — older or restricted WebViews may not support it
 - Each Multi-View tile runs one ffmpeg process; 9 simultaneous tiles = 9 ffmpeg processes. On low-end hardware (e.g. older Android phones) this may be demanding. Use fewer tiles or lower-bitrate channels if you experience performance issues.
@@ -530,4 +571,6 @@ All settings are saved in browser localStorage and persist across sessions.
 - DVR timeshift (watch while recording) transcodes on the fly via ffmpeg — on low-end hardware this may be slow to start or choppy. Timeshift works best on the same machine running the Flask server.
 - If the app is stopped while a recording is in progress, ffmpeg is killed and the partial `.ts` file is kept. On next startup the job is recovered as completed (if the file has content) or error (if the file is empty/missing).
 - Radio station discovery requires internet access to the RadioBrowser API and Shoutcast directory; only the ~30 built-in hardcoded streams work without network access
+- Large M3U radio playlists (e.g. the iptv-org all-radio list at ~20k stations) may take several seconds to load on first access; repeat loads within 24 hours are served from disk cache
 - Stream verification in the radio panel is a lightweight HEAD/GET check — it confirms the server is reachable but does not guarantee the audio stream is free of buffering or quality issues
+- M3U URL proxy playlists are stored in RAM and are lost when the FlaskyIPTV server restarts — any player that stored the URL will receive a `503` response until the playlist is regenerated from the actions drawer
