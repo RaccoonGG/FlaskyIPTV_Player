@@ -55,7 +55,7 @@ It is a local player interface — a front-end that connects to IPTV portals and
 | `download_addon.py` | ✓ | MKV/M3U download, quick record, ffmpeg/yt-dlp helpers |
 | `probe_addon.py` | ✓ |  Stream codec probing and pre-play URL resolution |
 | `epg_addon.py` | ✓ | EPG, Catch-up TV, What's On Now, XMLTV support |
-| `subtitles_addon.py` | ✓ | Subtitle UI, OpenSubtitles search/download, local subtitle file loading |
+| `subtitles_addon.py` | ✓ | Subtitle UI, multi-provider search (OpenSubtitles + SubDL), local subtitle file loading |
 | `install_requirements_FlaskyIPTV_Player.py` | — | Run once to install dependencies |
 | `cast_addon.py` | optional | Casting to Chromecast / DLNA / AirPlay |
 | `multiview_addon.py` | optional | Multi-View grid player |
@@ -375,15 +375,64 @@ Each portal connection can be configured to identify itself as a specific IPTV c
 The selected UA applies to all portal API requests (handshake, categories, items) and to direct stream connections (ffmpeg `-user_agent`, proxy fetch headers). MAG-family presets also send the full STB header set to both Stalker and generic MAC portals, which run the same Infomir portal software and recognise them.
 
 ### Subtitles (`subtitles_addon.py`)
-- Search and download subtitles from OpenSubtitles.com (free API key required from opensubtitles.com/en/consumers)
-- Load local subtitle files directly from device storage — all three common formats parsed client-side:
-  - **SRT** — SubRip text
-  - **VTT** — WebVTT
-  - **ASS / SSA** — Advanced SubStation Alpha (dialogue lines and timing extracted; complex style overrides simplified)
-- **Subtitle delay adjustment** — `+` and `−` buttons shift subtitle timing; tap once for a single step, hold for continuous rapid adjustment
-- **Sync to current time** — snaps the subtitle offset so the currently displaying cue aligns to the current playback position — useful when the delay drift is large
-- **Toggle visibility** — hide/show subtitles without clearing them, so they can be re-enabled without reloading
-- Subtitle state (loaded file, delay offset) persists for the current session
+
+Search and download subtitles from multiple providers simultaneously. All subtitle state (loaded file, delay offset) persists for the current session.
+
+#### Providers
+
+| Provider | Key required | Downloads/day | Notes |
+|---|---|---|---|
+| **OpenSubtitles** | App key (embed in file) + optional user key or login | 5 anon · 20 logged in | Largest database; login optional |
+| **SubDL** | Free key from subdl.com/profile — no login needed | 300/day | Free account; key set once in ⚙ Account |
+
+Selecting **🌐 All Sources** runs both providers in parallel, merges results, deduplicates by filename, and ranks by download count. Each result card shows a colour-coded provider badge.
+
+#### Setup — ⚙ Account panel
+
+Click **⚙ Account** in the subtitle modal tab row. All keys are saved in browser localStorage — set them once and they persist across sessions.
+
+| Section | Field | How to get it |
+|---|---|---|
+| OpenSubtitles | API key (optional) | [opensubtitles.com/en/consumers](https://www.opensubtitles.com/en/consumers) — free; enables 5 anon downloads/day |
+| OpenSubtitles | Login (optional) | Free account at opensubtitles.com — increases downloads to 20/day via JWT session |
+| SubDL | API key | [subdl.com/profile](https://subdl.com/profile) — free account; 300 downloads/day; no login step |
+
+**Server-side shortcut:** the server admin can embed a consumer key directly in `subtitles_addon.py` as `OPENSUBTITLES_APP_KEY` and/or `SUBDL_APP_KEY` — OS search and SubDL search then work for all users with zero UI setup required.
+
+#### Subtitle Formats
+
+All formats are parsed client-side:
+- **SRT** — SubRip text
+- **VTT** — WebVTT
+- **ASS / SSA** — Advanced SubStation Alpha (dialogue lines and timing extracted; style overrides simplified)
+
+#### Controls
+
+- **Subtitle delay** — `+` / `−` buttons shift timing in 0.1 s steps; hold for continuous adjustment
+- **Sync to movie time** — type the timestamp visible on screen (e.g. `34:31`) to auto-calculate the exact offset so the subtitle track aligns precisely
+- **Toggle visibility** — hide/show subtitles without clearing them
+- **Local file** — load any `.srt`, `.vtt`, `.ass`, or `.ssa` file directly from device storage:
+  - **Desktop** — opens a native OS file picker (tkinter)
+  - **Android / Termux** — inline file browser navigates the device filesystem
+
+#### Error handling
+
+Network failures (DNS lookup failures, timeouts, connection refused) are caught and displayed as short human-readable messages rather than raw exception traces. A collapsible **Technical details** section is available in the results panel for diagnostics.
+
+#### API Endpoints
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/subtitles/search` | POST | Search OpenSubtitles (user key › embedded app key) |
+| `/api/subtitles/search/subdl` | POST | Search SubDL (user key › embedded app key) |
+| `/api/subtitles/search/all` | POST | Parallel search all providers — merged + deduped |
+| `/api/subtitles/download` | POST | Download from OpenSubtitles; 429 on quota with fallback hint |
+| `/api/subtitles/download/subdl` | POST | Download from SubDL — zip extracted server-side |
+| `/api/subtitles/login` | POST | OpenSubtitles username + password → JWT token (24 h) |
+| `/api/subtitles/ui.js` | GET | Serves the complete subtitle UI (CSS + HTML + JS) |
+| `/api/load_subtitle_path` | POST | Load a local subtitle file by absolute server path |
+| `/api/browse_dir` | POST | Directory listing for the mobile inline file browser |
+| `/api/browse_subtitle` | GET | Open native OS file picker (desktop only) |
 
 ### VOD / Series Metadata & Links
 - Opens the metadata page for VOD and series items via a priority lookup chain:
@@ -518,7 +567,7 @@ All settings are saved in browser localStorage and persist across sessions.
 | M3U save path | ⚙ Settings | Default output path for exported M3U files |
 | External player (desktop) | ⚙ Settings | Full path to player executable |
 | External player (mobile) | ⚙ Settings | Choose VLC / MX Player / MX Pro / Just Player / Ask |
-| OpenSubtitles API key | ⚙ Settings | Free key from opensubtitles.com/en/consumers |
+| Subtitle keys | ⚙ Account panel (subtitle modal) | OpenSubtitles consumer key (optional), OpenSubtitles login, SubDL API key — all stored in localStorage |
 | External EPG URL | Connect panel | XMLTV URL used for EPG and What's On Now |
 | EPG time offset | Connect panel | Per-portal EPG offset in minutes; compensates for portal EPG data in a different timezone; applied live without reconnect |
 | DVR output folder | DVR tab | Folder where `.ts` recording files are saved |
@@ -546,7 +595,7 @@ All settings are saved in browser localStorage and persist across sessions.
 - HLS playback uses **HLS.js** loaded from CDN
 - Multi-View playback uses **mpegts.js** loaded from CDN — each tile decodes an MPEG-TS stream via MSE
 - Multi-View grid layout uses **GridStack** loaded from CDN
-- Subtitle rendering uses **WebVTT** natively or via a cue-injection bridge for .srt/.ass files
+- Subtitle rendering uses the browser's native **TextTrack / VTTCue API**; SRT, ASS/SSA, and VTT are all parsed client-side and injected as cues. The subtitle modal UI, all search/download routes, and the local file browser are served from `subtitles_addon.py` via a single `/api/subtitles/ui.js` endpoint. Multi-provider search (`/api/subtitles/search/all`) runs OpenSubtitles and SubDL in parallel using `concurrent.futures.ThreadPoolExecutor` and merges results server-side.
 - The HLS proxy endpoint (`/api/hls_proxy`) rewrites segment URLs so the browser can play streams that don't support CORS
 - Live activity log uses **Server-Sent Events** (`/api/logs`) streamed from a thread-safe queue
 - EPG data is cached in memory; large XMLTV files (30k+ channels) may use up to ~2 GB RAM
@@ -573,4 +622,5 @@ All settings are saved in browser localStorage and persist across sessions.
 - Radio station discovery requires internet access to the RadioBrowser API and Shoutcast directory; only the ~30 built-in hardcoded streams work without network access
 - Large M3U radio playlists (e.g. the iptv-org all-radio list at ~20k stations) may take several seconds to load on first access; repeat loads within 24 hours are served from disk cache
 - Stream verification in the radio panel is a lightweight HEAD/GET check — it confirms the server is reachable but does not guarantee the audio stream is free of buffering or quality issues
+- OpenSubtitles download quota is 5/day for anonymous use and 20/day for free registered accounts. When the quota is exhausted the player suggests switching to SubDL (300/day with a free key, no login required).
 - M3U URL proxy playlists are stored in RAM and are lost when the FlaskyIPTV server restarts — any player that stored the URL will receive a `503` response until the playlist is regenerated from the actions drawer
