@@ -646,7 +646,8 @@ s.textContent=`
 /* Get M3U URL action drawer button — vivid blue */
 #adr-dlm3u-url{background:linear-gradient(135deg,
   rgba(59,130,246,.45),rgba(37,99,235,.45));
-  border:1px solid rgba(59,130,246,.75)}
+  border:1px solid rgba(59,130,246,.75);color:#fff!important}
+#adr-dlm3u-url *{color:#fff!important}
 #adr-dlm3u-url:hover:not(:disabled){background:linear-gradient(135deg,
   rgba(59,130,246,.6),rgba(37,99,235,.6))}
 `;
