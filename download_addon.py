@@ -1815,6 +1815,7 @@ _DL_UI_JS = r"""
 .adr-btn span.adr-ico{font-size:18px;flex-shrink:0;width:26px;text-align:center;align-self:flex-start;padding-top:1px}
 .adr-btn span.adr-lbl{flex:1;min-width:0;white-space:normal;word-break:break-word;line-height:1.3}
 .adr-btn span.adr-sub{font-size:11px;color:rgba(255,255,255,.5);font-weight:400;flex-shrink:0;white-space:nowrap;align-self:flex-start;padding-top:2px}
+#adr-dlm3u,#adr-dlm3u *{color:#fff!important}
 .adr-sel-row{display:flex;gap:4px;margin-bottom:10px}
 .adr-sel-row button{flex:1;height:30px;font-size:11px;padding:0 4px}
 .adr-count{font-size:12px;color:var(--acc);font-weight:700;
