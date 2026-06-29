@@ -322,6 +322,31 @@ def check_radio_addon():
         info("Install with:  pip install requests")
 
 
+# ── m3u_proxy_addon check ─────────────────────────────────────────────────────
+def check_m3u_proxy_addon():
+    hdr("Checking m3u_proxy_addon.py …")
+
+    proxy_file = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "m3u_proxy_addon.py"
+    )
+    if not os.path.isfile(proxy_file):
+        warn("m3u_proxy_addon.py not found — M3U URL Proxy feature will be disabled")
+        info("Place m3u_proxy_addon.py alongside the Flask app to enable permanent")
+        info("M3U URLs for TiviMate / VLC / Kodi with automatic token refresh")
+        return
+
+    ok("m3u_proxy_addon.py found")
+    print()
+    print(f"  {BOLD}M3U URL Proxy requirements:{RESET}")
+    print(f"  • No extra Python packages needed — uses only Python stdlib + flask")
+    print(f"  • Generates permanent M3U URLs for TiviMate, VLC, Kodi")
+    print(f"  • For MAC/Stalker: stream tokens are renewed on every player click")
+    print(f"  • LAN IP auto-detected — works from other devices on the same network")
+    print(f"  • Proxy playlists are stored in RAM and cleared on server restart")
+    print()
+    ok("M3U URL Proxy ready — no additional setup needed")
+
+
 # ── Port availability check ───────────────────────────────────────────────────
 def check_port(port: int = 5000):
     import socket
@@ -382,6 +407,7 @@ def main():
     check_multiview_addon()
     check_dvr_addon()
     check_radio_addon()
+    check_m3u_proxy_addon()
     check_system_deps()
     check_port(5000)
 
