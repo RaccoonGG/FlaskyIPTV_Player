@@ -643,12 +643,12 @@ s.textContent=`
 .m3u-px-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;
   background:var(--green,#4ade80);box-shadow:0 0 5px var(--green,#4ade80)}
 .m3u-px-dot.off{background:#4b5563;box-shadow:none}
-/* Action drawer button */
+/* Get M3U URL action drawer button — vivid blue */
 #adr-dlm3u-url{background:linear-gradient(135deg,
-  rgba(20,184,166,.16),rgba(6,182,212,.16));
-  border:1px solid rgba(20,184,166,.32)}
+  rgba(59,130,246,.45),rgba(37,99,235,.45));
+  border:1px solid rgba(59,130,246,.75)}
 #adr-dlm3u-url:hover:not(:disabled){background:linear-gradient(135deg,
-  rgba(20,184,166,.26),rgba(6,182,212,.26))}
+  rgba(59,130,246,.6),rgba(37,99,235,.6))}
 `;
 document.head.appendChild(s);
 })();
@@ -891,7 +891,7 @@ async function _dlItemsM3UUrl(){
     if(document.getElementById('adr-dlm3u-url')) return;
     var btn=document.createElement('button');
     btn.id='adr-dlm3u-url';
-    btn.className='adr-btn';
+    btn.className='adr-btn btn-blue';
     btn.disabled=true;
     btn.onclick=dlSelectedAllM3UUrl;
     btn.innerHTML=
