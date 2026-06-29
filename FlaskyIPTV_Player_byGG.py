@@ -89,6 +89,13 @@ except ImportError:
     def register_probe_routes(*a, **kw): pass
 
 try:
+    from m3u_proxy_addon import register_m3u_proxy_routes
+    _M3U_PROXY_AVAILABLE = True
+except ImportError:
+    _M3U_PROXY_AVAILABLE = False
+    def register_m3u_proxy_routes(*a, **kw): pass
+
+try:
     from download_addon import (
         register_download_routes,
         safe_filename,
@@ -1597,6 +1604,7 @@ register_download_routes(flask_app, state, run_async, run_worker, _make_client,
                          _FFMPEG_PATH, _FFPROBE_PATH,
                          _FFMPEG_AVAILABLE, YTDLP_AVAILABLE)
 register_epg_routes(flask_app, state, run_async, _make_client)
+register_m3u_proxy_routes(flask_app, state, run_async, _make_client)
 
 @flask_app.route("/api/status", methods=["GET"])
 def api_status():
@@ -8668,6 +8676,7 @@ window._rdioLocalCC = (_LOCALE_TAG_CANDIDATES[0] || '').toUpperCase().slice(0, 2
 <script src="/api/dlm/ui.js"></script>
 <script src="/api/probe/ui.js"></script>
 <script src="/api/radio/ui.js"></script>
+<script src="/api/m3u_proxy/ui.js"></script>
 </body>
 </html>
 """
