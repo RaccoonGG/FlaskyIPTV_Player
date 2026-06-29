@@ -1228,8 +1228,18 @@ _MV_UI_JS = r"""
   color:var(--txt);border:1px solid var(--bdr2);border-radius:var(--rsm);
   cursor:pointer;
 }
+/* Separator line between button groups */
 .mv-tb-sep{
   width:1px;height:20px;background:var(--bdr2);margin:0 2px;
+}
+/* Full-width row break inside the flex toolbar body — forces the layout
+   selector onto its own line so Save / Load / Delete stay together */
+.mv-tb-break{
+  flex-basis:100%;height:0;
+}
+/* Layout dropdown: expand to fill the second row up to a readable max-width */
+#mv-layouts-sel{
+  flex:1;max-width:360px;
 }
 /* Close-multiview button — prominent, uses the same ⊞ icon as the entry button */
 #mv-close-btn{
@@ -1570,11 +1580,13 @@ _MV_UI_JS = r"""
       <button class="btn-ghost" id="mv-layout-1p2"  title="1+2: large left, two stacked right">1＋2</button>
       <div class="mv-tb-sep"></div>
       <button class="btn-ghost" id="mv-save-btn"    title="Save current layout">💾 Save</button>
+      <button class="btn-ghost" id="mv-load-btn"    title="Load selected layout">Load</button>
+      <button class="btn-ghost" id="mv-delete-btn"  title="Delete selected layout">🗑</button>
+      <!-- Layout selector on its own wrapped row — keeps Save/Load/Delete together above -->
+      <div class="mv-tb-break"></div>
       <select id="mv-layouts-sel" title="Saved layouts">
         <option value="" disabled selected>Load layout…</option>
       </select>
-      <button class="btn-ghost" id="mv-load-btn"    title="Load selected layout">Load</button>
-      <button class="btn-ghost" id="mv-delete-btn"  title="Delete selected layout">🗑</button>
     </div>
   </div>
 
@@ -1841,14 +1853,13 @@ async function _mvPlayFromUrl(wid, rawUrl, cEl){
 
 // ── Toolbar collapse ─────────────────────────────────────────────────────────
 
-// On mobile the toolbar body starts collapsed so the grid gets maximum space.
-// On desktop it starts expanded since there is plenty of room.
+// Toolbar always starts collapsed — user opens it with the Controls button.
+// Previously auto-opened on desktop; now closed by default on all screen sizes
+// so the grid gets maximum vertical space immediately on first open.
 function _mvTbInit(){
   const tb = document.getElementById('mv-toolbar');
   if(!tb) return;
-  const isMobile = window.innerWidth < 900;
-  // Start collapsed on mobile, expanded on desktop
-  tb.classList.toggle('tb-open', !isMobile);
+  tb.classList.remove('tb-open');
   _mvFitCellHeight();
 }
 
