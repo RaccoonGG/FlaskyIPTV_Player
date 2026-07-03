@@ -710,6 +710,12 @@ _SUBTITLES_UI_JS = r"""
 #sub-sync-inp{flex:1;min-width:0;height:24px;font-size:12px;padding:0 7px;border-radius:var(--rss);
   border:1px solid var(--bdr);background:var(--s3);color:var(--txt)}
 .sub-status-bar .btn-ghost{flex-shrink:0;white-space:nowrap}
+#sub-ocr-row button:hover{border-color:var(--acc)}
+#sub-ocr-row button:disabled{opacity:.5;cursor:default}
+#ocr-region-overlay{-webkit-tap-highlight-color:transparent}
+.ocr-debug-thumb{flex:0 0 auto;width:76px;text-align:center}
+.ocr-debug-thumb img{width:100%;height:44px;object-fit:contain;background:#000;border:1px solid var(--bdr2);border-radius:4px;image-rendering:pixelated}
+.ocr-debug-thumb span{display:block;font-size:8px;color:var(--txt3);margin-top:2px;line-height:1.2;white-space:normal}
 .sub-active-strip{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.2);
   border-radius:var(--rss);padding:4px 10px;font-size:11px;color:var(--green);
   display:flex;align-items:center;gap:6px}
@@ -983,6 +989,24 @@ _SUBTITLES_UI_JS = r"""
                  background:var(--acc);color:#fff;border:none;cursor:pointer;flex-shrink:0">Sync</button>
         <span id="sub-sync-status" style="font-size:11px;color:var(--green);display:none;white-space:nowrap"></span>
         <button class="btn-ghost" onclick="closeSubSearch()" style="height:28px;padding:0 12px;font-size:12px;flex-shrink:0">Close</button>
+      </div>
+      <div class="sub-sbar-r2" id="sub-ocr-row">
+        <span style="color:var(--txt3);white-space:nowrap">&#128269; Auto-read timecode:</span>
+        <button onclick="ocrOpenRegionSelector()" title="Draw a box around the on-screen timecode"
+          style="height:24px;padding:0 8px;font-size:11px;border-radius:var(--rss);border:1px solid var(--bdr2);
+                 background:var(--s3);color:var(--txt);cursor:pointer;flex-shrink:0">&#127919; Region</button>
+        <button onclick="ocrReadAndSync()" title="Read the on-screen timecode now and sync"
+          style="height:24px;padding:0 10px;font-size:11px;font-weight:700;border-radius:var(--rss);border:none;
+                 background:var(--acc);color:#fff;cursor:pointer;flex-shrink:0">&#10024; Sync now</button>
+      </div>
+      <div id="ocr-debug-row" style="display:none;padding:6px 0 2px;border-top:1px solid var(--bdr2)">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+          <span style="font-size:10px;color:var(--txt3)">OCR couldn\u2019t read this \u2014 here\u2019s what it captured:</span>
+          <button onclick="document.getElementById('ocr-debug-row').style.display='none'"
+            style="height:18px;padding:0 6px;font-size:10px;border-radius:4px;border:1px solid var(--bdr2);
+                   background:var(--s3);color:var(--txt3);cursor:pointer">\u2715</button>
+        </div>
+        <div id="ocr-debug-thumbs" style="display:flex;gap:6px;overflow-x:auto;padding-bottom:2px"></div>
       </div>
     </div>
   </div>
@@ -1295,6 +1319,8 @@ function _subApplyToPlayer(content, fileName, mime){
   if(_dr) _dr.style.display = 'flex';
   const _sr = document.getElementById('sub-sync-row');
   if(_sr) _sr.style.display = 'flex';
+  const _or = document.getElementById('sub-ocr-row');
+  if(_or) _or.style.display = 'flex';
   const _tb = document.getElementById('sub-toggle-btn');
   if(_tb) _tb.innerHTML = '&#x1F441; On';
 }
@@ -1349,6 +1375,636 @@ function subSyncToMovieTime(){
   if(inp) inp.value = '';
 }
 
+// ── OCR AUTO-SYNC ────────────────────────────────────────────────────
+// Reads a burned-in on-screen timecode (common on live/unseekable streams)
+// straight off the video frame via client-side OCR (Tesseract.js, lazy-loaded
+// from CDN on first use) and computes the subtitle delay automatically —
+// no more guessing/typing the corner clock by eye.
+//
+// Pure helpers below (no DOM) are exported on window._ocrTest for unit tests.
+
+function _ocrNormalizeDigits(text){
+  return (text || '')
+    .replace(/[oO]/g, '0')
+    .replace(/[lI|]/g, '1')
+    .replace(/[sS]/g, '5')
+    .replace(/[bB]/g, '8')
+    .replace(/[gG]/g, '9')
+    .replace(/[^\d:]/g, '');
+}
+
+// Parses OCR text like "12:34:56", "34:31", or noisy variants into seconds.
+// Returns null when no plausible HH:MM:SS / MM:SS pattern is found.
+function _ocrParseTimecode(rawText){
+  if(!rawText) return null;
+  const cleaned = _ocrNormalizeDigits(rawText.trim());
+  const m = cleaned.match(/(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/);
+  if(!m) return null;
+  let h = 0, mi, se;
+  if(m[3] !== undefined){ h = +m[1]; mi = +m[2]; se = +m[3]; }
+  else { mi = +m[1]; se = +m[2]; }
+  if(mi > 59 || se > 59 || h > 23) return null;
+  return h*3600 + mi*60 + se;
+}
+
+// Converts a saved {xPct,yPct,wPct,hPct} region into a pixel rect clamped
+// to the video's natural (decoded) resolution.
+function _ocrClampRect(regionPct, naturalW, naturalH){
+  if(!naturalW || !naturalH || !regionPct) return {x:0,y:0,w:1,h:1};
+  const xPct = Math.min(Math.max(regionPct.xPct || 0, 0), 1);
+  const yPct = Math.min(Math.max(regionPct.yPct || 0, 0), 1);
+  let wPct = Math.min(Math.max(regionPct.wPct || 0, 0), 1);
+  let hPct = Math.min(Math.max(regionPct.hPct || 0, 0), 1);
+  if(xPct + wPct > 1) wPct = 1 - xPct;
+  if(yPct + hPct > 1) hPct = 1 - yPct;
+  const x = Math.round(xPct * naturalW);
+  const y = Math.round(yPct * naturalH);
+  const w = Math.max(1, Math.round(wPct * naturalW));
+  const h = Math.max(1, Math.round(hPct * naturalH));
+  return {x, y, w, h};
+}
+
+// Converts a drag gesture (two points in overlay-local pixel coords) into a
+// resolution-independent {xPct,yPct,wPct,hPct} region. Returns null if the
+// drag was too small to be a real selection.
+function _ocrRegionFromDrag(x1, y1, x2, y2, containerW, containerH){
+  if(!containerW || !containerH) return null;
+  const left = Math.max(0, Math.min(x1, x2));
+  const top = Math.max(0, Math.min(y1, y2));
+  const right = Math.min(containerW, Math.max(x1, x2));
+  const bottom = Math.min(containerH, Math.max(y1, y2));
+  const wPx = right - left, hPx = bottom - top;
+  if(wPx < 6 || hPx < 6) return null;
+  const xPct = left / containerW, yPct = top / containerH;
+  const wPct = Math.min(1 - xPct, wPx / containerW);
+  const hPct = Math.min(1 - yPct, hPx / containerH);
+  if(wPct <= 0 || hPct <= 0) return null;
+  return {xPct, yPct, wPct, hPct};
+}
+
+function _ocrFormatSeconds(total){
+  total = Math.max(0, Math.round(total));
+  const h = Math.floor(total/3600), m = Math.floor((total%3600)/60), s = total%60;
+  const pad = n => String(n).padStart(2,'0');
+  return h > 0 ? (h+':'+pad(m)+':'+pad(s)) : (m+':'+pad(s));
+}
+
+// Otsu's method: picks the grayscale threshold (0-255) that best separates
+// a 256-bin histogram into two classes by maximizing between-class
+// variance. Replaces a single hardcoded threshold (which only worked for
+// high-contrast bold-white-on-black timecodes) with one computed from
+// whatever the user actually selected — thin/gray/semi-transparent
+// overlays included.
+function _ocrComputeOtsuThreshold(histogram){
+  const total = histogram.reduce((a,b) => a+b, 0);
+  if(total <= 0) return 128;
+  let sumAll = 0;
+  for(let i=0; i<256; i++) sumAll += i*histogram[i];
+  let sumB = 0, wB = 0, maxVar = -1, threshold = 128;
+  for(let t=0; t<256; t++){
+    wB += histogram[t];
+    if(wB === 0) continue;
+    const wF = total - wB;
+    if(wF === 0) break;
+    sumB += t*histogram[t];
+    const mB = sumB / wB;
+    const mF = (sumAll - sumB) / wF;
+    const diff = mB - mF;
+    const varBetween = wB * wF * diff * diff;
+    if(varBetween > maxVar){ maxVar = varBetween; threshold = t; }
+  }
+  return threshold;
+}
+
+// Expands a clamped pixel rect by paddingFrac of its own width/height on
+// each side, re-clamped to the native frame. A tight crop with the glyph
+// edges touching the crop boundary hurts Tesseract's own segmentation —
+// a little breathing room around a user's (often tightly-drawn) selection
+// helps without meaningfully diluting the region.
+function _ocrPadRect(rect, naturalW, naturalH, paddingFrac){
+  if(!rect) return rect;
+  paddingFrac = paddingFrac || 0;
+  const padX = Math.round(rect.w * paddingFrac);
+  const padY = Math.round(rect.h * paddingFrac);
+  const x = Math.max(0, rect.x - padX);
+  const y = Math.max(0, rect.y - padY);
+  const right = Math.min(naturalW, rect.x + rect.w + padX);
+  const bottom = Math.min(naturalH, rect.y + rect.h + padY);
+  return { x, y, w: Math.max(1, right - x), h: Math.max(1, bottom - y) };
+}
+
+// Picks an upscale factor that targets a fixed output height instead of a
+// flat multiplier — a genuinely tiny burned-in timecode (a handful of
+// source pixels tall) needs a much bigger multiplier than a large one to
+// reach a size Tesseract can reliably read, and a already-large crop
+// shouldn't be blown up further than necessary.
+function _ocrComputeUpscale(srcW, srcH, targetH, minScale, maxScale){
+  if(!srcH || srcH <= 0) return minScale != null ? minScale : 1;
+  let scale = targetH / srcH;
+  if(minScale != null) scale = Math.max(minScale, scale);
+  if(maxScale != null) scale = Math.min(maxScale, scale);
+  return scale;
+}
+
+// Single source of truth for the delay math: the subtitle offset is the
+// player's own clock reading (captured at the SAME instant as the OCR'd
+// video frame, not re-read later) minus the on-screen timecode that frame
+// showed. Correctness here depends entirely on the caller passing a
+// capture-time reading rather than a post-OCR one — this function itself
+// is just the subtraction, but pulling it out gives the timing fix one
+// place to be tested against instead of inline arithmetic.
+function _ocrComputeDelayMs(captureVideoTimeSec, onScreenSeconds){
+  return Math.round((captureVideoTimeSec - onScreenSeconds) * 1000);
+}
+
+// Simple unsharp-mask sharpen over a flat grayscale array: subtracts a 3x3
+// box-blur from each pixel and adds back `amount` of that high-frequency
+// detail. Counteracts the softening that heavy video compression (and
+// smooth/bilinear upscaling) introduces, which can wash out an
+// already-thin, low-opacity timecode's edges below a threshold's reach.
+// Pure/allocation-only — no canvas dependency — so it's unit-testable.
+function _ocrSharpen(gray, w, h, amount){
+  amount = (amount == null) ? 0.6 : amount;
+  const out = new Float32Array(w*h);
+  for(let y=0; y<h; y++){
+    for(let x=0; x<w; x++){
+      let sum = 0, cnt = 0;
+      for(let dy=-1; dy<=1; dy++){
+        const yy = y+dy;
+        if(yy < 0 || yy >= h) continue;
+        for(let dx=-1; dx<=1; dx++){
+          const xx = x+dx;
+          if(xx < 0 || xx >= w) continue;
+          sum += gray[yy*w+xx]; cnt++;
+        }
+      }
+      const idx = y*w+x;
+      const blurred = sum/cnt;
+      const v = gray[idx] + amount*(gray[idx]-blurred);
+      out[idx] = Math.max(0, Math.min(255, v));
+    }
+  }
+  return out;
+}
+
+// Computes the actual rendered picture's rect (CSS pixels, relative to the
+// video element's own top-left corner) given its box size, native video
+// dimensions, and CSS object-fit mode.
+//
+// This matters because the region selector positions its drag-overlay to
+// match the video element's full CSS box and maps drag percentages
+// directly onto the native frame. That mapping is only correct if the
+// video visually fills 100% of that box edge-to-edge. With object-fit:
+// contain (the standard choice for a player that preserves aspect ratio
+// without cropping), any mismatch between the native aspect ratio and the
+// box's aspect ratio produces letterbox/pillarbox bars — real screen space
+// that maps to nothing in the native frame. A selection dragged near an
+// edge or corner (exactly where burned-in timecodes usually sit) can then
+// land entirely inside a bar: a uniform, textless capture, which is
+// mathematically indistinguishable from "no contrast at all" to every
+// downstream thresholding step.
+//
+// 'cover' is intentionally treated the same as 'fill' here (full box) —
+// correctly supporting it would require remapping percentages against a
+// crop rather than resizing the content rect, a materially different code
+// path, and it's a far less likely choice for a primary content player
+// (which generally wants the whole picture visible, not cropped).
+function _ocrComputeVideoContentRect(elW, elH, videoW, videoH, objectFit){
+  if(!elW || !elH || !videoW || !videoH) return {x:0, y:0, width:elW||0, height:elH||0};
+  const elAspect = elW / elH;
+  const videoAspect = videoW / videoH;
+  if(objectFit === 'contain' || objectFit === 'scale-down'){
+    if(videoAspect > elAspect){
+      const width = elW, height = elW / videoAspect; // letterboxed top/bottom
+      return {x:0, y:(elH-height)/2, width, height};
+    }
+    const height = elH, width = elH * videoAspect; // pillarboxed left/right
+    return {x:(elW-width)/2, y:0, width, height};
+  }
+  // 'fill', 'cover', 'none', or unrecognized: assume the video fills the
+  // box exactly (the original, pre-fix behavior).
+  return {x:0, y:0, width:elW, height:elH};
+}
+
+if(typeof window !== 'undefined'){
+  window._ocrTest = {
+    _ocrNormalizeDigits, _ocrParseTimecode, _ocrClampRect, _ocrRegionFromDrag, _ocrFormatSeconds,
+    _ocrComputeOtsuThreshold, _ocrPadRect, _ocrComputeUpscale, _ocrSharpen, _ocrComputeVideoContentRect,
+    _ocrComputeDelayMs,
+  };
+}
+
+function _ocrGetSavedRegion(){
+  try{
+    const raw = localStorage.getItem('sub_ocr_region');
+    return raw ? JSON.parse(raw) : null;
+  }catch(e){ return null; }
+}
+
+// getBoundingClientRect() alone isn't enough when the video uses
+// object-fit:contain — it gives the element's full CSS box, which can
+// include letterbox/pillarbox bars that aren't actually part of the
+// picture. This corrects for that so the returned rect matches only the
+// real rendered frame content.
+function _ocrGetVideoOverlayRect(vidEl){
+  const r = vidEl.getBoundingClientRect();
+  if(!r.width || !r.height || !vidEl.videoWidth || !vidEl.videoHeight) return r;
+  let objectFit = 'fill';
+  try{ objectFit = window.getComputedStyle(vidEl).objectFit || 'fill'; }catch(e){}
+  const content = _ocrComputeVideoContentRect(r.width, r.height, vidEl.videoWidth, vidEl.videoHeight, objectFit);
+  return {
+    left: r.left + content.x, top: r.top + content.y,
+    width: content.width, height: content.height,
+  };
+}
+
+let _ocrOverlayEl = null;
+let _ocrDragState = null;
+let _ocrModalWasOpen = false;
+let _ocrKeydownHandler = null;
+
+function ocrOpenRegionSelector(){
+  const vidEl = document.getElementById('vid');
+  if(!vidEl){ toast('No video element found','err'); return; }
+  const _dbg = document.getElementById('ocr-debug-row');
+  if(_dbg) _dbg.style.display = 'none';
+
+  // Hide the subtitle modal for the duration of selection. Otherwise its
+  // backdrop/dialog sit right where the user needs to see the video, and
+  // once the crosshair overlay goes on top (z-index 2000 vs the modal's
+  // 1000) the modal's own Close button gets shadowed by it too, trapping
+  // the user in selection mode with no way back out.
+  const subOverlay = document.getElementById('sub-overlay');
+  _ocrModalWasOpen = !!(subOverlay && subOverlay.classList.contains('open'));
+  if(subOverlay) subOverlay.classList.remove('open');
+
+  // Read the rect AFTER hiding the modal (hiding it can shift layout, e.g.
+  // a scrollbar appearing/disappearing) so the overlay/percent math starts
+  // from the video's actual on-screen position. Uses the letterbox-aware
+  // wrapper, not a raw getBoundingClientRect(), so the overlay itself
+  // visually hugs just the real picture — making it obvious where dragging
+  // actually maps onto the native frame, rather than silently including
+  // any black bars in the draggable area.
+  let r = _ocrGetVideoOverlayRect(vidEl);
+  if(!r.width || !r.height){
+    toast('Video not visible','wrn');
+    if(_ocrModalWasOpen && subOverlay) subOverlay.classList.add('open');
+    return;
+  }
+  // Defensive cleanup of any stale leftover overlay DOM from a previous
+  // session — deliberately NOT the full _ocrCloseRegionSelector() below,
+  // which also restores modal visibility. Calling that here would use the
+  // _ocrModalWasOpen flag we just set two lines above for THIS open,
+  // immediately re-showing the modal we just hid.
+  _ocrTeardownOverlayDom();
+
+  const ov = document.createElement('div');
+  ov.id = 'ocr-region-overlay';
+  ov.style.cssText = 'position:fixed;left:'+r.left+'px;top:'+r.top+'px;width:'+r.width+'px;height:'+r.height+'px;'
+    + 'z-index:2000;cursor:crosshair;background:rgba(0,0,0,.15);touch-action:none';
+  ov.innerHTML =
+    '<div style="position:absolute;top:8px;left:8px;right:8px;background:rgba(0,0,0,.75);color:#fff;'
+    + 'font-size:12px;padding:6px 10px;border-radius:6px;pointer-events:none;text-align:center">'
+    + 'Drag a tight box around JUST the timecode digits (skip any logo/text below), then release \u2014 Esc to cancel</div>'
+    + '<div id="ocr-region-box" style="position:absolute;border:2px solid var(--acc,#7c3aed);'
+    + 'background:rgba(124,58,237,.2);display:none;pointer-events:none"></div>'
+    + '<button id="ocr-region-cancel" style="position:absolute;bottom:8px;right:8px;'
+    + 'height:28px;padding:0 12px;font-size:12px;border-radius:6px;border:none;'
+    + 'background:#ef4444;color:#fff;cursor:pointer">Cancel</button>';
+  document.body.appendChild(ov);
+  _ocrOverlayEl = ov;
+
+  let activePointerId = null;
+  const box = ov.querySelector('#ocr-region-box');
+  ov.querySelector('#ocr-region-cancel').addEventListener('click', function(e){
+    e.stopPropagation();
+    _ocrCloseRegionSelector();
+    toast('Region selection cancelled','info');
+  });
+  ov.addEventListener('pointerdown', function(e){
+    if(e.target && e.target.id === 'ocr-region-cancel') return;
+    if(activePointerId !== null) return; // ignore a second simultaneous touch/pen point
+    activePointerId = e.pointerId;
+    // Pointer capture guarantees pointermove/pointerup for this pointer
+    // keep routing to `ov` even if the gesture strays over a child element
+    // (the instruction banner, the cancel button) mid-drag — without it,
+    // event delivery can silently stop, freezing x2/y2 near the start
+    // point and making every drag look "too small" regardless of how far
+    // the user actually moved.
+    try{ ov.setPointerCapture(e.pointerId); }catch(err){}
+    r = _ocrGetVideoOverlayRect(vidEl); // re-read in case anything shifted since open
+    _ocrDragState = {x1:e.clientX-r.left, y1:e.clientY-r.top, x2:e.clientX-r.left, y2:e.clientY-r.top};
+    box.style.display = 'block';
+    _ocrUpdateBox(box, _ocrDragState);
+  });
+  ov.addEventListener('pointermove', function(e){
+    if(!_ocrDragState || e.pointerId !== activePointerId) return;
+    _ocrDragState.x2 = e.clientX-r.left; _ocrDragState.y2 = e.clientY-r.top;
+    _ocrUpdateBox(box, _ocrDragState);
+  });
+  ov.addEventListener('pointerup', function(e){
+    if(!_ocrDragState || e.pointerId !== activePointerId) return;
+    try{ ov.releasePointerCapture(e.pointerId); }catch(err){}
+    activePointerId = null;
+    const region = _ocrRegionFromDrag(_ocrDragState.x1, _ocrDragState.y1, _ocrDragState.x2, _ocrDragState.y2, r.width, r.height);
+    _ocrDragState = null;
+    if(!region){ toast('Selection too small \u2014 try again','wrn'); return; }
+    try{ localStorage.setItem('sub_ocr_region', JSON.stringify(region)); }catch(e){}
+    _ocrCloseRegionSelector();
+    toast('\u2713 OCR region saved','ok');
+  });
+  // Mobile browsers fire pointercancel instead of pointerup when a gesture
+  // gets contested (e.g. by a system back-swipe edge). Previously this was
+  // unhandled, so the drag just vanished with no feedback — worse, nothing
+  // reset activePointerId, so every following attempt in the same session
+  // was silently ignored too (pointerdown's guard above never let a new
+  // drag start). Reset cleanly here so the next attempt works normally.
+  ov.addEventListener('pointercancel', function(e){
+    if(e.pointerId !== activePointerId) return;
+    try{ ov.releasePointerCapture(e.pointerId); }catch(err){}
+    activePointerId = null;
+    _ocrDragState = null;
+    box.style.display = 'none';
+  });
+
+  _ocrKeydownHandler = function(e){
+    if(e.key === 'Escape'){
+      _ocrCloseRegionSelector();
+      toast('Region selection cancelled','info');
+    }
+  };
+  document.addEventListener('keydown', _ocrKeydownHandler);
+}
+
+function _ocrUpdateBox(box, d){
+  const x = Math.min(d.x1, d.x2), y = Math.min(d.y1, d.y2);
+  const w = Math.abs(d.x2-d.x1), h = Math.abs(d.y2-d.y1);
+  box.style.left = x+'px'; box.style.top = y+'px'; box.style.width = w+'px'; box.style.height = h+'px';
+}
+
+function _ocrTeardownOverlayDom(){
+  // Removes any existing overlay DOM node and its keydown listener WITHOUT
+  // touching modal visibility — used both as defensive pre-cleanup before
+  // creating a new overlay, and as the first step of the full close below.
+  if(_ocrOverlayEl){ _ocrOverlayEl.remove(); _ocrOverlayEl = null; }
+  _ocrDragState = null;
+  if(_ocrKeydownHandler){ document.removeEventListener('keydown', _ocrKeydownHandler); _ocrKeydownHandler = null; }
+}
+
+function _ocrCloseRegionSelector(){
+  _ocrTeardownOverlayDom();
+  const subOverlay = document.getElementById('sub-overlay');
+  if(subOverlay && _ocrModalWasOpen) subOverlay.classList.add('open');
+  _ocrModalWasOpen = false;
+}
+
+// ── Lazy Tesseract.js loading + a reused worker (kept warm for auto-resync) ──
+let _ocrLoadingPromise = null;
+function _ocrLoadTesseract(){
+  if(window.Tesseract) return Promise.resolve(window.Tesseract);
+  if(_ocrLoadingPromise) return _ocrLoadingPromise;
+  _ocrLoadingPromise = new Promise(function(resolve, reject){
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+    s.onload = function(){ resolve(window.Tesseract); };
+    s.onerror = function(){ _ocrLoadingPromise = null; reject(new Error('Could not load the OCR engine (check internet connection)')); };
+    document.head.appendChild(s);
+  });
+  return _ocrLoadingPromise;
+}
+
+let _ocrWorker = null;
+let _ocrWorkerPromise = null;
+async function _ocrGetWorker(){
+  if(_ocrWorker) return _ocrWorker;
+  if(_ocrWorkerPromise) return _ocrWorkerPromise;
+  _ocrWorkerPromise = (async function(){
+    const Tesseract = await _ocrLoadTesseract();
+    const worker = await Tesseract.createWorker('eng');
+    await worker.setParameters({ tessedit_char_whitelist: '0123456789:.,', tessedit_pageseg_mode: '7' });
+    _ocrWorker = worker;
+    return worker;
+  })();
+  return _ocrWorkerPromise;
+}
+
+// Returns the padded crop canvas plus tightOffset: the position/size of the
+// user's actual (unpadded) selection within that canvas's own local pixel
+// coordinates. Keeping these separate lets preprocessing compute contrast/
+// threshold from just the real text pixels while still handing Tesseract
+// the padded canvas (which gives its own segmentation some breathing room).
+function _ocrCaptureCroppedCanvas(regionPct, vidEl){
+  const vw = vidEl.videoWidth, vh = vidEl.videoHeight;
+  if(!vw || !vh) return null;
+  const tight = _ocrClampRect(regionPct, vw, vh);
+  const padded = _ocrPadRect(tight, vw, vh, 0.18); // ~18% breathing room per side
+  const full = document.createElement('canvas');
+  full.width = vw; full.height = vh;
+  full.getContext('2d').drawImage(vidEl, 0, 0, vw, vh);
+  const crop = document.createElement('canvas');
+  crop.width = padded.w; crop.height = padded.h;
+  crop.getContext('2d').drawImage(full, padded.x, padded.y, padded.w, padded.h, 0, 0, padded.w, padded.h);
+  const tightOffset = { x: tight.x - padded.x, y: tight.y - padded.y, w: tight.w, h: tight.h };
+  return { canvas: crop, tightOffset };
+}
+
+// Produces four OCR variants across two upscaling philosophies, since
+// neither is uniformly best for every stream's rendering/compression:
+//  - "crisp": nearest-neighbor upscale, preserves existing pixel-level
+//    contrast boundaries as-is. Better when smoothing would wash out an
+//    already-marginal thin/low-opacity stroke below a threshold's reach.
+//  - "sharpen": bilinear upscale (reconstructs anti-aliased gradients)
+//    then an unsharp-mask pass to counteract the softening that both
+//    upscaling and video compression introduce.
+// Each binarized variant's Otsu threshold is computed ONLY from the
+// user's tight (unpadded) selection — not diluted by the padding margin —
+// then applied across the full padded canvas. A plain-grayscale pass (no
+// threshold at all) is included as a last-resort fallback.
+// Also returns `debugImages`: labeled canvases for every stage, surfaced
+// in the UI on failure so the actual captured pixels can be inspected
+// instead of guessed at blind.
+function _ocrPreprocessVariants(sourceCanvas, tightOffset){
+  const coreH = (tightOffset && tightOffset.h) || sourceCanvas.height;
+  const scale = _ocrComputeUpscale(sourceCanvas.width, coreH, 120, 2, 10);
+  const w = Math.max(1, Math.round(sourceCanvas.width * scale));
+  const h = Math.max(1, Math.round(sourceCanvas.height * scale));
+
+  function upscaleGray(smooth){
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    ctx.imageSmoothingEnabled = !!smooth;
+    if(smooth && 'imageSmoothingQuality' in ctx) ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(sourceCanvas, 0, 0, w, h);
+    const src = ctx.getImageData(0, 0, w, h).data;
+    const gray = new Uint8ClampedArray(w*h);
+    for(let i=0, p=0; i<src.length; i+=4, p++){
+      gray[p] = 0.299*src[i] + 0.587*src[i+1] + 0.114*src[i+2];
+    }
+    return gray;
+  }
+
+  // tightOffset is in the padded crop's native (pre-upscale) coordinates;
+  // by _ocrPadRect's construction tightOffset.x/y are always >= 0, so no
+  // extra bounds-guarding is needed on the lower edge here.
+  function otsuFromCore(gray){
+    const hist = new Array(256).fill(0);
+    let counted = 0;
+    if(tightOffset && tightOffset.w > 0 && tightOffset.h > 0){
+      const sx = Math.round(tightOffset.x * scale), sy = Math.round(tightOffset.y * scale);
+      const ex = Math.min(w, sx + Math.max(1, Math.round(tightOffset.w * scale)));
+      const ey = Math.min(h, sy + Math.max(1, Math.round(tightOffset.h * scale)));
+      for(let y=sy; y<ey; y++){
+        for(let x=sx; x<ex; x++){ hist[gray[y*w+x]]++; counted++; }
+      }
+    }
+    if(counted === 0){ for(let p=0; p<gray.length; p++) hist[gray[p]]++; } // degenerate fallback: whole canvas
+    return _ocrComputeOtsuThreshold(hist);
+  }
+
+  function toCanvas(gray, mapFn){
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const out = new Uint8ClampedArray(w*h*4);
+    for(let p=0, i=0; p<w*h; p++, i+=4){
+      const v = mapFn(gray[p]);
+      out[i]=out[i+1]=out[i+2]=v; out[i+3]=255;
+    }
+    c.getContext('2d').putImageData(new ImageData(out, w, h), 0, 0);
+    return c;
+  }
+
+  const crispGray  = upscaleGray(false);
+  const smoothGray = upscaleGray(true);
+  const sharpGray  = Uint8ClampedArray.from(_ocrSharpen(smoothGray, w, h, 0.6));
+
+  const crispThresh = otsuFromCore(crispGray);
+  const sharpThresh = otsuFromCore(sharpGray);
+
+  const crispNormal   = toCanvas(crispGray,  g => g > crispThresh ? 255 : 0);
+  const crispInverted = toCanvas(crispGray,  g => g > crispThresh ? 0 : 255);
+  const sharpNormal   = toCanvas(sharpGray,  g => g > sharpThresh ? 255 : 0);
+  const grayscaleOnly = toCanvas(smoothGray, g => g);
+
+  const debugImages = [
+    { label: 'raw crop',       canvas: sourceCanvas },
+    { label: 'crisp+otsu',     canvas: crispNormal },
+    { label: 'crisp+otsu inv', canvas: crispInverted },
+    { label: 'sharpen+otsu',   canvas: sharpNormal },
+    { label: 'smooth gray',    canvas: grayscaleOnly },
+  ];
+
+  return { variants: [crispNormal, crispInverted, sharpNormal, grayscaleOnly], debugImages };
+}
+
+let _ocrBusy = false;
+
+// Manual, single-shot capture: reads the on-screen timecode from the current
+// video frame and computes/applies the subtitle delay from it.
+// Renders each stage of the OCR pipeline (raw crop through each processed
+// variant) as small labeled thumbnails so a failed read can be visually
+// diagnosed — is the region even landing on the digits? is there enough
+// native detail to be legible at all? is thresholding wiping it out? —
+// instead of guessed at blind.
+function _ocrShowDebugPreview(debugImages){
+  const row = document.getElementById('ocr-debug-row');
+  const thumbs = document.getElementById('ocr-debug-thumbs');
+  if(!row || !thumbs || !debugImages || !debugImages.length) return;
+  thumbs.innerHTML = '';
+  debugImages.forEach(function(item){
+    let dataUrl;
+    try{ dataUrl = item.canvas.toDataURL('image/png'); }catch(e){ return; }
+    const wrap = document.createElement('div');
+    wrap.className = 'ocr-debug-thumb';
+    const img = document.createElement('img');
+    img.src = dataUrl;
+    img.alt = item.label;
+    const cap = document.createElement('span');
+    cap.textContent = item.label;
+    wrap.appendChild(img); wrap.appendChild(cap);
+    thumbs.appendChild(wrap);
+  });
+  row.style.display = 'block';
+}
+
+async function ocrReadAndSync(){
+  if(_ocrBusy) return;
+  if(!_subCuesBase.length){ toast('Load a subtitle file first','wrn'); return; }
+  const region = _ocrGetSavedRegion();
+  if(!region){ toast('Set the OCR region first (\uD83C\uDFAF Region)','wrn'); return; }
+  const vidEl = document.getElementById('vid');
+  if(!vidEl || !vidEl.videoWidth || vidEl.readyState < 2){
+    toast('No stream playing','wrn');
+    return;
+  }
+  _ocrBusy = true;
+  const statusEl = document.getElementById('sub-sync-status');
+  const debugRow = document.getElementById('ocr-debug-row');
+  if(debugRow) debugRow.style.display = 'none'; // clear any stale preview from a prior attempt
+  if(statusEl){
+    statusEl.textContent = 'Reading timecode\u2026';
+    statusEl.style.color = 'var(--txt3)';
+    statusEl.style.display = 'inline';
+  }
+  try{
+    // Read the player's own clock at the SAME instant we grab the video
+    // frame for OCR — not after recognition finishes. The stream is live
+    // and keeps playing throughout OCR processing (worker warm-up,
+    // preprocessing, up to 4 sequential recognize() passes), which can
+    // easily take 500ms-2s+. Reading currentTime AFTER that work — as the
+    // previous version did — silently bakes the entire OCR duration in as
+    // sync error, growing worse the slower or more variants OCR needs.
+    // Pairing the frame with currentTime at the exact moment of capture
+    // (same synchronous tick, no await between them) keeps the result
+    // accurate regardless of how long OCR subsequently takes.
+    const captureWallClockStart = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    const captureVideoTime = vidEl.currentTime;
+    const captured = _ocrCaptureCroppedCanvas(region, vidEl);
+    if(!captured) throw new Error('capture failed');
+    const worker = await _ocrGetWorker();
+    const { variants, debugImages } = _ocrPreprocessVariants(captured.canvas, captured.tightOffset);
+    let seconds = null;
+    const seenTexts = [];
+    for(const canvas of variants){
+      const result = await worker.recognize(canvas);
+      const text = ((result && result.data && result.data.text) || '').trim();
+      if(text) seenTexts.push(text);
+      seconds = _ocrParseTimecode(text);
+      if(seconds !== null) break;
+    }
+    if(seconds === null){
+      console.warn('[OCR sync] no variant parsed as a valid timecode. Recognized text per variant:', seenTexts);
+      const sample = seenTexts.length ? seenTexts[0].replace(/\s+/g, ' ').slice(0, 24) : '';
+      const msg = sample
+        ? 'Couldn\u2019t read a valid timecode (saw \u201c'+sample+'\u2026\u201d) \u2014 try a tighter box around just the digits'
+        : 'Couldn\u2019t read anything in that region \u2014 try a tighter box around just the digits';
+      toast(msg, 'err');
+      if(statusEl) statusEl.style.display = 'none';
+      _ocrShowDebugPreview(debugImages);
+      return;
+    }
+    subDelayMs = _ocrComputeDelayMs(captureVideoTime, seconds);
+    _subLoadCuesToTrack(_subCuesBase);
+    const dv = document.getElementById('sub-delay-val');
+    if(dv) dv.textContent = (subDelayMs>=0?'+':'') + (subDelayMs/1000).toFixed(1) + 's';
+    const elapsedMs = Math.round(((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - captureWallClockStart);
+    if(statusEl){
+      statusEl.textContent = '\u2713 OCR synced (' + _ocrFormatSeconds(seconds) + ', captured in ' + elapsedMs + 'ms)';
+      statusEl.style.color = 'var(--green)';
+      statusEl.style.display = 'inline';
+      setTimeout(function(){ statusEl.style.display = 'none'; }, 4000);
+    }
+    toast('\u2713 Subtitles auto-synced to ' + _ocrFormatSeconds(seconds), 'ok');
+  }catch(e){
+    const tainted = /security|tainted|cross-?origin/i.test((e && e.message) || '');
+    const msg = tainted
+      ? 'Can\u2019t read video pixels for this source (not same-origin) \u2014 OCR sync unavailable'
+      : 'OCR error: ' + ((e && e.message) || e);
+    toast(msg, 'err');
+    if(statusEl) statusEl.style.display = 'none';
+  }finally{
+    _ocrBusy = false;
+  }
+}
+
 function subToggleVisible(){
   if(!_subTrackObj) return;
   const nowShowing = _subTrackObj.mode === 'showing';
@@ -1369,6 +2025,10 @@ function clearSubtitle(){
   if(_dr) _dr.style.display = 'none';
   const _sr2 = document.getElementById('sub-sync-row');
   if(_sr2) _sr2.style.display = 'none';
+  const _or2 = document.getElementById('sub-ocr-row');
+  if(_or2) _or2.style.display = 'none';
+  const _dbg = document.getElementById('ocr-debug-row');
+  if(_dbg) _dbg.style.display = 'none';
   const _tb = document.getElementById('sub-toggle-btn');
   if(_tb) _tb.innerHTML = '&#x1F441; On';
   toast('Subtitle removed','info');
@@ -1481,15 +2141,21 @@ async function subFbNav(path){
       return;
     }
     const rows = [];
+    const dirEntries = [];
+    const fileEntries = [];
     for(const name of d.dirs){
       const fullPath = path.replace(/\/+$/,'') + '/' + name;
-      rows.push(`<div class="sub-fb-row sub-fb-dir" onclick="subFbNav('${esc(fullPath)}')">
+      const idx = dirEntries.length;
+      dirEntries.push(fullPath);
+      rows.push(`<div class="sub-fb-row sub-fb-dir" data-dir-idx="${idx}">
         <span class="sub-fb-icon">&#x1F4C1;</span><span class="sub-fb-name">${esc(name)}</span><span class="sub-fb-arr">\u203a</span>
       </div>`);
     }
     for(const name of d.files){
       const fullPath = path.replace(/\/+$/,'') + '/' + name;
-      rows.push(`<div class="sub-fb-row sub-fb-file" onclick="subFbPickFile('${esc(fullPath)}','${esc(name)}')">
+      const idx = fileEntries.length;
+      fileEntries.push({fullPath, name});
+      rows.push(`<div class="sub-fb-row sub-fb-file" data-file-idx="${idx}">
         <span class="sub-fb-icon">&#x1F4AC;</span><span class="sub-fb-name">${esc(name)}</span>
       </div>`);
     }
@@ -1497,6 +2163,23 @@ async function subFbNav(path){
       rows.push('<div style="padding:10px;font-size:12px;color:var(--txt3)">No subtitle files here.</div>');
     }
     listEl.innerHTML = rows.join('');
+    // data-*-idx only ever holds an integer we generated ourselves — the
+    // actual path/name strings (which may contain apostrophes, quotes,
+    // unicode, etc.) never get embedded into an HTML attribute or inline
+    // JS source at all, so there's nothing left for those characters to break.
+    listEl.querySelectorAll('.sub-fb-dir').forEach(el => {
+      el.addEventListener('click', () => {
+        const idx = parseInt(el.dataset.dirIdx, 10);
+        subFbNav(dirEntries[idx]);
+      });
+    });
+    listEl.querySelectorAll('.sub-fb-file').forEach(el => {
+      el.addEventListener('click', () => {
+        const idx = parseInt(el.dataset.fileIdx, 10);
+        const entry = fileEntries[idx];
+        subFbPickFile(entry.fullPath, entry.name);
+      });
+    });
   } catch(e){
     listEl.innerHTML = `<div style="padding:10px;font-size:12px;color:#f87171">\u26a0 ${esc(String(e))}</div>`;
   }
@@ -1744,12 +2427,15 @@ function _subEmpty(msg){
 }
 
 // ── Render results ──────────────────────────────────────────────────
+let _subSearchResults = [];
+
 function _subRenderResults(results){
+  _subSearchResults = results || [];
   const wrap = document.getElementById('sub-results-wrap');
   const PROV_LABELS = {os:'OS', subdl:'SubDL'};
   const PROV_CLASS  = {os:'p-os', subdl:'p-subdl'};
 
-  const parts = results.map((item, i) => {
+  const parts = _subSearchResults.map((item, i) => {
     const epStr = (item.season && item.episode)
       ? '<span class="sub-meta-badge sub-meta-ep">S'+String(item.season).padStart(2,'0')+'E'+String(item.episode).padStart(2,'0')+'</span>'
       : '';
@@ -1773,20 +2459,28 @@ function _subRenderResults(results){
       +'</div>'
       +'<div class="sub-result-release">'+esc(item.file_name||'')+'&bull; '+esc(item.uploader||'')+'</div>'
       +'</div>'
+      // data-idx only ever holds a small integer we generated ourselves, so
+      // it's safe to embed raw — no title/filename/uploader content (which
+      // may contain quotes, &, <, unicode, etc.) ever touches an HTML
+      // attribute here. That's the whole point: nothing to escape, nothing
+      // to break.
       +'<button class="btn-ghost sub-load-btn" id="sub-load-'+i+'" data-idx="'+i+'"'
       +' title="Load into player">&#x25B6; Load</button>'
       +'</div>';
   });
   wrap.innerHTML = '<div class="sub-results">'+parts.join('')+'</div>';
 
-  // Wire clicks from the live results array via closure. file_id, file_name,
-  // provider, season and episode are never serialized into an HTML attribute,
-  // so there is no double-quote delimiter left for JSON.stringify() output
-  // to collide with.
+  // Attach handlers directly instead of serializing item data into an
+  // inline onclick="..." string. Building onclick="fn(JSON.stringify(x))"
+  // is fundamentally broken whenever JSON.stringify's output starts with a
+  // double quote (which it always does for strings) while the onclick
+  // attribute is itself double-quote delimited: the HTML parser closes the
+  // attribute at that first embedded quote, truncating the handler to just
+  // "subLoadSubtitle(" and throwing "Unexpected end of input" on click.
   wrap.querySelectorAll('.sub-load-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      const idx  = parseInt(btn.dataset.idx, 10);
-      const item = results[idx];
+      const idx = parseInt(btn.dataset.idx, 10);
+      const item = _subSearchResults[idx];
       if(!item) return;
       subLoadSubtitle(String(item.file_id), item.file_name || 'subtitle.srt', idx, item.provider || 'os', item.season || null, item.episode || null);
     });
