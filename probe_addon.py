@@ -523,6 +523,8 @@ def _log_stream_info(state, info: dict, source: str = "ffprobe") -> None:
         lines.append(f"[PROBE] Action: transcode ({info['transcode_reason']})")
     else:
         lines.append(f"[PROBE] Action: direct play")
+    if info.get("upscale_h"):
+        lines.append(f"[PROBE] Upscale: {info['upscale_h']}p ({info.get('upscale_algo','lanczos')})")
     lines.append(f"[PROBE] ────────────────────────────────────────")
     for line in lines:
         state.log(line)
@@ -657,6 +659,30 @@ _PROBE_UI_JS = r"""
 #si-panel .si-img-badge{
   color:#f59e0b; font-size:8px; margin-left:3px; opacity:.7;
 }
+/* Upscale sub-row (appears directly below the resolution row) */
+#si-panel .si-upscale-row{ gap:4px; margin-top:1px; flex-wrap:wrap; }
+#si-panel .si-up-arrow{ color:#60a5fa; font-size:10px; min-width:12px; flex-shrink:0; line-height:1; }
+#si-panel .si-upscale-btn{
+  padding:0 5px; border-radius:3px; cursor:pointer;
+  border:1px solid rgba(255,255,255,.10);
+  color:#64748b; font-size:8.5px; font-weight:700; letter-spacing:.3px;
+  background:rgba(255,255,255,.03); line-height:1.75;
+  transition:background .12s, border-color .12s, color .12s;
+  user-select:none; pointer-events:auto;
+}
+#si-panel .si-upscale-btn:hover{ background:rgba(255,255,255,.08); border-color:rgba(255,255,255,.20); color:#94a3b8; }
+#si-panel .si-upscale-btn.si-active{ background:rgba(99,179,237,.14); border-color:rgba(96,165,250,.45); color:#93c5fd; }
+#si-panel .si-up-off{ color:#475569; border-color:rgba(248,113,113,.18); font-size:8px; }
+#si-panel .si-up-off:hover{ border-color:rgba(248,113,113,.38); color:#f87171; }
+#si-panel .si-algo-badge{
+  margin-left:auto; font-size:9px; color:#94a3b8; cursor:pointer;
+  user-select:none; pointer-events:auto; padding:1px 4px;
+  border-radius:3px; border:1px solid rgba(255,255,255,.14);
+  background:rgba(255,255,255,.05);
+  transition:color .12s, border-color .12s, background .12s; line-height:1.6;
+  font-weight:600; letter-spacing:.2px;
+}
+#si-panel .si-algo-badge:hover{ color:#cbd5e1; border-color:rgba(255,255,255,.25); background:rgba(255,255,255,.09); }
     `;
     document.head.appendChild(s);
   })();
@@ -686,6 +712,10 @@ _PROBE_UI_JS = r"""
   let _snapRestoreTimer = null;  // handle for the fast-path panel-restore setTimeout
   // Touch reveal timer — drives si-touch-visible lifecycle on mobile
   let _revealTimer = null;
+  // Upscale state — 0 = off; 720/1080 = active target height.
+  // _curUpscaleAlgo persists across on/off toggles so the user's choice is sticky.
+  let _curUpscale     = 0;
+  let _curUpscaleAlgo = 'lanczos';
 
   /* ── Touch device detection ─────────────────────────────────────────── */
   const _isTouch = window.matchMedia('(hover: none)').matches;
@@ -787,7 +817,19 @@ _PROBE_UI_JS = r"""
         e.stopPropagation();
         const idx = parseInt(subBtn.getAttribute('data-sub-track-idx'), 10);
         if(!isNaN(idx)) _switchSubtitle(idx);
+        return;
       }
+      // Upscale target buttons (720p / 1080p)
+      const upBtn = e.target.closest('.si-upscale-btn[data-upscale]');
+      if(upBtn){
+        e.stopPropagation();
+        const h = parseInt(upBtn.getAttribute('data-upscale'), 10);
+        if(!isNaN(h)) _switchUpscale(h);
+        return;
+      }
+      // Algo badge — cycle algorithm
+      const algoBadge = e.target.closest('.si-algo-badge');
+      if(algoBadge){ e.stopPropagation(); _cycleAlgo(); return; }
     });
 
     // ── Button click/tap: toggle panel ───────────────────────────────
@@ -915,6 +957,8 @@ _PROBE_UI_JS = r"""
         _curStreamLive = isLive;
         _curOriginUrl  = _snapOriginUrl;      // restore so subtitle switching still works
         _activeSub     = _snapActiveSub;      // restore burn-in highlight
+        _activeAudio   = trackIdx;            // restore after _siHide cleared it; keeps
+                                              // subsequent subtitle/upscale resolves correct
         _siShow(_infoSnapshot);
       }, 120);
       return;
@@ -932,10 +976,13 @@ _PROBE_UI_JS = r"""
     }
     // Save origin URL and active subtitle before the fetch — doPlay() inside the
     // then() handler runs synchronously through _destroyPlayers() → _siHide()
-    // → _curOriginUrl = null, _activeSub = -1.  Restoring explicitly after doPlay()
-    // is deterministic (same microtask, no race).
-    const _savedOriginUrl = _curOriginUrl;
-    const _savedActiveSub = _activeSub;
+    // → _curOriginUrl = null, _activeAudio = -1, _activeSub = -1, _curUpscale = 0.
+    // Restoring explicitly after doPlay() is deterministic (same microtask, no race
+    // against the fetch interceptor's own, separately-scheduled restoration).
+    const _savedOriginUrl   = _curOriginUrl;
+    const _savedActiveSub   = _activeSub;
+    const _savedUpscale     = _curUpscale;
+    const _savedUpscaleAlgo = _curUpscaleAlgo;
     // If a subtitle is burned in, include it so the new stream preserves it.
     const _activeBurnSub  = (_activeSub >= 0 && _curInfo && _curInfo.subtitle_tracks
                              && (_curInfo.subtitle_tracks[_activeSub] || {}).is_image_based)
@@ -949,6 +996,7 @@ _PROBE_UI_JS = r"""
       audio_track: trackIdx,
     };
     if(_activeBurnSub !== null) _fallbackBody.subtitle_track = _activeBurnSub;
+    if(_curUpscale){ _fallbackBody.upscale_h = _curUpscale; _fallbackBody.upscale_algo = _curUpscaleAlgo; }
     fetch('/api/resolve', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -957,16 +1005,19 @@ _PROBE_UI_JS = r"""
       if(d.url && typeof doPlay === 'function'){
         doPlay(d.url, name, {isLive: isLive});
       }
-      // doPlay() → _destroyPlayers() → _siHide() → _curOriginUrl = null has run.
-      // Restore: prefer fresh origin_url from this resolve; fall back to pre-switch snapshot.
+      // doPlay() → _destroyPlayers() → _siHide() has run, wiping _curOriginUrl /
+      // _activeAudio / _activeSub / _curUpscale / _curUpscaleAlgo unconditionally.
+      // Restore all of them explicitly, synchronously, right here — deterministic
+      // regardless of whether the fetch interceptor's own (separately-scheduled,
+      // racing) restoration runs before or after this point. Both converge to the
+      // same values either way, so there's no correctness dependency on ordering.
       const _freshOrigin = (d.origin_url && typeof d.origin_url === 'string'
                             && d.origin_url.startsWith('http')) ? d.origin_url : null;
-      _curOriginUrl = _freshOrigin || _savedOriginUrl;
-      // Restore subtitle highlight (_activeSub was cleared by _siHide).
-      // The fetch interceptor sets _activeSub when it sees subtitle_track in the body;
-      // but if the interceptor's clone.json().then() runs after this microtask, it
-      // would overwrite — since both use the same value, that's harmless.
-      _activeSub = (_activeBurnSub !== null) ? _activeBurnSub : _savedActiveSub;
+      _curOriginUrl   = _freshOrigin || _savedOriginUrl;
+      _activeSub      = (_activeBurnSub !== null) ? _activeBurnSub : _savedActiveSub;
+      _activeAudio    = trackIdx;
+      _curUpscale     = _savedUpscale;
+      _curUpscaleAlgo = _savedUpscaleAlgo;
     }).catch(function(e){
       toast('Audio track switch failed: ' + (e.message||e), 'err');
     });
@@ -1084,7 +1135,18 @@ _PROBE_UI_JS = r"""
 
     setStatus(trackIdx >= 0 ? '[probe] Activating subtitle\u2026' : '[probe] Disabling subtitle\u2026');
 
-    const _savedOriginUrl = _curOriginUrl;
+    // doPlay() (below, inside .then()) → _destroyPlayers() → _siHide() wipes
+    // _curOriginUrl / _activeAudio / _activeSub / _curUpscale / _curUpscaleAlgo
+    // unconditionally. The fetch interceptor also tries to restore some of these
+    // from the response, but that runs in its own promise chain (reading a cloned
+    // response) racing against this .then() chain (reading the original) — there is
+    // no ordering guarantee between them. Saving here and restoring explicitly,
+    // synchronously, right after doPlay() makes the final state deterministic
+    // regardless of which chain settles last (both converge to the same value).
+    const _savedOriginUrl   = _curOriginUrl;
+    const _savedActiveAudio = _activeAudio;
+    const _savedUpscale     = _curUpscale;
+    const _savedUpscaleAlgo = _curUpscaleAlgo;
     const body = {
       item:     _curIt,
       mode:     (typeof mode   !== 'undefined' ? mode   : 'live'),
@@ -1092,6 +1154,7 @@ _PROBE_UI_JS = r"""
     };
     if(_activeAudio >= 0)  body.audio_track    = _activeAudio;
     if(trackIdx    >= 0)   body.subtitle_track  = trackIdx;
+    if(_curUpscale){ body.upscale_h = _curUpscale; body.upscale_algo = _curUpscaleAlgo; }
 
     fetch('/api/resolve', {
       method: 'POST',
@@ -1101,14 +1164,131 @@ _PROBE_UI_JS = r"""
       if(d.url && typeof doPlay === 'function'){
         doPlay(d.url, name, {isLive: isLive});
       }
-      // doPlay() → _siHide() → _curOriginUrl = null.  Restore.
       const _freshOrigin = (d.origin_url && typeof d.origin_url === 'string'
                             && d.origin_url.startsWith('http')) ? d.origin_url : null;
-      _curOriginUrl = _freshOrigin || _savedOriginUrl;
-      // _activeSub is set by the fetch interceptor from _reqSubTrackVal.
+      _curOriginUrl   = _freshOrigin || _savedOriginUrl;
+      _activeAudio    = _savedActiveAudio;
+      _curUpscale     = _savedUpscale;
+      _curUpscaleAlgo = _savedUpscaleAlgo;
+      // _activeSub: set deterministically from this call's own target (trackIdx is
+      // authoritative — -1 means "turn off") rather than relying solely on the
+      // interceptor, which is subject to the same race described above.
+      _activeSub = (trackIdx >= 0) ? trackIdx : -1;
     }).catch(function(e){
       if(typeof toast === 'function') toast('Subtitle switch failed: ' + (e.message||e), 'err');
     });
+  }
+
+  /* ── Upscale switching ──────────────────────────────────────────────── */
+  // Two paths mirror the audio-track switching pattern:
+  //
+  //   Fast-path (turning ON or CHANGING target, already in hls_proxy):
+  //     Rebuild the URL with updated upscale=N&upscale_algo=X.
+  //     The proxy auto-upgrades audio_only to full transcode when upscale is
+  //     set, so no extra flag needed from here.
+  //
+  //   Re-resolve (turning OFF, or stream is currently direct-play):
+  //     POST /api/resolve with upscale_h in body.  Server re-probes and
+  //     returns the optimal URL (may be direct-play if no other transcode
+  //     reason remains after upscale is removed).
+  //
+  // Toggling the same target that is already active turns it off (newH = 0).
+  // _curUpscaleAlgo persists across off/on cycles — user's last algo sticks.
+  function _switchUpscale(targetH){
+    if(!_curInfo){ setStatus('[probe] No stream info — try replaying'); return; }
+    const newH   = (targetH === _curUpscale) ? 0 : targetH;
+    const name   = _curStreamName || '';
+    const isLive = _curStreamLive !== false;
+    const _curIt = (typeof filtItems !== 'undefined' && typeof pIdx !== 'undefined')
+                   ? filtItems[pIdx] : null;
+    if(!_curIt){
+      if(typeof toast === 'function') toast('Cannot upscale — no current item', 'err');
+      return;
+    }
+
+    const _isProxyUrl = _curStreamUrl && _curStreamUrl.includes('/api/hls_proxy');
+
+    // ── Fast-path: turning on / changing target while already in hls_proxy ──
+    if(newH > 0 && _isProxyUrl){
+      const _savedOriginUrl   = _curOriginUrl;
+      const _savedActiveSub   = _activeSub;
+      const _savedActiveAudio = _activeAudio;  // doPlay→_siHide clears this; preserve it
+
+      let newUrl = _curStreamUrl
+        .replace(/[&?]upscale=\d+/g, '')
+        .replace(/[&?]upscale_algo=[^&]*/g, '')
+        .replace(/[&?]$/, '');
+      newUrl += (newUrl.includes('?') ? '&' : '?')
+              + 'upscale=' + newH + '&upscale_algo=' + _curUpscaleAlgo;
+
+      // Snapshot: embed new upscale_h so _siShow restores the active button
+      const _infoSnap = Object.assign({}, _curInfo,
+        { upscale_h: newH, upscale_algo: _curUpscaleAlgo });
+
+      _curUpscale = newH;
+      setStatus('[probe] Upscaling to ' + newH + 'p (' + _curUpscaleAlgo + ')\u2026');
+
+      if(typeof doPlay === 'function') doPlay(newUrl, name, {isLive: isLive});
+
+      if(_snapRestoreTimer) clearTimeout(_snapRestoreTimer);
+      _snapRestoreTimer = setTimeout(function(){
+        _snapRestoreTimer = null;
+        _curStreamUrl  = newUrl;
+        _curStreamName = name;
+        _curStreamLive = isLive;
+        _curOriginUrl  = _savedOriginUrl;
+        _activeSub     = _savedActiveSub;
+        _activeAudio   = _savedActiveAudio;  // restore track highlight after _siHide cleared it
+        _siShow(_infoSnap);
+      }, 120);
+      return;
+    }
+
+    // ── Re-resolve: turning off, or stream was direct-play ────────────────
+    _curUpscale = newH;
+    setStatus(newH ? '[probe] Activating upscale\u2026' : '[probe] Disabling upscale\u2026');
+
+    // doPlay() (below, inside .then()) → _siHide() wipes _curOriginUrl / _activeAudio /
+    // _activeSub / _curUpscale unconditionally — including the newH we just set above.
+    // Restore explicitly, synchronously, right after doPlay() rather than relying on
+    // the fetch interceptor's own (separately-scheduled, racing) restoration — see the
+    // identical reasoning in _resolveSubtitle / _switchAudio's fallback.
+    const _savedOriginUrl   = _curOriginUrl;
+    const _savedActiveAudio = _activeAudio;
+    const _savedActiveSub   = _activeSub;
+    const body = {
+      item:     _curIt,
+      mode:     (typeof mode   !== 'undefined' ? mode   : 'live'),
+      category: (typeof curCat !== 'undefined' ? curCat : {}),
+    };
+    if(newH)              { body.upscale_h = newH; body.upscale_algo = _curUpscaleAlgo; }
+    if(_activeAudio >= 0)  body.audio_track    = _activeAudio;
+    if(_activeSub   >= 0)  body.subtitle_track  = _activeSub;
+
+    fetch('/api/resolve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    }).then(function(r){ return r.json(); }).then(function(d){
+      if(d.url && typeof doPlay === 'function') doPlay(d.url, name, {isLive: isLive});
+      const _freshOrigin = (d.origin_url && typeof d.origin_url === 'string'
+                            && d.origin_url.startsWith('http')) ? d.origin_url : null;
+      _curOriginUrl = _freshOrigin || _savedOriginUrl;
+      _activeAudio  = _savedActiveAudio;
+      _activeSub    = _savedActiveSub;
+      _curUpscale   = newH;
+    }).catch(function(e){
+      if(typeof toast === 'function') toast('Upscale switch failed: ' + (e.message||e), 'err');
+    });
+  }
+
+  // Cycle through algorithms (cheap — just rebuilds URL if upscale is active)
+  const _ALGO_CYCLE = ['lanczos','bicubic','bilinear','fast_bilinear'];
+  function _cycleAlgo(){
+    const idx = _ALGO_CYCLE.indexOf(_curUpscaleAlgo);
+    _curUpscaleAlgo = _ALGO_CYCLE[(idx + 1) % _ALGO_CYCLE.length];
+    if(_curUpscale) _switchUpscale(_curUpscale);  // re-apply immediately
+    else _rebuildTracks();                          // just refresh badge label
   }
 
   /* ── Transcode reason formatter ────────────────────────────────────── */
@@ -1141,6 +1321,11 @@ _PROBE_UI_JS = r"""
       const m = r.match(/track (\d+)/);
       return 'subtitle burn-in' + (m ? ' [track ' + m[1] + ']' : '');
     }
+    // "upscale 480p → 1080p"
+    if(r.startsWith('upscale')){
+      const m = r.match(/(\d+)p.*?(\d+)p/);
+      return m ? '\u2191 ' + m[1] + '\u2192' + m[2] + 'p' : '\u2191 upscale';
+    }
     // Fallback: show raw reason, but cap length for panel width
     return r.length > 38 ? r.slice(0, 36) + '\u2026' : r;
   }
@@ -1156,6 +1341,32 @@ _PROBE_UI_JS = r"""
       const lbl = info.res_label ? '<span class="si-qlbl">' + info.res_label + '</span>' : '';
       const fps = info.fps       ? '<span class="si-val"> @ ' + info.fps + ' fps</span>' : '';
       html += '<div class="si-row"><span class="si-label">V</span>' + res + lbl + fps + '</div>';
+
+      // ── Upscale sub-row: shown directly below resolution when source < target ──
+      // Only offer targets strictly above the source height so we never downscale.
+      // height is populated from ffprobe; absent on HLS-without-probe fallback.
+      const _srcH    = info.height || 0;
+      const _upOpts  = [720, 1080].filter(function(h){ return _srcH > 0 && _srcH < h; });
+      if(_upOpts.length > 0){
+        const _algoShort = { lanczos:'lanczos', bicubic:'bicubic',
+                             bilinear:'bilinear', fast_bilinear:'fast', spline:'spline' };
+        let upRow = '<div class="si-row si-upscale-row">'
+                  + '<span class="si-label si-up-arrow">\u2191</span>';
+        if(_curUpscale){
+          upRow += '<span class="si-upscale-btn si-up-off" data-upscale="0">off</span>';
+        }
+        _upOpts.forEach(function(h){
+          const active = _curUpscale === h;
+          upRow += '<span class="si-upscale-btn' + (active ? ' si-active' : '')
+                 + '" data-upscale="' + h + '">' + h + 'p</span>';
+        });
+        // Algo badge: always visible, click cycles algorithm.
+        // Only actionable when upscale is on; dimmed appearance signals it.
+        upRow += '<span class="si-algo-badge" title="Click to cycle algorithm">'
+               + (_algoShort[_curUpscaleAlgo] || _curUpscaleAlgo) + '</span>';
+        upRow += '</div>';
+        html += upRow;
+      }
     }
     if(info.vcodec){
       const bad = _BAD_VCODEC.has(info.vcodec.toUpperCase().replace(/[.\-]/g,''));
@@ -1163,11 +1374,22 @@ _PROBE_UI_JS = r"""
                 : (info.bitrate      ? '<span class="si-br">'  + info.bitrate       + '</span>'
                 : (isHLS             ? '<span class="si-abr">ABR</span>' : ''));
       // → transcode on the video row: show when transcoding for any video-side reason
-      // (HEVC, interlaced, subtitle burn-in) but NOT for pure audio reasons (audio_only
-      // copies video verbatim so no video re-encode takes place).
-      const tx  = (info.transcode && !(info.transcode_reason||'').startsWith('incompatible')
-                                  && !(info.transcode_reason||'').startsWith('audio track'))
-                  ? '<span class="si-tx">\u2192 transcode</span>' : '';
+      // (HEVC, interlaced, subtitle burn-in, upscale) but NOT for pure audio reasons
+      // (audio_only copies video verbatim so no video re-encode takes place).
+      // Exception: if upscale is also active the video IS re-encoded regardless of
+      // what originally triggered the transcode, so we always show the badge then.
+      const _txReason = info.transcode_reason || '';
+      // _curUpscale > 0 is definitive proof of a full video re-encode — the backend
+      // always upgrades audio_only/remux to full transcode when upscale is active
+      // (see proxy_addon.py's "if scale_vf and not transcode" upgrade block), so it
+      // overrides ANY audio-sounding reason prefix, not just "audio track…". Without
+      // this OR-ing in first, a combo like "incompatible audio (AC3)" + upscale would
+      // wrongly hide the badge even though video is being re-encoded.
+      const _videoReencode = info.transcode && (
+        _curUpscale > 0 ||
+        (!_txReason.startsWith('incompatible') && !_txReason.startsWith('audio track'))
+      );
+      const tx  = _videoReencode ? '<span class="si-tx">\u2192 transcode</span>' : '';
       // [i] badge: stream has non-progressive field_order (interlaced scan lines).
       const itag = info.interlaced ? '<span class="si-img-badge" title="Interlaced scan">[i]</span>' : '';
       html += '<div class="si-row"><span class="si-label"></span>'
@@ -1309,6 +1531,15 @@ _PROBE_UI_JS = r"""
     if(!info || (!info.res_str && !info.vcodec && !info.acodec)){ _siHide(); return; }
     _curInfo = info;
     _hasData = true;
+    // Sync upscale state from server response so the sub-row renders correctly.
+    // upscale_h is only present when an upscale is active; 0/absent = off.
+    if(typeof info.upscale_h === 'number' && info.upscale_h > 0){
+      _curUpscale     = info.upscale_h;
+      _curUpscaleAlgo = info.upscale_algo || _curUpscaleAlgo;
+    } else if(!_curUpscale) {
+      // Leave _curUpscale at 0 — already reset by _siHide or never set.
+      // Don't clobber if the caller manually set it for a fast-path snapshot.
+    }
 
     const { text, warn } = _btnLabel(info);
     document.getElementById('si-btn-lbl').textContent = text;
@@ -1357,6 +1588,7 @@ _PROBE_UI_JS = r"""
     _hlsAudioTracks = []; _activeAudio = -1;
     _hlsSubTracks   = []; _activeSub   = -1;
     _curStreamUrl = null; _curStreamName = null; _curOriginUrl = null;
+    _curUpscale = 0; _curUpscaleAlgo = 'lanczos';
     if(_isTouch && _btn) _cancelReveal();
     if(_btn){ _btn.classList.remove('si-hover','si-open','si-sticky','si-warn'); }
     if(_panel){ _panel.classList.remove('si-open'); }
@@ -1400,20 +1632,23 @@ _PROBE_UI_JS = r"""
       let _reqHadAudioTrack = false;
       let _reqHadSubTrack   = false;
       let _reqSubTrackVal   = -1;
+      let _reqHadUpscale    = false;
       try {
         const _body = (opts && opts.body) ? JSON.parse(opts.body) : null;
         _reqHadAudioTrack = (_body && typeof _body.audio_track   === 'number');
         _reqHadSubTrack   = (_body && typeof _body.subtitle_track === 'number');
         _reqSubTrackVal   = _reqHadSubTrack ? _body.subtitle_track : -1;
+        _reqHadUpscale    = (_body && typeof _body.upscale_h === 'number' && _body.upscale_h > 0);
       } catch(_){}
       const _savedAudio = _reqHadAudioTrack ? _activeAudio : -1;
       _hlsBound = false; _hlsAudioTracks = []; _activeAudio = -1;
-      // New channel resolve (not an audio-track or subtitle-track switch):
-      // clear any active subtitle and origin URL.
-      // Audio/subtitle switches re-resolve the same stream — state stays valid.
-      if(!_reqHadAudioTrack && !_reqHadSubTrack){
+      // New channel (not audio/sub/upscale switch): clear subtitle and origin URL.
+      // Upscale: reset to 0 for a new channel — _siShow() will re-apply from
+      // stream_info.upscale_h if the server returned an active upscale.
+      if(!_reqHadAudioTrack && !_reqHadSubTrack && !_reqHadUpscale){
         _clearSubtitles();
         _curOriginUrl = null;
+        _curUpscale   = 0;
       }
       const clone = res.clone();
       clone.json().then(function(d){
@@ -1730,6 +1965,45 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                         state.log(f"[PROBE] Forcing full transcode for subtitle burn-in: track {req_sub_track}")
                         stream_info = dict(stream_info, transcode=True, transcode_reason=transcode_reason)
 
+                # ── Upscale ────────────────────────────────────────────────────
+                # upscale_h:   target height (720, 1080) or 0 / absent = off.
+                # upscale_algo: resampling kernel forwarded to hls_proxy as-is.
+                #
+                # Guard: only apply if source height is strictly below target.
+                # Downscaling (src >= target) is silently skipped so the caller
+                # never accidentally degrades a 1080p stream to 720p.
+                _VALID_UP_H    = {720, 1080, 1440, 2160}
+                _VALID_UP_ALGO = {"lanczos", "bicubic", "bilinear", "fast_bilinear", "spline"}
+                try:    req_upscale_h = int(data.get("upscale_h") or 0)
+                except: req_upscale_h = 0
+                if req_upscale_h not in _VALID_UP_H:
+                    req_upscale_h = 0
+                req_upscale_algo = str(data.get("upscale_algo") or "lanczos").strip()
+                if req_upscale_algo not in _VALID_UP_ALGO:
+                    req_upscale_algo = "lanczos"
+
+                _src_h = codecs.get("height") if isinstance(codecs, dict) else None
+                if req_upscale_h and _src_h and _src_h >= req_upscale_h:
+                    state.log(f"[PROBE] Upscale to {req_upscale_h}p skipped: "
+                              f"source ({_src_h}p) already at/above target")
+                    req_upscale_h = 0
+
+                up_param = ""
+                if req_upscale_h:
+                    up_param = f"&upscale={req_upscale_h}&upscale_algo={req_upscale_algo}"
+                    if not needs_transcode:
+                        _src_lbl = f"{_src_h}p" if _src_h else "SD"
+                        needs_transcode  = True
+                        transcode_reason = f"upscale {_src_lbl} \u2192 {req_upscale_h}p"
+                        state.log(f"[PROBE] Forcing transcode for upscale: "
+                                  f"{_src_lbl} → {req_upscale_h}p ({req_upscale_algo})")
+                        stream_info = dict(stream_info, transcode=True, transcode_reason=transcode_reason)
+                    # Always embed upscale state in stream_info so the JS panel
+                    # can reflect active target and algorithm.
+                    stream_info = dict(stream_info,
+                                       upscale_h=req_upscale_h,
+                                       upscale_algo=req_upscale_algo)
+
                 if needs_transcode:
                     vod_flag = "1" if is_vod else "0"
                     # audio_only when: bad audio codec, OR explicit track selection
@@ -1751,24 +2025,50 @@ def register_probe_routes(flask_app, state, run_async, _make_client, ffprobe_pat
                     if _is_interlaced:
                         audio_only_issue = False
                     di_param = "&deinterlace=1" if _is_interlaced else ""
+                    # Upscaling requires full libx264 — cannot scale with -c:v copy.
+                    if up_param:
+                        audio_only_issue = False
                     if is_multiview:
                         if audio_only_issue:
                             state.log(f"[PROBE] MV audio → hls_proxy: {transcode_reason}")
                             audio_url = f"/api/hls_proxy?audio_only=1&vod={vod_flag}{at_param}&url={quote(url, safe='')}"
                             return jsonify({"url": audio_url, "origin_url": url, "hevc": False, "stream_info": stream_info})
                         else:
+                            # Multiview never applies upscale/subtitle-burn-in here — NOT
+                            # because per-tile transcoding is too expensive (multiview_addon.py
+                            # already does full per-tile HEVC→H.264 re-encoding, deduplicated by
+                            # stream_key, via its OWN separate ffmpeg pipeline: StreamBroadcaster
+                            # / "/api/multiview/stream", entirely independent of this file's
+                            # hls_proxy). The real reason is architectural: upscale's scale filter
+                            # only exists in THIS file's hls_proxy filter chain. Multiview's own
+                            # _spawn() has no -vf scale=... anywhere — it only ever reaches
+                            # hls_proxy for the audio_only branch above (AC3/DTS→AAC fix-up),
+                            # never for HEVC or upscale. multiview_addon.py's own /api/resolve?mv=1
+                            # call also never sends upscale_h (no UI for it exists in multiview),
+                            # so up_param/st_param are always empty on the actual, live multiview
+                            # resolve path — this stripping is a defensive no-op today, kept in
+                            # case that ever changes. Adding real multiview upscale support would
+                            # mean threading a scale filter through StreamBroadcaster._spawn() in
+                            # multiview_addon.py, plus new UI there — separate work, out of scope
+                            # here (the probe overlay this feature targets doesn't exist in
+                            # multiview tiles at all).
+                            if up_param or st_param:
+                                state.log(f"[PROBE] MV: upscale/subtitle-burn-in not applied in "
+                                          f"multiview (multiview's own ffmpeg pipeline has no scale "
+                                          f"filter support) — serving source as-is")
+                                if isinstance(stream_info, dict):
+                                    stream_info = dict(stream_info, upscale_h=0, upscale_algo=None)
                             return jsonify({"url": url, "origin_url": url, "hevc": True, "stream_info": stream_info})
                     else:
                         state.log(f"[PROBE] Routing to transcode proxy: {transcode_reason}"
                                   + (f" [audio track {req_audio_track}]" if at_param else "")
                                   + (f" [subtitle burn-in track {req_sub_track}]" if st_param else "")
-                                  + (" [deinterlace]" if di_param else ""))
+                                  + (" [deinterlace]" if di_param else "")
+                                  + (f" [upscale→{req_upscale_h}p]" if up_param else ""))
                         if audio_only_issue:
-                            # Copy video stream, re-encode audio only — much cheaper
-                            # than a full libx264 video re-encode.
                             transcode_url = f"/api/hls_proxy?audio_only=1&vod={vod_flag}{at_param}&url={quote(url, safe='')}"
                         else:
-                            transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}{di_param}{at_param}{st_param}&url={quote(url, safe='')}"
+                            transcode_url = f"/api/hls_proxy?transcode=1&vod={vod_flag}{di_param}{at_param}{st_param}{up_param}&url={quote(url, safe='')}"
                         return jsonify({"url": transcode_url, "origin_url": url, "hevc": True, "stream_info": stream_info})
 
             return jsonify({"url": url, "origin_url": url, "stream_info": stream_info})
