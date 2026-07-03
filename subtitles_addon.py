@@ -2019,8 +2019,6 @@ function clearSubtitle(){
   _subActiveFile = null;
   const info = document.getElementById('sub-active-info');
   if(info) info.style.display='none';
-  const subBtn = document.getElementById('subbtn');
-  if(subBtn) subBtn.style.opacity='0.35';
   const _dr = document.getElementById('sub-delay-row');
   if(_dr) _dr.style.display = 'none';
   const _sr2 = document.getElementById('sub-sync-row');
@@ -2203,8 +2201,6 @@ async function _subLoadFromServerPath(path, stEl){
     _subActiveFile = {name: d.file_name};
     document.getElementById('sub-active-name').textContent = d.file_name;
     document.getElementById('sub-active-info').style.display = 'flex';
-    const subBtn = document.getElementById('subbtn');
-    if(subBtn) subBtn.style.opacity = '1';
     stEl.style.color = 'var(--green)';
     stEl.textContent = '\u2713 Loaded: ' + d.file_name;
     document.getElementById('sub-status-msg').textContent = 'Ready';
@@ -2235,8 +2231,6 @@ function subLoadLocalFile(input){
     _subActiveFile = {name: file.name};
     document.getElementById('sub-active-name').textContent = file.name;
     document.getElementById('sub-active-info').style.display = 'flex';
-    const subBtn = document.getElementById('subbtn');
-    if(subBtn) subBtn.style.opacity = '1';
     stEl.style.color = 'var(--green)';
     stEl.textContent = '\u2713 Loaded: ' + file.name;
     document.getElementById('sub-status-msg').textContent = 'Ready';
@@ -2525,8 +2519,6 @@ async function subLoadSubtitle(fileId, fileName, btnIdx, provider, season, episo
     if(btn){ btn.textContent='\u2713 Loaded'; btn.classList.add('loaded'); }
     const quotaStr = (d.remaining != null) ? ' \u2022 OS quota: '+d.remaining+' left' : '';
     msg.textContent = 'Loaded: ' + loadedName + quotaStr;
-    const subBtn = document.getElementById('subbtn');
-    if(subBtn) subBtn.style.opacity='1';
     toast('Subtitle loaded','ok');
   } catch(e){
     toast('Error: '+e,'err');
