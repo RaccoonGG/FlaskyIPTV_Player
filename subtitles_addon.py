@@ -1763,11 +1763,6 @@ function _subRenderResults(results){
     const ratStr   = (item.rating && item.rating !== '?')
       ? '<span class="sub-meta-badge sub-meta-rat">\u2605 '+item.rating+'</span>'
       : '';
-    // Encode file_id safely for onclick; it may be a URL path string for subdl
-    const fidJson  = JSON.stringify(String(item.file_id));
-    const fnJson   = JSON.stringify(item.file_name || 'subtitle.srt');
-    const seasJson = JSON.stringify(item.season || null);
-    const epJson   = JSON.stringify(item.episode || null);
     return '<div class="sub-result-item">'
       +'<div class="sub-result-info">'
       +'<div class="sub-result-title">'+esc(item.title)+yearStr+'</div>'
@@ -1778,12 +1773,24 @@ function _subRenderResults(results){
       +'</div>'
       +'<div class="sub-result-release">'+esc(item.file_name||'')+'&bull; '+esc(item.uploader||'')+'</div>'
       +'</div>'
-      +'<button class="btn-ghost sub-load-btn" id="sub-load-'+i+'"'
-      +' onclick="subLoadSubtitle('+fidJson+','+fnJson+','+i+','+JSON.stringify(prov)+','+seasJson+','+epJson+')"'
+      +'<button class="btn-ghost sub-load-btn" id="sub-load-'+i+'" data-idx="'+i+'"'
       +' title="Load into player">&#x25B6; Load</button>'
       +'</div>';
   });
   wrap.innerHTML = '<div class="sub-results">'+parts.join('')+'</div>';
+
+  // Wire clicks from the live results array via closure. file_id, file_name,
+  // provider, season and episode are never serialized into an HTML attribute,
+  // so there is no double-quote delimiter left for JSON.stringify() output
+  // to collide with.
+  wrap.querySelectorAll('.sub-load-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx  = parseInt(btn.dataset.idx, 10);
+      const item = results[idx];
+      if(!item) return;
+      subLoadSubtitle(String(item.file_id), item.file_name || 'subtitle.srt', idx, item.provider || 'os', item.season || null, item.episode || null);
+    });
+  });
 }
 
 // ── Download + apply to player ───────────────────────────────────────
