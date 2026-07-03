@@ -70,6 +70,35 @@ _FFMPEG_WHICH     = shutil.which("ffmpeg")
 _FFMPEG_PATH      = _FFMPEG_WHICH or "ffmpeg"
 _FFMPEG_AVAILABLE = _FFMPEG_WHICH is not None
 
+# ── Software upscale constants ─────────────────────────────────────────────────
+# Allowlisted target heights and their canonical 16:9 widths.
+# force_original_aspect_ratio=decrease means non-16:9 sources (4:3 SD etc.)
+# get letterbox/pillarbox bars — never stretched to fill.
+_UPSCALE_TARGETS = frozenset({720, 1080, 1440, 2160})
+_UPSCALE_ALGOS   = frozenset({"lanczos", "bicubic", "bilinear", "fast_bilinear", "spline"})
+_UPSCALE_W_MAP   = {720: 1280, 1080: 1920, 1440: 2560, 2160: 3840}
+
+
+def _build_scale_vf(target_h: int, algo: str) -> str:
+    """Return an ffmpeg -vf scale+pad string that upscales to *target_h* lines.
+
+    Aspect ratio is always preserved.  The source is scaled to fit within the
+    target bounding box (force_original_aspect_ratio=decrease) and the remainder
+    is filled with black — identical to the letterbox/pillarbox approach used by
+    mainstream media players.
+
+    (ow-iw)/2 / (oh-ih)/2 are ffmpeg filter expressions for centred padding;
+    they work at any source aspect ratio and are universally supported.
+    H.264 requires even dimensions; the values in _UPSCALE_W_MAP are all even
+    and scale's internal rounding keeps sub-target intermediate sizes even.
+    """
+    w = _UPSCALE_W_MAP.get(target_h, (target_h * 16 // 9) & ~1)
+    return (
+        f"scale={w}:{target_h}:flags={algo}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color=black"
+    )
+
+
 # ── Image cache ────────────────────────────────────────────────────────────────
 # Server-side in-memory image cache keyed by URL without query string.
 # Portals append random ?{number} tokens to logo URLs — stripping them means
@@ -689,6 +718,30 @@ def register_proxy_routes(flask_app, state):
         except (ValueError, TypeError):
             sub_track = None
 
+        # upscale=N     — target height in pixels; 0 / absent = off.
+        # upscale_algo  — libswscale resampling kernel (see _UPSCALE_ALGOS).
+        #                 fast_bilinear is recommended for Termux/ARM;
+        #                 lanczos gives best quality on desktop at ~3× CPU cost.
+        # Upscaling requires a full libx264 re-encode — cannot combine with
+        # -c:v copy.  If the current mode is remux or audio_only the block below
+        # automatically upgrades it to a full transcode.
+        _up_raw = request.args.get("upscale", "0").strip()
+        try:    upscale_h = int(_up_raw)
+        except: upscale_h = 0
+        if upscale_h not in _UPSCALE_TARGETS:
+            upscale_h = 0
+
+        upscale_algo = request.args.get("upscale_algo", "lanczos").strip()
+        if upscale_algo not in _UPSCALE_ALGOS:
+            upscale_algo = "lanczos"
+
+        scale_vf = _build_scale_vf(upscale_h, upscale_algo) if upscale_h else None
+
+        if scale_vf and not transcode:
+            transcode  = True
+            audio_only = False
+            state.log(f"[ffmpeg/hls_proxy] Upscale {upscale_h}p ({upscale_algo}) — upgrading to full transcode")
+
         cors = _CORS_HEADERS
 
         base_input = [
@@ -714,25 +767,43 @@ def register_proxy_routes(flask_app, state):
             state.log(f"[ffmpeg/hls_proxy] err_recover seek to {seek_secs}s")
         base_input += ["-i", url]
 
-        # ── Stream selection ──────────────────────────────────────────────────
-        # sub_track set  → -filter_complex "[0:v:0][0:s:N]overlay[vout]"
-        #                    burns bitmap subtitle frames into the video signal;
-        #                    requires libx264 re-encode (incompatible with -c:v copy).
-        #                    audio_map explicitly selects audio track or defaults to 0:a:0.
-        # audio_track only → -map 0:v:0 -map 0:a:N  (video copy + audio select)
-        # neither          → no explicit -map (ffmpeg auto-selects best streams)
+        # ── Stream selection and filter chain ─────────────────────────────────
+        # Four composable filter elements feed the video filter chain:
         #
-        # When deinterlace=1, yadif=mode=0:parity=-1:deint=1 is prepended to the
-        # video filter chain.  deint=1 means "only process frames flagged as
-        # interlaced" — progressive frames pass through untouched.
+        #   _yadif   — deinterlace (deinterlace=1 param, non-progressive source)
+        #   scale_vf — scale+pad to target resolution (upscale param, built above)
+        #
+        # Composition rules
+        # -----------------
+        # sub_track set → must use -filter_complex (overlay requires it).
+        #   yadif and scale are chained as named graph nodes inside it.
+        #   Scale is applied AFTER overlay: bitmap subs are composited at source
+        #   resolution then the composite is enlarged — keeps subs proportional.
+        # No sub_track → simple -vf chain: "yadif,scale" or just "scale" etc.
+        # audio_track  → explicit -map added regardless of vf chain.
+        #
+        # yadif deint=1 processes only frames flagged interlaced — progressive
+        # frames pass through untouched (negligible overhead on clean sources).
         _yadif = "yadif=mode=0:parity=-1:deint=1" if deinterlace else None
+
         if sub_track is not None:
-            audio_map    = f"0:a:{audio_track}" if audio_track is not None else "0:a:0"
+            # ── filter_complex: sub burn-in (+ optional yadif + optional scale) ──
+            audio_map = f"0:a:{audio_track}" if audio_track is not None else "0:a:0"
+            _fc_parts = []
+            _vid_in   = "0:v:0"
+
             if _yadif:
-                # Chain yadif before subtitle overlay in filter_complex
-                _fc = f"[0:v:0]{_yadif}[v_di];[v_di][0:s:{sub_track}]overlay[vout]"
-            else:
-                _fc = f"[0:v:0][0:s:{sub_track}]overlay[vout]"
+                _fc_parts.append(f"[{_vid_in}]{_yadif}[v_di]")
+                _vid_in = "v_di"
+
+            # Overlay output is intermediate when scale follows, else final [vout]
+            _overlay_out = "v_sub" if scale_vf else "vout"
+            _fc_parts.append(f"[{_vid_in}][0:s:{sub_track}]overlay[{_overlay_out}]")
+
+            if scale_vf:
+                _fc_parts.append(f"[v_sub]{scale_vf}[vout]")
+
+            _fc = ";".join(_fc_parts)
             stream_select = [
                 "-filter_complex", _fc,
                 "-map", "[vout]",
@@ -740,19 +811,26 @@ def register_proxy_routes(flask_app, state):
             ]
             state.log(f"[ffmpeg] Subtitle burn-in: track {sub_track}"
                       + (f"  audio track {audio_track}" if audio_track is not None else "")
-                      + ("  deinterlace" if _yadif else ""))
+                      + ("  deinterlace" if _yadif else "")
+                      + (f"  upscale→{upscale_h}p" if scale_vf else ""))
+
         elif audio_track is not None:
-            if _yadif:
-                stream_select = ["-vf", _yadif, "-map", "0:v:0", "-map", f"0:a:{audio_track}"]
+            # ── -map path: explicit audio track (+ optional yadif/scale via -vf) ──
+            _vf_parts = [p for p in [_yadif, scale_vf] if p]
+            _vf       = ",".join(_vf_parts) if _vf_parts else None
+            if _vf:
+                stream_select = ["-vf", _vf, "-map", "0:v:0", "-map", f"0:a:{audio_track}"]
             else:
                 stream_select = ["-map", "0:v:0", "-map", f"0:a:{audio_track}"]
             state.log(f"[ffmpeg] Audio track: {audio_track} (-map 0:a:{audio_track})"
-                      + ("  deinterlace" if _yadif else ""))
+                      + ("  deinterlace" if _yadif else "")
+                      + (f"  upscale→{upscale_h}p" if scale_vf else ""))
+
         else:
-            if _yadif:
-                stream_select = ["-vf", _yadif]
-            else:
-                stream_select = []
+            # ── Simple -vf path (+ optional yadif/scale) ─────────────────────
+            _vf_parts = [p for p in [_yadif, scale_vf] if p]
+            _vf       = ",".join(_vf_parts) if _vf_parts else None
+            stream_select = (["-vf", _vf] if _vf else [])
 
         if transcode:
             cmd = base_input + stream_select + [
@@ -761,13 +839,15 @@ def register_proxy_routes(flask_app, state):
                 "-f", "mpegts", "-",
             ]
             mode_str = ("transcode"
-                        + ("/burnin" if sub_track is not None else "")
-                        + ("/deinterlace" if deinterlace else ""))
+                        + ("/burnin"      if sub_track is not None else "")
+                        + ("/deinterlace" if deinterlace            else "")
+                        + (f"/up{upscale_h}p" if scale_vf          else ""))
         elif audio_only:
-            # audio_only: copy video, re-encode audio.  sub_track is not applied here —
-            # overlay requires -c:v libx264, incompatible with -c:v copy.
-            # api_resolve() upgrades audio_only → full transcode when sub_track is set.
-            ao_select = ["-map", "0:v:0", "-map", f"0:a:{audio_track}"] if audio_track is not None else []
+            # audio_only: copy video, re-encode audio only.
+            # scale_vf with audio_only is already upgraded to full transcode above
+            # so this branch is only reached when upscale is off.
+            ao_select = (["-map", "0:v:0", "-map", f"0:a:{audio_track}"]
+                         if audio_track is not None else [])
             cmd = base_input + ao_select + [
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
