@@ -2480,6 +2480,14 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .plm-hdr{display:flex;align-items:center;gap:8px;padding:14px 16px;
   border-bottom:1px solid var(--bdr);flex-shrink:0}
 .plm-hdr h2{flex:1;font-size:14px;font-weight:800;color:var(--txt)}
+.pl-search-row{padding:8px 16px 0;flex-shrink:0}
+.pl-search-wrap{position:relative;display:flex;align-items:center}
+.pl-search-wrap input{width:100%;height:32px;font-size:12px;padding:6px 30px 6px 28px}
+.pl-search-ico{position:absolute;left:9px;font-size:12px;color:var(--txt3);pointer-events:none;line-height:1}
+.pl-search-clear{position:absolute;right:5px;background:none;border:none;padding:0;
+  width:20px;height:20px;border-radius:50%;font-size:11px;color:var(--txt2);
+  display:flex;align-items:center;justify-content:center;cursor:pointer}
+.pl-search-clear:hover{background:rgba(255,255,255,.08);color:var(--txt)}
 .pl-list{flex:1;overflow-y:auto;padding:10px;min-height:60px}
 .pl-empty{text-align:center;padding:32px 16px;color:var(--txt3);font-size:12px}
 .pl-empty span{font-size:40px;display:block;margin-bottom:8px;opacity:.2}
@@ -3689,6 +3697,17 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <h2>📋 Saved Playlists</h2>
       <button class="btn-ghost" onclick="closePL()"
         style="height:28px;padding:0 10px;font-size:12px">✕ Close</button>
+    </div>
+    <div class="pl-search-row" id="pl-search-row">
+      <div class="pl-search-wrap">
+        <span class="pl-search-ico">🔍</span>
+        <input id="pl-search" type="text" placeholder="Search by name…"
+          autocomplete="off" autocorrect="off" spellcheck="false"
+          oninput="renderPLList()"
+          onkeydown="if(event.key==='Escape'){plClearSearch();}">
+        <button type="button" id="pl-search-clear" class="pl-search-clear"
+          onclick="plClearSearch()" title="Clear search" style="display:none">✕</button>
+      </div>
     </div>
     <div class="pl-list" id="pl-list"></div>
     <div class="pl-add">
@@ -7570,10 +7589,16 @@ function closeProfileModal(){
 
 function openPL(){
   document.getElementById('pl-overlay').classList.add('open');
+  const s=document.getElementById('pl-search'); if(s) s.value='';
   renderPLList();
 }
 function closePL(){
   document.getElementById('pl-overlay').classList.remove('open');
+}
+function plClearSearch(){
+  const inp=document.getElementById('pl-search');
+  if(inp) inp.value='';
+  renderPLList();
 }
 
 function plSetCT(t){
@@ -7596,15 +7621,36 @@ function plSaveAll(arr){
 function renderPLList(){
   const arr=plLoadAll();
   const el=document.getElementById('pl-list');
+  const searchRow=document.getElementById('pl-search-row');
+  const searchInp=document.getElementById('pl-search');
+  const clearBtn=document.getElementById('pl-search-clear');
+
   if(!arr.length){
+    if(searchRow) searchRow.style.display='none';
     el.innerHTML='<div class="pl-empty"><span>📋</span>No saved playlists yet.<br>Add one below.</div>';
     return;
   }
+  if(searchRow) searchRow.style.display='';
+
+  const q=(searchInp&&searchInp.value?searchInp.value:'').trim().toLowerCase();
+  if(clearBtn) clearBtn.style.display=q?'flex':'none';
+
+  // Keep original array indices so plConnect/plEdit/plDelete (which index
+  // into the full unfiltered list) still target the correct entry.
+  const indexed=arr.map((p,i)=>({p,i}))
+    .filter(x=>!q || (x.p.name||'Untitled').toLowerCase().includes(q));
+
+  if(!indexed.length){
+    el.innerHTML='<div class="pl-empty"><span>🔍</span>No playlists match "'+esc(searchInp?searchInp.value.trim():'')+'".</div>';
+    return;
+  }
+
   const icons={mac:'🔌',xtream:'📡',m3u_url:'📄',stalker:'📺'};
   const typeAccent={mac:'#3b82f6',xtream:'#22c55e',m3u_url:'#ef4444',stalker:'#a855f7'};
   const typeLbl={mac:'MAC',xtream:'XTREAM',m3u_url:'M3U',stalker:'STALKER'};
   const typeCls={mac:'pli-type-mac',xtream:'pli-type-xtream',m3u_url:'pli-type-m3u',stalker:'pli-type-stalker'};
-  el.innerHTML=arr.map((p,i)=>{
+  el.innerHTML=indexed.map((x,pos)=>{
+    const p=x.p, i=x.i;
     const raw=p.type||'mac';
     const t=raw==='mac'&&p.is_stalker?'stalker':raw;
     const ico=icons[t]||'📡';
@@ -7612,7 +7658,7 @@ function renderPLList(){
     const sub=t==='mac'?p.url+' • '+p.mac
       :t==='xtream'?p.url+' • '+p.username
       :p.m3u_url||p.url||'';
-    return '<div class="pli" style="--delay:'+(i*.04)+'s;--pli-accent:'+accent+'">'
+    return '<div class="pli" style="--delay:'+(pos*.04)+'s;--pli-accent:'+accent+'">'
       +'<span class="pli-ico">'+ico+'</span>'
       +'<div class="pli-info"><div class="pli-name" style="display:flex;align-items:center;gap:6px">'
       +'<span>'+esc(p.name||'Untitled')+'</span>'
