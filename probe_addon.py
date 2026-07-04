@@ -1291,6 +1291,26 @@ _PROBE_UI_JS = r"""
     else _rebuildTracks();                          // just refresh badge label
   }
 
+  // Per-algorithm quality/cost blurb shown in the algo badge's hover tooltip.
+  // Ordered roughly best→cheapest quality-wise; cost is inverse of quality here
+  // (libswscale has no "free lunch" kernel — sharper = more CPU per frame).
+  // 'spline' isn't in _ALGO_CYCLE (not click-cycleable yet) but the backend
+  // accepts it (_VALID_UP_ALGO), so it's included here for forward-compat / tests.
+  const _ALGO_INFO = {
+    lanczos:       { label: 'Lanczos',       quality: 'Best quality — sharp edges, fine detail preserved',      cost: 'Most expensive — highest CPU load, slowest' },
+    spline:        { label: 'Spline',        quality: 'Excellent quality — smooth, close to Lanczos',          cost: 'Expensive — similar cost to Lanczos' },
+    bicubic:       { label: 'Bicubic',       quality: 'Good quality — smooth, slightly softer than Lanczos',   cost: 'Moderate cost — noticeably cheaper than Lanczos' },
+    bilinear:      { label: 'Bilinear',      quality: 'Lower quality — visibly softer/blurrier',               cost: 'Cheap — fast, easy on weaker devices' },
+    fast_bilinear: { label: 'Fast Bilinear', quality: 'Lowest quality — blurriest, most artifacts',             cost: 'Cheapest — fastest, best for low-power/Android' }
+  };
+
+  // Pure + exported for unit testing (see test_probe_algo_tooltip.js).
+  function _algoTooltip(algo){
+    const info = _ALGO_INFO[algo];
+    if(!info) return 'Click to cycle algorithm';
+    return info.label + '\n' + info.quality + '\n' + info.cost + '\n\nClick to cycle algorithm';
+  }
+
   /* ── Transcode reason formatter ────────────────────────────────────── */
   // Returns a concise, human-readable explanation for the → transcode reason row.
   function _fmtTranscodeReason(r){
@@ -1331,6 +1351,17 @@ _PROBE_UI_JS = r"""
   }
 
   /* ── Build panel HTML ───────────────────────────────────────────────── */
+  // A "switchable" audio option requires 2+ real tracks. Track count is
+  // the only reliable signal: a language/title tag can be present on a
+  // stream's sole audio track (upstream mislabeling — e.g. a regional
+  // feed reusing another region's encoder template) without a second
+  // track existing to switch to, so tag presence must never substitute
+  // for track count here. Exported as a standalone function so it can be
+  // unit-tested directly (see test_probe_audio_switchable.js).
+  function _audioTrackSwitchable(trackCount){
+    return trackCount > 1;
+  }
+
   function _buildPanel(info){
     let html = '';
     const isHLS = info.is_hls;
@@ -1362,7 +1393,9 @@ _PROBE_UI_JS = r"""
         });
         // Algo badge: always visible, click cycles algorithm.
         // Only actionable when upscale is on; dimmed appearance signals it.
-        upRow += '<span class="si-algo-badge" title="Click to cycle algorithm">'
+        // Tooltip shows quality/cost tradeoff for the CURRENT algo so hovering
+        // tells you what you're using, not just "click to cycle".
+        upRow += '<span class="si-algo-badge" title="' + _algoTooltip(_curUpscaleAlgo) + '">'
                + (_algoShort[_curUpscaleAlgo] || _curUpscaleAlgo) + '</span>';
         upRow += '</div>';
         html += upRow;
@@ -1451,16 +1484,15 @@ _PROBE_UI_JS = r"""
         const name     = t.title || t.name || '';
         const codec    = (!useLiveAudio && t.codec)     ? t.codec.toUpperCase() : '';
         const ch       = (!useLiveAudio && t.channels)  ? t.channels + 'ch'    : '';
-        // Switchable when:
-        //   (a) live HLS with HLS.js track list (instant rendition switch)
-        //   (b) transcoded stream (re-resolve with track index, ffmpeg -map)
-        //   (c) direct MPEG-TS with multiple tracks (re-resolve forces audio_only
-        //       transcode so ffmpeg can apply -map 0:a:<N>)
-        // Single-track direct streams with no language tag: informational only —
-        // clicking would restart the stream identically with no benefit.
-        const isMultiOrTagged = audioTracks.length > 1
-                             || !!(t.lang || t.language);
-        const canSwitch = useLiveAudio || info.transcode || isMultiOrTagged;
+        // Switchable only when a second real audio track actually exists.
+        // A language/title tag is a *display* label, not proof of a second
+        // track — providers sometimes mistag the sole audio stream (shared
+        // encoder templates across regional feeds are a common cause), so a
+        // tag alone must never make a lone track switchable. With only one
+        // real track, any transport (HLS live, existing transcode, direct
+        // MPEG-TS) can only re-map to that same track: a wasted ffmpeg
+        // restart with no audible change.
+        const canSwitch = _audioTrackSwitchable(audioTracks.length);
         // data-track-idx drives event delegation on _panel — no inline onclick needed.
         html += '<div class="si-track-btn' + (isActive?' si-active':'') + (canSwitch?'':' si-info-only') + '"'
               + (canSwitch ? ' data-track-idx="' + hlsId + '"' : '')
