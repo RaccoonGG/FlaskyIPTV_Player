@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse, quote, quote_plus, unquote, parse_qs
 import asyncio
+import concurrent.futures
 import webbrowser
 import requests as _requests_lib
 
@@ -546,26 +547,80 @@ def run_async(coro, timeout=None):
 
 
 def run_worker(coro, on_done=None):
-    """Run an async coroutine in a background thread."""
-    def worker():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        state.active_loop = loop
-        task = loop.create_task(coro)
-        state.active_task = task
-        try:
-            loop.run_until_complete(task)
-        except asyncio.CancelledError:
-            state.log("Operation cancelled.")
-        except Exception as e:
-            state.log(f"ERROR: {e}")
-        finally:
-            loop.close()
-            state.active_loop = None
-            state.active_task = None
-            state.busy = False
-            if on_done:
-                on_done()
+    """Run an async coroutine in a background thread.
+
+    Mirrors run_async()'s persistent-loop dispatch: when a PortalSessionManager
+    is active, *coro* is submitted to its event loop via
+    asyncio.run_coroutine_threadsafe() instead of running on a brand-new
+    throwaway loop. This matters because _make_client() hands back the
+    manager's already-connected client whenever portal_mgr is set, and that
+    client's aiohttp ClientSession/connector permanently remembers the loop
+    it was created on (captured once, at construction — see connector.py).
+    If *coro* then executes on a *different* loop — which is exactly what an
+    unconditional asyncio.new_event_loop() here produced before this fix —
+    every aiohttp request the coroutine makes fails deep inside aiohttp with:
+        RuntimeError: Timeout context manager should be used inside a task
+    aiohttp's TimerContext resolves asyncio.current_task() against the loop
+    the session was built on, not whichever loop is actually calling it; on a
+    mismatch no task is found there and the timeout setup itself raises
+    before any network I/O even begins. This broke every background job that
+    touches a portal client — M3U export, MKV/yt-dlp downloads — on every
+    portal type (Stalker's create_stream_link, MAC's resolve_localhost_url,
+    Xtream equivalents, etc.), since they all eventually call
+    self.session.get()/.post() on the shared persistent session.
+
+    Falls back to a temporary loop when no portal connection is active yet
+    (M3U-URL-only mode), identical to the previous behaviour and to
+    run_async()'s own fallback.
+
+    state.active_loop/state.active_task are populated in both branches so
+    /api/stop's `loop.call_soon_threadsafe(task.cancel)` keeps working
+    unchanged: concurrent.futures.Future (returned by
+    run_coroutine_threadsafe for the persistent-loop branch) implements the
+    same .done()/.cancel() surface api_stop() already relies on, and
+    cancelling it propagates the cancellation through to the underlying task
+    running on portal_mgr.loop.
+    """
+    mgr = getattr(state, "portal_mgr", None)
+
+    if mgr is not None and not mgr.loop.is_closed():
+        def worker():
+            future = asyncio.run_coroutine_threadsafe(coro, mgr.loop)
+            state.active_loop = mgr.loop
+            state.active_task = future
+            try:
+                future.result()
+            except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                state.log("Operation cancelled.")
+            except Exception as e:
+                state.log(f"ERROR: {e}")
+            finally:
+                state.active_loop = None
+                state.active_task = None
+                state.busy = False
+                if on_done:
+                    on_done()
+    else:
+        def worker():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            state.active_loop = loop
+            task = loop.create_task(coro)
+            state.active_task = task
+            try:
+                loop.run_until_complete(task)
+            except asyncio.CancelledError:
+                state.log("Operation cancelled.")
+            except Exception as e:
+                state.log(f"ERROR: {e}")
+            finally:
+                loop.close()
+                state.active_loop = None
+                state.active_task = None
+                state.busy = False
+                if on_done:
+                    on_done()
+
     t = threading.Thread(target=worker, daemon=True)
     state.worker_thread = t
     state.busy = True
@@ -4890,10 +4945,35 @@ const _TAG_GROUPS  = (function(){
 // Each entry: { tag: string, test: fn(titleUpperCase) → bool }
 // A category satisfies a content tag if test() returns true.
 // Content tags are shown as general tags in the tag bar with their own pill.
+
+// ── SPORT keyword groups ──────────────────────────────────────────────────────
+// The bare \bSPORT[S]?\b test only catches categories that literally say
+// "sport(s)". It misses named competitions/leagues/orgs (World Cup, Champions
+// League, NBA...) and brand names that glue "sport" onto a prefix with no
+// separator (Eurosport, Supersport), where there's no word boundary in front of
+// "sport" for the base pattern to find. Split into a few regexes purely for
+// readability — the SPORT test below ORs them all together. Add new
+// competitions/leagues/orgs to whichever group reads closest, or start a new
+// one. [\s-]* between words absorbs however a portal separates them: "WORLD
+// CUP" / "WORLD-CUP" / "WORLDCUP" all match the same pattern.
+const _SPORT_WORD_RE   = /\bSPORT[S]?\b/;
+// Brand names with "sport" glued to a prefix (no boundary for the pattern above).
+const _SPORT_BRAND_RE  = /\bEUROSPORT\b|\bSUPERSPORT\b|\bTALKSPORT\b/;
+// Governing bodies / confederations — catches every event they run in one shot.
+const _SPORT_ORG_RE    = /\bFIFA\b|\bUEFA\b|\bCONCACAF\b|\bCONMEBOL\b|\bCAF\b|\bAFC\b|\bIOC\b|\bICC\b|\bIIHF\b|\bFIBA\b/;
+// Major international tournaments / one-off events.
+const _SPORT_EVENT_RE  = /\bWORLD[\s-]*CUP\b|\bNATIONS[\s-]*LEAGUE\b|\bOLYMPIC[S]?\b|\bPARALYMPIC[S]?\b|\bCOPA[\s-]*AMERICA\b|\bCOPA[\s-]*LIBERTADORES\b|\bAFCON\b|\bASIAN[\s-]*CUP\b|\bGOLD[\s-]*CUP\b|\bSUPER[\s-]*BOWL\b|\bWORLD[\s-]*SERIES\b|\bRYDER[\s-]*CUP\b|\bDAVIS[\s-]*CUP\b|\bSIX[\s-]*NATIONS\b|\bWIMBLEDON\b|\bROLAND[\s-]*GARROS\b|\bGRAND[\s-]*SLAM\b/;
+// Domestic/club leagues and top-tier competition brands, by sport.
+const _SPORT_LEAGUE_RE = /\bCHAMPIONS[\s-]*LEAGUE\b|\bEUROPA[\s-]*LEAGUE\b|\bCONFERENCE[\s-]*LEAGUE\b|\bPREMIER[\s-]*LEAGUE\b|\bLA[\s-]*LIGA\b|\bSERIE[\s-]*[AB]\b|\bBUNDESLIGA\b|\bLIGUE[\s-]*1\b|\bEREDIVISIE\b|\bPRIMEIRA[\s-]*LIGA\b|\bMLS\b|\bEURO[\s-]*LEAGUE\b|\bEURO[\s-]*CUP\b|\bEURO[\s-]*BASKET\b|\bNBA\b|\bWNBA\b|\bNFL\b|\bNHL\b|\bMLB\b|\bNCAA\b/;
+// Sport names themselves, plus tour/org acronyms and motorsport — covers a
+// category titled just "Football" or "F1" with no other sport-signalling word.
+const _SPORT_NAME_RE   = /\bFOOTBALL\b|\bBASKETBALL\b|\bTENNIS\b|\bGOLF\b|\bHANDBALL\b|\bVOLLEYBALL\b|\bHOCKEY\b|\bRUGBY\b|\bCRICKET\b|\bIPL\b|\bBOXING\b|\bWRESTLING\b|\bUFC\b|\bWWE\b|\bMMA\b|\bATP\b|\bWTA\b|\bPGA\b|\bLPGA\b|\bSNOOKER\b|\bDARTS\b|\bSWIMMING\b|\bATHLETICS\b|\bSKIING\b|\bFORMULA[\s-]*1\b|\bFORMULA[\s-]*E\b|\bF1\b|\bMOTOGP\b|\bMOTORSPORT\b|\bNASCAR\b|\bINDY[\s-]*CAR\b|\bINDY[\s-]*500\b/;
+
 const _CONTENT_TAGS = [
   {
     tag: 'SPORT',
-    test: t => /\bSPORT[S]?\b/.test(t),
+    test: t => _SPORT_WORD_RE.test(t) || _SPORT_BRAND_RE.test(t) || _SPORT_ORG_RE.test(t)
+            || _SPORT_EVENT_RE.test(t) || _SPORT_LEAGUE_RE.test(t) || _SPORT_NAME_RE.test(t),
   },
   {
     tag: '24/7',
@@ -4905,7 +4985,10 @@ const _CONTENT_TAGS = [
   },
   {
     tag: 'SERIES',
-    test: t => /\bSERIE[S]?\b|\bSHOW[S]?\b|\bEPISODE[S]?\b/.test(t),
+    // Negative lookahead excludes "SERIE A" / "SERIE B" (Italian football
+    // divisions, now matched by _SPORT_LEAGUE_RE above) so a football category
+    // doesn't also show up under the TV-series pill.
+    test: t => /\bSERIE(?![\s-]*[AB]\b)[S]?\b|\bSHOW[S]?\b|\bEPISODE[S]?\b/.test(t),
   },
 ];
 
