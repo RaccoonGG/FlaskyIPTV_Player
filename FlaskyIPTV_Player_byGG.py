@@ -4199,7 +4199,16 @@ async function doConnect(){
         } catch(e){}
       }
       catsCache=d.categories||{};
-      categoryItemsCache = {}; 
+      categoryItemsCache = {};
+      // Stale-selection guard: checkboxes left checked from the previous
+      // portal (selSet items and/or selCats whole-categories) must not
+      // ride along into this connection. Left uncleared, dlSelectedAll()
+      // would export them — now-invalid category/items — *in addition to*
+      // whatever gets freshly selected here, and since the backend's
+      // state.busy is one global flag (download_addon.py), that stale job
+      // occupies it long enough that the real export 409s with
+      // "Another operation is in progress".
+      _clearSelection();
       // Cache stream UA for multiview stream requests (separate from portal API UA)
       window._mvEffectiveUa = d.stream_ua || d.effective_ua || 'VLC/3.0.0 LibVLC/3.0.0';
       // Store EPG display offset so EPG addon can apply it to all time displays
@@ -4296,6 +4305,7 @@ async function refreshPlaylist(){
     categoryItemsCache = {};
     catsCache = {};
     allItems = []; filtItems = []; curCat = null; navStack = [];
+    _clearSelection();
     // 3. Reconnect — re-fetches categories and rebuilds everything
     await doConnect();
   } catch(e){
@@ -4318,7 +4328,7 @@ function setMode(m){
   _favsFilterActive=false;
   document.querySelector('.mt[data-m="favs"]').classList.remove('on');
   mode=m; navStack=[]; allItems=[]; filtItems=[]; curCat=null;
-  selSet.clear(); selCats.clear(); refreshCatBtns();
+  _clearSelection();
   if(_epgGridActive) _closeEpgGrid();
   document.getElementById('epg-grid-btn').style.display='none';
   _updateVodSeriesExpandBtn();
@@ -5632,6 +5642,18 @@ function refreshBtns(){
   _updateHiddenCount();
 }
 const refreshCatBtns = refreshBtns;
+
+// Clears item-level (selSet) and whole-category (selCats) selections and
+// syncs the FAB/badge UI in one place. Centralised so every call site that
+// must invalidate the current selection (mode switch, portal connect,
+// playlist refresh) goes through one path — the export bug this fixes was
+// exactly a case of one such site (portal reconnect) forgetting to clear
+// selCats, so scattering this logic again would risk re-introducing it.
+function _clearSelection(){
+  selSet.clear();
+  selCats.clear();
+  refreshCatBtns();
+}
 
 async function dlSelectedAll(type){
   const nCats=selCats.size, nItems=selSet.size;
