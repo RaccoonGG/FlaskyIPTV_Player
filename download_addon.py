@@ -1994,7 +1994,7 @@ _DL_UI_JS = r"""
     <!-- M3U export inline progress — only shown during M3U saves -->
     <div id="adr-m3u-progress">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-        <span style="font-size:10px;font-weight:800;text-transform:uppercase;
+        <span id="adr-m3u-prog-title" style="font-size:10px;font-weight:800;text-transform:uppercase;
           letter-spacing:1px;color:var(--acc)">💾 Saving M3U…</span>
         <button onclick="dismissM3uProgress()" title="Dismiss"
           style="background:none;border:none;color:var(--txt3);cursor:pointer;
@@ -2007,7 +2007,7 @@ _DL_UI_JS = r"""
       </div>
       <div style="display:flex;justify-content:space-between;align-items:center">
         <span id="adr-m3u-prog-count" style="font-size:11px;color:var(--txt3);font-weight:600"></span>
-        <button onclick="doStop()" title="Stop"
+        <button id="adr-m3u-stop-btn" onclick="doStop()" title="Stop"
           style="height:22px;padding:0 8px;font-size:10px;font-weight:700;
                  background:rgba(255,80,80,.15);border:1px solid rgba(255,80,80,.3);
                  border-radius:4px;cursor:pointer;color:#f06060">⏹ Stop</button>
@@ -2187,15 +2187,38 @@ function _showProgressNow(ctx, title, label, total){
   const panel = document.getElementById('adr-m3u-progress');
   if(!panel) return;
   panel.classList.add('active');
+  const titleEl = document.getElementById('adr-m3u-prog-title');
   const lbl   = document.getElementById('adr-m3u-prog-label');
   const bar   = document.getElementById('adr-m3u-prog-bar');
   const count = document.getElementById('adr-m3u-prog-count');
+  const stopBtn = document.getElementById('adr-m3u-stop-btn');
+  if(titleEl) titleEl.textContent = title;
   if(lbl)   lbl.textContent = label;
   if(bar){  bar.style.width = '0%'; bar.style.animation = 'adr-m3u-indeterminate 1.2s linear infinite'; bar.style.opacity='0.55'; }
   if(count) count.textContent = total > 0 ? `0 / ${total} items` : 'Starting\u2026';
+  // Re-show the Stop button in case a previous run in this same panel hid it
+  // on completion (see _endM3uProgress) — a fresh run always has something
+  // stoppable again.
+  if(stopBtn) stopBtn.style.display = '';
   // Open actions drawer so the panel is visible
   if(typeof openDrawer === 'function') openDrawer('items');
   else if(typeof openActTab === 'function') openActTab();
+}
+
+// Marks the M3U progress panel as finished (success or failure): swaps the
+// header to a completion message and hides the Stop button, since there's
+// nothing left to stop once the job is over. No-ops safely if the panel
+// isn't currently active (e.g. an MKV job finishing while no M3U save is
+// showing).
+function _endM3uProgress(titleText){
+  const panel = document.getElementById('adr-m3u-progress');
+  if(!panel || !panel.classList.contains('active')) return;
+  const titleEl = document.getElementById('adr-m3u-prog-title');
+  const stopBtn = document.getElementById('adr-m3u-stop-btn');
+  const bar     = document.getElementById('adr-m3u-prog-bar');
+  if(titleEl) titleEl.textContent = titleText;
+  if(stopBtn) stopBtn.style.display = 'none';
+  if(bar) bar.style.animation = '';
 }
 
 async function dlM3U(){
@@ -2208,7 +2231,8 @@ async function dlM3U(){
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({items:[...selSet],category:curCat,mode,out_path:op,total_hint:selSet.size})});
   const d=await r.json();
-  if(d.ok){toast(d.message,'ok');pollBusy();setTimeout(()=>dlmRefresh().catch(()=>{}),1000);}else{toast(d.error,'err');setBusy(false);}
+  if(d.ok){toast(d.message,'ok');pollBusy();setTimeout(()=>dlmRefresh().catch(()=>{}),1000);}
+  else{toast(d.error,'err');setBusy(false);_endM3uProgress('\u26a0\ufe0f Save Failed');}
 }
 
 // Mobile MKV button — opens Actions drawer if download in progress, else downloads
@@ -2267,7 +2291,9 @@ async function pollBusy(){
     setTimeout(pollBusy,800);
   } else {
     setBusy(false);
-    // Freeze M3U progress panel with final count, then auto-dismiss after 3s
+    // Freeze M3U progress panel with the final count and mark it complete —
+    // no more Stop button, since there's nothing left to stop. The panel
+    // stays visible until the user dismisses it via the ✕ button.
     const _m3uPanel = document.getElementById('adr-m3u-progress');
     if(_m3uPanel && _m3uPanel.classList.contains('active')){
       const _ls = await fetch('/api/status').then(r=>r.json()).catch(()=>({}));
@@ -2277,7 +2303,7 @@ async function pollBusy(){
       if(_bar){ _bar.style.animation=''; _bar.style.opacity='1'; _bar.style.width='100%'; }
       if(_cnt){ const _sk=_fs>0?` \u00b7 ${_fs} skipped`:'';
         _cnt.textContent=_ft>0?`${_fd} / ${_ft} items${_sk}`:(_fd>0?`${_fd} items${_sk}`:'Complete'); }
-      // Panel stays visible — user dismisses via the ✕ button
+      _endM3uProgress('\u2705 M3U Saved');
     }
     // Refresh Downloads manager to show completed jobs
     fetch('/api/dlm/jobs').then(r=>r.json()).then(j=>{
