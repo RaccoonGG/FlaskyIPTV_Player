@@ -4801,15 +4801,28 @@ function _refreshExportBtn(){
   const m3uBtn=document.getElementById('adr-dlm3u');
   const mkvBtn=document.getElementById('adr-dlmkv');
   if(m3uBtn) m3uBtn.disabled=total===0;
-  if(mkvBtn){mkvBtn.disabled=total===0||!ff; if(!ff) mkvBtn.title='ffmpeg not found';}
+  // MKV only ever acts on individually selected items (selSet). Whole-category
+  // selections (selCats) are ignored on purpose — category-level MKV has no
+  // reliable "fetch everything in this category" path unless it was already
+  // browsed, and used to silently fall back to writing an M3U file instead.
+  // So enable state is driven by item count alone, never by category count.
+  if(mkvBtn){
+    mkvBtn.disabled=n===0||!ff;
+    if(!ff) mkvBtn.title='ffmpeg not found';
+    else if(n===0 && nc>0) mkvBtn.title='MKV download works on individually selected items only — category selections are ignored';
+    else if(nc>0) mkvBtn.title='Category selection ignored — downloading '+n+' selected item'+(n===1?'':'s')+' only';
+    else mkvBtn.title='';
+  }
   const sub=document.getElementById('adr-m3u-sub');
   const mkvSub=document.getElementById('adr-mkv-sub');
   const parts=[];
   if(nc) parts.push(nc+' cat'+(nc===1?'':'s'));
   if(n)  parts.push(n+' item'+(n===1?'':'s'));
-  const label=parts.join(' + ');
-  if(sub) sub.textContent=label;
-  if(mkvSub) mkvSub.textContent=label;
+  if(sub) sub.textContent=parts.join(' + ');
+  if(mkvSub){
+    const base=n?(n+' item'+(n===1?'':'s')):'';
+    mkvSub.textContent = nc ? (base?base+' \u00b7 ':'')+'cat'+(nc===1?'':'s')+' ignored' : base;
+  }
 }
 
 function _refreshHideBtn(){
@@ -5656,23 +5669,32 @@ function _clearSelection(){
 }
 
 async function dlSelectedAll(type){
+  // MKV ignores whole-category selections entirely — it only ever acts on
+  // individually selected items (selSet). Category-level MKV never worked
+  // right (no full-fetch path for a category that was never browsed, and it
+  // silently wrote an M3U file instead of MKV), so rather than fix that path
+  // this simply never routes MKV through it. M3U export below is unchanged
+  // and still supports categories and items together.
+  if(type==='mkv'){
+    if(!selSet.size){toast('Select items inside a category first — MKV does not support category-level download','wrn');return;}
+    await dlMKV();
+    return;
+  }
   const nCats=selCats.size, nItems=selSet.size;
   if(!nCats && !nItems){toast('Select categories or items first','wrn');return;}
-  if(nCats) await dlSelCats(type);
-  if(nItems){
-    if(type==='m3u') await dlM3U();
-    else await dlMKV();
-  }
+  if(nCats) await dlSelCats();
+  if(nItems) await dlM3U();
 }
-async function dlSelCats(type){
+// Whole-category export. MKV is intentionally not supported at the category
+// level (see dlSelectedAll above) — this now only ever performs M3U export,
+// so it takes no `type` argument.
+async function dlSelCats(){
   const cats=[...selCats.values()];
   if(!cats.length){toast('Select categories first','wrn');return;}
   const op=document.getElementById('o-m3u').value.trim();
-  const od=document.getElementById('o-dir').value.trim();
-  if(type==='m3u'&&!op){toast('Set M3U output path in ⚙ settings','wrn');return;}
-  if(type==='mkv'&&!od){toast('Set output folder in ⚙ settings','wrn');return;}
+  if(!op){toast('Set M3U output path in ⚙ settings','wrn');return;}
   setBusy(true);
-  if(type==='m3u') _showProgressNow('m3u_inline','💾 Saving M3U\u2026',cats.map(c=>c.title).join(', '),0);
+  _showProgressNow('m3u_inline','💾 Saving M3U\u2026',cats.map(c=>c.title).join(', '),0);
   let done=0;
   const _hidden=loadHidden(mode);
   for(const cat of cats){
@@ -5686,10 +5708,9 @@ async function dlSelCats(type){
       if(order) ordered=_applyOrder(cached, order, it=>it.name||it.o_name||it.fname||'');
       items=ordered.filter(it=>!_hidden.has(it.name||it.o_name||it.fname||''));
     }
-    const outPath=type==='m3u'?op:(od.replace(/\/?$/,'/')+mode+'_'+cat.title.replace(/[^a-z0-9]/gi,'_')+'.m3u');
     const r=await fetch('/api/download/m3u',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({items,category:cat,mode,out_path:outPath,total_hint:items?items.length:0})});
+      body:JSON.stringify({items,category:cat,mode,out_path:op,total_hint:items?items.length:0})});
     const d=await r.json();
     if(!d.ok) toast('Error on '+cat.title+': '+(d.error||'?'),'err');
   }
