@@ -5685,6 +5685,25 @@ async function dlSelectedAll(type){
   if(nCats) await dlSelCats();
   if(nItems) await dlM3U();
 }
+// Polls /api/status until the backend job has actually *finished* rather
+// than just been *accepted*. state.busy is one global flag shared by every
+// download job (see the reconnect stale-selection note above) — the server
+// returns "Download started" as soon as the background thread is launched,
+// well before that category's items are actually done. Without waiting here,
+// dlSelCats()'s loop below would fire the next category's request while the
+// previous one is still running, and the server correctly rejects it with
+// "Another operation is in progress" — silently skipping that category's
+// export entirely rather than merely showing an odd toast.
+async function _waitUntilIdle(maxWaitMs=120000){
+  const start=Date.now();
+  while(Date.now()-start<maxWaitMs){
+    const r=await fetch('/api/status').catch(()=>null);
+    const d=r?await r.json().catch(()=>null):null;
+    if(!d||!d.busy) return;
+    await new Promise(res=>setTimeout(res,800));
+  }
+}
+
 // Whole-category export. MKV is intentionally not supported at the category
 // level (see dlSelectedAll above) — this now only ever performs M3U export,
 // so it takes no `type` argument.
@@ -5695,7 +5714,7 @@ async function dlSelCats(){
   if(!op){toast('Set M3U output path in ⚙ settings','wrn');return;}
   setBusy(true);
   _showProgressNow('m3u_inline','💾 Saving M3U\u2026',cats.map(c=>c.title).join(', '),0);
-  let done=0;
+  let done=0, failed=0;
   const _hidden=loadHidden(mode);
   for(const cat of cats){
     setStatus('Downloading cat '+(++done)+'/'+cats.length+': '+cat.title+'…');
@@ -5712,9 +5731,13 @@ async function dlSelCats(){
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({items,category:cat,mode,out_path:op,total_hint:items?items.length:0})});
     const d=await r.json();
-    if(!d.ok) toast('Error on '+cat.title+': '+(d.error||'?'),'err');
+    if(!d.ok){ toast('Error on '+cat.title+': '+(d.error||'?'),'err'); failed++; }
+    // Whether this category started fine or was rejected as busy, wait for
+    // the backend to be idle again before the next one is submitted.
+    await _waitUntilIdle();
   }
-  toast('Done! '+done+' categories exported','ok');
+  if(failed) toast((done-failed)+'/'+done+' categories exported ('+failed+' failed — see errors above)', failed===done?'err':'wrn');
+  else toast('Done! '+done+' categories exported','ok');
   pollBusy();
 }
 
