@@ -1785,27 +1785,6 @@ def api_browse_folder():
     except Exception as e:
         return jsonify({"path": "", "error": str(e)})
 
-@flask_app.route("/api/browse_m3u_file", methods=["GET"])
-def api_browse_m3u_file():
-    """Desktop only: save-as dialog to set the M3U output path with a predefined filename."""
-    default_name = request.args.get("name", "playlist.m3u")
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.wm_attributes("-topmost", True)
-        path = filedialog.asksaveasfilename(
-            title="Set M3U Output Path",
-            initialfile=default_name,
-            defaultextension=".m3u",
-            filetypes=[("M3U playlist", "*.m3u *.m3u8"), ("All files", "*.*")],
-        )
-        root.destroy()
-        return jsonify({"path": path or ""})
-    except Exception as e:
-        return jsonify({"path": "", "error": str(e)})
-
 
 @flask_app.route("/api/reveal_in_folder", methods=["POST"])
 def api_reveal_in_folder():
@@ -3203,10 +3182,12 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <!-- DESKTOP: path inputs + tkinter browse buttons -->
         <div id="out-paths-desktop">
           <div class="prow" style="position:relative">
-            <span class="plbl">M3U:</span>
-            <input id="o-m3u" type="text" placeholder="/sdcard/Download/playlist.m3u" oninput="saveFP()" style="height:30px;font-size:12px">
+            <span class="plbl">M3U folder:</span>
+            <input id="o-m3u" type="text" placeholder="/sdcard/Download/" oninput="saveFP()" style="height:30px;font-size:12px"
+              title="Output folder for M3U exports — the filename is auto-generated per export (portal + date + session export number)">
             <button class="btn-ghost psug-btn" onclick="outBrowseRow('m3u')" title="Browse">&#x1F4C2;</button>
           </div>
+          <div id="o-m3u-preview" style="font-size:10px;color:var(--txt3);margin:-3px 0 2px 2px"></div>
           <div class="prow" style="position:relative">
             <span class="plbl">Download:</span>
             <input id="o-dir" type="text" placeholder="/sdcard/Download/" oninput="saveFP()" style="height:30px;font-size:12px">
@@ -3254,22 +3235,19 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
             <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/storage/emulated/0')">&#x1F4F1; /storage/0</button>
             <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px" onclick="outFbNav('/data/data/com.termux/files/home')">&#x1F5A5; Termux</button>
           </div>
-          <!-- M3U: filename input + quick presets -->          <!-- M3U: filename input + quick presets -->
+          <!-- M3U: filename is auto-generated, this just previews it -->
           <div id="out-fb-fname-row" style="display:none;align-items:center;gap:6px;margin-bottom:5px">
-            <span style="font-size:10px;color:var(--txt3);white-space:nowrap">Filename:</span>
-            <input id="out-fb-fname" type="text" placeholder="playlist.m3u"
-              style="flex:1;height:24px;font-size:11px;padding:0 7px;border-radius:var(--rss);
-                     border:1px solid var(--bdr2);background:var(--s3);color:var(--txt)"
-              autocomplete="off" autocorrect="off" spellcheck="false">
+            <span style="font-size:12px">&#x2139;&#xFE0F;</span>
+            <span id="out-fb-fname-preview" style="font-size:10px;color:var(--txt3);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
           </div>
-                    <div id="out-fb-m3u-presets" style="display:none;flex-wrap:wrap;gap:3px;margin-bottom:5px">
-            <span style="font-size:10px;color:var(--txt3);width:100%;margin-bottom:2px">&#x26A1; Quick set M3U path:</span>            <span style="font-size:10px;color:var(--txt3);width:100%;margin-bottom:2px">&#x26A1; Quick set M3U path:</span>
+          <div id="out-fb-m3u-presets" style="display:none;flex-wrap:wrap;gap:3px;margin-bottom:5px">
+            <span style="font-size:10px;color:var(--txt3);width:100%;margin-bottom:2px">&#x26A1; Quick set M3U folder:</span>
             <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
-              onclick="outFbQuickApply('/sdcard/Download/playlist.m3u')">/sdcard/DL/playlist.m3u</button>              onclick="outFbQuickApply('/sdcard/Download/playlist.m3u')">/sdcard/DL/playlist.m3u</button>
+              onclick="outFbQuickApply('/sdcard/Download/')">/sdcard/Download/</button>
             <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
-              onclick="outFbQuickApply('/storage/emulated/0/Download/playlist.m3u')">/0/DL/playlist.m3u</button>              onclick="outFbQuickApply('/storage/emulated/0/Download/playlist.m3u')">/0/DL/playlist.m3u</button>
+              onclick="outFbQuickApply('/storage/emulated/0/Download/')">/0/Download/</button>
             <button class="btn-ghost" style="font-size:10px;height:20px;padding:0 6px"
-              onclick="outFbQuickApply('/data/data/com.termux/files/home/playlist.m3u')">Termux ~/playlist.m3u</button>              onclick="outFbQuickApply('/data/data/com.termux/files/home/playlist.m3u')">Termux ~/playlist.m3u</button>
+              onclick="outFbQuickApply('/data/data/com.termux/files/home/')">Termux ~/</button>
           </div>
           <!-- Download dir: quick presets -->          <!-- Download dir: quick presets -->
           <div id="out-fb-dir-presets" style="display:none;flex-wrap:wrap;gap:3px;margin-bottom:5px">
@@ -5668,6 +5646,22 @@ function _clearSelection(){
   refreshCatBtns();
 }
 
+// Restores the M3U output *folder* setting on page load, migrating from the
+// old 'm3u_path' key (a full file path, e.g. .../playlist.m3u) if a new
+// 'm3u_folder' value hasn't been saved yet — so existing users keep their
+// configured location instead of silently reverting to the default.
+function _restoreM3uFolder(){
+  try{
+    let folder = localStorage.getItem('m3u_folder');
+    if(!folder){
+      const legacy = localStorage.getItem('m3u_path');
+      folder = legacy ? (legacy.replace(/[^\/]*$/, '') || '/sdcard/Download/') : '/sdcard/Download/';
+    }
+    document.getElementById('o-m3u').value = folder;
+  }catch(e){}
+  if(typeof _refreshM3uPreview==='function') _refreshM3uPreview();
+}
+
 async function dlSelectedAll(type){
   // MKV ignores whole-category selections entirely — it only ever acts on
   // individually selected items (selSet). Category-level MKV never worked
@@ -5682,8 +5676,17 @@ async function dlSelectedAll(type){
   }
   const nCats=selCats.size, nItems=selSet.size;
   if(!nCats && !nItems){toast('Select categories or items first','wrn');return;}
-  if(nCats) await dlSelCats();
-  if(nItems) await dlM3U();
+  if(!document.getElementById('o-m3u').value.trim()){toast('Set M3U output folder in \u2699 settings','wrn');return;}
+  // A previous export (single-item or multi-category) may still be
+  // finishing server-side — wait for it, or this request can 409 exactly
+  // like the multi-category race dlSelCats() guards against internally.
+  await _waitUntilIdle();
+  // Computed once so a combined categories+items export lands in a single
+  // file rather than each part generating (and consuming) its own number.
+  const outPath=_nextM3uOutPath();
+  if(nCats) await dlSelCats(outPath);
+  if(nItems) await dlM3U(outPath);
+  if(typeof _refreshM3uPreview==='function') _refreshM3uPreview();
 }
 // Polls /api/status until the backend job has actually *finished* rather
 // than just been *accepted*. state.busy is one global flag shared by every
@@ -5705,13 +5708,16 @@ async function _waitUntilIdle(maxWaitMs=120000){
 }
 
 // Whole-category export. MKV is intentionally not supported at the category
-// level (see dlSelectedAll above) — this now only ever performs M3U export,
-// so it takes no `type` argument.
-async function dlSelCats(){
+// level (see dlSelectedAll above) — this now only ever performs M3U export.
+// Accepts an optional pre-computed out_path (shared with a sibling dlM3U()
+// call from dlSelectedAll); falls back to generating its own if called
+// standalone.
+async function dlSelCats(outPath){
   const cats=[...selCats.values()];
   if(!cats.length){toast('Select categories first','wrn');return;}
-  const op=document.getElementById('o-m3u').value.trim();
-  if(!op){toast('Set M3U output path in ⚙ settings','wrn');return;}
+  const folder=document.getElementById('o-m3u').value.trim();
+  if(!folder){toast('Set M3U output folder in ⚙ settings','wrn');return;}
+  const op = outPath || _nextM3uOutPath();
   setBusy(true);
   _showProgressNow('m3u_inline','💾 Saving M3U\u2026',cats.map(c=>c.title).join(', '),0);
   let done=0, failed=0;
@@ -8023,9 +8029,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   try{const sv=localStorage.getItem('mkv_folder');
     if(sv) document.getElementById('o-dir').value=sv;
     else document.getElementById('o-dir').value='/sdcard/Download/';}catch(e){}
-  try{const sm=localStorage.getItem('m3u_path');
-    if(sm) document.getElementById('o-m3u').value=sm;
-    else document.getElementById('o-m3u').value='/sdcard/Download/playlist.m3u';}catch(e){}
+  _restoreM3uFolder();
   try{const sdv=localStorage.getItem('dvr_folder');
     if(sdv) document.getElementById('o-dvr').value=sdv;
     else document.getElementById('o-dvr').value='/sdcard/Download/DVR/';}catch(e){}
