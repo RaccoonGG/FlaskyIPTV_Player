@@ -2221,19 +2221,66 @@ function _endM3uProgress(titleText){
   if(bar) bar.style.animation = '';
 }
 
-async function dlM3U(){
-  const op=document.getElementById('o-m3u').value.trim();
-  if(!op){toast('Set M3U output path first','wrn');return;}
+// ── M3U auto-filename generation ────────────────────────────────────────────
+// o-m3u now holds a FOLDER only (like o-dir/o-dvr). The actual filename for
+// each export is generated as <portal>_<date>_<n>.m3u, where n is a counter
+// that increments once per export operation *for this browser session* (not
+// per category/item) — resets to 1 on a fresh page load, as intended.
+let _m3uSessionExportCount = 0;
+
+// Deterministic parts only — no side effects, safe to call for UI previews.
+function _m3uFilenameParts(){
+  const portalRaw = (document.getElementById('portal-name-label')?.textContent || '').trim();
+  const portal = (portalRaw && portalRaw !== '\u2014')
+    ? portalRaw.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 60)
+    : 'export';
+  const d = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  const date = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  return { portal, date };
+}
+
+// Builds the full output path for ONE export operation and advances the
+// session counter. Call this exactly once per user-facing export action
+// (see dlSelectedAll) so a multi-category+item export still lands in a
+// single combined file rather than being split across several.
+function _nextM3uOutPath(){
+  const folder = (document.getElementById('o-m3u')?.value || '/sdcard/Download').trim().replace(/\/+$/, '');
+  const { portal, date } = _m3uFilenameParts();
+  _m3uSessionExportCount++;
+  return folder + '/' + portal + '_' + date + '_' + _m3uSessionExportCount + '.m3u';
+}
+
+// Non-incrementing preview of what the *next* export will be named — safe
+// to call as often as needed to keep the settings UI's hint up to date.
+function _previewM3uFilename(){
+  const { portal, date } = _m3uFilenameParts();
+  return portal + '_' + date + '_' + (_m3uSessionExportCount + 1) + '.m3u';
+}
+
+function _refreshM3uPreview(){
+  const preview = 'Next: ' + _previewM3uFilename();
+  const d1 = document.getElementById('o-m3u-preview');
+  if(d1) d1.textContent = preview;
+  const d2 = document.getElementById('out-fb-fname-preview');
+  if(d2) d2.textContent = preview;
+}
+
+async function dlM3U(outPath){
+  const folder=document.getElementById('o-m3u').value.trim();
+  if(!folder){toast('Set M3U output folder first','wrn');return;}
   if(!selSet.size){toast('Select items first','wrn');return;}
+  const op = outPath || _nextM3uOutPath();
   setBusy(true);
   _showProgressNow('m3u_inline','💾 Saving M3U…', curCat?curCat.title:'', selSet.size);
   const r=await fetch('/api/download/m3u',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({items:[...selSet],category:curCat,mode,out_path:op,total_hint:selSet.size})});
   const d=await r.json();
-  if(d.ok){toast(d.message,'ok');pollBusy();setTimeout(()=>dlmRefresh().catch(()=>{}),1000);}
+  if(d.ok){toast(d.message,'ok');pollBusy();setTimeout(()=>dlmRefresh().catch(()=>{}),1000);_refreshM3uPreview();}
   else{toast(d.error,'err');setBusy(false);_endM3uProgress('\u26a0\ufe0f Save Failed');}
 }
+
 
 // Mobile MKV button — opens Actions drawer if download in progress, else downloads
 window._mobMkvClick = function(){
@@ -2617,8 +2664,9 @@ document.addEventListener('click',e=>{
 });
 function saveFP(){
   try{localStorage.setItem('mkv_folder',document.getElementById('o-dir').value);}catch(e){}
-  try{localStorage.setItem('m3u_path',document.getElementById('o-m3u').value);}catch(e){}
+  try{localStorage.setItem('m3u_folder',document.getElementById('o-m3u').value);}catch(e){}
   try{const dv=document.getElementById('o-dvr');if(dv)localStorage.setItem('dvr_folder',dv.value);}catch(e){}
+  if(typeof _refreshM3uPreview==='function') _refreshM3uPreview();
 }
 // ── Shared output-path mobile browser ─────────────────────────────────────
 let _outFbTarget     = 'm3u';
@@ -2627,7 +2675,7 @@ let _outFbOpen       = false;
 let _outFbMobileMode = false;
 
 // localStorage key map — source of truth for all three paths
-const _outFbLsKey = {m3u:'m3u_path', dir:'mkv_folder', dvr:'dvr_folder'};
+const _outFbLsKey = {m3u:'m3u_folder', dir:'mkv_folder', dvr:'dvr_folder'};
 
 // ── State synchronisation ──────────────────────────────────────────────────
 function _outFbSyncReadouts(){
@@ -2665,7 +2713,7 @@ function _outFbApplyState(){
 function outFbToggle(){
   _outFbOpen = !_outFbOpen;
   _outFbApplyState();
-  if(_outFbOpen) outFbSetTarget(_outFbTarget);
+  if(_outFbOpen){ outFbSetTarget(_outFbTarget); _refreshM3uPreview(); }
 }
 function outFbClose(){
   _outFbOpen = false;
@@ -2677,7 +2725,7 @@ function outFbSetTarget(t){
   document.querySelectorAll('.out-fb-tgt').forEach(b=>b.classList.remove('active'));
   const tb = document.getElementById('out-fb-tgt-'+t);
   if(tb) tb.classList.add('active');
-  // Filename row — only for M3U
+  // Info row — only shown for M3U, now just previews the auto-generated name
   const fnRow = document.getElementById('out-fb-fname-row');
   if(fnRow) fnRow.style.display = (t==='m3u') ? 'flex' : 'none';
   // Update the single path readout label + value for the new tab
@@ -2686,20 +2734,15 @@ function outFbSetTarget(t){
   const val = document.getElementById('out-mob-path-val');
   if(lbl) lbl.textContent = lblMap[t] || '';
   if(val) val.textContent = (localStorage.getItem(_outFbLsKey[t])) || '(not set)';
-  if(t==='m3u'){
-    // Pre-fill filename from localStorage
-    const cur  = localStorage.getItem('m3u_path') || '';
-    const base = cur.split('/').pop() || 'playlist.m3u';
-    const inp  = document.getElementById('out-fb-fname');
-    if(inp) inp.value = base;
-    // Start path = directory of saved M3U path
-    const dir = cur.includes('/') ? cur.replace(/\/[^/]+$/, '') : _outFbCurPath;
-    if(dir && dir !== _outFbCurPath){
-      _outFbCurPath = dir;
-      const pathEl = document.getElementById('out-fb-path');
-      if(pathEl) pathEl.textContent = dir;
-    }
+  // All three targets are folder-only now — jump to whichever folder is
+  // already saved for the tab being switched to.
+  const savedDir = (localStorage.getItem(_outFbLsKey[t]) || '').replace(/\/+$/, '');
+  if(savedDir && savedDir !== _outFbCurPath){
+    _outFbCurPath = savedDir;
+    const pathEl = document.getElementById('out-fb-path');
+    if(pathEl) pathEl.textContent = savedDir;
   }
+  if(t==='m3u') _refreshM3uPreview();
   outFbNav(_outFbCurPath);
 }
 
@@ -2716,10 +2759,9 @@ async function outFbNav(path){
   const upBtn  = document.getElementById('out-fb-up');
   if(pathEl) pathEl.textContent = path;
   if(listEl) listEl.innerHTML = '<div style="padding:8px;font-size:12px;color:var(--txt3)">Loading\u2026</div>';
-  const dirsOnly = (_outFbTarget !== 'm3u');
   try{
     const r = await fetch('/api/browse_dir',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({path, dirs_only:dirsOnly})});
+      body:JSON.stringify({path, dirs_only:true})});
     const d = await r.json();
     if(upBtn) upBtn.disabled = !d.parent;
     const rows = [];
@@ -2729,15 +2771,9 @@ async function outFbNav(path){
         <span class="sub-fb-icon">\uD83D\uDCC1</span><span class="sub-fb-name">${esc(name)}</span><span class="sub-fb-arr">\u203a</span>
       </div>`);
     }
-    for(const name of (d.files||[])){
-      const fp = path.replace(/\/+$/,'') + '/' + name;
-      rows.push(`<div class="sub-fb-row sub-fb-file" onclick="outFbPickFile('${esc(fp)}')">
-        <span class="sub-fb-icon">\uD83D\uDCC4</span><span class="sub-fb-name">${esc(name)}</span>
-      </div>`);
-    }
     if(!rows.length) rows.push('<div style="padding:8px;font-size:12px;color:var(--txt3)">No items here.</div>');
     if(listEl) listEl.innerHTML = rows.join('');
-    if(d.error && !d.dirs.length && !d.files.length && listEl){
+    if(d.error && !d.dirs.length && listEl){
       listEl.innerHTML = `<div style="padding:8px;font-size:12px;color:#f87171">\u26a0 ${esc(d.error)}</div>`;
     }
   }catch(e){
@@ -2747,15 +2783,8 @@ async function outFbNav(path){
 
 function outFbConfirm(){
   const dir = (document.getElementById('out-fb-path')?.textContent || _outFbCurPath).replace(/\/+$/,'');
-  if(_outFbTarget === 'm3u'){
-    const inp   = document.getElementById('out-fb-fname');
-    const fname = (inp && inp.value.trim()) || 'playlist.m3u';
-    outFbApply(dir + '/' + fname);
-  } else {
-    outFbApply(dir + '/');
-  }
+  outFbApply(dir + '/');
 }
-function outFbPickFile(fp){ outFbApply(fp); }
 
 function outFbApply(val){
   const lsKey = _outFbLsKey[_outFbTarget];
@@ -2792,13 +2821,11 @@ async function outBrowseRow(target){
     outFbSetTarget(target);
     return;
   }
-  // Desktop without mobile mode: try tkinter picker
-  const _m3uBase = (document.getElementById('o-m3u')?.value||'').split('/').pop()||'playlist.m3u';
-  const apiUrl = (target === 'm3u')
-    ? '/api/browse_m3u_file?name='+encodeURIComponent(_m3uBase)
-    : '/api/browse_folder';
+  // Desktop without mobile mode: try tkinter folder picker. All three output
+  // paths (M3U/Download/DVR) are folder-only — M3U's filename is generated
+  // per export from the portal name, date, and a per-session counter.
   try{
-    const r = await fetch(apiUrl);
+    const r = await fetch('/api/browse_folder');
     const d = await r.json();
     if(d.path && d.path.length){
       const idMap = {m3u:'o-m3u', dir:'o-dir', dvr:'o-dvr'};
