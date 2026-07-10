@@ -2284,8 +2284,7 @@ async function dlM3U(outPath){
 
 // Mobile MKV button — opens Actions drawer if download in progress, else downloads
 window._mobMkvClick = function(){
-  const stopBtn = document.getElementById('stopbtn');
-  if(stopBtn && !stopBtn.disabled) openActTab();  // busy = stopbtn enabled
+  if(_dlActive) openActTab();
   else dlNowMKV();
 };
 
@@ -2545,7 +2544,6 @@ function setStatus(m){
 function setBusy(v){
   document.getElementById('busy-sp').classList.toggle('hidden',!v);
   document.getElementById('cbtn').disabled=v;
-  document.getElementById('stopbtn').disabled=!v;
 }
 
 // ── DOWNLOAD-AWARE BUTTON SYNC ──────────────────────────────
