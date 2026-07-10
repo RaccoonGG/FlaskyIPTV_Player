@@ -3050,7 +3050,6 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
     <div class="hdr-r">
       <span id="busy-sp" class="spin hidden"></span>
       <span id="hdr-tags">{{ tags_html | safe }}</span>
-      <button class="btn-ghost hdr-ico" id="stopbtn" onclick="doStop()" disabled title="Stop">⏹</button>
       <button class="btn-ghost hdr-ico" id="gsrch-btn" onclick="openGlobalSearch()" title="Global channel search">🔍</button>
       <button class="btn-ghost hdr-ico" onclick="openWhatsOn()" title="What's on Now">📺</button>
       <button class="btn-ghost hdr-ico" onclick="refreshPlaylist()" title="Refresh playlist — clear cache &amp; reconnect" id="refresh-btn">🔄</button>
