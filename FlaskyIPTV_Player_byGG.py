@@ -38,7 +38,7 @@ import warnings
 import gzip as _gzip
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urlparse, quote, quote_plus, unquote, parse_qs
+from urllib.parse import urlparse, urlunparse, quote, quote_plus, unquote, parse_qs
 import asyncio
 import concurrent.futures
 import webbrowser
@@ -629,12 +629,100 @@ def run_worker(coro, on_done=None):
 
 # ===================== CONNECT LOGIC =====================
 
-async def _connect_async():
+# --- Alt/backup URL failover -------------------------------------------
+# A saved playlist may carry additional "backup" URLs. If the primary URL
+# fails to connect, each backup is tried in turn — same saved MAC /
+# username / password — before the connect is reported as failed. See
+# _connect_with_failover_async() below, which orchestrates this around the
+# existing, unmodified _connect_async() single-attempt logic.
+#
+# Semantics (see plan discussion): MAC/Stalker/Xtream backups are a
+# wholesale replacement of the base URL (normalize_base_url() already
+# discards any path from *either* the primary or a backup, so this exactly
+# matches how the primary URL is already treated). M3U backups replace
+# only scheme+host+port, preserving the saved M3U URL's path/query, since
+# that URL is a complete resource reference (e.g. get.php?username=..),
+# not a bare base.
+
+MAX_ALT_URLS = 10                    # hard cap on backup URLs tried per connect attempt
+_BACKUP_SUBMIT_TIMEOUT = 25.0        # sec — MAC/Stalker/Xtream backup attempts (vs. 90s for the primary)
+_BACKUP_M3U_TIMEOUT_TOTAL = 45.0     # sec — M3U backup attempts (vs. 300s for the primary)
+_BACKUP_M3U_TIMEOUT_CONNECT = 8.0    # sec — M3U backup attempts (vs. 20s for the primary)
+
+
+def _ensure_scheme(u: str) -> str:
+    """Prepend http:// when a URL has no scheme at all, so a value typed
+    without one (e.g. 'datahub11.com/c/') doesn't silently normalize to a
+    hostless, broken base via urlparse()."""
+    u = (u or "").strip()
+    if u and "://" not in u:
+        u = "http://" + u
+    return u
+
+
+def _candidate_key(u: str) -> str:
+    """Comparison key used for de-duplication only — collapses two URLs
+    that differ merely in trailing slash, path, or explicit default port
+    down to the same scheme://host:port bucket."""
+    try:
+        return normalize_base_url(_ensure_scheme(u))
+    except Exception:
+        return _ensure_scheme(u).lower()
+
+
+def _sanitize_alt_urls(raw, primary: str) -> list:
+    """Clean, de-duplicate (against the primary and against each other),
+    and cap a raw list of backup URL strings from the request payload.
+    Order is preserved — this is the try-order for failover."""
+    seen = {_candidate_key(primary)}
+    out = []
+    for item in (raw or []):
+        u = _ensure_scheme(str(item or ""))
+        if not u:
+            continue
+        key = _candidate_key(u)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(u)
+        if len(out) >= MAX_ALT_URLS:
+            break
+    return out
+
+
+def _build_m3u_candidate(primary_m3u_url: str, alt_url: str) -> str:
+    """Construct a backup M3U URL by swapping only scheme+host+port from
+    *alt_url* onto the primary's path/query/fragment. The primary's path
+    and query are what actually identify the playlist/account on a given
+    provider script (e.g. get.php?username=..&password=..&type=m3u_plus) —
+    a bare backup base has no meaning here the way it does for MAC/Xtream.
+    If the primary URL carries HTTP basic-auth userinfo (user:pass@host)
+    and the backup entry doesn't specify its own, the primary's is carried
+    over so an unusual basic-auth-protected M3U source still works."""
+    p = urlparse(_ensure_scheme(primary_m3u_url))
+    a = urlparse(_ensure_scheme(alt_url))
+    netloc = a.netloc
+    if "@" not in netloc and "@" in p.netloc:
+        netloc = p.netloc.rsplit("@", 1)[0] + "@" + netloc
+    return urlunparse((a.scheme, netloc, p.path, p.params, p.query, p.fragment))
+
+
+async def _connect_async(is_backup_attempt: bool = False):
     conn = state.conn_type
     # Snapshot the current connection epoch synchronously (before any await).
     # If api_connect() is called again while we're suspended in a long I/O operation,
     # _connect_epoch will have been incremented and our guard checks will catch it.
     my_epoch = state._connect_epoch
+
+    # Timeout budgets: the primary attempt keeps its original, generous
+    # values (unchanged behaviour). A backup-URL attempt gets a tighter
+    # budget so one dead/hanging mirror can't stall the whole failover
+    # sequence for minutes — see _connect_with_failover_async().
+    _submit_timeout = _BACKUP_SUBMIT_TIMEOUT if is_backup_attempt else 90
+    _m3u_timeout_kwargs = (
+        {"timeout_total": _BACKUP_M3U_TIMEOUT_TOTAL, "timeout_connect": _BACKUP_M3U_TIMEOUT_CONNECT}
+        if is_backup_attempt else {}
+    )
 
     if conn == "m3u_url":
         m3u_url = state.m3u_url
@@ -677,6 +765,7 @@ async def _connect_async():
                     is_stalker=False,
                     connect_epoch=my_epoch,
                     get_epoch_fn=lambda: state._connect_epoch,
+                    submit_timeout=_submit_timeout,
                 )
                 if result.get("success"):
                     _cli = state.portal_mgr.client
@@ -709,7 +798,7 @@ async def _connect_async():
 
         # Pure M3U
         state.m3u_xtream_override = None
-        client = M3UClient(m3u_url, state.log)
+        client = M3UClient(m3u_url, state.log, **_m3u_timeout_kwargs)
         async with client:
             await client.handshake()
             # Epoch guard: a new api_connect() may have arrived while the M3U
@@ -726,7 +815,7 @@ async def _connect_async():
             max_conn = _ai3[2] if len(_ai3) > 2 else 0
             state.log(f"[CONNECT] ✓ Connected: {ident} | {exp}")
             for m in ("live", "vod", "series"):
-                tmp = M3UClient(m3u_url, state.log, preloaded=state.m3u_cache)
+                tmp = M3UClient(m3u_url, state.log, preloaded=state.m3u_cache, **_m3u_timeout_kwargs)
                 async with tmp:
                     state.cats_cache[m] = await tmp.fetch_categories(m)
                     state.log(f"[CONNECT] {m.upper()}: {len(state.cats_cache[m])} categories")
@@ -766,6 +855,7 @@ async def _connect_async():
             is_stalker=state.is_stalker_portal,
             connect_epoch=my_epoch,
             get_epoch_fn=lambda: state._connect_epoch,
+            submit_timeout=_submit_timeout,
         )
     except Exception:
         # Network error, timeout, auth exception — ensure the partially-created
@@ -810,6 +900,90 @@ async def _connect_async():
         "max_connections": result.get("max_connections", 0),
         "portal_url":      state.url or state.m3u_url,
         "is_stalker":      state.is_stalker_portal,
+    }
+
+
+async def _connect_with_failover_async(alt_urls) -> dict:
+    """Orchestrates the primary connect attempt plus any configured backup
+    URLs, around the single-attempt _connect_async() above (unmodified
+    except for the is_backup_attempt timeout knob it already accepts).
+
+    - No backups configured (the common case: every playlist saved before
+      this feature, and any without the field filled in) → this is a thin
+      passthrough to _connect_async() with zero behavioural difference
+      from before this feature existed (same exceptions propagate the
+      same way, same return shape — nothing here wraps or reformats it).
+    - Local-file M3U → no network URL exists to fail over; passthrough.
+    - Otherwise: try the primary, then each backup in the saved order,
+      using the *same* MAC/username/password every time. A raised
+      exception OR a {"success": False} result is treated as "this URL
+      failed, try the next one" — EXCEPT error == "superseded", which
+      means a newer /api/connect call has already taken over, and the
+      loop stops immediately rather than burning time on remaining
+      candidates.
+    - Total failure restores state.url/state.m3u_url/is_stalker_portal to
+      the primary's values, so AppState doesn't linger pointed at a dead
+      mirror, and returns an aggregated error naming every candidate that
+      was tried.
+    """
+    if state.conn_type == "m3u_url" and state.m3u_is_local:
+        return await _connect_async()
+
+    is_m3u = (state.conn_type == "m3u_url")
+    primary = state.m3u_url if is_m3u else state.url
+    backups = _sanitize_alt_urls(alt_urls, primary)
+
+    if not backups:
+        return await _connect_async()
+
+    candidates = [primary] + backups
+    last_n = len(candidates) - 1
+    errors = []
+
+    for idx, cand in enumerate(candidates):
+        if idx > 0:
+            if is_m3u:
+                state.m3u_url = _build_m3u_candidate(primary, cand)
+            else:
+                state.url = _ensure_scheme(cand)
+                state.is_stalker_portal = (
+                    state.conn_type == "mac" and "stalker_portal" in state.url.lower()
+                )
+            _shown = state.m3u_url if is_m3u else state.url
+            state.log(f"[CONNECT] Backup URL {idx}/{last_n} — trying {_shown}")
+
+        try:
+            result = await _connect_async(is_backup_attempt=(idx > 0))
+        except Exception as e:
+            state.log(f"[CONNECT] ✗ Backup failed: {cand} — {e}")
+            errors.append((cand, str(e)))
+            continue
+
+        if result.get("success"):
+            if idx > 0:
+                state.log(f"[CONNECT] ✓ Connected via backup URL ({idx}/{last_n}): {cand}")
+            return result
+
+        if result.get("error") == "superseded":
+            return result  # a newer connect() call took over — stop, don't try more
+
+        state.log(f"[CONNECT] ✗ Backup failed: {cand} — {result.get('error', 'unknown error')}")
+        errors.append((cand, result.get("error", "unknown error")))
+
+    # All candidates exhausted — restore primary so AppState doesn't linger
+    # pointed at a dead mirror.
+    if is_m3u:
+        state.m3u_url = primary
+    else:
+        state.url = primary
+        state.is_stalker_portal = (
+            state.conn_type == "mac" and "stalker_portal" in primary.lower()
+        )
+    summary = " | ".join(f"{c}: {e}" for c, e in errors)
+    return {
+        "success": False,
+        "error": f"All {len(candidates)} URL(s) failed — {summary}",
+        "categories": {}, "ident": "", "exp": "",
     }
 
 
@@ -983,8 +1157,10 @@ def api_connect():
                 state.m3u_cache = None
                 state.m3u_is_local = False
 
+    alt_urls = data.get("alt_urls") or []
+
     try:
-        result = run_async(_connect_async())
+        result = run_async(_connect_with_failover_async(alt_urls))
         # Ensure "All Channels / All VOD / All Series" appears at the top of
         # each mode's category list with id="__all__" so api_items() always
         # routes it through the correct fast path instead of paginating with a
@@ -3788,6 +3964,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
             </div>
           </details>
         </div>
+        <div class="pl-row"><label title="Tried in order, with the same login as above, if the primary URL fails to connect">Alt URLs</label><textarea id="pl-alt-urls" rows="3" placeholder="Backup portal URLs, one per line — tried in order (same login) if the URL above fails" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;flex:1;height:50px;font-family:monospace;font-size:11px"></textarea></div>
         <div class="pl-row" style="justify-content:flex-end;gap:7px">
           <button class="btn-ghost" onclick="plClearForm()" style="height:34px;padding:0 12px;font-size:12px">Clear</button>
           <button class="btn-acc" onclick="plSave()" style="height:34px;padding:0 16px;font-size:12px">💾 Save</button>
@@ -4119,7 +4296,15 @@ function _getUaCustom() {
 }
 
 // ── CONNECT ────────────────────────────────────────────────
-async function doConnect(){
+// Alt/backup URLs for whichever connection is currently loaded (empty for
+// a manual connect). Set at the top of doConnect() on every call — success
+// or failure — so refreshPlaylist() can reconnect with the same failover
+// list without needing its own copy of the saved playlist entry.
+let _lastConnectAltUrls = [];
+
+async function doConnect(altUrls){
+  const _altUrls = Array.isArray(altUrls) ? altUrls.slice(0,10) : [];
+  _lastConnectAltUrls = _altUrls;
   const xurl = document.getElementById('i-xu')?.value.trim()||'';
   const url = CT==='xtream' ? xurl : document.getElementById('i-url').value.trim();
   const payload={
@@ -4129,6 +4314,7 @@ async function doConnect(){
     password:document.getElementById('i-pw').value.trim(),
     m3u_url:document.getElementById('i-m3u').value.trim(),
     m3u_content: CT==='m3u_url' && !document.getElementById('i-m3u').value.trim() ? (_m3uLocalContent||'') : '',
+    alt_urls: _altUrls,
     ext_epg_url:(CT==='xtream'
       ? document.getElementById('i-epg').value.trim()
       : CT==='mac'
@@ -4160,7 +4346,18 @@ async function doConnect(){
       isStalker = !!d.is_stalker;
       const _rawUrl = payload.m3u_url || payload.url || '';
       const _portalHost = _rawUrl ? (()=>{try{return new URL(_rawUrl).hostname;}catch(e){return _rawUrl.replace(/https?:\/\//,'').split('/')[0].split(':')[0];}})() : '';
-      document.getElementById('portal-name-label').textContent = _portalHost || '—';
+      // Display label prefers the URL actually connected to (relevant when a
+      // backup URL had to be used) — deliberately kept separate from
+      // _portalHost below, which anchors favorites / hidden-channel /
+      // category-order storage keys and must stay tied to the *saved*
+      // primary URL, or failing over would silently fragment those stores
+      // into a different key per mirror the user happens to land on.
+      const _actualUrl = d.portal_url || _rawUrl;
+      const _actualHost = _actualUrl ? (()=>{try{return new URL(_actualUrl).hostname;}catch(e){return _actualUrl.replace(/https?:\/\//,'').split('/')[0].split(':')[0];}})() : '';
+      const _lbl = document.getElementById('portal-name-label');
+      _lbl.textContent = _actualHost || _portalHost || '—';
+      _lbl.title = (_actualHost && _portalHost && _actualHost !== _portalHost)
+        ? ('Connected via backup URL: '+_actualHost+'  (saved as '+_portalHost+')') : '';
       // Include the credential (username for Xtream/M3U, MAC for MAC/Stalker) so
       // two different logins on the same portal host get completely separate fav stores.
       const _credSlug = (payload.username || payload.mac || '').trim().toLowerCase()
@@ -4222,6 +4419,7 @@ async function doConnect(){
           m3u_url: payload.m3u_url,
           ext_epg_url: payload.ext_epg_url||'',
           epg_offset_secs: payload.epg_offset_secs||0,
+          alt_urls: [],
         };
         arr.push(entry);
         plSaveAll(arr);
@@ -4247,12 +4445,17 @@ async function doConnect(){
       document.getElementById('cdot').classList.remove('on');
       document.getElementById('conn-btn').classList.remove('connected');
       setStatus('Error: '+(d.error||'Unknown'));
-      document.getElementById('portal-name-label').textContent = '—';
+      const _flbl = document.getElementById('portal-name-label');
+      _flbl.textContent = '—'; _flbl.title = '';
       toast(d.error||'Connection failed','err');
       alog('❌ '+(d.error||''),'e');
       toggleCP(); // re-open so user can fix credentials
     }
-  }catch(e){setStatus('Error: '+e.message);toast(e.message,'err');document.getElementById('portal-name-label').textContent='—';}
+  }catch(e){
+    setStatus('Error: '+e.message);toast(e.message,'err');
+    const _elbl = document.getElementById('portal-name-label');
+    _elbl.textContent='—'; _elbl.title='';
+  }
   finally{setBusy(false);}
 }
 
@@ -4284,7 +4487,7 @@ async function refreshPlaylist(){
     allItems = []; filtItems = []; curCat = null; navStack = [];
     _clearSelection();
     // 3. Reconnect — re-fetches categories and rebuilds everything
-    await doConnect();
+    await doConnect(_lastConnectAltUrls);
   } catch(e){
     toast('Refresh failed: ' + e.message, 'err');
   } finally {
@@ -7817,6 +8020,7 @@ function renderPLList(){
       +'<div class="pli-info"><div class="pli-name" style="display:flex;align-items:center;gap:6px">'
       +'<span>'+esc(p.name||'Untitled')+'</span>'
       +'<span class="pli-type-badge '+(typeCls[t]||'pli-type-mac')+'">'+typeLbl[t]+'</span>'
+      +(p.alt_urls && p.alt_urls.length ? '<span class="pli-type-badge" style="background:rgba(148,163,184,.18);color:var(--txt2,#94a3b8);border-color:rgba(148,163,184,.35)" title="'+p.alt_urls.length+' backup URL(s) — tried in order if the URL above fails">+'+p.alt_urls.length+'</span>' : '')
       +'</div>'
       +'<div class="pli-sub">'+esc(sub)+'</div></div>'
       +'<div class="pli-acts">'
@@ -7857,6 +8061,10 @@ function plSave(){
     stalker_signature:  plCT==='mac' ? (document.getElementById('pl-sig')?.value.trim()||'')   : '',
     portal_ua_preset: _plGetUaPreset(),
     portal_ua_custom: _plGetUaCustom(),
+    // One backup URL per line, tried in order if the primary fails.
+    // Cap of 10 mirrors MAX_ALT_URLS on the backend.
+    alt_urls: (document.getElementById('pl-alt-urls')?.value||'')
+      .split('\n').map(s=>s.trim()).filter(Boolean).slice(0,10),
   };
   if(plEditId){
     const idx=arr.findIndex(p=>p.id===plEditId);
@@ -7893,6 +8101,7 @@ function plEdit(i){
   if(document.getElementById('pl-devid'))  document.getElementById('pl-devid').value=p.stalker_device_id||'';
   if(document.getElementById('pl-devid2')) document.getElementById('pl-devid2').value=p.stalker_device_id2||'';
   if(document.getElementById('pl-sig'))    document.getElementById('pl-sig').value=p.stalker_signature||'';
+  if(document.getElementById('pl-alt-urls')) document.getElementById('pl-alt-urls').value=(p.alt_urls||[]).join('\n');
   // Restore UA preset fields for all panel types
   _plSetUaFields(p.portal_ua_preset||'', p.portal_ua_custom||'');
   // scroll form into view
@@ -7908,7 +8117,7 @@ function plClearForm(){
   plEditId=null;
   ['pl-name','pl-url','pl-mac','pl-xu','pl-us','pl-pw','pl-m3u',
    'pl-epg','pl-mac-epg','pl-m3u-epg','pl-epg-offset','pl-mac-epg-offset','pl-m3u-epg-offset',
-   'pl-sn','pl-devid','pl-devid2','pl-sig'].forEach(id=>{
+   'pl-sn','pl-devid','pl-devid2','pl-sig','pl-alt-urls'].forEach(id=>{
     const el=document.getElementById(id); if(el) el.value='';
   });
   // Reset all UA preset selectors, hide custom rows, sync custom dropdowns
@@ -7983,7 +8192,7 @@ async function plConnect(i){
     const s=document.getElementById('i-m3u-ua-preset'); if(s){s.value=preset; _syncUADropdown('i-m3u-ua-preset'); uaPresetChange('i-m3u-ua-preset','i-m3u-ua-custom');}
     const c=document.getElementById('i-m3u-ua-custom'); if(c) c.value=custom;
   }
-  await doConnect();
+  await doConnect(p.alt_urls||[]);
 }
 
 // ── INIT ───────────────────────────────────────────────────
