@@ -4600,7 +4600,9 @@ def _extract_series_name(ep_name: str) -> str:
 
 
 class M3UClient:
-    def __init__(self, m3u_url: str, log_cb, preloaded=None, custom_ua: str = ""):
+    def __init__(self, m3u_url: str, log_cb, preloaded=None, custom_ua: str = "",
+                 timeout_total: float = 300, timeout_connect: float = 20,
+                 xtream_timeout_total: float = 30, xtream_timeout_connect: float = 10):
         self.m3u_url = m3u_url.strip()
         self.log = log_cb
         self.session = None
@@ -4610,16 +4612,24 @@ class M3UClient:
         self._tvg_url = ""
         # UA spoofing — empty = auto-default (VLC), or resolved custom string.
         self.custom_ua: str = (custom_ua or "").strip()
+        # Timeout budgets — defaults match the historical hardcoded values.
+        # A shorter pair is passed in by the connect-failover path when this
+        # client is being tried as a *backup* URL, so a dead/hanging mirror
+        # can't stall the whole failover sequence for minutes at a time.
+        self._timeout_total = timeout_total
+        self._timeout_connect = timeout_connect
+        self._xtream_timeout_total = xtream_timeout_total
+        self._xtream_timeout_connect = xtream_timeout_connect
 
     async def __aenter__(self):
-        _timeout = aiohttp.ClientTimeout(total=300, connect=20, sock_read=None)
+        _timeout = aiohttp.ClientTimeout(total=self._timeout_total, connect=self._timeout_connect, sock_read=None)
         connector = aiohttp.TCPConnector(ssl=False)
         self.session = aiohttp.ClientSession(timeout=_timeout, connector=connector)
         if self._xtream_creds:
             creds = self._xtream_creds
             self._xtream_client = XtreamClient(creds["base"], creds["username"], creds["password"], self.log)
             self._xtream_client.session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=30, connect=10))
+                timeout=aiohttp.ClientTimeout(total=self._xtream_timeout_total, connect=self._xtream_timeout_connect))
         return self
 
     async def __aexit__(self, *args):
@@ -5131,6 +5141,7 @@ class PortalSessionManager:
         is_stalker: bool = False,
         connect_epoch: int = 0,
         get_epoch_fn=None,
+        submit_timeout: float = 90,
     ) -> dict:
         """Create session + client, handshake once (or reuse cached token).
 
@@ -5413,7 +5424,7 @@ class PortalSessionManager:
                 "profile_data": profile_data,
             }
 
-        return self.submit(_do(), timeout=90)
+        return self.submit(_do(), timeout=submit_timeout)
 
     def disconnect(self) -> None:
         """Close the persistent session.  Safe to call from any thread."""
