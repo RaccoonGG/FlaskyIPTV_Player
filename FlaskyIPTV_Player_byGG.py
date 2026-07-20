@@ -38,7 +38,7 @@ import warnings
 import gzip as _gzip
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urlparse, urlunparse, quote, quote_plus, unquote, parse_qs
+from urllib.parse import urlparse, urlunparse, quote, quote_plus, unquote, parse_qs, parse_qsl, urlencode
 import asyncio
 import concurrent.futures
 import webbrowser
@@ -137,7 +137,7 @@ from portal_clients import (
     normalize_base_url, _extract_url_from_text, safe_json, normalize_js,
     extract_xtream_from_m3u_url, _extinf_line, _extract_series_name,
     PortalClient, StalkerPortalClient, XtreamClient, M3UClient,
-    PortalSessionManager,
+    PortalSessionManager, parse_expiry_to_epoch, extract_http_status_from_message,
 )
 
 
@@ -707,6 +707,265 @@ def _build_m3u_candidate(primary_m3u_url: str, alt_url: str) -> str:
     return urlunparse((a.scheme, netloc, p.path, p.params, p.query, p.fragment))
 
 
+# --- Alt/backup ACCOUNT failover ----------------------------------------
+# Distinct dimension from the URL failover above: here the URL is presumed
+# reachable, but the LOGIN itself is no good — expired/banned account,
+# rejected credentials, or a nominally successful handshake that hands back
+# zero content. See _connect_with_failover_async() for how the URL and
+# account dimensions compose (classification-driven, not a full cross
+# product — see that function's docstring for the exact scope).
+
+MAX_ALT_ACCOUNTS = 10
+
+# Hard ceiling on total connect attempts within one /api/connect call,
+# independent of how many URLs/accounts are configured — bounds worst-case
+# latency if someone configures a large number of both (this is a linear
+# URL-list + account-list design, not a full cross product, so in practice
+# this cap is rarely approached — see _connect_with_failover_async()).
+MAX_TOTAL_CONNECT_ATTEMPTS = 20
+
+# What _classify_connect_outcome() below hands back — used to decide which
+# backup dimension (URL vs account) is worth reaching for next.
+_OUTCOME_NETWORK       = "network"        # advance URL, keep account
+_OUTCOME_ACCOUNT       = "account"        # advance account, keep URL
+_OUTCOME_CONTENT_EMPTY = "content_empty"  # advance account, keep URL (heuristic — see flag below)
+_OUTCOME_SUPERSEDED    = "superseded"      # stop everything immediately
+_OUTCOME_HEALTHY       = "healthy"        # genuine, unclassified success
+
+# Xtream user_info.status values (case-insensitive) that mean "this account
+# is not usable" even though the handshake itself succeeded. IPTV panels
+# aren't standardized here — this is the known common set; extend it if a
+# real panel returns different wording.
+_ACCOUNT_BAD_STATUS_VALUES = {
+    "banned", "expired", "disabled", "disable", "inactive", "suspended",
+    "blocked", "canceled", "cancelled", "deactivated",
+}
+
+# Whether "zero live+vod+series categories after an otherwise successful
+# login" alone is trusted to trigger account failover. On by default, and
+# deliberately conservative (requires ALL THREE modes empty, not just one,
+# since a live-only or VOD-only account legitimately has empty categories
+# elsewhere) — flip to False if this proves too aggressive in practice.
+CONTENT_EMPTY_TRIGGERS_ACCOUNT_FAILOVER = True
+
+
+def _redact_url_for_log(url: str) -> str:
+    """Mask password-like query-parameter values before a URL is written to
+    the activity log. M3U URLs commonly embed credentials
+    (get.php?username=..&password=..) and the activity log is user-visible,
+    so this must never leak one. Never raises, and never returns anything
+    other than a string — a logging helper failing must not break the
+    connect flow it's merely describing."""
+    if not url or not isinstance(url, str):
+        return ""
+    try:
+        parts = urlparse(url)
+        if not parts.query:
+            return url
+        pairs = parse_qsl(parts.query, keep_blank_values=True)
+        redacted = [(k, "***" if k.lower() in ("password", "pass", "pwd") else v)
+                    for k, v in pairs]
+        # safe='*' — otherwise urlencode percent-escapes the mask itself
+        # (password=%2A%2A%2A), which defeats the point of a human-readable
+        # activity log.
+        return urlunparse((parts.scheme, parts.netloc, parts.path, parts.params,
+                            urlencode(redacted, safe="*"), parts.fragment))
+    except Exception:
+        return "(url — redaction failed, withheld from log)"
+
+
+def _describe_account(conn_type: str, account: dict) -> str:
+    """Safe-for-activity-log identifier for an account — enough to tell
+    which credential is being tried/succeeded/failed, never a password."""
+    if conn_type == "mac":
+        return f"MAC {account.get('mac', '?')}"
+    if conn_type == "xtream":
+        return f"user '{account.get('username', '?')}'"
+    if conn_type == "m3u_url":
+        return _redact_url_for_log(account.get("m3u_url", "?"))
+    return "account"
+
+
+def _sanitize_alt_macs(raw, primary_mac: str) -> list:
+    """One MAC per entry — cleaned, de-duplicated against the primary and
+    against each other (case-insensitive), capped, order preserved (the
+    try-order for account failover)."""
+    seen = {(primary_mac or "").strip().upper()}
+    out = []
+    for item in (raw or []):
+        mac = str(item or "").strip()
+        if not mac or mac.upper() in seen:
+            continue
+        seen.add(mac.upper())
+        out.append({"mac": mac})
+        if len(out) >= MAX_ALT_ACCOUNTS:
+            break
+    return out
+
+
+def _sanitize_alt_accounts(raw, primary_username: str) -> list:
+    """raw: list of {"username", "password", "url"} dicts, already split
+    from 'user:pass' / 'user:pass:url' lines client-side. An entry missing
+    either username or password is dropped — a backup account needs both.
+    'url', if given, is used only for attempts against THIS account and
+    does not gain its own URL-backup list (see orchestrator docstring)."""
+    seen = {(primary_username or "").strip().lower()}
+    out = []
+    for item in (raw or []):
+        if not isinstance(item, dict):
+            continue
+        u = str(item.get("username") or "").strip()
+        p = str(item.get("password") or "").strip()
+        if not u or not p:
+            continue
+        key = u.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = {"username": u, "password": p}
+        url_override = str(item.get("url") or "").strip()
+        if url_override:
+            entry["url"] = _ensure_scheme(url_override)
+        out.append(entry)
+        if len(out) >= MAX_ALT_ACCOUNTS:
+            break
+    return out
+
+
+def _sanitize_alt_m3u_accounts(raw, primary_m3u_url: str) -> list:
+    """Complete, independent M3U URLs. Unlike URL-level M3U backups these
+    are NOT netloc-swapped onto the primary's path/query — each one is a
+    wholly separate account/provider and is used exactly as given, so
+    dedup compares the full URL, not just its host."""
+    primary_norm = _ensure_scheme(str(primary_m3u_url or "").strip())
+    seen = {primary_norm}
+    out = []
+    for item in (raw or []):
+        u = _ensure_scheme(str(item or "").strip())
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append({"m3u_url": u})
+        if len(out) >= MAX_ALT_ACCOUNTS:
+            break
+    return out
+
+
+def _classify_connect_outcome(exc, result):
+    """Buckets a single connect attempt's outcome so the orchestrator knows
+    which backup dimension — URL or account — is worth reaching for next.
+    Exactly one of exc/result is meaningful per call (exc when
+    _connect_async() raised; result when it returned normally).
+    Returns (outcome, human_reason_string) for logging."""
+    if exc is not None:
+        msg = str(exc)
+        status = extract_http_status_from_message(msg)
+        if status is not None:
+            if 400 <= status <= 499:
+                return _OUTCOME_ACCOUNT, f"HTTP {status} — {msg}"
+            if status >= 500:
+                return _OUTCOME_NETWORK, f"HTTP {status} — {msg}"
+        if isinstance(exc, (OSError, TimeoutError, ConnectionError)):
+            # Covers aiohttp's connector/timeout/OS-level errors too — they
+            # all derive from these standard-library types.
+            return _OUTCOME_NETWORK, msg
+        low = msg.lower()
+        if "authentication failed" in low or "wrong username" in low:
+            return _OUTCOME_ACCOUNT, msg
+        # No embedded status, not a recognized network-exception type: some
+        # response was still produced by *this* server for *this* login in
+        # the overwhelming majority of such cases (a genuine full network
+        # outage almost always surfaces as one of the typed exceptions
+        # above) — default to ACCOUNT rather than silently giving up
+        # without ever trying backup credentials.
+        return _OUTCOME_ACCOUNT, msg
+
+    if result.get("error") == "superseded":
+        return _OUTCOME_SUPERSEDED, "superseded"
+    if not result.get("success"):
+        return _OUTCOME_ACCOUNT, result.get("error", "unknown error")
+
+    # Nominally successful — "successful" only means the handshake
+    # completed; check whether the account is actually usable.
+    status_raw = (result.get("account_status") or "").strip().lower()
+    if status_raw and status_raw in _ACCOUNT_BAD_STATUS_VALUES:
+        return _OUTCOME_ACCOUNT, f"account status: {result.get('account_status')}"
+    exp_epoch = result.get("exp_epoch")
+    if exp_epoch is not None and exp_epoch < time.time():
+        return _OUTCOME_ACCOUNT, f"account expired ({result.get('exp')})"
+    if CONTENT_EMPTY_TRIGGERS_ACCOUNT_FAILOVER:
+        cats = result.get("categories") or {}
+        counts = {m: len(cats.get(m) or []) for m in ("live", "vod", "series")}
+        if counts and all(v == 0 for v in counts.values()):
+            return _OUTCOME_CONTENT_EMPTY, "zero live/vod/series categories despite an accepted login"
+    return _OUTCOME_HEALTHY, ""
+
+
+def _apply_account_to_state(conn_type: str, account: dict, url_for_attempt=None):
+    """Mutate AppState for a single (url, account) attempt. Only the fields
+    relevant to *conn_type* are touched; stalker device overrides, UA
+    settings, and EPG config are deliberately left untouched — those are
+    device/display settings, not per-account identity, and stay whatever
+    the primary had for every backup MAC/account tried."""
+    if conn_type == "mac":
+        state.mac = account["mac"]
+        if url_for_attempt is not None:
+            state.url = url_for_attempt
+            state.is_stalker_portal = ("stalker_portal" in state.url.lower())
+    elif conn_type == "xtream":
+        state.username = account["username"]
+        state.password = account["password"]
+        if url_for_attempt is not None:
+            state.url = url_for_attempt
+    elif conn_type == "m3u_url":
+        state.m3u_url = account["m3u_url"]
+
+
+def _teardown_stale_portal_mgr():
+    """Tear down state.portal_mgr left behind by a *previous* attempt within
+    the same failover sequence, before the next attempt creates its own.
+
+    _connect_async() already disconnects state.portal_mgr on failure (the
+    established pattern used at several points elsewhere in this file) —
+    but it has no reason to when connect_sync() reports success, which
+    happens even for an attempt this orchestrator's classifier is about to
+    override anyway (CONTENT_EMPTY, or a bad account_status/expired
+    exp_epoch). Before this existed, nothing ever called _connect_async() a
+    second time within one request, so a technically-successful-but-empty
+    handshake never needed cleaning up — every subsequent connect was a
+    fresh /api/connect call, with its own fresh AppState reset. Account
+    failover changes that: a MAC/Stalker "wrong credential" commonly
+    manifests as exactly this — a handshake that succeeds with an empty
+    default profile — rather than a raised auth exception (which Xtream's
+    explicit auth=0 check DOES raise, and which the existing cleanup
+    already handles; that's why this specifically surfaced on the MAC/
+    Stalker path first and not Xtream/M3U — not because those are immune).
+
+    Left alive, that abandoned session's background thread/event loop
+    running concurrently with the next attempt's own has been observed in
+    practice to cause spurious low-level connection failures on Windows
+    (WinError 64) on the very next attempt. This closes the session
+    (bounded, via disconnect()'s own short timeout) and asks its loop to
+    stop without blocking on the thread actually exiting — daemon=True
+    means it can't hang process shutdown either way, and blocking here
+    would eat into backup attempts' already-tight timeout budget for no
+    benefit.
+    """
+    mgr = state.portal_mgr
+    if mgr is None:
+        return
+    try:
+        mgr.disconnect()
+    except Exception:
+        pass
+    try:
+        if not mgr.loop.is_closed():
+            mgr.loop.call_soon_threadsafe(mgr.loop.stop)
+    except Exception:
+        pass
+    state.portal_mgr = None
+
+
 async def _connect_async(is_backup_attempt: bool = False):
     conn = state.conn_type
     # Snapshot the current connection epoch synchronously (before any await).
@@ -903,86 +1162,192 @@ async def _connect_async(is_backup_attempt: bool = False):
     }
 
 
-async def _connect_with_failover_async(alt_urls) -> dict:
-    """Orchestrates the primary connect attempt plus any configured backup
-    URLs, around the single-attempt _connect_async() above (unmodified
-    except for the is_backup_attempt timeout knob it already accepts).
+async def _connect_with_failover_async(alt_urls, alt_macs, alt_accounts, alt_m3u_accounts) -> dict:
+    """Orchestrates the primary connect attempt plus two independent backup
+    dimensions, around the single-attempt _connect_async() above (unmodified
+    except for the is_backup_attempt timeout knob it already accepts):
 
-    - No backups configured (the common case: every playlist saved before
-      this feature, and any without the field filled in) → this is a thin
-      passthrough to _connect_async() with zero behavioural difference
-      from before this feature existed (same exceptions propagate the
-      same way, same return shape — nothing here wraps or reformats it).
-    - Local-file M3U → no network URL exists to fail over; passthrough.
-    - Otherwise: try the primary, then each backup in the saved order,
-      using the *same* MAC/username/password every time. A raised
-      exception OR a {"success": False} result is treated as "this URL
-      failed, try the next one" — EXCEPT error == "superseded", which
-      means a newer /api/connect call has already taken over, and the
-      loop stops immediately rather than burning time on remaining
-      candidates.
-    - Total failure restores state.url/state.m3u_url/is_stalker_portal to
-      the primary's values, so AppState doesn't linger pointed at a dead
-      mirror, and returns an aggregated error naming every candidate that
-      was tried.
+      URL backups (alt_urls) — "the login is fine, the address isn't": same
+      MAC/username/password, a different place to reach the same account.
+      Unchanged from the original implementation.
+
+      Account backups (alt_macs / alt_accounts / alt_m3u_accounts) — "the
+      address is fine, the login isn't": a different MAC / username+password
+      / complete M3U URL, tried against a URL already proven reachable.
+
+    No backups of either kind configured (the common case) → thin
+    passthrough to _connect_async(), byte-identical to pre-feature
+    behaviour — same exceptions propagate the same way, same return shape.
+
+    Local-file M3U → no network URL/account exists to fail over; passthrough.
+
+    How the two dimensions compose: deliberately NOT a full url × account
+    cross product (that's U×A attempts, mostly wasted — retrying a
+    proven-bad account against five mirrors of the same panel achieves
+    nothing, and neither does retrying a proven-dead URL with five
+    different logins). The primary attempt's outcome is classified — see
+    _classify_connect_outcome() — and that decides which dimension is
+    worth reaching for:
+
+      NETWORK failure   → try URL backups (same primary account, exactly
+                          as before). If one of those turns out reachable
+                          but rejects the primary account too, or if every
+                          URL is unreachable, THEN try account backups —
+                          against whichever URL was just proven reachable,
+                          or, if none were, only those backup accounts that
+                          carry their own independent URL override (nothing
+                          else has a reachable server left to test against).
+
+      ACCOUNT /
+      CONTENT_EMPTY     → try account backups directly (against the primary
+                          URL, or each account's own URL override if it has
+                          one). URL backups are not consulted in this
+                          branch — if the primary URL responded well enough
+                          to tell us the *account* is bad, retrying that
+                          same bad account against a mirror of the same
+                          panel isn't expected to help.
+
+      SUPERSEDED        → stop immediately; a newer /api/connect call has
+                          already taken over.
+
+    MAX_TOTAL_CONNECT_ATTEMPTS bounds worst-case latency regardless of how
+    many backups of either kind are configured.
+
+    On total failure, state is restored to the primary URL AND primary
+    account, and the returned error names every attempt made — with
+    passwords never included (see _describe_account / _redact_url_for_log).
     """
     if state.conn_type == "m3u_url" and state.m3u_is_local:
         return await _connect_async()
 
     is_m3u = (state.conn_type == "m3u_url")
-    primary = state.m3u_url if is_m3u else state.url
-    backups = _sanitize_alt_urls(alt_urls, primary)
+    primary_url = state.m3u_url if is_m3u else state.url
+    backup_urls = _sanitize_alt_urls(alt_urls, primary_url)
 
-    if not backups:
+    if state.conn_type == "mac":
+        primary_account = {"mac": state.mac}
+        backup_accounts = _sanitize_alt_macs(alt_macs, state.mac)
+    elif state.conn_type == "xtream":
+        primary_account = {"username": state.username, "password": state.password}
+        backup_accounts = _sanitize_alt_accounts(alt_accounts, state.username)
+    else:
+        primary_account = {"m3u_url": primary_url}
+        backup_accounts = _sanitize_alt_m3u_accounts(alt_m3u_accounts, primary_url)
+
+    if not backup_urls and not backup_accounts:
         return await _connect_async()
 
-    candidates = [primary] + backups
-    last_n = len(candidates) - 1
-    errors = []
+    errors = []          # [(label, reason), ...] for the aggregated failure message
+    attempts = {"n": 0}
 
-    for idx, cand in enumerate(candidates):
-        if idx > 0:
-            if is_m3u:
-                state.m3u_url = _build_m3u_candidate(primary, cand)
-            else:
-                state.url = _ensure_scheme(cand)
-                state.is_stalker_portal = (
-                    state.conn_type == "mac" and "stalker_portal" in state.url.lower()
-                )
-            _shown = state.m3u_url if is_m3u else state.url
-            state.log(f"[CONNECT] Backup URL {idx}/{last_n} — trying {_shown}")
-
+    async def _attempt(label, is_backup):
+        attempts["n"] += 1
+        if is_backup:
+            state.log(f"[CONNECT] Trying {label}")
+        _teardown_stale_portal_mgr()
         try:
-            result = await _connect_async(is_backup_attempt=(idx > 0))
+            result = await _connect_async(is_backup_attempt=is_backup)
+            return result, None
         except Exception as e:
-            state.log(f"[CONNECT] ✗ Backup failed: {cand} — {e}")
-            errors.append((cand, str(e)))
-            continue
+            return None, e
 
-        if result.get("success"):
-            if idx > 0:
-                state.log(f"[CONNECT] ✓ Connected via backup URL ({idx}/{last_n}): {cand}")
-            return result
+    async def _try_backup_accounts(default_url_hint):
+        """Try every backup account in order, each against its own URL
+        override if it has one, else default_url_hint. For MAC/Xtream, an
+        account with neither is skipped (no known-reachable server to test
+        it against). M3U accounts are self-contained URLs and are never
+        skipped on this basis."""
+        for jdx, acct in enumerate(backup_accounts, start=1):
+            if attempts["n"] >= MAX_TOTAL_CONNECT_ATTEMPTS:
+                state.log("[CONNECT] Backup-account attempt cap reached — stopping.")
+                break
+            acct_url = acct.get("url") or default_url_hint
+            label = f"backup account {jdx}/{len(backup_accounts)} — {_describe_account(state.conn_type, acct)}"
+            if not is_m3u and acct_url is None:
+                state.log(f"[CONNECT] Skipping {label} — no reachable URL to try it against")
+                errors.append((label, "skipped: no reachable URL"))
+                continue
+            _apply_account_to_state(state.conn_type, acct,
+                                     url_for_attempt=None if is_m3u else acct_url)
+            result, exc = await _attempt(label, is_backup=True)
+            outcome, reason = _classify_connect_outcome(exc, result)
+            if outcome == _OUTCOME_HEALTHY:
+                state.log(f"[CONNECT] ✓ Connected — {label}")
+                return result
+            if outcome == _OUTCOME_SUPERSEDED:
+                return result
+            state.log(f"[CONNECT] ✗ {label} — {reason}")
+            errors.append((label, reason))
+        return None
 
-        if result.get("error") == "superseded":
-            return result  # a newer connect() call took over — stop, don't try more
+    # ---- Attempt 1: primary URL + primary account -------------------------
+    primary_label = ("primary login" if is_m3u else
+                      f"primary login ({_describe_account(state.conn_type, primary_account)})")
+    result, exc = await _attempt(primary_label, is_backup=False)
+    outcome, reason = _classify_connect_outcome(exc, result)
 
-        state.log(f"[CONNECT] ✗ Backup failed: {cand} — {result.get('error', 'unknown error')}")
-        errors.append((cand, result.get("error", "unknown error")))
+    if outcome == _OUTCOME_HEALTHY:
+        state.log(f"[CONNECT] ✓ Connected — {primary_label}")
+        return result
+    if outcome == _OUTCOME_SUPERSEDED:
+        return result
 
-    # All candidates exhausted — restore primary so AppState doesn't linger
-    # pointed at a dead mirror.
-    if is_m3u:
-        state.m3u_url = primary
-    else:
-        state.url = primary
-        state.is_stalker_portal = (
-            state.conn_type == "mac" and "stalker_portal" in primary.lower()
-        )
-    summary = " | ".join(f"{c}: {e}" for c, e in errors)
+    state.log(f"[CONNECT] ✗ {primary_label} — {reason}")
+    errors.append((primary_label, reason))
+    final_result = None
+
+    if outcome == _OUTCOME_NETWORK:
+        account_problem_seen = False
+        last_reachable_url = None
+        for idx, cand_url in enumerate(backup_urls, start=1):
+            if attempts["n"] >= MAX_TOTAL_CONNECT_ATTEMPTS:
+                break
+            if is_m3u:
+                candidate_url = _build_m3u_candidate(primary_url, cand_url)
+                state.m3u_url = candidate_url
+                shown = _redact_url_for_log(candidate_url)
+            else:
+                candidate_url = _ensure_scheme(cand_url)
+                state.url = candidate_url
+                state.is_stalker_portal = (state.conn_type == "mac" and "stalker_portal" in candidate_url.lower())
+                shown = candidate_url
+            label = f"backup URL {idx}/{len(backup_urls)} — {shown}"
+            result, exc = await _attempt(label, is_backup=True)
+            outcome2, reason2 = _classify_connect_outcome(exc, result)
+            if outcome2 == _OUTCOME_HEALTHY:
+                state.log(f"[CONNECT] ✓ Connected — {label}")
+                return result
+            if outcome2 == _OUTCOME_SUPERSEDED:
+                return result
+            if outcome2 == _OUTCOME_NETWORK:
+                state.log(f"[CONNECT] ✗ {label} — {reason2}")
+                errors.append((label, reason2))
+                continue
+            # This URL is reachable — it's the (still-primary) account that's bad here.
+            state.log(f"[CONNECT] ✗ {label} — {reason2} (URL is reachable; likely an account issue)")
+            errors.append((label, reason2))
+            account_problem_seen = True
+            last_reachable_url = candidate_url
+            break
+        hint = last_reachable_url if account_problem_seen else None
+        final_result = await _try_backup_accounts(hint)
+    else:  # _OUTCOME_ACCOUNT or _OUTCOME_CONTENT_EMPTY
+        final_result = await _try_backup_accounts(None if is_m3u else primary_url)
+
+    if final_result is not None:
+        return final_result
+
+    # Total failure — restore primary URL and primary account so AppState
+    # doesn't linger on a dead mirror or a rejected login.
+    if not is_m3u:
+        state.url = primary_url
+        state.is_stalker_portal = (state.conn_type == "mac" and "stalker_portal" in primary_url.lower())
+    _apply_account_to_state(state.conn_type, primary_account)
+
+    summary = " | ".join(f"{lbl}: {rsn}" for lbl, rsn in errors)
     return {
         "success": False,
-        "error": f"All {len(candidates)} URL(s) failed — {summary}",
+        "error": f"All {len(errors)} attempt(s) failed — {summary}",
         "categories": {}, "ident": "", "exp": "",
     }
 
@@ -1158,9 +1523,12 @@ def api_connect():
                 state.m3u_is_local = False
 
     alt_urls = data.get("alt_urls") or []
+    alt_macs = data.get("alt_macs") or []
+    alt_accounts = data.get("alt_accounts") or []
+    alt_m3u_accounts = data.get("alt_m3u_accounts") or []
 
     try:
-        result = run_async(_connect_with_failover_async(alt_urls))
+        result = run_async(_connect_with_failover_async(alt_urls, alt_macs, alt_accounts, alt_m3u_accounts))
         # Ensure "All Channels / All VOD / All Series" appears at the top of
         # each mode's category list with id="__all__" so api_items() always
         # routes it through the correct fast path instead of paginating with a
@@ -3941,6 +4309,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
             </div>
           </details>
           <div class="pl-row"><label>EPG</label><textarea id="pl-mac-epg" rows="2" placeholder="External EPG URL(s), one per line (optional)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;flex:1;height:34px"></textarea><label style="flex-shrink:0" title="Shift EPG display times by this many minutes (±720).">EPG±</label><input type="number" id="pl-mac-epg-offset" step="30" min="-720" max="720" placeholder="0" style="flex:none;min-width:0;width:60px;appearance:none;-moz-appearance:textfield"></div>
+          <div class="pl-row"><label title="Tried in order, on the same URL, if the MAC above logs in but the account is expired/banned/empty">Backup MACs</label><textarea id="pl-alt-macs" rows="2" placeholder="Backup MAC addresses, one per line — same URL/device settings, tried if the account above is rejected or empty" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;flex:1;height:34px;font-family:monospace;font-size:11px"></textarea></div>
         </div>
         <div id="plf-xtream" class="hidden">
           <div class="pl-row"><label>URL</label><input id="pl-xu" type="text" inputmode="url" placeholder="http://server.host:8080" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
@@ -3953,6 +4322,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
               <div id="pl-xu-ua-custom-row" style="display:none" class="pl-row ua-row"><label style="min-width:80px;font-size:11px">Custom UA</label><input id="pl-xu-ua-custom" placeholder="e.g. MyApp/1.0 (Linux)" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
             </div>
           </details>
+          <div class="pl-row"><label title="Tried in order, if the login above logs in but the account is expired/banned/empty. One per line: username:password or username:password:url (url optional — defaults to the URL above)">Backup Accounts</label><textarea id="pl-alt-accounts" rows="2" placeholder="Backup accounts, one per line: username:password  or  username:password:url" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;flex:1;height:34px;font-family:monospace;font-size:11px"></textarea></div>
         </div>
         <div id="plf-m3u" class="hidden">
           <div class="pl-row"><label>URL</label><input id="pl-m3u" type="text" inputmode="url" placeholder="http://example.com/list.m3u" autocomplete="new-password" autocorrect="off" spellcheck="false"></div>
@@ -3963,6 +4333,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
               <div id="pl-m3u-ua-custom-row" style="display:none" class="pl-row ua-row"><label style="min-width:80px;font-size:11px">Custom UA</label><input id="pl-m3u-ua-custom" placeholder="e.g. MyApp/1.0 (Linux)" autocomplete="off" autocorrect="off" spellcheck="false" style="font-family:monospace;font-size:11px"></div>
             </div>
           </details>
+          <div class="pl-row"><label title="Complete, independent M3U URLs — tried in order if the URL above logs in but the account is expired/banned/empty. Not mirrors: a wholly separate URL/account per line.">Backup Accounts</label><textarea id="pl-alt-m3u-accounts" rows="2" placeholder="Backup M3U account URLs, one per line (separate accounts, not mirrors)" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;flex:1;height:34px;font-family:monospace;font-size:11px"></textarea></div>
         </div>
         <div class="pl-row"><label title="Tried in order, with the same login as above, if the primary URL fails to connect">Alt URLs</label><textarea id="pl-alt-urls" rows="3" placeholder="Backup portal URLs, one per line — tried in order (same login) if the URL above fails" autocomplete="new-password" autocorrect="off" spellcheck="false" style="resize:vertical;flex:1;height:50px;font-family:monospace;font-size:11px"></textarea></div>
         <div class="pl-row" style="justify-content:flex-end;gap:7px">
@@ -4296,15 +4667,18 @@ function _getUaCustom() {
 }
 
 // ── CONNECT ────────────────────────────────────────────────
-// Alt/backup URLs for whichever connection is currently loaded (empty for
-// a manual connect). Set at the top of doConnect() on every call — success
-// or failure — so refreshPlaylist() can reconnect with the same failover
-// list without needing its own copy of the saved playlist entry.
-let _lastConnectAltUrls = [];
+// Backup config for whichever connection is currently loaded (all empty
+// for a manual connect). Set at the top of doConnect() on every call —
+// success or failure — so refreshPlaylist() can reconnect with the same
+// failover config without needing its own copy of the saved playlist entry.
+let _lastConnectBackups = { urls: [], macs: [], accounts: [], m3uAccounts: [] };
 
-async function doConnect(altUrls){
+async function doConnect(altUrls, altMacs, altAccounts, altM3uAccounts){
   const _altUrls = Array.isArray(altUrls) ? altUrls.slice(0,10) : [];
-  _lastConnectAltUrls = _altUrls;
+  const _altMacs = Array.isArray(altMacs) ? altMacs.slice(0,10) : [];
+  const _altAccounts = Array.isArray(altAccounts) ? altAccounts.slice(0,10) : [];
+  const _altM3uAccounts = Array.isArray(altM3uAccounts) ? altM3uAccounts.slice(0,10) : [];
+  _lastConnectBackups = { urls: _altUrls, macs: _altMacs, accounts: _altAccounts, m3uAccounts: _altM3uAccounts };
   const xurl = document.getElementById('i-xu')?.value.trim()||'';
   const url = CT==='xtream' ? xurl : document.getElementById('i-url').value.trim();
   const payload={
@@ -4315,6 +4689,9 @@ async function doConnect(altUrls){
     m3u_url:document.getElementById('i-m3u').value.trim(),
     m3u_content: CT==='m3u_url' && !document.getElementById('i-m3u').value.trim() ? (_m3uLocalContent||'') : '',
     alt_urls: _altUrls,
+    alt_macs: _altMacs,
+    alt_accounts: _altAccounts,
+    alt_m3u_accounts: _altM3uAccounts,
     ext_epg_url:(CT==='xtream'
       ? document.getElementById('i-epg').value.trim()
       : CT==='mac'
@@ -4420,6 +4797,9 @@ async function doConnect(altUrls){
           ext_epg_url: payload.ext_epg_url||'',
           epg_offset_secs: payload.epg_offset_secs||0,
           alt_urls: [],
+          alt_macs: [],
+          alt_accounts: [],
+          alt_m3u_accounts: [],
         };
         arr.push(entry);
         plSaveAll(arr);
@@ -4487,7 +4867,8 @@ async function refreshPlaylist(){
     allItems = []; filtItems = []; curCat = null; navStack = [];
     _clearSelection();
     // 3. Reconnect — re-fetches categories and rebuilds everything
-    await doConnect(_lastConnectAltUrls);
+    await doConnect(_lastConnectBackups.urls, _lastConnectBackups.macs,
+                     _lastConnectBackups.accounts, _lastConnectBackups.m3uAccounts);
   } catch(e){
     toast('Refresh failed: ' + e.message, 'err');
   } finally {
@@ -8020,7 +8401,11 @@ function renderPLList(){
       +'<div class="pli-info"><div class="pli-name" style="display:flex;align-items:center;gap:6px">'
       +'<span>'+esc(p.name||'Untitled')+'</span>'
       +'<span class="pli-type-badge '+(typeCls[t]||'pli-type-mac')+'">'+typeLbl[t]+'</span>'
-      +(p.alt_urls && p.alt_urls.length ? '<span class="pli-type-badge" style="background:rgba(148,163,184,.18);color:var(--txt2,#94a3b8);border-color:rgba(148,163,184,.35)" title="'+p.alt_urls.length+' backup URL(s) — tried in order if the URL above fails">+'+p.alt_urls.length+'</span>' : '')
+      +((p.alt_urls&&p.alt_urls.length)||(p.alt_macs&&p.alt_macs.length)||(p.alt_accounts&&p.alt_accounts.length)||(p.alt_m3u_accounts&&p.alt_m3u_accounts.length) ? (()=>{
+          const nUrl=(p.alt_urls||[]).length, nAcct=(p.alt_macs||[]).concat(p.alt_accounts||[]).concat(p.alt_m3u_accounts||[]).length;
+          const parts=[]; if(nUrl) parts.push(nUrl+' backup URL'+(nUrl>1?'s':'')); if(nAcct) parts.push(nAcct+' backup account'+(nAcct>1?'s':''));
+          return '<span class="pli-type-badge" style="background:rgba(148,163,184,.18);color:var(--txt2,#94a3b8);border-color:rgba(148,163,184,.35)" title="'+esc(parts.join(' + '))+'">+'+(nUrl+nAcct)+'</span>';
+        })() : '')
       +'</div>'
       +'<div class="pli-sub">'+esc(sub)+'</div></div>'
       +'<div class="pli-acts">'
@@ -8029,6 +8414,27 @@ function renderPLList(){
       +'<button class="btn-red" onclick="plDelete('+i+')" style="height:28px;padding:0 8px">🗑</button>'
       +'</div></div>';
   }).join('');
+}
+
+// Parses one 'username:password' or 'username:password:url' line from the
+// Backup Accounts textarea. Manual index-based split (not String.split(':'))
+// because a URL third field commonly contains its own colons
+// (http://host:8080) — split(':', 2) in JS discards everything past the
+// limit rather than keeping the remainder joined the way Python's does.
+function _parseBackupAccountLine(line){
+  const s=(line||'').trim();
+  if(!s) return null;
+  const i1=s.indexOf(':');
+  if(i1===-1) return null; // no password given — not a usable backup account
+  const username=s.slice(0,i1).trim();
+  const rest=s.slice(i1+1);
+  const i2=rest.indexOf(':');
+  const password=(i2===-1?rest:rest.slice(0,i2)).trim();
+  const url=(i2===-1?'':rest.slice(i2+1)).trim();
+  if(!username||!password) return null;
+  const out={username,password};
+  if(url) out.url=url;
+  return out;
 }
 
 function plSave(){
@@ -8065,6 +8471,15 @@ function plSave(){
     // Cap of 10 mirrors MAX_ALT_URLS on the backend.
     alt_urls: (document.getElementById('pl-alt-urls')?.value||'')
       .split('\n').map(s=>s.trim()).filter(Boolean).slice(0,10),
+    // Backup MACs (MAC/Stalker) — plain MAC per line, same URL/device settings.
+    alt_macs: plCT==='mac' ? (document.getElementById('pl-alt-macs')?.value||'')
+      .split('\n').map(s=>s.trim()).filter(Boolean).slice(0,10) : [],
+    // Backup accounts (Xtream) — 'username:password' or 'username:password:url' per line.
+    alt_accounts: plCT==='xtream' ? (document.getElementById('pl-alt-accounts')?.value||'')
+      .split('\n').map(_parseBackupAccountLine).filter(Boolean).slice(0,10) : [],
+    // Backup accounts (M3U) — complete, independent M3U URLs, one per line.
+    alt_m3u_accounts: plCT==='m3u_url' ? (document.getElementById('pl-alt-m3u-accounts')?.value||'')
+      .split('\n').map(s=>s.trim()).filter(Boolean).slice(0,10) : [],
   };
   if(plEditId){
     const idx=arr.findIndex(p=>p.id===plEditId);
@@ -8102,6 +8517,11 @@ function plEdit(i){
   if(document.getElementById('pl-devid2')) document.getElementById('pl-devid2').value=p.stalker_device_id2||'';
   if(document.getElementById('pl-sig'))    document.getElementById('pl-sig').value=p.stalker_signature||'';
   if(document.getElementById('pl-alt-urls')) document.getElementById('pl-alt-urls').value=(p.alt_urls||[]).join('\n');
+  if(document.getElementById('pl-alt-macs')) document.getElementById('pl-alt-macs').value=(p.alt_macs||[]).join('\n');
+  if(document.getElementById('pl-alt-accounts'))
+    document.getElementById('pl-alt-accounts').value=(p.alt_accounts||[])
+      .map(a=>a.url ? `${a.username}:${a.password}:${a.url}` : `${a.username}:${a.password}`).join('\n');
+  if(document.getElementById('pl-alt-m3u-accounts')) document.getElementById('pl-alt-m3u-accounts').value=(p.alt_m3u_accounts||[]).join('\n');
   // Restore UA preset fields for all panel types
   _plSetUaFields(p.portal_ua_preset||'', p.portal_ua_custom||'');
   // scroll form into view
@@ -8117,7 +8537,8 @@ function plClearForm(){
   plEditId=null;
   ['pl-name','pl-url','pl-mac','pl-xu','pl-us','pl-pw','pl-m3u',
    'pl-epg','pl-mac-epg','pl-m3u-epg','pl-epg-offset','pl-mac-epg-offset','pl-m3u-epg-offset',
-   'pl-sn','pl-devid','pl-devid2','pl-sig','pl-alt-urls'].forEach(id=>{
+   'pl-sn','pl-devid','pl-devid2','pl-sig','pl-alt-urls',
+   'pl-alt-macs','pl-alt-accounts','pl-alt-m3u-accounts'].forEach(id=>{
     const el=document.getElementById(id); if(el) el.value='';
   });
   // Reset all UA preset selectors, hide custom rows, sync custom dropdowns
@@ -8192,7 +8613,7 @@ async function plConnect(i){
     const s=document.getElementById('i-m3u-ua-preset'); if(s){s.value=preset; _syncUADropdown('i-m3u-ua-preset'); uaPresetChange('i-m3u-ua-preset','i-m3u-ua-custom');}
     const c=document.getElementById('i-m3u-ua-custom'); if(c) c.value=custom;
   }
-  await doConnect(p.alt_urls||[]);
+  await doConnect(p.alt_urls||[], p.alt_macs||[], p.alt_accounts||[], p.alt_m3u_accounts||[]);
 }
 
 // ── INIT ───────────────────────────────────────────────────
