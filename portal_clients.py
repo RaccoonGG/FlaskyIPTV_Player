@@ -19,6 +19,8 @@ Contains all four portal client classes and their shared helpers:
   ─────────────────────────────────────────────────────────────────────
   normalize_base_url(url)          Strip path/query, return base URL.
   _extract_url_from_text(s)        Pull first http(s) URL from a string.
+  parse_expiry_to_epoch(exp_str)   Best-effort portal expiry string → epoch.
+  extract_http_status_from_message(msg)  Pull embedded "(HTTP nnn)" from a message.
   safe_json(resp)                  Safely decode aiohttp JSON response.
   normalize_js(payload)            Normalise Stalker JS-wrapped JSON.
   extract_xtream_from_m3u_url(url) Detect Xtream credentials in M3U URL.
@@ -245,6 +247,78 @@ def _extract_url_from_text(s: str):
     m = _URL_RE.search(s2)
     if m:
         return m.group(0)
+    return None
+
+
+# Sentinel expiry values seen across MAC/Stalker/Xtream portals that mean
+# "no expiry" rather than an actual date — must NOT be parsed as "expired".
+_NO_EXPIRY_SENTINELS = {
+    "", "unknown", "none", "null", "never", "unlimited", "0", "n/a", "-",
+}
+
+# Formats seen in the wild across MAC/Stalker "phone"/"end_date"/
+# "expire_billing_date" fields and Xtream's formatted display string.
+# Tried in order; first successful parse wins.
+_EXPIRY_DATE_FORMATS = (
+    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d.%m.%Y %H:%M:%S", "%d.%m.%Y",
+    "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y",
+)
+
+
+def parse_expiry_to_epoch(exp_str) -> "int | None":
+    """Best-effort parse of a portal's expiry field into a unix epoch.
+
+    Deliberately conservative: returns None (i.e. "unknown, do not treat as
+    expired") for anything that isn't confidently parseable, rather than
+    risking a false "this account is expired" verdict from a misread date.
+    Field naming/format is not standardized across MAC/Stalker panels
+    (phone / end_date / expire_billing_date, epoch or one of several date
+    formats) or even guaranteed consistent for a single panel vendor.
+    """
+    if exp_str is None:
+        return None
+    s = str(exp_str).strip()
+    if s.lower() in _NO_EXPIRY_SENTINELS:
+        return None
+    # Pure-digit epoch (seconds). Xtream's raw exp_date is commonly this
+    # before formatting; some MAC panels also expose a raw epoch string.
+    if s.isdigit():
+        try:
+            val = int(s)
+            # Guard against obviously-wrong values (e.g. a plan-id or a
+            # count that happens to be numeric) — a unix epoch for any
+            # plausible subscription expiry falls comfortably in this range.
+            if 0 < val < 4102444800:  # < year 2100
+                return val
+        except (ValueError, OverflowError):
+            return None
+        return None
+    for fmt in _EXPIRY_DATE_FORMATS:
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except ValueError:
+            continue
+    return None
+
+
+_HTTP_STATUS_IN_MSG_RE = re.compile(r'HTTP[:\s]+(\d{3})\b')
+
+
+def extract_http_status_from_message(msg) -> "int | None":
+    """Pull an HTTP status code out of an exception message, where present.
+    Several client error messages already embed '(HTTP 456)'-style text —
+    this lets a caller classify on it without needing a new exception type
+    per status code. Returns None when no status is embedded (e.g. a plain
+    connector/timeout exception, or a Stalker message that predates this)."""
+    if not msg:
+        return None
+    m = _HTTP_STATUS_IN_MSG_RE.search(str(msg))
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
     return None
 
 
@@ -2466,8 +2540,10 @@ class StalkerPortalClient:
         headers = self._headers(include_auth=False, include_token=False)
         self.log(f"[STALKER] Handshake → {self.base}{self.LOAD_PHP}")
         payload = None
+        _last_status = None
         for _attempt in range(4):  # up to 3 retries on 429
             async with self.session.get(url, headers=headers) as r:
+                _last_status = r.status
                 self.log(f"[STALKER] Handshake HTTP {r.status}")
                 if r.status == 429:
                     _wait = 2 ** _attempt
@@ -2481,6 +2557,7 @@ class StalkerPortalClient:
                     url2 = self._load_url(type="stb", action="handshake",
                                           token=tok, prehash=prehash, JsHttpRequest="1-xml")
                     async with self.session.get(url2, headers=headers) as r2:
+                        _last_status = r2.status
                         self.log(f"[STALKER] Retry handshake HTTP {r2.status}")
                         payload = await self._read_json(r2, "handshake retry")
                 else:
@@ -2488,13 +2565,13 @@ class StalkerPortalClient:
                 break
 
         if not isinstance(payload, dict) or "js" not in payload:
-            raise RuntimeError("[STALKER] Handshake failed — no valid JSON response")
+            raise RuntimeError(f"[STALKER] Handshake failed — no valid JSON response (HTTP {_last_status})")
         js = payload["js"]
         if not isinstance(js, dict):
-            raise RuntimeError("[STALKER] Handshake failed — unexpected js structure")
+            raise RuntimeError(f"[STALKER] Handshake failed — unexpected js structure (HTTP {_last_status})")
         self.token = js.get("token")
         if not self.token:
-            raise RuntimeError("[STALKER] Handshake failed — token missing in response")
+            raise RuntimeError(f"[STALKER] Handshake failed — token missing in response (HTTP {_last_status})")
         rand = js.get("random")
         self._random = rand.lower() if rand else self._generate_random()
         self.bearer_token = self.token
@@ -4308,7 +4385,8 @@ class XtreamClient:
         status = info.get("status", "?")
         password = str(info.get("password", "") or "")
         self.log(f"[XTREAM] Account: user={self.username}  status={status}  expiry={exp}  connections={active}/{max_conn_raw}")
-        return (self.username, exp, max_conn_int, password, str(active))
+        # Index 5 (status) is additive — existing callers only read ai[0..2].
+        return (self.username, exp, max_conn_int, password, str(active), status)
 
     async def fetch_categories(self, mode: str):
         action_map = {"live": "get_live_categories", "vod": "get_vod_categories", "series": "get_series_categories"}
@@ -5263,6 +5341,12 @@ class PortalSessionManager:
             ai = await client.account_info()
             ident, exp = ai[0], ai[1]
             max_conn = ai[2] if len(ai) > 2 else 0
+            # ai[5] (raw status string) is only present for XtreamClient today —
+            # MAC/Stalker have no equivalent field on their panels. exp_epoch is
+            # a best-effort parse of the *display* expiry string, computed the
+            # same way regardless of portal type.
+            account_status_raw = ai[5] if len(ai) > 5 else None
+            exp_epoch = parse_expiry_to_epoch(exp)
             # Epoch guard: bail immediately if a newer api_connect() arrived while we
             # were suspended in account_info().  Do this before any state writes so
             # the new portal's clean state is never overwritten by this stale result.
@@ -5418,6 +5502,8 @@ class PortalSessionManager:
                 "categories": cats,
                 "ident": ident,
                 "exp": exp,
+                "exp_epoch": exp_epoch,
+                "account_status": account_status_raw,
                 "max_connections": max_conn,
                 "portal_url": url,
                 "is_stalker": is_stalker,
