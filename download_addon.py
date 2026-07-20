@@ -2445,15 +2445,24 @@ function startLog(){
     // Checked before error/success so JSON payloads containing those words
     // inside the response body don't bleed into the wrong color class.
     else if(/ raw[\s:(]/.test(msg)) c='i';
+    // Explicit "about to try a candidate" marker from the connect-failover
+    // orchestrator — checked early, same reasoning as the raw-dump check
+    // above: an in-progress action is neither success nor failure, and
+    // must not be left to fall through to whatever the account/MAC
+    // identifier after the dash happens to contain.
+    else if(/^\[CONNECT\] Trying/.test(msg)) c='i';
     // Success milestones: ✓ lines, explicit "Auth OK", "Token acquired/refreshed".
-    else if(/✓|success|saved|Done|token (?:acquired|refreshed)|Auth OK/i.test(msg)) c='k';
+    // "success" is word-bounded so "successful"/"unsuccessful" — plain
+    // adjectives that can appear inside an otherwise failing line's
+    // explanation — don't pre-empt the ✗/error/failed check below.
+    else if(/✓|\bsuccess\b|saved|Done|token (?:acquired|refreshed)|Auth OK/i.test(msg)) c='k';
     // ⚠ is an explicit warning marker — checked before the red pattern so that
     // exception class names like LookupError / RuntimeError in the same line
     // don't accidentally trigger red instead of orange.
     else if(/⚠/.test(msg)) c='w';
     else if(/✗|error|failed|ERROR/i.test(msg)) c='e';
     // Remaining warning patterns (no ⚠ marker but clearly warning-level events).
-    else if(/warn|\b429\b|backing off|\brejected\b|retrying with|returned empty/i.test(msg)) c='w';
+    else if(/warn|\b429\b|backing off|\brejected\b|retrying with|returned empty|^\[CONNECT\] Skipping/i.test(msg)) c='w';
     else if(/\[MKV\]|\[SERIES\]|\[REC\]/i.test(msg)) c='m';
     else if(/▶|Playing/i.test(msg)) c='i';
     alog(msg.replace(/\[STATUS\]\s*/,'').trim(),c);
