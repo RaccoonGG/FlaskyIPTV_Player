@@ -3163,6 +3163,44 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   border:1px solid var(--bdr2);letter-spacing:.5px;transition:var(--tr)}
 #vf-btn:hover{background:var(--s3);color:var(--txt)}
 
+/* ── Audio Output button (toolbar) ───────────────────────────── */
+#audio-out-btn{height:26px;padding:0 10px;font-size:12px;font-weight:700;
+  border-radius:var(--rss);background:var(--s4);color:var(--txt2);
+  border:1px solid var(--bdr2);transition:var(--tr)}
+#audio-out-btn:hover{background:var(--s3);color:var(--txt)}
+#audio-out-btn.active{background:rgba(124,58,237,.18);color:var(--acc);
+  border-color:rgba(124,58,237,.5);box-shadow:0 0 10px rgba(124,58,237,.25)}
+#audio-out-btn:disabled{opacity:.4;cursor:not-allowed}
+
+/* ── Audio Output overlay/modal ───────────────────────────────── */
+@keyframes ao-slide-up{from{opacity:0;transform:translateY(14px)} to{opacity:1;transform:none}}
+#audio-out-overlay{position:fixed;inset:0;z-index:601;background:rgba(0,0,0,.55);
+  display:none;align-items:flex-end;justify-content:flex-end;padding:0 0 48px 10px}
+@media(min-width:900px){#audio-out-overlay{padding:0 14px 42px 0}}
+#audio-out-overlay.open{display:flex}
+#audio-out-modal{background:var(--s2);border:1px solid var(--bdr2);
+  border-radius:var(--r) var(--r) 0 0;
+  width:min(380px,100vw);max-height:70dvh;display:flex;flex-direction:column;
+  box-shadow:0 -8px 48px rgba(0,0,0,.7);
+  animation:ao-slide-up .22s cubic-bezier(.34,1.2,.64,1);
+  transform:translateZ(0)}
+@media(min-width:900px){
+  #audio-out-modal{border-radius:var(--r);margin-bottom:8px;max-height:70dvh}
+}
+.ao-hdr{display:flex;align-items:center;gap:8px;padding:13px 16px 10px;flex-shrink:0}
+.ao-hdr h2{flex:1;font-size:13px;font-weight:800;color:var(--txt);
+  text-transform:uppercase;letter-spacing:1.5px;margin:0}
+.ao-body{flex:1;overflow-y:auto;padding:6px 10px 14px;display:flex;flex-direction:column;gap:5px}
+.ao-note{font-size:11px;color:var(--txt3);padding:8px 10px;line-height:1.5}
+.ao-dev{display:flex;align-items:center;gap:8px;padding:9px 10px;
+  border-radius:var(--rsm);background:rgba(255,255,255,.025);
+  border:1px solid var(--bdr);transition:var(--tr);cursor:pointer}
+.ao-dev:hover{border-color:var(--acc);background:rgba(124,58,237,.08)}
+.ao-dev.sel{border-color:var(--acc);background:rgba(124,58,237,.12)}
+.ao-dev-chk{width:14px;flex-shrink:0;color:var(--acc);font-size:12px;text-align:center}
+.ao-dev-lbl{flex:1;font-size:12px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ao-refresh{margin:4px 10px 0;height:28px;font-size:11px;border-radius:var(--rss);width:calc(100% - 20px)}
+
 /* ── Radio open button (toolbar) ─────────────────────────────── */
 #radio-open-btn{height:26px;padding:0 10px;font-size:12px;font-weight:700;
   border-radius:var(--rss);background:var(--s4);color:var(--txt2);
@@ -3947,6 +3985,12 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
               🎨 
             </button>
 
+            <button id="audio-out-btn"
+              onclick="event.stopPropagation();toggleAudioOutPanel()"
+              title="Audio Output Device">
+              🔊
+            </button>
+
             <button id="pctrl-act-btn"
               onclick="event.stopPropagation();openActTab()"
               title="Actions"
@@ -4145,6 +4189,20 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         </div>
       </div>
 
+    </div>
+  </div>
+
+  <!-- AUDIO OUTPUT DEVICE PANEL -->
+  <div id="audio-out-overlay" onclick="if(event.target===this)closeAudioOutPanel()">
+    <div id="audio-out-modal">
+      <div class="ao-hdr">
+        <h2>🔊 Audio Output</h2>
+        <button class="btn-ghost" onclick="closeAudioOutPanel()"
+          style="height:26px;width:26px;padding:0;font-size:14px">✕</button>
+      </div>
+      <div class="ao-body" id="ao-body">
+        <div class="ao-note">Loading devices…</div>
+      </div>
     </div>
   </div>
 
@@ -8140,6 +8198,149 @@ function toggleVfPanel(){
     document.addEventListener('DOMContentLoaded', applyVidFilter);
   else
     applyVidFilter();
+})();
+
+// ── AUDIO OUTPUT DEVICE (Audio Output Devices API) ─────────────
+// Desktop Chrome/Edge/Safari only — Android (incl. any Android browser/
+// WebView) does not support per-app audio output routing at the OS level,
+// so this feature-detects and disables the control cleanly instead of
+// showing a broken or empty list.
+const _AO_SUPPORTED = !!(vid && typeof vid.setSinkId === 'function'
+  && navigator.mediaDevices && navigator.mediaDevices.enumerateDevices);
+let _aoDevices = [];   // last enumerated audiooutput devices
+let _aoCurrentId = ''; // '' = system default
+
+function _aoSaved(){
+  try{ return JSON.parse(localStorage.getItem('audio_out_device')||'null'); }catch(e){ return null; }
+}
+function _aoSave(dev){
+  try{ localStorage.setItem('audio_out_device', JSON.stringify(dev||null)); }catch(e){}
+}
+
+async function _aoApply(deviceId){
+  if(!_AO_SUPPORTED) return false;
+  try{
+    await vid.setSinkId(deviceId||'');
+    _aoCurrentId = deviceId||'';
+    const btn = document.getElementById('audio-out-btn');
+    if(btn) btn.classList.toggle('active', !!deviceId);
+    return true;
+  }catch(e){
+    const body = document.getElementById('ao-body');
+    if(body) body.insertAdjacentHTML('afterbegin',
+      '<div class="ao-note" style="color:#ef4444">Could not switch output: '
+      +String((e&&e.message)||e).replace(/</g,'&lt;')+'</div>');
+    return false;
+  }
+}
+
+function _aoRenderList(){
+  const body = document.getElementById('ao-body');
+  if(!body) return;
+  const rows = [{deviceId:'',label:'System default'}].concat(_aoDevices.filter(d=>d.deviceId!=='default'));
+  let html = rows.map(d=>{
+    const sel = d.deviceId === _aoCurrentId;
+    return '<div class="ao-dev'+(sel?' sel':'')+'" onclick="_aoChoose(\''+d.deviceId+'\')">'
+      +'<span class="ao-dev-chk">'+(sel?'✓':'')+'</span>'
+      +'<span class="ao-dev-lbl">'+(d.label||'Speaker').replace(/</g,'&lt;')+'</span></div>';
+  }).join('');
+  html += '<button class="btn-ghost ao-refresh" onclick="_aoRefresh()">⟳ Refresh devices</button>';
+  body.innerHTML = html;
+}
+
+async function _aoRefresh(){
+  const body = document.getElementById('ao-body');
+  if(!body) return;
+  if(!_AO_SUPPORTED){
+    body.innerHTML = '<div class="ao-note">Audio output selection isn\'t supported in this '
+      +'browser or platform — available on desktop Chrome, Edge, and Safari; not available on '
+      +'Android.</div>';
+    return;
+  }
+  body.innerHTML = '<div class="ao-note">Loading devices…</div>';
+  try{
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const outs = devices.filter(d=>d.kind==='audiooutput');
+    if(!outs.some(d=>d.label)){
+      if(navigator.mediaDevices.selectAudioOutput){
+        body.innerHTML = '<div class="ao-note">Device names are hidden until you pick one.</div>'
+          +'<button class="btn-acc ao-refresh" onclick="_aoPickNative()">Choose output device…</button>';
+      } else {
+        body.innerHTML = '<div class="ao-note">Grant microphone permission once to reveal named '
+          +'output devices (a browser limitation — no audio is captured or sent anywhere).</div>'
+          +'<button class="btn-ghost ao-refresh" onclick="_aoRequestLabels()">Enable device names</button>';
+      }
+      return;
+    }
+    _aoDevices = outs;
+    _aoRenderList();
+  }catch(e){
+    body.innerHTML = '<div class="ao-note">'+String((e&&e.message)||e).replace(/</g,'&lt;')+'</div>';
+  }
+}
+
+async function _aoChoose(deviceId){
+  const ok = await _aoApply(deviceId);
+  if(!ok) return; // keep the error note visible instead of re-rendering over it
+  const dev = _aoDevices.find(d=>d.deviceId===deviceId);
+  _aoSave(deviceId ? {deviceId, label:(dev&&dev.label)||''} : null);
+  _aoRenderList();
+}
+
+async function _aoRequestLabels(){
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    stream.getTracks().forEach(t=>t.stop());
+  }catch(e){ /* user declined — list stays unlabeled */ }
+  _aoRefresh();
+}
+
+async function _aoPickNative(){
+  try{
+    const dev = await navigator.mediaDevices.selectAudioOutput();
+    await _aoApply(dev.deviceId);
+    _aoSave({deviceId:dev.deviceId, label:dev.label||''});
+    _aoRefresh();
+  }catch(e){ /* user cancelled the picker */ }
+}
+
+function openAudioOutPanel(){
+  // These two small panels share the same corner — don't stack them.
+  if(typeof closeVfPanel==='function') closeVfPanel();
+  document.getElementById('audio-out-overlay').classList.add('open');
+  _aoRefresh();
+}
+function closeAudioOutPanel(){
+  document.getElementById('audio-out-overlay').classList.remove('open');
+}
+function toggleAudioOutPanel(){
+  const ov = document.getElementById('audio-out-overlay');
+  if(ov.classList.contains('open')) closeAudioOutPanel();
+  else openAudioOutPanel();
+}
+
+// ── Boot: disable the control if unsupported, else restore last device ──
+(function _aoBoot(){
+  const btn = document.getElementById('audio-out-btn');
+  if(!_AO_SUPPORTED){
+    if(btn){
+      btn.disabled = true;
+      btn.title = 'Audio output selection not supported on this platform (desktop Chrome/Edge/Safari only)';
+    }
+    return;
+  }
+  const saved = _aoSaved();
+  if(saved && saved.deviceId){
+    const tryApply = ()=>_aoApply(saved.deviceId);
+    if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', tryApply);
+    else tryApply();
+  }
+  if(navigator.mediaDevices.addEventListener){
+    navigator.mediaDevices.addEventListener('devicechange', function(){
+      const ov = document.getElementById('audio-out-overlay');
+      if(ov && ov.classList.contains('open')) _aoRefresh();
+    });
+  }
 })();
 
 
