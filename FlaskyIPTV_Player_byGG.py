@@ -3168,9 +3168,6 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   border-radius:var(--rss);background:var(--s4);color:var(--txt2);
   border:1px solid var(--bdr2);transition:var(--tr)}
 #audio-out-btn:hover{background:var(--s3);color:var(--txt)}
-#audio-out-btn.active{background:rgba(124,58,237,.18);color:var(--acc);
-  border-color:rgba(124,58,237,.5);box-shadow:0 0 10px rgba(124,58,237,.25)}
-#audio-out-btn:disabled{opacity:.4;cursor:not-allowed}
 
 /* ── Audio Output overlay/modal ───────────────────────────────── */
 @keyframes ao-slide-up{from{opacity:0;transform:translateY(14px)} to{opacity:1;transform:none}}
@@ -3191,6 +3188,9 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .ao-hdr h2{flex:1;font-size:13px;font-weight:800;color:var(--txt);
   text-transform:uppercase;letter-spacing:1.5px;margin:0}
 .ao-body{flex:1;overflow-y:auto;padding:6px 10px 14px;display:flex;flex-direction:column;gap:5px}
+.ao-sec-hdr{font-size:10px;font-weight:700;text-transform:uppercase;
+  letter-spacing:1.2px;color:var(--txt3);margin:6px 2px 2px}
+.ao-sec-hdr:first-child{margin-top:2px}
 .ao-note{font-size:11px;color:var(--txt3);padding:8px 10px;line-height:1.5}
 .ao-dev{display:flex;align-items:center;gap:8px;padding:9px 10px;
   border-radius:var(--rsm);background:rgba(255,255,255,.025);
@@ -3987,7 +3987,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 
             <button id="audio-out-btn"
               onclick="event.stopPropagation();toggleAudioOutPanel()"
-              title="Audio Output Device">
+              title="Audio Output & Volume">
               🔊
             </button>
 
@@ -4192,16 +4192,21 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
     </div>
   </div>
 
-  <!-- AUDIO OUTPUT DEVICE PANEL -->
+  <!-- AUDIO OUTPUT + VOLUME PANEL -->
   <div id="audio-out-overlay" onclick="if(event.target===this)closeAudioOutPanel()">
     <div id="audio-out-modal">
       <div class="ao-hdr">
-        <h2>🔊 Audio Output</h2>
+        <h2>🔊 Audio</h2>
         <button class="btn-ghost" onclick="closeAudioOutPanel()"
           style="height:26px;width:26px;padding:0;font-size:14px">✕</button>
       </div>
       <div class="ao-body" id="ao-body">
-        <div class="ao-note">Loading devices…</div>
+        <div class="ao-sec-hdr">Volume</div>
+        <div id="ao-gain-rows"></div>
+        <div class="ao-sec-hdr" id="ao-dev-hdr">Output Device</div>
+        <div id="ao-dev-rows">
+          <div class="ao-note">Loading devices…</div>
+        </div>
       </div>
     </div>
   </div>
@@ -8202,9 +8207,10 @@ function toggleVfPanel(){
 
 // ── AUDIO OUTPUT DEVICE (Audio Output Devices API) ─────────────
 // Desktop Chrome/Edge/Safari only — Android (incl. any Android browser/
-// WebView) does not support per-app audio output routing at the OS level,
-// so this feature-detects and disables the control cleanly instead of
-// showing a broken or empty list.
+// WebView) does not support per-app audio output routing at the OS level.
+// Volume (below) is a SEPARATE capability (plain Web Audio API, supported
+// everywhere incl. Android) so only the device-picker portion is gated
+// on this, never the whole modal.
 const _AO_SUPPORTED = !!(vid && typeof vid.setSinkId === 'function'
   && navigator.mediaDevices && navigator.mediaDevices.enumerateDevices);
 let _aoDevices = [];   // last enumerated audiooutput devices
@@ -8217,16 +8223,87 @@ function _aoSave(dev){
   try{ localStorage.setItem('audio_out_device', JSON.stringify(dev||null)); }catch(e){}
 }
 
+// ── Volume (soft/boost) — was radio-only (its own GainNode inside
+// radio_addon.py's visualizer); now global via ONE shared Web Audio graph
+// on the SAME #vid element radio already plays through, so this affects
+// whatever's currently audible, radio or a regular channel alike. ──
+const _GAIN_STEPS = [1.0, 1.5, 2.0, 0.5];  // Normal, Loud, Boost, Soft
+const _GAIN_LABELS = {1:'Normal', 1.5:'Loud', 2:'Boost', 0.5:'Soft'};
+let _audioCtx = null, _gainSource = null, _gainNode = null;
+
+// Lazily builds ONE AudioContext + MediaElementAudioSourceNode(#vid) +
+// GainNode for the whole page. createMediaElementSource can only be
+// called once per element, ever — this is the single owner of that call.
+// Exposed on window so radio_addon.py's visualizer taps its analyser off
+// this shared gain node instead of building its own graph (which would
+// throw the moment it tried createMediaElementSource a second time).
+function _globalAudioGraph(){
+  if(_gainNode) return {ctx:_audioCtx, source:_gainSource, gain:_gainNode};
+  if(!vid) return null;
+  try{
+    _audioCtx = _audioCtx || new (window.AudioContext||window.webkitAudioContext)();
+    if(_audioCtx.state === 'suspended') _audioCtx.resume().catch(()=>{});
+    _gainNode = _audioCtx.createGain();
+    const stored = parseFloat(localStorage.getItem('rdio_gain') || '1');
+    _gainNode.gain.value = isNaN(stored) ? 1 : Math.max(0.1, Math.min(4, stored));
+    _gainSource = _audioCtx.createMediaElementSource(vid);
+    _gainSource.connect(_gainNode);
+    _gainNode.connect(_audioCtx.destination);
+  }catch(e){ _gainNode = null; return null; }
+  return {ctx:_audioCtx, source:_gainSource, gain:_gainNode};
+}
+window._globalAudioGraph = _globalAudioGraph;
+
+function _gainApply(value){
+  const g = _globalAudioGraph();
+  if(!g) return;
+  g.gain.gain.value = value;
+  localStorage.setItem('rdio_gain', value);
+  _gainRenderRows();
+  _syncToolbarBtn();
+}
+
+function _gainRenderRows(){
+  const body = document.getElementById('ao-gain-rows');
+  if(!body) return;
+  const current = _gainNode ? _gainNode.gain.value : 1.0;
+  body.innerHTML = _GAIN_STEPS.map(v=>{
+    const sel = Math.abs(v-current) < 0.05;
+    return '<div class="ao-dev'+(sel?' sel':'')+'" onclick="_gainApply('+v+')">'
+      +'<span class="ao-dev-chk">'+(sel?'✓':'')+'</span>'
+      +'<span class="ao-dev-lbl">'+(_GAIN_LABELS[v]||v)+' ('+v+'×)</span></div>';
+  }).join('');
+}
+
+// Toolbar 🔊 button lights up if EITHER a non-default output device or a
+// non-1.0 volume is active — an at-a-glance signal without opening the
+// modal, replacing what #rdio-gain-btn used to show inline on its own.
+function _syncToolbarBtn(){
+  const btn = document.getElementById('audio-out-btn');
+  if(!btn) return;
+  const gainOn = _gainNode && Math.abs(_gainNode.gain.value - 1) > 0.001;
+  btn.classList.toggle('active', !!_aoCurrentId || !!gainOn);
+}
+
 async function _aoApply(deviceId){
   if(!_AO_SUPPORTED) return false;
   try{
-    await vid.setSinkId(deviceId||'');
+    if(_gainNode){
+      // Volume has rerouted #vid's audio through the Web Audio graph —
+      // the element's own setSinkId no longer drives what's audible, so
+      // device switching has to go through the AudioContext's own sink.
+      if(typeof _audioCtx.setSinkId !== 'function'){
+        throw new Error("This browser can't switch output devices while Volume boost/soft is active");
+      }
+      await _audioCtx.setSinkId(deviceId||'');
+    } else {
+      await vid.setSinkId(deviceId||'');
+    }
     _aoCurrentId = deviceId||'';
-    const btn = document.getElementById('audio-out-btn');
-    if(btn) btn.classList.toggle('active', !!deviceId);
+    _syncToolbarBtn();
     return true;
   }catch(e){
-    const body = document.getElementById('ao-body');
+    const body = document.getElementById('ao-dev-rows');
     if(body) body.insertAdjacentHTML('afterbegin',
       '<div class="ao-note" style="color:#ef4444">Could not switch output: '
       +String((e&&e.message)||e).replace(/</g,'&lt;')+'</div>');
@@ -8235,7 +8312,7 @@ async function _aoApply(deviceId){
 }
 
 function _aoRenderList(){
-  const body = document.getElementById('ao-body');
+  const body = document.getElementById('ao-dev-rows');
   if(!body) return;
   const rows = [{deviceId:'',label:'System default'}].concat(_aoDevices.filter(d=>d.deviceId!=='default'));
   let html = rows.map(d=>{
@@ -8249,12 +8326,28 @@ function _aoRenderList(){
 }
 
 async function _aoRefresh(){
-  const body = document.getElementById('ao-body');
+  const body = document.getElementById('ao-dev-rows');
+  const hdr  = document.getElementById('ao-dev-hdr');
   if(!body) return;
   if(!_AO_SUPPORTED){
-    body.innerHTML = '<div class="ao-note">Audio output selection isn\'t supported in this '
-      +'browser or platform — available on desktop Chrome, Edge, and Safari; not available on '
-      +'Android.</div>';
+    // Platform-level gap (Android, or any browser without the Audio Output
+    // Devices API) — this never becomes available on this device, so hide
+    // the section entirely rather than showing a permanent apology in a
+    // modal that's now reachable here for Volume alone.
+    if(hdr) hdr.style.display = 'none';
+    body.style.display = 'none';
+    return;
+  }
+  if(hdr) hdr.style.display = '';
+  body.style.display = '';
+  if(_gainNode && typeof _audioCtx.setSinkId !== 'function'){
+    // Session-level gap caused by the user's own Volume choice, on a
+    // browser that otherwise supports device switching fine — worth
+    // explaining rather than hiding, since it can look like the feature
+    // vanished if this section just disappears mid-session.
+    body.innerHTML = '<div class="ao-note">Output device switching isn\'t available in this '
+      +'browser once Volume boost/soft has been used (Chromium-only feature). This applies for '
+      +'the rest of the session, even after setting Volume back to Normal.</div>';
     return;
   }
   body.innerHTML = '<div class="ao-note">Loading devices…</div>';
@@ -8308,6 +8401,7 @@ function openAudioOutPanel(){
   // These two small panels share the same corner — don't stack them.
   if(typeof closeVfPanel==='function') closeVfPanel();
   document.getElementById('audio-out-overlay').classList.add('open');
+  _gainRenderRows();
   _aoRefresh();
 }
 function closeAudioOutPanel(){
@@ -8319,28 +8413,32 @@ function toggleAudioOutPanel(){
   else openAudioOutPanel();
 }
 
-// ── Boot: disable the control if unsupported, else restore last device ──
+// ── Boot: restore a previously-saved volume (this is the ONLY thing that
+// eagerly builds the shared graph — someone who's never touched Volume
+// never pays the setSinkId-compatibility cost noted above) and, where the
+// Audio Output Devices API is supported, restore the last output device ──
 (function _aoBoot(){
-  const btn = document.getElementById('audio-out-btn');
-  if(!_AO_SUPPORTED){
-    if(btn){
-      btn.disabled = true;
-      btn.title = 'Audio output selection not supported on this platform (desktop Chrome/Edge/Safari only)';
+  const savedGain = parseFloat(localStorage.getItem('rdio_gain') || '1');
+  if(!isNaN(savedGain) && Math.abs(savedGain - 1) > 0.001){
+    const tryGain = ()=>_globalAudioGraph();
+    if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', tryGain);
+    else tryGain();
+  }
+  if(_AO_SUPPORTED){
+    const saved = _aoSaved();
+    if(saved && saved.deviceId){
+      const tryApply = ()=>_aoApply(saved.deviceId);
+      if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', tryApply);
+      else tryApply();
     }
-    return;
+    if(navigator.mediaDevices.addEventListener){
+      navigator.mediaDevices.addEventListener('devicechange', function(){
+        const ov = document.getElementById('audio-out-overlay');
+        if(ov && ov.classList.contains('open')) _aoRefresh();
+      });
+    }
   }
-  const saved = _aoSaved();
-  if(saved && saved.deviceId){
-    const tryApply = ()=>_aoApply(saved.deviceId);
-    if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', tryApply);
-    else tryApply();
-  }
-  if(navigator.mediaDevices.addEventListener){
-    navigator.mediaDevices.addEventListener('devicechange', function(){
-      const ov = document.getElementById('audio-out-overlay');
-      if(ov && ov.classList.contains('open')) _aoRefresh();
-    });
-  }
+  _syncToolbarBtn();
 })();
 
 
