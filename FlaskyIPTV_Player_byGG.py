@@ -2480,6 +2480,71 @@ def api_resolve_url():
         return jsonify({"error": str(e)}), 500
 
 
+def _external_player_ua_args(exe: str, ua: str) -> list:
+    """
+    Extra CLI arguments so an externally-launched player identifies itself
+    with the same User-Agent already used for this portal's other stream
+    connections (state.stream_ua — ffmpeg, the HLS/MPEG-TS proxy, ffprobe,
+    DVR, casting and multiview all already send this UA; see AppState.stream_ua).
+
+    Without this, mpv/VLC each fall back to their OWN default UA. VLC's
+    built-in default happens to look like "VLC/x.x.x LibVLC/x.x.x" — exactly
+    what stream_ua itself defaults to, and what these CDN backends have
+    always been tested against — so VLC gets waved through "by accident".
+    mpv's default UA doesn't match that pattern, so a CDN gating on client UA
+    can reject it outright: mpv opens its window, the connection is refused,
+    and it exits almost immediately (the "window flashes, never opens"
+    symptom). Unrecognized executables get no extra flags — same as before.
+    """
+    if not ua:
+        return []
+    name = os.path.basename(exe).lower()
+    if "mpv" in name:
+        return [f"--user-agent={ua}"]
+    if "vlc" in name:
+        return [f"--http-user-agent={ua}"]
+    return []
+
+
+def _watch_external_player_exit(proc, player_name: str, started_at: float, log_fn=None):
+    """
+    Drain the external player's stdout/stderr for its whole lifetime — so the
+    OS pipe buffer never fills and stalls a long playback session — and if it
+    exits fast and/or with a non-zero code, surface whatever it printed via
+    state.log() instead of letting the failure disappear silently behind a
+    detached subprocess. log_fn defaults to state.log; overridable for tests.
+    """
+    logger = log_fn or state.log
+    tail = []
+    try:
+        if proc.stdout is not None:
+            for raw in proc.stdout:
+                try:
+                    line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+                except Exception:
+                    line = str(raw)
+                line = line.rstrip()
+                if line:
+                    tail.append(line)
+                    if len(tail) > 40:
+                        tail.pop(0)
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+    rc = proc.poll()
+    elapsed = time.time() - started_at
+    if rc not in (0, None) or (elapsed < 8 and tail):
+        joined = "\n".join(tail)[-2000:]
+        logger(
+            f"[EXT] {player_name} exited after {elapsed:.1f}s (code {rc})."
+            + (f" Output:\n{joined}" if joined else
+               " No output captured — try launching it from a terminal to see the real error.")
+        )
+
+
 @flask_app.route("/api/open_external", methods=["POST"])
 def api_open_external():
     """Resolve item URL then launch it in the configured external player."""
@@ -2505,8 +2570,14 @@ def api_open_external():
             url = run_async(_resolve())
         if not url:
             return jsonify({"error": "Could not resolve stream URL"}), 400
-        state.log(f"[EXT] Launching {os.path.basename(exe)} with stream URL")
-        subprocess.Popen([exe, url], close_fds=True)
+
+        ua = state.stream_ua
+        cmd = [exe, *_external_player_ua_args(exe, ua), url]
+        player_name = os.path.basename(exe)
+        state.log(f"[EXT] Launching {player_name} with stream URL (UA: {ua})")
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, close_fds=True)
+        threading.Thread(target=_watch_external_player_exit,
+                          args=(proc, player_name, time.time()), daemon=True).start()
         return jsonify({"ok": True})
     except Exception as e:
         state.log(f"[EXT] Error: {e}")
