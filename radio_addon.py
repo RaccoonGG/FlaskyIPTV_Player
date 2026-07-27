@@ -1913,11 +1913,6 @@ _RADIO_UI_JS = r"""
     // as "nothing happening yet" rather than implying live audio.
     '#rdio-np-bar.rdio-np-idle .rdio-np-icon{animation:none;opacity:.3}' +
     '#rdio-np-bar.rdio-np-idle #rdio-np-text{opacity:.5;font-style:italic}' +
-    '#rdio-gain-btn{background:none;border:none;cursor:pointer;' +
-    'color:var(--tx1,#fff);opacity:.55;font-size:11px;padding:0 6px;' +
-    'line-height:1;flex-shrink:0;transition:opacity .15s,color .15s}' +
-    '#rdio-gain-btn:hover{opacity:.9}' +
-    '#rdio-gain-btn.active{opacity:1;color:var(--acc,#a78bfa)}' +
     // Blurred album-art background — painted BELOW the modal's own content
     // (negative z-index) but ABOVE the modal's solid base background.
     // #radio-modal needs an explicit z-index (not just position:relative)
@@ -1982,9 +1977,6 @@ let _curRadioInfo = null;
 let _rdioNpTimer  = null;    // setInterval handle for now-playing polling
 let _rdioLastNp   = '';      // last known StreamTitle from ICY stream
 let _rdioArtworkTimer = null; // debounce handle for iTunes artwork lookup
-// Gain presets cycled by the 🔊 button — index into the array
-const _GAIN_STEPS = [1.0, 1.5, 2.0, 0.5];
-let   _rdioGainIdx = 0;
 // Last country/genre drilled into, so reopening the radio browser (e.g.
 // after playing a station, which closes it) can jump straight back to
 // that view instead of resetting to the top-level grid. {cc, label} /
@@ -2714,52 +2706,11 @@ function _rdioSetMediaSession(title, artworkUrl){
 }
 
 // ── gain (volume normalization) ────────────────────────────────────────────
-// Cycles through _GAIN_STEPS via the 🔊 button in #rdio-np-bar.
-// The GainNode lives on _rdioViz; gain persists across station changes
-// because _gainNode is only created once per AudioContext lifetime.
-
-function _rdioGainNext(){
-  _rdioGainIdx = (_rdioGainIdx + 1) % _GAIN_STEPS.length;
-  const v = _GAIN_STEPS[_rdioGainIdx];
-  if(_rdioViz && _rdioViz._gainNode) _rdioViz._gainNode.gain.value = v;
-  localStorage.setItem('rdio_gain', v);
-  _rdioGainSyncBtn();
-  if(typeof toast === 'function'){
-    const labels = ['Normal','Loud','Boost','Soft'];
-    toast(`Volume: ${labels[_rdioGainIdx]}`, 'k');
-  }
-}
-
-function _rdioGainSyncBtn(){
-  const btn = document.getElementById('rdio-gain-btn');
-  if(!btn) return;
-  const v = _GAIN_STEPS[_rdioGainIdx];
-  if(v === 1.0){
-    btn.textContent = '🔊';
-    btn.title = 'Volume: Normal — click to boost';
-    btn.classList.remove('active');
-  } else {
-    const labels = {0.5:'Soft', 1.5:'Loud', 2.0:'Boost'};
-    btn.textContent = `🔊 ${v}×`;
-    btn.title = `Volume: ${labels[v]||v+'×'} — click to change`;
-    btn.classList.add('active');
-  }
-}
-
-function _rdioGainEnsureBtn(){
-  if(document.getElementById('rdio-gain-btn')) return;
-  const bar = document.getElementById('rdio-np-bar');
-  if(!bar) return;
-  // Restore saved gain index on first show
-  const saved = parseFloat(localStorage.getItem('rdio_gain') || '1');
-  const idx   = _GAIN_STEPS.findIndex(v => Math.abs(v - saved) < 0.05);
-  if(idx >= 0) _rdioGainIdx = idx;
-  const btn = document.createElement('button');
-  btn.id      = 'rdio-gain-btn';
-  btn.onclick = _rdioGainNext;
-  bar.insertBefore(btn, bar.firstChild.nextSibling || null); // after np-text
-  _rdioGainSyncBtn();
-}
+// Moved to the main template's global Audio Output modal (🔊 toolbar
+// button → Volume section) so Soft/Boost applies to whatever's playing,
+// not just radio. The GainNode is created there, on window._globalAudioGraph();
+// _setupAudio() below taps its own analyser off that shared node instead
+// of owning a gain node itself.
 
 // ── now-playing bar (ICY StreamTitle polling) ─────────────────────────────
 // Polls /api/radio/nowplaying every 20 s after a station starts playing.
@@ -2833,7 +2784,6 @@ function _rdioNpBarShow(){
     text.textContent = 'Select a station to play';
     bar.classList.add('rdio-np-idle');
   }
-  _rdioGainEnsureBtn();     // 🔊 right after title text
   _rdioShuffleEnsureBtn();  // 🎲 before ⏱
   _rdioSleepEnsureBtn();    // ⏱ always last
 }
@@ -3260,7 +3210,6 @@ class _RdioViz {
     this._animId    = null;   this._running   = false;
     this._audioCtx  = null;   this._analyser  = null;
     this._source    = null;   this._audioOk   = false;
-    this._gainNode  = null;   // GainNode between source and analyser
     // Album art override — highest priority tier, set by now-playing poller
     this._artworkImg = null;  this._artworkUrl = null;
     this._info      = {};     this._dpr        = 1;
@@ -3509,32 +3458,27 @@ class _RdioViz {
   // ── audio ────────────────────────────────────────────────────────
 
   _setupAudio(){
-    const vid = document.getElementById('vid');
-    if(!vid) return;
+    // The AudioContext + GainNode + MediaElementAudioSourceNode(#vid) are
+    // now owned globally by the main template (window._globalAudioGraph),
+    // since createMediaElementSource can only ever be called once per
+    // element and Volume boost/soft needs that same graph for regular
+    // (non-radio) playback too. This just taps its own analyser off the
+    // shared gain node's output for the visualizer's frequency data.
+    const graph = (typeof window._globalAudioGraph === 'function') ? window._globalAudioGraph() : null;
+    if(!graph){ this._audioOk = false; return; }
+    this._audioCtx = graph.ctx;
+    this._source   = graph.source;
     try{
-      if(!this._audioCtx)
-        this._audioCtx = new(window.AudioContext||window.webkitAudioContext)();
-      if(this._audioCtx.state === 'suspended') this._audioCtx.resume().catch(()=>{});
       if(!this._analyser){
         this._analyser = this._audioCtx.createAnalyser();
         this._analyser.fftSize               = 512;
         this._analyser.smoothingTimeConstant = 0.80;
         this._analyser.minDecibels           = -88;
         this._analyser.maxDecibels           = -10;
-      }
-      // GainNode: created once, survives stop/start cycles so the user's
-      // gain preference is preserved across station changes.
-      if(!this._gainNode){
-        this._gainNode = this._audioCtx.createGain();
-        const stored = parseFloat(localStorage.getItem('rdio_gain') || '1');
-        this._gainNode.gain.value = isNaN(stored) ? 1 : Math.max(0.1, Math.min(4, stored));
-      }
-      if(!this._source){
-        // Graph: source → gainNode → analyser → destination
-        this._source = this._audioCtx.createMediaElementSource(vid);
-        this._source.connect(this._gainNode);
-        this._gainNode.connect(this._analyser);
-        this._analyser.connect(this._audioCtx.destination);
+        // Parallel tap — the shared gain node already connects onward to
+        // destination on its own, so this doesn't need to (and doesn't
+        // change what's audible either way).
+        graph.gain.connect(this._analyser);
       }
       this._audioOk = true;
     }catch(e){ this._audioOk = false; }
