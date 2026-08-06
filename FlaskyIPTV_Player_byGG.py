@@ -920,6 +920,16 @@ def _classify_connect_outcome(exc, result):
         cats = result.get("categories") or {}
         counts = {m: len(cats.get(m) or []) for m in ("live", "vod", "series")}
         if counts and all(v == 0 for v in counts.values()):
+            if result.get("no_payload_seen"):
+                # The handshake succeeded, but account_info()/every category
+                # fetch came back with no usable payload at all — the same
+                # "wrong address" signature the exception-based check above
+                # already sends to URL failover, just discovered one step
+                # later (e.g. a mirror/WAF that lets the handshake endpoint
+                # through but blocks everything else). A genuinely dead or
+                # expired account still gets a real — if empty — response
+                # from a working portal, so this is kept separate from that.
+                return _OUTCOME_NETWORK, "zero live/vod/series categories — no valid response from any endpoint"
             return _OUTCOME_CONTENT_EMPTY, "zero live/vod/series categories despite an accepted login"
     return _OUTCOME_HEALTHY, ""
 
