@@ -748,6 +748,18 @@ _ACCOUNT_BAD_STATUS_VALUES = {
 # elsewhere) — flip to False if this proves too aggressive in practice.
 CONTENT_EMPTY_TRIGGERS_ACCOUNT_FAILOVER = True
 
+# Handshake-failure phrasings (MAC/Stalker/Xtream — see portal_clients.py)
+# that mean "no recognizable portal payload came back at all", as opposed to
+# a parsed response that's merely missing a token/auth flag. A 4xx paired
+# with one of these is at least as consistent with a WAF/CDN edge block or a
+# dead/rate-limited mirror sitting in front of the real portal as it is with
+# the portal itself rejecting the account — see _classify_connect_outcome().
+_NO_PORTAL_PAYLOAD_PHRASES = (
+    "empty/non-json response",   # MAC handshake
+    "no valid json response",    # Stalker handshake
+    "no json response",          # Xtream handshake
+)
+
 
 def _redact_url_for_log(url: str) -> str:
     """Mask password-like query-parameter values before a URL is written to
@@ -859,9 +871,21 @@ def _classify_connect_outcome(exc, result):
     Returns (outcome, human_reason_string) for logging."""
     if exc is not None:
         msg = str(exc)
+        low = msg.lower()
         status = extract_http_status_from_message(msg)
         if status is not None:
             if 400 <= status <= 499:
+                # A 4xx alone can't tell "the portal rejected this account"
+                # apart from "something in front of the portal — WAF, CDN
+                # edge, a dead/rate-limited mirror — rejected the request
+                # before the portal's own auth logic ever ran". Only the
+                # former is actual evidence the account is bad. Route the
+                # latter to the same backup dimension (URL) that exists to
+                # work around exactly this, instead of skipping straight to
+                # account backups — or, with none configured, giving up
+                # after only the primary attempt.
+                if any(p in low for p in _NO_PORTAL_PAYLOAD_PHRASES):
+                    return _OUTCOME_NETWORK, f"HTTP {status} — {msg}"
                 return _OUTCOME_ACCOUNT, f"HTTP {status} — {msg}"
             if status >= 500:
                 return _OUTCOME_NETWORK, f"HTTP {status} — {msg}"
@@ -869,7 +893,6 @@ def _classify_connect_outcome(exc, result):
             # Covers aiohttp's connector/timeout/OS-level errors too — they
             # all derive from these standard-library types.
             return _OUTCOME_NETWORK, msg
-        low = msg.lower()
         if "authentication failed" in low or "wrong username" in low:
             return _OUTCOME_ACCOUNT, msg
         # No embedded status, not a recognized network-exception type: some
