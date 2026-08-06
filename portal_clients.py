@@ -552,6 +552,7 @@ class PortalClient:
                 payload = await self._read_json(r, "account_info")
                 break
         if not isinstance(payload, dict):
+            self._had_no_payload_response = True
             return ("unknown", "unknown")
         js = payload.get("js")
         if isinstance(js, list) and js:
@@ -1174,6 +1175,8 @@ class PortalClient:
         async with self.session.get(url, headers=self.headers) as r:
             self.log(f"[MAC] Categories HTTP {r.status} ({mode.upper()})")
             payload = await safe_json(r)
+        if not isinstance(payload, dict):
+            self._had_no_payload_response = True
         cats = normalize_js(payload)
         cats = [c for c in cats if isinstance(c, dict) and str(c.get("id", "")).strip()]
         self.log(f"[MAC] {mode.upper()} categories: {len(cats)} found")
@@ -2799,6 +2802,8 @@ class StalkerPortalClient:
         async with self.session.get(url, headers=headers) as r:
             self.log(f"[STALKER] Account info HTTP {r.status}")
             payload = await self._read_json(r, "Account info")
+        if not isinstance(payload, dict):
+            self._had_no_payload_response = True
 
         def _extract_max_conn(js: dict) -> int:
             try:
@@ -2907,6 +2912,8 @@ class StalkerPortalClient:
                 self.log(f"[STALKER] Categories (alt) HTTP {r2.status} ({mode.upper()})")
                 payload = await self._read_json(r2, f"Categories alt ({mode.upper()})")
             cats = normalize_js(payload)
+        if not cats and not isinstance(payload, dict):
+            self._had_no_payload_response = True
         result = []
         for c in cats:
             if not isinstance(c, dict):
@@ -4355,6 +4362,7 @@ class XtreamClient:
                 self.log(f"[XTREAM] Account info HTTP {r.status}")
                 data = await self._read_json(r, "account_info")
             if not isinstance(data, dict):
+                self._had_no_payload_response = True
                 return (self.username, "unknown")
             info = data.get("user_info", {})
             if not isinstance(info, dict):
@@ -4396,6 +4404,7 @@ class XtreamClient:
             self.log(f"[XTREAM] Categories HTTP {r.status} ({mode.upper()})")
             data = await safe_json(r)
         if not isinstance(data, list):
+            self._had_no_payload_response = True
             return []
         cats = []
         for c in data:
@@ -5508,6 +5517,13 @@ class PortalSessionManager:
                 "portal_url": url,
                 "is_stalker": is_stalker,
                 "profile_data": profile_data,
+                # True if account_info() and/or every category fetch got no
+                # usable payload at all (vs. a real response that's just
+                # empty) — lets the caller's classifier tell "dead/blocked
+                # mirror past the handshake" apart from "genuinely empty
+                # account". See PortalClient/StalkerPortalClient/XtreamClient
+                # account_info()/fetch_categories() where this is set.
+                "no_payload_seen": getattr(client, "_had_no_payload_response", False),
             }
 
         return self.submit(_do(), timeout=submit_timeout)
