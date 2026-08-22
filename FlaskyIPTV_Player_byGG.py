@@ -125,6 +125,7 @@ except ImportError:
     _RADIO_AVAILABLE = False
     def register_radio_addon(*a, **kw): pass
 
+
 # ===================== OPTIONAL DEPS =====================
 
 try:
@@ -7169,7 +7170,7 @@ async function playItem(i){
   _cuBtn.style.pointerEvents=_cuSupported?'':'none';
   const name=it.name||it.o_name||it.fname||'Unknown';
   const direct=it._direct_url||it._url;
-  if(direct){doPlay(direct,name,{isLive:itemMode==='live'});return;}
+  if(direct){doPlay(direct,name,{isLive:itemMode==='live',pIdx:i});return;}
   setNP('⟳ Resolving: '+name+'…');
   forceTab('p-player','t-player');
   try{
@@ -7177,7 +7178,7 @@ async function playItem(i){
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({item:it, mode:itemMode, category:curCat||{}})});
     const d=await r.json();
-    if(d.url) doPlay(d.url, name, {isLive: itemMode==='live'});
+    if(d.url) doPlay(d.url, name, {isLive: itemMode==='live', pIdx:i});
     else{setNP('✗ Could not resolve: '+name);toast('Could not resolve URL','err');}
   }catch(e){setNP('✗ '+e.message);}
 }
@@ -7323,6 +7324,62 @@ function doPlay(url, name, opts={}){
   // else-if(mpegtsOk) block, which made it a ReferenceError in the HLS retry
   // handler — causing a silent crash with no log and no remux fallback.
   const isLiveStream = (opts.isLive !== false);
+
+  // ── Silent-end fresh-retry (live only) ───────────────────────────────────
+  // Rare portal/channel glitch: playback stops with no HLS.js/mpegts.js error
+  // event at all — the origin just stops sending data, or serves an
+  // end-of-stream signal — so <video> reaches a natural 'ended' state.
+  // hlsErrorHandler, the mpegts.js ERROR handler, and the stall watchdog
+  // (which explicitly skips its own currentTime-freeze check while
+  // vid.ended — see the watchdog above) are all keyed off an actual error or
+  // a frozen currentTime, so none of them observe this. Only live channels
+  // are eligible — catchup/VOD legitimately reaches 'ended' on its own, and
+  // radio has its own list-aware navigation (_curIsRadio) with no pIdx.
+  if(window._endedFreshRetryHandler){
+    vid.removeEventListener('ended', window._endedFreshRetryHandler);
+    window._endedFreshRetryHandler = null;
+  }
+  if(isLiveStream && !_curIsRadio){
+    // opts.pIdx (set by playItem()) ties this session to its filtItems slot,
+    // so the retry can re-resolve fresh: a new play_token for Stalker/MAC, a
+    // fresh URL construction for Xtream, or a plain re-request for M3U — the
+    // exact same resolution a manual replay would do.  Sessions started
+    // outside the channel list (playDirectUrl()) never set pIdx; the mutable
+    // global pIdx could still hold a stale, unrelated value from a previous
+    // channel-list session, so re-requesting the session's own url is used
+    // instead of risking a silent switch to whatever pIdx last pointed at.
+    const _freshRetryIdx = (typeof opts.pIdx === 'number' && opts.pIdx >= 0) ? opts.pIdx : -1;
+    const _erk = _freshRetryIdx >= 0 ? ('i'+_freshRetryIdx) : ('u:'+url);
+    const _endedRetryHandler = () => {
+      if(_stale()) return;
+      if(!window._endedFreshRetries) window._endedFreshRetries = {};
+      window._endedFreshRetries[_erk] = (window._endedFreshRetries[_erk]||0)+1;
+      if(window._endedFreshRetries[_erk] <= 3 && !_stale()){
+        alog('[Player] Live stream ended with no error (attempt '+window._endedFreshRetries[_erk]+'/3) — fresh reconnect…','w');
+        setNP('⟳ Stream ended unexpectedly — reconnecting: '+pName+'…');
+        setTimeout(()=>{
+          if(_stale()) return;
+          if(_freshRetryIdx >= 0) playItem(_freshRetryIdx);
+          else doPlay(url, name, {isLive:true});
+        }, 1000);
+      } else {
+        alog('[Player] Live stream kept ending after fresh reconnects — stopping','e');
+        setNP('✗ Stream unavailable: '+name);
+        document.getElementById('ppbtn').textContent='▶';
+        window._endedFreshRetries[_erk] = 0;
+      }
+    };
+    window._endedFreshRetryHandler = _endedRetryHandler;
+    vid.addEventListener('ended', _endedRetryHandler);
+    // Once playback genuinely recovers, reset this channel's retry budget —
+    // otherwise a channel that hiccups 3 times over a long session (each
+    // time recovering fine) would silently have no budget left for a later,
+    // unrelated failure.
+    vid.addEventListener('playing', () => {
+      if(!_stale() && window._endedFreshRetries) window._endedFreshRetries[_erk] = 0;
+    }, {once:true});
+  }
+  // ─────────────────────────────────────────────────────────────────────────
 
   // ── Catchup MPEG-TS → HLS-VOD proxy (seek bar + sync_byte fix) ──────────
   // Raw Xtream timeshift .ts streams don't support seeking and suffer from
