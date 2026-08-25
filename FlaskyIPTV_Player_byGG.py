@@ -7361,7 +7361,7 @@ function doPlay(url, name, opts={}){
           if(_stale()) return;
           if(_freshRetryIdx >= 0) playItem(_freshRetryIdx);
           else doPlay(url, name, {isLive:true});
-        }, 1000);
+        }, 3000);
       } else {
         alog('[Player] Live stream kept ending after fresh reconnects — stopping','e');
         setNP('✗ Stream unavailable: '+name);
