@@ -1,0 +1,974 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#060612">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<title>FlaskyIPTV Remote</title>
+<style>
+  :root{
+    --bg:#060612; --panel:#0e0e24; --panel-2:#14142e; --border:#23234a;
+    --accent:#7c3aed; --accent-soft:rgba(124,58,237,.18); --accent-glow:rgba(124,58,237,.45);
+    --text:#e4e8f5; --text-dim:#8b8fb0; --text-faint:#565a78;
+    --blue:#3b82f6; --cyan:#06b6d4; --green:#22c55e; --orange:#f59e0b; --red:#ef4444;
+    --radius:16px; --radius-sm:10px;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Menlo, Consolas, monospace;
+  }
+  *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body{ margin:0; padding:0; background:var(--bg); color:var(--text); font-family:var(--font); }
+  body{ padding-bottom: env(safe-area-inset-bottom, 0); min-height:100vh; }
+  .shell{ max-width:480px; margin:0 auto; min-height:100vh; display:flex; flex-direction:column; }
+  button{ font-family:inherit; color:inherit; }
+  a{ color:var(--accent); }
+
+  /* ---------- top bar ---------- */
+  .topbar{
+    position:sticky; top:0; z-index:20; display:flex; align-items:center; gap:10px;
+    padding:14px 16px calc(10px + env(safe-area-inset-top,0)); padding-top:calc(14px + env(safe-area-inset-top,0));
+    background:rgba(6,6,18,.85); backdrop-filter:blur(10px); border-bottom:1px solid var(--border);
+  }
+  .dot{ width:10px; height:10px; border-radius:50%; background:var(--text-faint); flex:none; transition:background .2s; }
+  .dot.fresh{ background:var(--green); box-shadow:0 0 8px var(--green); }
+  .dot.stale{ background:var(--orange); box-shadow:0 0 8px var(--orange); }
+  .dot.off{ background:var(--red); }
+  .topbar h1{ font-size:15px; font-weight:600; margin:0; letter-spacing:.2px; }
+  .topbar .sub{ font-size:11px; color:var(--text-dim); margin-left:auto; text-align:right; }
+
+  main{ flex:1; padding:14px 14px 28px; display:flex; flex-direction:column; gap:14px; }
+
+  /* ---------- now playing hero ---------- */
+  .np-card{
+    background:linear-gradient(160deg, var(--panel-2), var(--panel));
+    border:1px solid var(--border); border-radius:var(--radius); padding:16px;
+    display:flex; flex-direction:column; gap:10px;
+  }
+  .np-top{ display:flex; align-items:center; gap:12px; }
+  .np-logo{
+    width:52px; height:52px; border-radius:10px; background:var(--panel-2); flex:none;
+    object-fit:contain; border:1px solid var(--border);
+  }
+  .np-logo.empty{ display:flex; align-items:center; justify-content:center; color:var(--text-faint); }
+  .np-text{ min-width:0; flex:1; }
+  .np-title{
+    font-size:17px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    text-shadow:0 0 18px var(--accent-glow);
+  }
+  .np-track{ font-size:12.5px; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:2px; }
+  .np-meta{ font-family:var(--mono); font-size:11px; color:var(--text-faint); margin-top:2px; }
+  .np-progress{ height:4px; border-radius:2px; background:var(--panel-2); overflow:hidden; }
+  .np-progress i{ display:block; height:100%; width:0%; background:var(--accent); box-shadow:0 0 6px var(--accent-glow); }
+  .np-banner{
+    display:none; font-size:12px; padding:8px 10px; border-radius:var(--radius-sm);
+    background:var(--accent-soft); border:1px solid var(--accent); color:var(--text);
+  }
+  .np-banner.show{ display:block; }
+
+  /* ---------- transport ---------- */
+  .transport{ display:flex; align-items:center; justify-content:center; gap:18px; }
+  .tbtn{
+    border:1px solid var(--border); background:var(--panel); border-radius:50%;
+    display:flex; align-items:center; justify-content:center; cursor:pointer;
+    transition:transform .08s ease, background .15s, border-color .15s;
+  }
+  .tbtn:active{ transform:scale(.92); background:var(--panel-2); }
+  .tbtn:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .tbtn svg{ width:22px; height:22px; fill:var(--text); }
+  .tbtn.big{ width:72px; height:72px; }
+  .tbtn.big svg{ width:28px; height:28px; }
+  .tbtn.primary{ background:var(--accent); border-color:var(--accent); box-shadow:0 0 22px var(--accent-glow); }
+  .tbtn.primary svg{ fill:#fff; }
+  .tbtn.small{ width:52px; height:52px; }
+  .tbtn.small svg{ width:19px; height:19px; }
+  .tbtn.active{ background:var(--accent-soft); border-color:var(--accent); }
+  .tbtn.active svg{ fill:var(--accent); }
+  .tbtn:disabled{ opacity:.35; pointer-events:none; }
+
+  .row2{ display:flex; align-items:center; justify-content:center; gap:14px; flex-wrap:wrap; }
+
+  /* ---------- volume ---------- */
+  .volume-card{
+    background:var(--panel); border:1px solid var(--border); border-radius:var(--radius);
+    padding:12px 16px; display:flex; align-items:center; gap:12px;
+  }
+  .volume-card .tbtn{ width:44px; height:44px; }
+  .volume-card .tbtn svg{ width:17px; height:17px; }
+  .vol-mid{ flex:1; display:flex; flex-direction:column; gap:6px; }
+  .vol-mid .num{ font-family:var(--mono); font-size:12px; color:var(--text-dim); text-align:center; }
+  input[type=range]{
+    -webkit-appearance:none; appearance:none; width:100%; height:4px; border-radius:2px;
+    background:var(--panel-2); outline:none;
+  }
+  input[type=range]::-webkit-slider-thumb{
+    -webkit-appearance:none; width:18px; height:18px; border-radius:50%; background:var(--accent);
+    box-shadow:0 0 8px var(--accent-glow); cursor:pointer; margin-top:-7px;
+  }
+  input[type=range]::-webkit-slider-runnable-track{ height:4px; border-radius:2px; background:var(--panel-2); }
+  input[type=range]::-moz-range-thumb{ width:18px; height:18px; border:none; border-radius:50%; background:var(--accent); cursor:pointer; }
+  input[type=range]::-moz-range-track{ height:4px; border-radius:2px; background:var(--panel-2); }
+
+  /* ---------- browse ---------- */
+  .browse-card{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; }
+  .tabs{ display:flex; border-bottom:1px solid var(--border); }
+  .tab{
+    flex:1; text-align:center; padding:12px 8px; font-size:13px; font-weight:600; color:var(--text-dim);
+    background:none; border:none; cursor:pointer; border-bottom:2px solid transparent;
+  }
+  .tab.on{ color:var(--text); border-bottom-color:var(--accent); }
+  .browse-toolbar{ display:flex; align-items:center; gap:8px; padding:10px 12px; border-bottom:1px solid var(--border); }
+  .crumb{
+    font-size:12px; color:var(--text-dim); background:var(--panel-2); border:1px solid var(--border);
+    border-radius:20px; padding:5px 10px; cursor:pointer; white-space:nowrap; max-width:60%; overflow:hidden; text-overflow:ellipsis;
+  }
+  .search{
+    flex:1; background:var(--panel-2); border:1px solid var(--border); border-radius:20px;
+    padding:7px 12px; font-size:13px; color:var(--text); min-width:0;
+  }
+  .search::placeholder{ color:var(--text-faint); }
+  .list{ max-height:44vh; overflow-y:auto; }
+  .list-item{
+    display:flex; align-items:center; gap:10px; padding:10px 12px; cursor:pointer;
+    border-bottom:1px solid var(--border); transition:background .1s;
+  }
+  .list-item:active{ background:var(--panel-2); }
+  .list-item.now{ background:var(--accent-soft); }
+  .li-logo{ width:34px; height:34px; border-radius:7px; object-fit:contain; background:var(--panel-2); flex:none; border:1px solid var(--border); }
+  .li-name{ font-size:13.5px; flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .li-chevron{ color:var(--text-faint); flex:none; }
+
+  /* ---------- radio ---------- */
+  .radio-toolbar{ border-bottom:1px solid var(--border); }
+  .radio-subtabs{
+    display:flex; gap:6px; padding:10px 12px; overflow-x:auto; -webkit-overflow-scrolling:touch;
+    scrollbar-width:none;
+  }
+  .radio-subtabs::-webkit-scrollbar{ display:none; }
+  .rtab{
+    flex:none; background:var(--panel-2); border:1px solid var(--border); border-radius:20px;
+    padding:7px 13px; font-size:12.5px; font-weight:600; color:var(--text-dim); cursor:pointer; white-space:nowrap;
+  }
+  .rtab.on{ background:var(--accent-soft); border-color:var(--accent); color:var(--text); }
+  .radio-search-row{ display:flex; gap:8px; padding:0 12px 10px; }
+  .radio-search-row .search{ flex:1; }
+  .radio-go-btn{
+    background:var(--accent); border:none; border-radius:20px; padding:0 16px;
+    font-size:13px; font-weight:600; color:#fff; cursor:pointer;
+  }
+  .li-fav{
+    background:none; border:none; color:var(--text-faint); font-size:17px; cursor:pointer;
+    flex:none; padding:4px 6px; line-height:1;
+  }
+  .li-fav.active{ color:var(--accent); text-shadow:0 0 10px var(--accent-glow); }
+  .li-meta{ font-size:11px; color:var(--text-faint); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:1px; }
+  .li-name-wrap{ flex:1; min-width:0; }
+  .genre-pills{ display:flex; flex-wrap:wrap; gap:8px; padding:12px; }
+  .genre-pill{
+    background:var(--panel-2); border:1px solid var(--border); border-radius:20px;
+    padding:8px 14px; font-size:12.5px; color:var(--text); cursor:pointer;
+  }
+  .genre-pill:active{ background:var(--accent-soft); border-color:var(--accent); }
+  .empty-state{ padding:26px 16px; text-align:center; color:var(--text-dim); font-size:13px; line-height:1.5; }
+  .empty-state .big{ font-size:26px; display:block; margin-bottom:8px; }
+  .spinner{
+    width:22px; height:22px; border-radius:50%; border:2.5px solid var(--panel-2); border-top-color:var(--accent);
+    margin:18px auto; animation:spin .8s linear infinite;
+  }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+
+  footer{ text-align:center; padding:6px 16px 18px; font-size:11px; color:var(--text-faint); }
+
+  /* ---------- connect overlay (standalone-file mode only) ---------- */
+  .connect-overlay{
+    display:none; position:fixed; inset:0; z-index:999; background:var(--bg);
+    align-items:center; justify-content:center; padding:24px;
+  }
+  .connect-card{
+    max-width:360px; width:100%; background:var(--panel); border:1px solid var(--border);
+    border-radius:var(--radius); padding:22px; display:flex; flex-direction:column; gap:12px;
+  }
+  .connect-card h2{ margin:0; font-size:17px; text-shadow:0 0 18px var(--accent-glow); }
+  .connect-card p{ margin:0; font-size:12.5px; color:var(--text-dim); line-height:1.5; }
+  .connect-card input{
+    background:var(--panel-2); border:1px solid var(--border); border-radius:var(--radius-sm);
+    padding:11px 12px; font-size:14px; color:var(--text); font-family:var(--mono); width:100%;
+  }
+  .connect-card input::placeholder{ color:var(--text-faint); }
+  .connect-card input:focus{ outline:2px solid var(--accent); outline-offset:1px; }
+  .connect-card button{
+    background:var(--accent); border:none; border-radius:var(--radius-sm); padding:12px;
+    font-size:14px; font-weight:600; color:#fff; cursor:pointer; box-shadow:0 0 18px var(--accent-glow);
+  }
+  .connect-card button:active{ transform:scale(.98); }
+  .connect-card .connect-hint{ font-size:11px; color:var(--text-faint); }
+  .connect-card .connect-hint code{ font-family:var(--mono); color:var(--text-dim); }
+  .connect-quick-btn{
+    background:var(--panel-2); border:1px solid var(--border); border-radius:var(--radius-sm);
+    padding:12px; font-size:14px; font-weight:600; color:var(--text); cursor:pointer; width:100%;
+  }
+  .connect-quick-btn:active{ transform:scale(.98); background:var(--accent-soft); }
+  .connect-divider{ display:flex; align-items:center; gap:10px; margin:2px 0; }
+  .connect-divider::before, .connect-divider::after{ content:''; flex:1; height:1px; background:var(--border); }
+  .connect-divider span{ font-size:11px; color:var(--text-faint); white-space:nowrap; }
+  .connect-ip-row{ display:flex; align-items:center; gap:6px; }
+  .connect-ip-row input#connectIpInput{ flex:2.2; }
+  .connect-ip-row input#connectPortInput{ flex:1; text-align:center; }
+  .connect-colon{ color:var(--text-faint); font-family:var(--mono); font-size:15px; }
+
+  @media (prefers-reduced-motion: reduce){
+    *{ animation-duration:.001ms !important; transition-duration:.001ms !important; }
+  }
+</style>
+</head>
+<body>
+<div class="connect-overlay" id="connectOverlay">
+  <div class="connect-card">
+    <h2>Connect to FlaskyIPTV</h2>
+    <p>This copy is running as a standalone file. Pre-filled below with your PC's last known address — check it's still right, or edit it if not.</p>
+
+    <button id="connectSamePcBtn" class="connect-quick-btn" type="button">This PC (127.0.0.1)</button>
+
+    <div class="connect-divider"><span>or your PC's LAN IP</span></div>
+
+    <div class="connect-ip-row">
+      <input type="text" id="connectIpInput" placeholder="192.168.1.100" autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="decimal">
+      <span class="connect-colon">:</span>
+      <input type="text" id="connectPortInput" placeholder="5000" autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="numeric">
+    </div>
+    <input type="text" id="connectPinInput" placeholder="PIN (leave blank if none)" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <button id="connectSubmitBtn">Connect</button>
+    <p class="connect-hint">If that address stopped working (PC's IP changed), find the new one in Wi-Fi settings on the PC — same one you'd use for the m3u playlist URL. This default isn't updated automatically, and nothing here is saved between opens; to skip re-checking it every time, open FlaskyIPTV's own <code>/remote</code> link once and add it to your home screen from there instead, that version already knows its own address.</p>
+  </div>
+</div>
+<div class="shell">
+
+  <header class="topbar">
+    <span class="dot off" id="statusDot"></span>
+    <h1>FlaskyIPTV Remote</h1>
+    <span class="sub" id="statusSub">connecting…</span>
+  </header>
+
+  <main>
+    <section class="np-card">
+      <div class="np-top">
+        <img class="np-logo" id="npLogo" alt="" style="display:none">
+        <div class="np-logo empty" id="npLogoEmpty">
+          <svg width="22" height="22" viewBox="0 0 24 24"><path fill="currentColor" d="M4 6h16v10H4z" opacity=".25"/><path fill="currentColor" d="M2 4h20v14H12l-4 4v-4H2z" opacity=".4"/></svg>
+        </div>
+        <div class="np-text">
+          <div class="np-title" id="npTitle">Waiting for FlaskyIPTV…</div>
+          <div class="np-track" id="npTrack"></div>
+          <div class="np-meta" id="npMeta"></div>
+        </div>
+      </div>
+      <div class="np-progress"><i id="npProgressBar"></i></div>
+      <div class="np-banner" id="npBanner"></div>
+    </section>
+
+    <div class="transport">
+      <button class="tbtn" id="btnPrev" title="Previous" aria-label="Previous">
+        <svg viewBox="0 0 24 24"><path fill="currentColor" d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/></svg>
+      </button>
+      <button class="tbtn big primary" id="btnPlay" title="Play / Pause" aria-label="Play or pause">
+        <svg id="playIcon" viewBox="0 0 24 24"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>
+      </button>
+      <button class="tbtn" id="btnNext" title="Next" aria-label="Next">
+        <svg viewBox="0 0 24 24"><path fill="currentColor" d="M16 6h2v12h-2zM6 6l8.5 6L6 18z"/></svg>
+      </button>
+    </div>
+
+    <div class="row2">
+      <button class="tbtn small" id="btnStop" title="Stop" aria-label="Stop">
+        <svg viewBox="0 0 24 24"><path fill="currentColor" d="M6 6h12v12H6z"/></svg>
+      </button>
+      <button class="tbtn small" id="btnMute" title="Mute" aria-label="Mute">
+        <svg viewBox="0 0 24 24"><path fill="currentColor" d="M4 9v6h4l5 5V4L8 9z"/></svg>
+      </button>
+      <button class="tbtn small" id="btnEpg" title="Guide (current channel)" aria-label="Toggle EPG">
+        <svg viewBox="0 0 24 24"><path fill="currentColor" d="M4 4h16v16H4zm2 3v2h12V7zm0 4v2h12v-2zm0 4v2h8v-2z" opacity=".9"/></svg>
+      </button>
+      <button class="tbtn small" id="btnFs" title="Fullscreen" aria-label="Toggle fullscreen">
+        <svg id="fsIcon" viewBox="0 0 24 24"><path fill="currentColor" d="M7 14H5v5h5v-2H7zm-2-4h2V7h3V5H5zm12 9h-3v2h5v-5h-2zM14 5v2h3v3h2V5z"/></svg>
+      </button>
+    </div>
+
+    <div class="volume-card">
+      <button class="tbtn" id="btnVolDown" title="Volume down" aria-label="Volume down">
+        <svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 10v4h4l5 5V5L7 10zm12.5 2A4.5 4.5 0 0 0 14 8.5v7A4.5 4.5 0 0 0 15.5 12z" opacity=".55"/><rect x="16" y="11" width="6" height="2" fill="currentColor"/></svg>
+      </button>
+      <div class="vol-mid">
+        <input type="range" id="volSlider" min="0" max="100" value="0">
+        <div class="num" id="volNum">-- %</div>
+      </div>
+      <button class="tbtn" id="btnVolUp" title="Volume up" aria-label="Volume up">
+        <svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 10v4h4l5 5V5L7 10z"/><rect x="16" y="11" width="6" height="2" fill="currentColor"/><rect x="18" y="9" width="2" height="6" fill="currentColor"/></svg>
+      </button>
+    </div>
+
+    <section class="browse-card">
+      <div class="tabs" id="modeTabs">
+        <button class="tab on" data-mode="live">Live</button>
+        <button class="tab" data-mode="vod">Movies</button>
+        <button class="tab" data-mode="series">Series</button>
+        <button class="tab" data-mode="radio">Radio</button>
+      </div>
+      <div class="browse-toolbar" id="tvToolbar">
+        <button class="crumb" id="crumbBtn" style="display:none"></button>
+        <input class="search" id="searchBox" placeholder="Filter…">
+      </div>
+      <div class="radio-toolbar" id="radioToolbar" style="display:none">
+        <div class="radio-subtabs" id="radioSubtabs">
+          <button class="rtab on" data-rtab="favorites">★ Favorites</button>
+          <button class="rtab" data-rtab="top">Top</button>
+          <button class="rtab" data-rtab="builtin">Built-in</button>
+          <button class="rtab" data-rtab="genres">Genres</button>
+          <button class="rtab" data-rtab="search">Search</button>
+        </div>
+        <div class="radio-search-row" id="radioSearchRow" style="display:none">
+          <input class="search" id="radioSearchBox" placeholder="Search stations…" inputmode="search">
+          <button class="radio-go-btn" id="radioSearchBtn" type="button">Go</button>
+        </div>
+      </div>
+      <div class="list" id="browseList">
+        <div class="empty-state"><span class="big">📡</span>Loading categories…</div>
+      </div>
+    </section>
+
+    <footer id="footerNote">FlaskyIPTV Remote · same Wi-Fi network only</footer>
+    <footer id="lanUrlHint" style="display:none"></footer>
+  </main>
+</div>
+
+<script>
+(function(){
+  'use strict';
+
+  // ---------------------------------------------------------------------
+  // If this copy is opened standalone (no ?server= in its URL) and the
+  // connect prompt has to ask, it pre-fills these instead of starting
+  // blank. Not auto-detected, not persisted between opens — just a plain
+  // default baked into this file. Update it if your PC's LAN IP changes;
+  // the field stays editable either way, this only saves typing when it's
+  // still correct.
+  // ---------------------------------------------------------------------
+  var DEFAULT_SERVER_IP = '192.168.1.100';
+  var DEFAULT_SERVER_PORT = '5000';
+
+  // ---------------------------------------------------------------------
+  // Base URL + PIN. Defaults to same-origin (the normal case: this page is
+  // served by remote_addon.py at /remote). If opened standalone (file://,
+  // or hosted somewhere else) pass ?server=http://<flaskyiptv-ip>:<port>.
+  // PIN (only meaningful if FLASKY_REMOTE_PIN was set) travels as ?pin=...
+  // in the same URL, so bookmarking/adding-to-home-screen keeps it — no
+  // login prompt and nothing stored in the page itself.
+  // ---------------------------------------------------------------------
+  var qs = new URLSearchParams(location.search);
+  var explicitServer = (qs.get('server') || '').trim().replace(/\/+$/, '');
+  var PIN = qs.get('pin') || '';
+  // null (not '') specifically means "we don't know yet" — opened as a local
+  // file with no ?server= to go on. '' means "same origin", which is correct
+  // and known whenever this page was actually fetched from the addon.
+  var BASE = explicitServer || (location.protocol === 'file:' ? null : location.origin);
+
+  function api(path){ return BASE + path; }
+  function withPin(url){
+    if (!PIN) return url;
+    return url + (url.indexOf('?') === -1 ? '?' : '&') + 'pin=' + encodeURIComponent(PIN);
+  }
+
+  function post(path, body){
+    return fetch(withPin(api(path)), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body || {})
+    }).then(function(r){ return r.json(); });
+  }
+  function getJSON(path){
+    return fetch(withPin(api(path))).then(function(r){ return r.json(); });
+  }
+
+  function sendCommand(action, extra){
+    var body = Object.assign({action: action}, extra || {});
+    post('/api/remote/command', body)['catch'](function(){ setConn('off', null); });
+  }
+
+  function normalizeServerUrl(raw){
+    var v = (raw || '').trim().replace(/\/+$/, '');
+    if (!v) return '';
+    if (!/^https?:\/\//i.test(v)) v = 'http://' + v;
+    return v;
+  }
+
+  function buildConnectUrl(ip, port){
+    ip = (ip || '').trim();
+    if (!ip) return '';
+    // If a full URL or host:port got typed/pasted into the IP field
+    // anyway, respect it as-is instead of mangling it with the port field.
+    if (/^https?:\/\//i.test(ip) || ip.indexOf(':') !== -1) {
+      return normalizeServerUrl(ip);
+    }
+    return normalizeServerUrl(ip + ':' + ((port || '').trim() || '5000'));
+  }
+
+  // ---------------------------------------------------------------------
+  // Everything below touches the DOM/network and needs a resolved BASE, so
+  // it's deferred behind startApp() — called immediately when BASE is
+  // already known (the normal case: fetched from the addon's own /remote),
+  // or once the connect overlay's "Connect" button supplies one (opened as
+  // a standalone file with no ?server= in the URL).
+  // ---------------------------------------------------------------------
+  function startApp(){
+
+  // ---------------------------------------------------------------------
+  // Connection status + now-playing rendering
+  // ---------------------------------------------------------------------
+  var dot = document.getElementById('statusDot');
+  var sub = document.getElementById('statusSub');
+  var lastPlaying = false, lastMuted = false;
+
+  function setConn(kind, ageSeconds){
+    dot.className = 'dot ' + kind;
+    if (kind === 'fresh') sub.textContent = 'connected';
+    else if (kind === 'stale') sub.textContent = 'last seen ' + Math.round(ageSeconds) + 's ago';
+    else sub.textContent = 'not connected';
+  }
+
+  function fmtTime(s){
+    if (s == null || !isFinite(s)) return '';
+    s = Math.max(0, Math.round(s));
+    var m = Math.floor(s / 60), sec = s % 60;
+    return m + ':' + (sec < 10 ? '0' : '') + sec;
+  }
+
+  function render(state){
+    if (!state){
+      document.getElementById('npTitle').textContent = 'Waiting for FlaskyIPTV…';
+      document.getElementById('npTrack').textContent = '';
+      document.getElementById('npMeta').textContent = 'Open FlaskyIPTV and start watching something on that screen.';
+      document.getElementById('npProgressBar').style.width = '0%';
+      showBanner('');
+      return;
+    }
+    document.getElementById('npTitle').textContent = state.stopped ? '⏹ Stopped' : (state.title || 'Unknown');
+    document.getElementById('npTrack').textContent = state.track || '';
+
+    var metaBits = [];
+    if (state.isRadio) { metaBits.push('RADIO'); }
+    else if (state.mode) { metaBits.push(state.mode.toUpperCase()); }
+    if (typeof state.itemIndex === 'number' && state.itemIndex >= 0 && state.itemCount) {
+      metaBits.push((state.itemIndex + 1) + ' / ' + state.itemCount);
+    }
+    if (state.duration) metaBits.push(fmtTime(state.currentTime) + ' / ' + fmtTime(state.duration));
+    document.getElementById('npMeta').textContent = metaBits.join('  ·  ');
+
+    var pct = (state.duration && state.currentTime != null) ? Math.min(100, 100 * state.currentTime / state.duration) : 0;
+    document.getElementById('npProgressBar').style.width = pct + '%';
+
+    var logo = state.logo, logoImg = document.getElementById('npLogo'), logoEmpty = document.getElementById('npLogoEmpty');
+    if (logo) { logoImg.src = logo; logoImg.style.display = ''; logoEmpty.style.display = 'none'; logoImg.onerror = function(){ logoImg.style.display='none'; logoEmpty.style.display='flex'; }; }
+    else { logoImg.style.display = 'none'; logoEmpty.style.display = 'flex'; }
+
+    lastPlaying = !!state.playing;
+    document.getElementById('playIcon').innerHTML = lastPlaying
+      ? '<path fill="currentColor" d="M6 5h4v14H6zm8 0h4v14h-4z"/>'
+      : '<path fill="currentColor" d="M8 5v14l11-7z"/>';
+
+    lastMuted = !!state.muted;
+    document.getElementById('btnMute').classList.toggle('active', lastMuted);
+
+    if (typeof state.volume === 'number'){
+      var slider = document.getElementById('volSlider');
+      if (document.activeElement !== slider) slider.value = state.volume;
+      document.getElementById('volNum').textContent = state.volume + ' %';
+    }
+
+    document.getElementById('btnEpg').classList.toggle('active', !!state.epgOpenGuess);
+
+    var fsOn = !!state.fullscreen;
+    document.getElementById('fsIcon').innerHTML = fsOn
+      ? '<path fill="currentColor" d="M9 9H5V7h2V5h2zm6 0V5h2v2h2v2h-4zM9 15v4H5v-2h2v-2zm6 0h4v2h-2v2h-2z"/>'
+      : '<path fill="currentColor" d="M7 14H5v5h5v-2H7zm-2-4h2V7h3V5H5zm12 9h-3v2h5v-5h-2zM14 5v2h3v3h2V5z"/>';
+    document.getElementById('btnFs').classList.toggle('active', fsOn);
+
+    showBanner(state.playBlocked
+      ? 'Playback may be blocked by the browser — tap once on the FlaskyIPTV screen to allow remote play.'
+      : '');
+  }
+
+  function showBanner(msg){
+    var b = document.getElementById('npBanner');
+    if (!msg){ b.classList.remove('show'); return; }
+    b.textContent = msg; b.classList.add('show');
+  }
+
+  function applyStatus(data){
+    if (!data || data.ok === false){
+      setConn('off', null);
+      if (data && data.error === 'invalid pin') {
+        document.getElementById('footerNote').textContent = 'PIN required or incorrect — use the link FlaskyIPTV gave you.';
+      }
+      render(null);
+      return;
+    }
+    if (!data.state){ setConn('off', null); render(null); return; }
+    setConn(data.fresh ? 'fresh' : 'stale', data.age_seconds);
+    render(data.state);
+  }
+
+  // ---------------------------------------------------------------------
+  // Live updates: SSE primary, polling fallback
+  // ---------------------------------------------------------------------
+  var pollTimer = null;
+  function startPolling(){
+    if (pollTimer) return;
+    pollTimer = setInterval(function(){
+      getJSON('/api/remote/status').then(applyStatus)['catch'](function(){ setConn('off', null); });
+    }, 2000);
+  }
+  function stopPolling(){ if (pollTimer){ clearInterval(pollTimer); pollTimer = null; } }
+
+  function connectEvents(){
+    if (typeof EventSource === 'undefined'){ startPolling(); return; }
+    var es;
+    try { es = new EventSource(withPin(api('/api/remote/events'))); }
+    catch(e){ startPolling(); return; }
+
+    es.onmessage = function(ev){
+      stopPolling();
+      try {
+        var msg = JSON.parse(ev.data);
+        setConn('fresh', 0);
+        render(msg.state);
+      } catch(e){}
+    };
+    es.onerror = function(){
+      // EventSource retries on its own; run polling alongside as a safety net
+      // in case this particular deployment (proxy, odd browser) never recovers.
+      startPolling();
+    };
+  }
+
+  function checkLanUrlHint(){
+    getJSON('/api/remote/available').then(function(data){
+      var hint = document.getElementById('lanUrlHint');
+      if (data && data.lan_url){
+        hint.textContent = 'On your phone, use: ' + data.lan_url;
+        hint.style.display = '';
+      }
+    })['catch'](function(){ /* non-essential, fail silently */ });
+  }
+
+  getJSON('/api/remote/status').then(applyStatus)['catch'](function(){ setConn('off', null); });
+  connectEvents();
+  checkLanUrlHint();
+
+  // ---------------------------------------------------------------------
+  // Transport controls
+  // ---------------------------------------------------------------------
+  document.getElementById('btnPlay').addEventListener('click', function(){
+    sendCommand(lastPlaying ? 'pause' : 'resume');
+  });
+  document.getElementById('btnStop').addEventListener('click', function(){ sendCommand('stop'); });
+  document.getElementById('btnPrev').addEventListener('click', function(){ sendCommand('previous'); });
+  document.getElementById('btnNext').addEventListener('click', function(){ sendCommand('next'); });
+  document.getElementById('btnMute').addEventListener('click', function(){ sendCommand('mute_toggle'); });
+  document.getElementById('btnEpg').addEventListener('click', function(){ sendCommand('toggle_epg'); });
+  document.getElementById('btnFs').addEventListener('click', function(){
+    sendCommand(document.getElementById('btnFs').classList.contains('active') ? 'fullscreen_off' : 'fullscreen_on');
+  });
+  document.getElementById('btnVolUp').addEventListener('click', function(){ sendCommand('volume_up'); });
+  document.getElementById('btnVolDown').addEventListener('click', function(){ sendCommand('volume_down'); });
+
+  var volSlider = document.getElementById('volSlider');
+  var volDebounce = null;
+  volSlider.addEventListener('input', function(){
+    document.getElementById('volNum').textContent = volSlider.value + ' %';
+    clearTimeout(volDebounce);
+    volDebounce = setTimeout(function(){
+      sendCommand('set_volume', {value: Number(volSlider.value)});
+    }, 120);
+  });
+
+  // ---------------------------------------------------------------------
+  // Browse: categories -> items -> (series: episodes)
+  // ---------------------------------------------------------------------
+  var browseMode = 'live';
+  var browseStack = []; // [{label, kind:'category'|'show', data}]
+  var currentCategory = null;
+  var currentItems = [];
+  var searchTerm = '';
+  var radioSubTab = 'favorites';
+  var radioGenreDrill = null; // genre tag currently drilled into, or null = the pill list
+
+  document.querySelectorAll('.tab').forEach(function(tab){
+    tab.addEventListener('click', function(){
+      document.querySelectorAll('.tab').forEach(function(t){ t.classList.remove('on'); });
+      tab.classList.add('on');
+      browseMode = tab.getAttribute('data-mode');
+      browseStack = []; currentCategory = null; searchTerm = '';
+      document.getElementById('searchBox').value = '';
+      radioGenreDrill = null;
+      setCrumb(null);
+      if (browseMode === 'radio'){
+        document.getElementById('tvToolbar').style.display = 'none';
+        document.getElementById('radioToolbar').style.display = '';
+        loadRadioSubTab();
+      } else {
+        document.getElementById('tvToolbar').style.display = '';
+        document.getElementById('radioToolbar').style.display = 'none';
+        loadCategories();
+      }
+    });
+  });
+
+  document.getElementById('searchBox').addEventListener('input', function(e){
+    searchTerm = e.target.value.toLowerCase();
+    renderList();
+  });
+
+  document.getElementById('crumbBtn').addEventListener('click', function(){
+    if (browseMode === 'radio'){
+      if (radioGenreDrill){ radioGenreDrill = null; loadRadioGenres(); }
+      return;
+    }
+    if (!browseStack.length) return;
+    browseStack.pop();
+    if (browseStack.length){
+      var top = browseStack[browseStack.length - 1];
+      renderItemsList(top.data, top.kind);
+    } else {
+      currentCategory = null;
+      loadCategories();
+    }
+  });
+
+  function setCrumb(label){
+    var btn = document.getElementById('crumbBtn');
+    if (label){ btn.textContent = '‹ ' + label; btn.style.display = ''; }
+    else { btn.style.display = 'none'; }
+  }
+
+  function listEl(){ return document.getElementById('browseList'); }
+  function showEmpty(icon, text){
+    listEl().innerHTML = '';
+    var div = document.createElement('div');
+    div.className = 'empty-state';
+    div.innerHTML = '<span class="big">' + icon + '</span>' + text;
+    listEl().appendChild(div);
+  }
+  function showSpinner(){ listEl().innerHTML = '<div class="spinner"></div>'; }
+
+  function loadCategories(){
+    setCrumb(null);
+    showSpinner();
+    getJSON('/api/categories?mode=' + encodeURIComponent(browseMode)).then(function(data){
+      if (!data || data.error){ showEmpty('🔌', (data && data.error) || 'Not connected. Connect to a portal on the FlaskyIPTV screen first.'); return; }
+      var cats = data.categories || [];
+      if (!cats.length){ showEmpty('📭', 'No categories yet — browse this tab once on the FlaskyIPTV screen, then come back.'); return; }
+      currentItems = cats.map(function(c){ return {__cat: true, id: c.id, title: c.title || c.name || 'Untitled', raw: c}; });
+      renderList();
+    })['catch'](function(){ showEmpty('⚠️', 'Could not reach FlaskyIPTV.'); });
+  }
+
+  function loadItems(cat){
+    currentCategory = cat;
+    setCrumb(cat.title);
+    showSpinner();
+    post('/api/items', {mode: browseMode, category: cat.raw || cat, browse: true}).then(function(data){
+      if (!data || data.error){ showEmpty('⚠️', (data && data.error) || 'Could not load items.'); return; }
+      if (data.pending){ setTimeout(function(){ loadItems(cat); }, 1200); showEmpty('⏳', 'Loading…'); return; }
+      var items = data.items || [];
+      renderItemsList(items, 'items');
+      browseStack.push({label: cat.title, kind: 'items', data: items, cat: cat});
+    })['catch'](function(){ showEmpty('⚠️', 'Could not reach FlaskyIPTV.'); });
+  }
+
+  function loadEpisodes(show){
+    setCrumb(itemName(show));
+    showSpinner();
+    post('/api/episodes', {item: show, category: (currentCategory && (currentCategory.raw || currentCategory)) || {}}).then(function(data){
+      var eps = (data && (data.episodes || data.items)) || [];
+      if (!eps.length){ showEmpty('📭', 'No episodes found.'); return; }
+      renderItemsList(eps, 'episodes');
+      browseStack.push({label: itemName(show), kind: 'episodes', data: eps});
+    })['catch'](function(){ showEmpty('⚠️', 'Could not load episodes.'); });
+  }
+
+  function renderItemsList(items, kind){
+    currentItems = (items || []).map(function(it){ return {__cat: false, __kind: kind, raw: it}; });
+    renderList();
+  }
+
+  function itemName(it){
+    if (!it) return 'Untitled';
+    return it.name || it.title || it.stream_name || it.o_name || it.fname || 'Untitled';
+  }
+  function itemLogo(it){
+    if (!it) return '';
+    return it.logo || it.stream_icon || it.cover || it.screenshot_uri || it.pic || '';
+  }
+
+  function renderList(){
+    var el = listEl();
+    var items = currentItems;
+    if (searchTerm){
+      items = items.filter(function(it){
+        var n = it.__cat ? it.title : itemName(it.raw);
+        return (n || '').toLowerCase().indexOf(searchTerm) !== -1;
+      });
+    }
+    if (!items.length){ showEmpty('🔍', 'Nothing matches.'); return; }
+    el.innerHTML = '';
+    var frag = document.createDocumentFragment();
+    items.forEach(function(it, i){
+      var row = document.createElement('div');
+      row.className = 'list-item';
+      var name = it.__cat ? it.title : itemName(it.raw);
+      var logo = it.__cat ? '' : itemLogo(it.raw);
+      row.innerHTML =
+        (logo ? '<img class="li-logo" src="' + logo.replace(/"/g,'&quot;') + '" onerror="this.style.visibility=\'hidden\'">'
+              : '<div class="li-logo"></div>') +
+        '<div class="li-name"></div>' +
+        '<div class="li-chevron">' + (it.__cat || (it.__kind === 'items' && browseMode === 'series') ? '›' : '') + '</div>';
+      row.querySelector('.li-name').textContent = name;
+      row.addEventListener('click', function(){
+        if (it.__cat){
+          loadItems(it);
+        } else if (it.__kind === 'items' && browseMode === 'series'){
+          loadEpisodes(it.raw);
+        } else {
+          sendCommand('play_item', {
+            mode: browseMode,
+            category: (currentCategory && (currentCategory.raw || currentCategory)) || {},
+            index: i,
+            name: name
+          });
+        }
+      });
+      frag.appendChild(row);
+    });
+    el.appendChild(frag);
+  }
+
+  // ---------------------------------------------------------------------
+  // Radio browse — separate from the Live/Movies/Series flow above: no
+  // categories, just flat station lists (Favorites/Top/Built-in/Genres/
+  // Search) hitting radio_addon.py's /api/radio/* endpoints directly,
+  // same-origin, same as /api/categories and /api/items for TV.
+  // ---------------------------------------------------------------------
+  var radioStations = []; // the list currently shown — sent back verbatim on
+                           // play so radio_addon.py's _rdioPlayIdx() can
+                           // snapshot it for prev/next, same reason play_item
+                           // passes a full item list rather than just an id
+
+  function stationName(s){ return (s && s.name) || 'Untitled'; }
+  function stationLogo(s){ return (s && (s.logo || s.icon_fallback)) || ''; }
+  function stationMeta(s){
+    if (!s) return '';
+    var bits = [];
+    if (s.countrycode) bits.push(String(s.countrycode).toUpperCase());
+    if (s.tags) {
+      var tags = String(s.tags).split(',').map(function(t){ return t.trim(); }).filter(Boolean).slice(0, 2);
+      if (tags.length) bits.push(tags.join(' · '));
+    }
+    return bits.join('  ·  ');
+  }
+
+  document.querySelectorAll('.rtab').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      document.querySelectorAll('.rtab').forEach(function(b){ b.classList.remove('on'); });
+      btn.classList.add('on');
+      radioSubTab = btn.getAttribute('data-rtab');
+      radioGenreDrill = null;
+      setCrumb(null);
+      document.getElementById('radioSearchRow').style.display = (radioSubTab === 'search') ? '' : 'none';
+      loadRadioSubTab();
+    });
+  });
+
+  document.getElementById('radioSearchBtn').addEventListener('click', runRadioSearch);
+  document.getElementById('radioSearchBox').addEventListener('keydown', function(e){
+    if (e.key === 'Enter') runRadioSearch();
+  });
+
+  function runRadioSearch(){
+    var q = document.getElementById('radioSearchBox').value.trim();
+    if (!q) return;
+    showSpinner();
+    getJSON('/api/radio/search?q=' + encodeURIComponent(q)).then(function(data){
+      if (!data || data.status === 'error'){ showEmpty('⚠️', (data && data.message) || 'Search failed.'); return; }
+      renderStationList(data.data || []);
+    })['catch'](function(){ showEmpty('⚠️', 'Could not reach FlaskyIPTV.'); });
+  }
+
+  function loadRadioSubTab(){
+    if (radioSubTab === 'search'){
+      var q = document.getElementById('radioSearchBox').value.trim();
+      if (q) runRadioSearch(); else showEmpty('🔍', 'Type a station name or genre and hit Go.');
+      return;
+    }
+    if (radioSubTab === 'genres'){ loadRadioGenres(); return; }
+    var path = radioSubTab === 'favorites' ? '/api/radio/favorites'
+             : radioSubTab === 'top'       ? '/api/radio/top?limit=100'
+             : radioSubTab === 'builtin'   ? '/api/radio/builtin'
+             : null;
+    if (!path) return;
+    showSpinner();
+    getJSON(path).then(function(data){
+      if (!data || data.status === 'error'){ showEmpty('⚠️', (data && data.message) || 'Could not load.'); return; }
+      var list = data.data || [];
+      if (radioSubTab === 'favorites' && !list.length){
+        showEmpty('★', 'No favorites yet — star a station from any list to save it here.');
+        radioStations = [];
+        return;
+      }
+      renderStationList(list);
+    })['catch'](function(){ showEmpty('⚠️', 'Could not reach FlaskyIPTV.'); });
+  }
+
+  function loadRadioGenres(){
+    setCrumb(null);
+    showSpinner();
+    getJSON('/api/radio/genres').then(function(data){
+      renderGenrePills((data && data.data) || []);
+    })['catch'](function(){ showEmpty('⚠️', 'Could not load genres.'); });
+  }
+
+  function renderGenrePills(genres){
+    if (!genres.length){ showEmpty('📭', 'No genres available.'); return; }
+    var el = listEl();
+    el.innerHTML = '';
+    var wrap = document.createElement('div');
+    wrap.className = 'genre-pills';
+    genres.forEach(function(g){
+      var name = (g && (g.name || g.tag)) || String(g);
+      var count = g && g.stationcount;
+      var btn = document.createElement('button');
+      btn.className = 'genre-pill';
+      btn.type = 'button';
+      btn.textContent = name + (count ? ' (' + count + ')' : '');
+      btn.addEventListener('click', function(){
+        radioGenreDrill = name;
+        setCrumb(name);
+        showSpinner();
+        getJSON('/api/radio/genre/' + encodeURIComponent(name)).then(function(data){
+          renderStationList((data && data.data) || []);
+        })['catch'](function(){ showEmpty('⚠️', 'Could not load genre.'); });
+      });
+      wrap.appendChild(btn);
+    });
+    el.appendChild(wrap);
+  }
+
+  function renderStationList(stations){
+    radioStations = stations || [];
+    var el = listEl();
+    if (!radioStations.length){ showEmpty('📭', 'No stations found.'); return; }
+    el.innerHTML = '';
+    var frag = document.createDocumentFragment();
+    radioStations.forEach(function(s, i){
+      var row = document.createElement('div');
+      row.className = 'list-item';
+      var logo = stationLogo(s);
+      var meta = stationMeta(s);
+      row.innerHTML =
+        (logo ? '<img class="li-logo" src="' + logo.replace(/"/g,'&quot;') + '" onerror="this.style.visibility=\'hidden\'">'
+              : '<div class="li-logo">📻</div>') +
+        '<div class="li-name-wrap"><div class="li-name"></div>' +
+        (meta ? '<div class="li-meta"></div>' : '') + '</div>' +
+        '<button class="li-fav' + (s._is_favorite ? ' active' : '') + '" type="button" title="Favorite">' +
+        (s._is_favorite ? '★' : '☆') + '</button>';
+      row.querySelector('.li-name').textContent = stationName(s);
+      if (meta) row.querySelector('.li-meta').textContent = meta;
+      row.querySelector('.li-fav').addEventListener('click', function(e){
+        e.stopPropagation();
+        toggleFavorite(s, e.currentTarget);
+      });
+      row.addEventListener('click', function(){
+        sendCommand('play_station', {stations: radioStations, index: i, name: stationName(s)});
+      });
+      frag.appendChild(row);
+    });
+    el.appendChild(frag);
+  }
+
+  function toggleFavorite(station, btn){
+    var willFavorite = !station._is_favorite;
+    // Optimistic UI update — revert on failure rather than waiting on the
+    // round trip, favoriting should feel instant on a phone.
+    station._is_favorite = willFavorite;
+    btn.classList.toggle('active', willFavorite);
+    btn.textContent = willFavorite ? '★' : '☆';
+    var req = willFavorite
+      ? post('/api/radio/favorites', station)
+      : fetch(withPin(api('/api/radio/favorites/' + encodeURIComponent(station.stationuuid || station.url))), {method: 'DELETE'}).then(function(r){ return r.json(); });
+    req.then(function(data){
+      var ok = data && (willFavorite ? data.added !== false : data.removed !== false);
+      if (!ok){
+        station._is_favorite = !willFavorite;
+        btn.classList.toggle('active', !willFavorite);
+        btn.textContent = !willFavorite ? '★' : '☆';
+      } else if (radioSubTab === 'favorites' && !willFavorite){
+        // removed from the favorites list itself — drop the row instead of
+        // leaving an unfavorited star sitting in a list titled Favorites
+        loadRadioSubTab();
+      }
+    })['catch'](function(){
+      station._is_favorite = !willFavorite;
+      btn.classList.toggle('active', !willFavorite);
+      btn.textContent = !willFavorite ? '★' : '☆';
+    });
+  }
+
+  loadCategories();
+
+  } // end startApp()
+
+  // ---------------------------------------------------------------------
+  // Dispatch: normal case (served by the addon, or ?server= supplied) runs
+  // immediately. Opened as a bare local file with no ?server= shows an
+  // inline prompt instead of guessing — nothing is stored (see the no-
+  // localStorage note above), so this asks again next time unless the
+  // page was reached via a bookmark/home-screen icon that already has
+  // ?server= (and optionally ?pin=) baked into its URL.
+  // ---------------------------------------------------------------------
+  if (BASE !== null) {
+    startApp();
+  } else {
+    var overlay = document.getElementById('connectOverlay');
+    var ipInput = document.getElementById('connectIpInput');
+    var portInput = document.getElementById('connectPortInput');
+    var pinInput = document.getElementById('connectPinInput');
+    overlay.style.display = 'flex';
+    ipInput.value = DEFAULT_SERVER_IP;
+    portInput.value = DEFAULT_SERVER_PORT;
+    ipInput.focus();
+    ipInput.select(); // pre-filled, not blank — select so overwriting it is one tap+type, not a manual clear first
+
+    function connectTo(url){
+      BASE = url;
+      if (pinInput.value.trim()) PIN = pinInput.value.trim();
+      overlay.style.display = 'none';
+      startApp();
+    }
+
+    function submitConnect(){
+      var v = buildConnectUrl(ipInput.value, portInput.value);
+      if (!v) { ipInput.focus(); return; }
+      connectTo(v);
+    }
+
+    document.getElementById('connectSamePcBtn').addEventListener('click', function(){
+      connectTo('http://127.0.0.1:' + ((portInput.value || '').trim() || '5000'));
+    });
+    document.getElementById('connectSubmitBtn').addEventListener('click', submitConnect);
+    [ipInput, portInput, pinInput].forEach(function(el){
+      el.addEventListener('keydown', function(e){ if (e.key === 'Enter') submitConnect(); });
+    });
+  }
+})();
+</script>
+</body>
+</html>
