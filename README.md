@@ -62,6 +62,8 @@ It is a local player interface — a front-end that connects to IPTV portals and
 | `dvr_addon.py` | optional | DVR — scheduled and manual recordings |
 | `radio_addon.py` | optional | Internet radio — RadioBrowser API, Shoutcast directory, M3U playlists, favourites |
 | `m3u_proxy_addon.py` | optional | M3U URL proxy — convert any portal into a permanent token-refreshing M3U URL for TiviMate / VLC / Kodi |
+| `remote_addon.py` | optional | LAN remote control — control playback, browse, and adjust volume/EPG/fullscreen from a phone or any browser on the network |
+| `remote_control.html` | optional | Remote-control page served by `remote_addon.py` at `/remote`; also works copied onto a phone and opened as a standalone file |
 | `multiview_layouts.json` | auto-created | Saved Multi-View layouts (created on first save) |
 | `dvr_jobs.json` | auto-created | Saved DVR job list (created on first scheduled recording) |
 
@@ -115,6 +117,8 @@ python FlaskyIPTV_Player_byGG.py
 Then open **http://localhost:5000** in your browser or WebView.
 
 On Android (Termux), the server binds to all interfaces so you can also reach it from other devices on the same network via `http://<device-ip>:5000`.
+
+To control playback from a phone instead of using it as the main screen, see **Remote Control** below.
 
 ---
 
@@ -342,6 +346,30 @@ If the browser is opened directly via the LAN IP (e.g. `http://192.168.1.100:500
 - Each playlist has a **📋 copy** and **🗑 delete** button
 - Up to 50 playlists are stored simultaneously; the oldest is evicted automatically when the cap is reached
 - Playlists live in RAM — they are cleared when FlaskyIPTV restarts. Players receive a descriptive `503` response with instructions to regenerate from FlaskyIPTV.
+
+### Remote Control (`remote_addon.py`)
+
+Control playback from a phone or any other browser on the same network — see what's playing, browse categories and channels, and send transport commands — without touching the machine FlaskyIPTV is running on.
+
+**Requires:** `remote_addon.py` **and** `remote_control.html` in the same directory. No additional Python packages needed.
+
+#### Connecting
+- Open **`http://<flaskyiptv-ip>:5000/remote`** in a phone's browser — served directly by FlaskyIPTV, nothing to install. Add it to the phone's home screen (Safari/Chrome "Add to Home Screen") for one-tap access afterward.
+- Alternatively, copy `remote_control.html` onto the phone and open it directly as a standalone file. The first time, a "Connect to FlaskyIPTV" prompt asks for the PC's address — a **This PC (127.0.0.1)** button covers same-device use, otherwise enter the LAN IP shown on FlaskyIPTV's own screen (same one the M3U proxy dialog shows).
+
+#### Controls
+- **Now playing** — channel name, logo, and live/VOD/series context, updated in real time
+- **Transport** — previous / play-pause / next, stop, mute
+- **Volume** — rocker buttons or a drag slider
+- **Guide** — toggles the EPG panel for the current channel
+- **Fullscreen** — requests the browser's native fullscreen API where the browser allows a remote trigger; falls back automatically to a full-viewport overlay otherwise (see Known Limitations)
+- **Browse** — Live / Movies / Series tabs, category list, item list with search filter; tapping an item plays it directly on the FlaskyIPTV screen
+
+#### How it works
+Playback state (current channel, playing/paused, volume) lives in whichever browser tab has FlaskyIPTV open, not on the server — so the remote works as a relay rather than controlling anything directly. Commands post to `remote_addon.py`, which pushes them over Server-Sent Events to a small script injected into the main page, which calls the same functions the on-screen controls use. State changes flow back to the remote the same way, so it stays in sync with whatever's actually playing.
+
+#### Security
+No login by default, matching the rest of FlaskyIPTV — anyone on the network can use the remote, same trust model as the main app. Set the `FLASKY_REMOTE_PIN` environment variable before launching to require a PIN; bookmark the phone link as `.../remote?pin=1234` and it's carried automatically from then on.
 
 ### Stalker / MAC Portal Advanced Overrides
 For MAC/Stalker portals, an expandable **Stalker overrides** section in the connect panel lets you supply hardcoded device identity values instead of the auto-computed ones:
@@ -589,7 +617,7 @@ All settings are saved in browser localStorage and persist across sessions.
 ## Architecture Notes
 
 - The app is split across multiple files — the main `.py` entry point plus required and optional addon modules, all in the same directory
-- `cast_addon.py`, `multiview_addon.py`, `dvr_addon.py`, `radio_addon.py`, and `m3u_proxy_addon.py` are fully self-contained drop-in modules; the main app degrades gracefully if any of them are absent
+- `cast_addon.py`, `multiview_addon.py`, `dvr_addon.py`, `radio_addon.py`, `m3u_proxy_addon.py`, and `remote_addon.py` are fully self-contained drop-in modules; the main app degrades gracefully if any of them are absent
 - `portal_clients.py`, `proxy_addon.py`, `download_addon.py`, `probe_addon.py`, `epg_addon.py`, and `subtitles_addon.py` are required — the app will not function correctly without them
 - The HTML is a Jinja2 template rendered by Flask's `render_template_string`
 - HLS playback uses **HLS.js** loaded from CDN
@@ -604,6 +632,7 @@ All settings are saved in browser localStorage and persist across sessions.
 - DVR scheduler runs as a background daemon thread, waking every 5 seconds to fire any due jobs. Job state persists to `dvr_jobs.json`. On startup, any job stuck in `recording` state (ffmpeg died while the app was stopped) is recovered — completed if the file exists and has size, otherwise marked as error.
 - Radio addon uses a two-tier cache (10-minute memory + 24-hour disk) stored at `~/.flasky_radio_cache/`. RadioBrowser queries rotate across five geographically distributed API servers with automatic failover. Favourites persist at `~/.flasky_radio_cache/radio_favorites.json`.
 - M3U URL proxy (`m3u_proxy_addon.py`) stores up to 50 proxy playlists in an in-memory dict keyed by a 12-char UUID. Playlist content is generated dynamically per-request from `request.host` so stream links automatically reflect the correct IP for both localhost and LAN access. All state is lost on server restart.
+- Remote control (`remote_addon.py`) has no server-side view of "what's playing" — that state lives entirely in the browser tab running the player. It relays over two Server-Sent Event channels, mirroring the `/api/logs` pattern: the browser tab reports state changes, the remote posts commands that get pushed back to a small script injected into the tab (`/api/remote/ui.js`), which calls the same functions the on-screen controls use. Registered as its own Flask Blueprint so its CORS headers — needed because the standalone-file mode runs as a different browser origin — don't apply to the rest of the app.
 
 ---
 
@@ -624,3 +653,6 @@ All settings are saved in browser localStorage and persist across sessions.
 - Stream verification in the radio panel is a lightweight HEAD/GET check — it confirms the server is reachable but does not guarantee the audio stream is free of buffering or quality issues
 - OpenSubtitles download quota is 5/day for anonymous use and 20/day for free registered accounts. When the quota is exhausted the player suggests switching to SubDL (300/day with a free key, no login required).
 - M3U URL proxy playlists are stored in RAM and are lost when the FlaskyIPTV server restarts — any player that stored the URL will receive a `503` response until the playlist is regenerated from the actions drawer
+- Fullscreen requested from the remote can fall back to a full-viewport CSS overlay instead of true browser fullscreen — this is a browser security restriction (a remote tap can't carry the "direct user gesture" requirement across devices), not a bug. The visual result is the same either way.
+- The remote's EPG guide button tracks open/closed by mirroring its own presses, not the panel's actual on-screen state — it can drift out of sync if EPG is opened or closed from the FlaskyIPTV screen directly instead of from the remote
+- `remote_control.html` opened as a standalone file (rather than via the `/remote` link) has no way to remember the PC's address between opens — nothing is persisted; re-enter it or use the `/remote` link + home screen icon instead if that's annoying
