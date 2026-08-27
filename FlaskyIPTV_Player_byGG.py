@@ -125,6 +125,12 @@ except ImportError:
     _RADIO_AVAILABLE = False
     def register_radio_addon(*a, **kw): pass
 
+try:
+    from remote_addon import register_remote_routes
+    _REMOTE_AVAILABLE = True
+except ImportError:
+    _REMOTE_AVAILABLE = False
+    def register_remote_routes(*a, **kw): pass
 
 # ===================== OPTIONAL DEPS =====================
 
@@ -234,6 +240,20 @@ class AppState:
         # NOTE: _mac_epg_token/_mac_epg_headers/_mac_epg_token_lock removed —
         # token management is now handled entirely by PortalSessionManager.
         self.profile_data: dict = {}   # raw profile/account info for display
+        # Connection-Profile modal: Server IP / Suggested VPN geo cache.
+        # Keyed by lowercased hostname → (fetched_ts, {"ip","country","country_code"}).
+        # TTL = 24h. Populated by _resolve_ip_cached(), consumed by /api/resolve_ip
+        # and warmed proactively right after connect by _bg_prefetch_geo_ip() —
+        # see api_connect(). Deliberately NOT cleared in api_connect()'s reset
+        # block like the portal-specific caches above — a host's IP/country
+        # doesn't depend on which account/portal is currently connected, and the
+        # whole point of the 24h TTL is to survive across reconnects, not just
+        # repeat clicks within one connection. Keyed purely by portal_url's
+        # hostname, so this covers all 4 profile types (stalker/mac/xtream/m3u)
+        # uniformly with no type-specific handling needed.
+        self._geo_cache: dict = {}
+        self._geo_cache_ttl = 86400  # seconds (24h)
+        self._geo_cache_lock = threading.Lock()
         # UTC offset in seconds of the Xtream portal server clock (0 = UTC).
         # Populated by XtreamClient.handshake() via calendar.timegm arithmetic.
         self._portal_utc_offset: int = 0
@@ -896,18 +916,42 @@ def _classify_connect_outcome(exc, result):
             return _OUTCOME_NETWORK, msg
         if "authentication failed" in low or "wrong username" in low:
             return _OUTCOME_ACCOUNT, msg
-        # No embedded status, not a recognized network-exception type: some
-        # response was still produced by *this* server for *this* login in
-        # the overwhelming majority of such cases (a genuine full network
-        # outage almost always surfaces as one of the typed exceptions
-        # above) — default to ACCOUNT rather than silently giving up
-        # without ever trying backup credentials.
-        return _OUTCOME_ACCOUNT, msg
+        # No embedded status, not a recognized network-exception type, and no
+        # recognized account-rejection phrase either: there is no actual
+        # positive evidence the *account* is at fault here — only the
+        # absence of a pattern this function knows how to read. This used
+        # to default to ACCOUNT on the theory that a genuine network outage
+        # "almost always" surfaces as one of the typed exceptions above —
+        # but a handshake helper that raises a bare Exception carrying only
+        # a malformed/reconstructed URL (e.g. a saved URL with no scheme,
+        # misparsed further down the stack — urlparse() reads a scheme-less
+        # "host:port/path" as scheme=host, netloc="", losing the real host
+        # entirely) lands exactly here, with no diagnosable content in the
+        # message at all. Defaulting to ACCOUNT in that case means: if no
+        # backup MACs/accounts are configured, _try_backup_accounts() has
+        # nothing to do and the whole connect gives up after only the
+        # primary attempt — every configured Alt URL goes untried, which is
+        # the reported "backup URLs not being attempted" symptom. Default to
+        # NETWORK instead: a URL-backup attempt against an unclassifiable
+        # failure costs little (same account, another address), whereas
+        # defaulting to ACCOUNT can silently skip every configured Alt URL
+        # whenever no backup account happens to be configured too.
+        return _OUTCOME_NETWORK, msg
 
     if result.get("error") == "superseded":
         return _OUTCOME_SUPERSEDED, "superseded"
     if not result.get("success"):
-        return _OUTCOME_ACCOUNT, result.get("error", "unknown error")
+        err = result.get("error", "unknown error")
+        # Same phrase-based check as the exception branch above, applied to
+        # the other shape a handshake failure can arrive in: connect_sync()
+        # returning success=False directly instead of raising. Whichever
+        # way it arrives, "no recognizable portal payload" carries the same
+        # WAF/edge-block/dead-mirror ambiguity — so it gets routed the same
+        # way, rather than defaulting to ACCOUNT unconditionally here while
+        # the exception path already knows better.
+        if any(p in err.lower() for p in _NO_PORTAL_PAYLOAD_PHRASES):
+            return _OUTCOME_NETWORK, err
+        return _OUTCOME_ACCOUNT, err
 
     # Nominally successful — "successful" only means the handshake
     # completed; check whether the account is actually usable.
@@ -1426,6 +1470,7 @@ if _DVR_AVAILABLE:
 register_subtitles_routes(flask_app, state)
 register_proxy_routes(flask_app, state)
 register_radio_addon(flask_app)
+register_remote_routes(flask_app, state)
 
 @flask_app.route('/api/multiview/available')
 def multiview_available():
@@ -1466,11 +1511,20 @@ def api_connect():
     data = request.get_json(force=True)
     with state.lock:
         state.conn_type = data.get("conn_type", "mac")
-        state.url = data.get("url", "").strip()
+        # _ensure_scheme(): a URL saved/typed without "http://" (e.g.
+        # "host.com:80/c/") is otherwise handed to portal_clients.py as-is —
+        # urlparse() reads a scheme-less "host:port/path" as scheme=host,
+        # netloc="", silently losing the real host and producing a
+        # malformed request the handshake can't succeed against (see
+        # _classify_connect_outcome()'s network-fallback comment for the
+        # failure mode this causes). Alt/backup URLs already get this same
+        # normalization via _sanitize_alt_urls()/_build_m3u_candidate() —
+        # this brings the primary URL in line with them.
+        state.url = _ensure_scheme(data.get("url", "").strip())
         state.mac = data.get("mac", "").strip().upper()
         state.username = data.get("username", "").strip()
         state.password = data.get("password", "").strip()
-        state.m3u_url = data.get("m3u_url", "").strip()
+        state.m3u_url = _ensure_scheme(data.get("m3u_url", "").strip())
         state.ext_epg_url = data.get("ext_epg_url", "").strip()
         state.epg_offset_secs = int(data.get("epg_offset_secs", 0) or 0)
         state.is_stalker_portal = (
@@ -1609,6 +1663,17 @@ def api_connect():
             _inject_all_cat("vod")
             _inject_all_cat("series")
             result["categories"] = state.cats_cache
+
+            # ── Background: prefetch Server IP / Suggested VPN for the Connection
+            # Profile modal (see openProfileModal() / api_resolve_ip() / the 24h
+            # cache in _resolve_ip_cached()). Keyed only by profile_data's
+            # portal_url, so this covers all 4 profile types (stalker/mac/xtream/m3u)
+            # uniformly — unlike the channel/VOD prefetches below it isn't gated on
+            # _is_mac/_is_xtream, so a plain remote M3U connect gets it too.
+            _pf_geo_host = _hostname_from_url(state.profile_data.get("portal_url", ""))
+            if _pf_geo_host:
+                threading.Thread(target=_bg_prefetch_geo_ip, args=(_pf_geo_host,),
+                                 daemon=True, name="geo-prefetch").start()
 
         # ── Background: prefetch full live channel list for logo cache + EPG ──
         # Only for MAC/Stalker portals — get_all_channels is a dedicated endpoint
@@ -2268,23 +2333,26 @@ def api_profile():
     return jsonify(state.profile_data if state.connected else {})
 
 
-@flask_app.route("/api/resolve_ip", methods=["GET"])
-def api_resolve_ip():
-    """Resolve a hostname/IP to a numeric IP + basic geo country for profile display.
-    Uses socket for DNS, then ip-api.com for country lookup (5-req/s free tier).
-    Returns: {ip, country, country_code, error?}
+def _resolve_host_geo(host: str) -> dict:
+    """Pure lookup, no caching: hostname/IP → numeric IP + basic geo country.
+    Uses socket for DNS, then ip-api.com for country lookup (45 req/min free tier).
+    ip-api.com also accepts a bare hostname and resolves it server-side, so the
+    geo call is still attempted even when local DNS fails below — matches the
+    original endpoint's behaviour.
+
+    Returns {"ip", "country", "country_code", "dns_ok"}. dns_ok is False only
+    when the hostname itself could not be resolved locally — callers use this
+    to decide whether the result is worth caching for 24h (see
+    _resolve_ip_cached): a transient local DNS blip shouldn't lock in
+    "unavailable" for a full day the way a normal successful lookup should.
     """
     import socket as _sock
-    host = request.args.get("host", "").strip()
-    if not host:
-        return jsonify({"error": "No host provided", "ip": "", "country": "", "country_code": ""})
-    # Resolve hostname → IP (no-op if already an IP)
     ip = host
+    dns_ok = True
     try:
         ip = _sock.gethostbyname(host)
     except Exception:
-        pass  # leave as original host string if unresolvable
-    # Geo-lookup via ip-api.com (plain HTTP, no API key needed, 45 req/min)
+        dns_ok = False  # leave ip as the original host string
     country = ""; country_code = ""
     try:
         import urllib.request as _ur, json as _js
@@ -2294,7 +2362,92 @@ def api_resolve_ip():
         country_code = _geo.get("countryCode", "")
     except Exception:
         pass
-    return jsonify({"ip": ip, "country": country, "country_code": country_code})
+    return {"ip": ip, "country": country, "country_code": country_code, "dns_ok": dns_ok}
+
+
+def _geo_cache_lookup(cache: dict, ttl: float, host: str):
+    """Return the cached {"ip","country","country_code"} dict for *host* if
+    present and younger than *ttl* seconds, else None. *host* must already be
+    normalised (stripped + lowercased) by the caller."""
+    entry = cache.get(host)
+    if entry is None:
+        return None
+    ts, data = entry
+    if (time.time() - ts) >= ttl:
+        return None
+    return data
+
+
+def _resolve_ip_cached(host: str, cache: dict, ttl: float, lock: threading.Lock) -> dict:
+    """Cache-first wrapper around _resolve_host_geo(), shared by /api/resolve_ip
+    and the connect-time background prefetch (_bg_prefetch_geo_ip) so a prefetch
+    started right after connect and the modal's own fetch on first click land on
+    the same cache entry instead of racing two independent lookups.
+
+    *cache*/*ttl*/*lock* are passed in (state._geo_cache / state._geo_cache_ttl /
+    state._geo_cache_lock in production) rather than read from globals, so this
+    function is trivially unit-testable with a throwaway dict/lock — see
+    test_geo_cache.py.
+    """
+    host = (host or "").strip().lower()
+    if not host:
+        return {"ip": "", "country": "", "country_code": ""}
+    cached = _geo_cache_lookup(cache, ttl, host)
+    if cached is not None:
+        return cached
+    with lock:
+        # Re-check inside the lock: a concurrent caller (e.g. the connect-time
+        # prefetch racing the modal's own fetch) may have just finished the
+        # same lookup while we were waiting for the lock.
+        cached = _geo_cache_lookup(cache, ttl, host)
+        if cached is not None:
+            return cached
+        result = _resolve_host_geo(host)
+        data = {"ip": result["ip"], "country": result["country"], "country_code": result["country_code"]}
+        if result["dns_ok"]:
+            cache[host] = (time.time(), data)
+        return data
+
+
+def _hostname_from_url(url: str) -> str:
+    """Extract the hostname from a portal URL — Python-side mirror of the
+    frontend's `new URL(u).hostname` helper used in openProfileModal().
+    Returns "" for an empty/unparsable URL instead of raising."""
+    if not url:
+        return ""
+    try:
+        return urlparse(url).hostname or ""
+    except Exception:
+        return ""
+
+
+def _bg_prefetch_geo_ip(host: str):
+    """Warm the 24h geo-IP cache for *host* right after a successful connect, so
+    the Connection Profile modal's Server IP / Suggested VPN rows are already
+    cached by the time the user's own click hits /api/resolve_ip. Mirrors the
+    channel/VOD/EPG background-prefetch pattern in api_connect() below, but
+    needs no async/portal-session machinery — this is a plain blocking DNS +
+    HTTP call, safe to run on a bare daemon thread.
+    """
+    try:
+        _resolve_ip_cached(host, state._geo_cache, state._geo_cache_ttl, state._geo_cache_lock)
+    except Exception as e:
+        state.log(f"[PREFETCH] Geo/IP prefetch error for {host}: {e}")
+
+
+@flask_app.route("/api/resolve_ip", methods=["GET"])
+def api_resolve_ip():
+    """Resolve a hostname/IP to a numeric IP + basic geo country for profile display.
+    Cache-first: results are cached for 24h (state._geo_cache), keyed by hostname,
+    shared across all 4 connection types (stalker/mac/xtream/m3u) and warmed
+    proactively right after connect by _bg_prefetch_geo_ip() — see api_connect().
+    Returns: {ip, country, country_code, error?}
+    """
+    host = request.args.get("host", "").strip()
+    if not host:
+        return jsonify({"error": "No host provided", "ip": "", "country": "", "country_code": ""})
+    data = _resolve_ip_cached(host, state._geo_cache, state._geo_cache_ttl, state._geo_cache_lock)
+    return jsonify(data)
 
 
 @flask_app.route("/api/logs")
@@ -9965,6 +10118,7 @@ window._rdioLocalCC = (_LOCALE_TAG_CANDIDATES[0] || '').toUpperCase().slice(0, 2
 <script src="/api/probe/ui.js"></script>
 <script src="/api/radio/ui.js"></script>
 <script src="/api/m3u_proxy/ui.js"></script>
+<script src="/api/remote/ui.js"></script>
 </body>
 </html>
 """
