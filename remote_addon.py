@@ -4,8 +4,8 @@ remote_addon.py — LAN remote-control addon for FlaskyIPTV Player by GG
 
 Lets a phone (or any browser) on the same network see what's playing and
 send transport commands (play/pause/resume/stop, next/previous, volume,
-EPG toggle, fullscreen) to whichever machine has FlaskyIPTV open in a
-browser tab. Pairs with remote_control.html, which this addon also serves
+volume boost, EPG toggle, fullscreen) to whichever machine has FlaskyIPTV
+open in a browser tab. Pairs with remote_control.html, which this addon also serves
 at /remote.
 
 WHY A RELAY, NOT DIRECT CONTROL
@@ -84,6 +84,18 @@ KNOWN LIMITATIONS (see remote_control.html for how these surface in the UI)
   by reading the panel's real DOM state (epg_addon.py's markup isn't
   available to introspect from here) — it can drift out of sync if EPG
   is opened/closed from the main screen instead of the remote.
+* Next/Previous preview (the dimmed up-next/just-before name+logo next to
+  those buttons in remote_control.html) reads radio_addon.py's own nav
+  list/index via its window._rdioNavPeek() when radio was started from the
+  FlaskyIPTV screen itself rather than from this remote (_remoteRadioList
+  is then empty/unset). The one case it still can't preview is right after
+  _rdioShuffle() on the main screen, which deliberately clears that nav
+  list (a shuffled pick isn't "from" any particular browsed list) — same
+  moment the real Next/Previous buttons would toast "No station list to
+  navigate" if pressed, so the preview going quiet there matches actual
+  behavior rather than falling short of it. Requires a radio_addon.py with
+  _rdioNavPeek (added alongside this bullet); against an older one the
+  preview just omits itself for that case rather than throwing.
 """
 
 import json
@@ -108,6 +120,7 @@ VALID_ACTIONS = {
     "pause", "resume", "stop", "toggle_play",
     "next", "previous",
     "volume_up", "volume_down", "set_volume", "mute_toggle",
+    "set_boost",
     "toggle_epg",
     "fullscreen_on", "fullscreen_off",
     "play_item",
@@ -130,6 +143,21 @@ def clamp_volume(v):
     if v != v:  # NaN
         return 0
     return int(max(0, min(100, round(v))))
+
+
+def clamp_boost(v):
+    """Clamp to a float in [0.1, 4.0] — the same range _globalAudioGraph()/
+    _gainApply() clamp to in FlaskyIPTV_Player_byGG.py's Audio Output modal
+    (Normal/Loud/Boost/Soft = 1.0/1.5/2.0/0.5x all live inside that range).
+    Non-numeric input clamps to 1.0 (Normal) rather than raising — callers
+    always get a usable value back."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return 1.0
+    if v != v:  # NaN
+        return 1.0
+    return round(max(0.1, min(4.0, v)), 3)
 
 
 def pin_matches(supplied, configured):
@@ -240,6 +268,15 @@ def validate_command(payload):
         except (TypeError, ValueError):
             return False, "set_volume 'value' must be numeric"
         out["value"] = clamp_volume(payload["value"])
+
+    elif action == "set_boost":
+        if "value" not in payload:
+            return False, "set_boost requires 'value'"
+        try:
+            float(payload["value"])
+        except (TypeError, ValueError):
+            return False, "set_boost 'value' must be numeric"
+        out["value"] = clamp_boost(payload["value"])
 
     elif action in ("volume_up", "volume_down"):
         step = payload.get("step", _VOLUME_STEP_DEFAULT)
@@ -528,6 +565,50 @@ _REMOTE_UI_JS = r"""
     return it.logo || it.icon_fallback || it.stream_icon || it.cover || it.screenshot_uri || it.pic || '';
   }
 
+  // Item at pIdx/_remoteRadioIndex +1 (next) or -1 (previous), mirroring
+  // the exact list + wraparound handleCommand()'s 'next'/'previous' cases
+  // use below (which themselves mirror remoteRadioRelative() and the
+  // filtItems.length wraparound in playerPrev()/playerNext()), so the
+  // preview always matches what pressing the button will actually do.
+  // Returns null when nothing is browsable yet (mirrors playerNext()/
+  // playerPrev()'s own `if(!filtItems.length)return;` guard), or — for
+  // radio only — when neither this remote's own list nor radio_addon.py's
+  // window._rdioNavPeek() (see below) can produce one, e.g. right after
+  // _rdioShuffle() clears radio_addon.py's own nav list on purpose.
+  function previewItem(direction){
+    var isRadioNow = (typeof _curIsRadio !== 'undefined') && !!_curIsRadio;
+    if (isRadioNow) {
+      if (_remoteRadioList && _remoteRadioList.length && _remoteRadioIndex >= 0) {
+        var n = _remoteRadioList.length;
+        return _remoteRadioList[(_remoteRadioIndex + direction + n) % n];
+      }
+      // Not tracked by this remote (radio was started from the FlaskyIPTV
+      // screen itself) — fall back to radio_addon.py's own read-only peek
+      // into ITS nav list/index, the exact state window._rdioPlayRelative()
+      // steps through for real (playerNext()/playerPrev() fall back to
+      // that same function when _curIsRadio is true, so this keeps the
+      // preview honest in that case too instead of going dark). Guarded
+      // the same way _gainApply is elsewhere in this file, so an older
+      // radio_addon.py predating this hook degrades to no preview rather
+      // than throwing.
+      if (typeof window._rdioNavPeek === 'function') {
+        try {
+          return window._rdioNavPeek(direction) || null;
+        } catch (e) {
+          console.warn('[FlaskyRemote] _rdioNavPeek threw', e);
+          return null;
+        }
+      }
+      return null;
+    }
+    if (typeof filtItems !== 'undefined' && filtItems && filtItems.length &&
+        typeof pIdx !== 'undefined' && pIdx >= 0) {
+      var n2 = filtItems.length;
+      return filtItems[(pIdx + direction + n2) % n2];
+    }
+    return null;
+  }
+
   var _lastPlayBlocked = false;
 
   function snapshot(){
@@ -536,6 +617,8 @@ _REMOTE_UI_JS = r"""
     var dur = v ? v.duration : NaN;
     var isRadioNow = (typeof _curIsRadio !== 'undefined') && !!_curIsRadio;
     var radioListOk = isRadioNow && _remoteRadioList && _remoteRadioIndex >= 0;
+    var nextIt = previewItem(1);
+    var prevIt = previewItem(-1);
     return {
       title: textOf('np') || itemName(it) || '',
       track: textOf('np-track') || '',
@@ -545,6 +628,7 @@ _REMOTE_UI_JS = r"""
       stopped: (typeof _playerStopped !== 'undefined') ? !!_playerStopped : !(v && v.currentSrc),
       volume: v ? Math.round(v.volume * 100) : null,
       muted: v ? !!v.muted : null,
+      boost: (typeof _gainNode !== 'undefined' && _gainNode) ? _gainNode.gain.value : 1,
       currentTime: v ? v.currentTime : null,
       duration: (isFinite(dur) && dur > 0) ? dur : null,
       isRadio: isRadioNow,
@@ -552,6 +636,8 @@ _REMOTE_UI_JS = r"""
       itemIndex: radioListOk ? _remoteRadioIndex : ((typeof pIdx !== 'undefined') ? pIdx : null),
       itemCount: radioListOk ? _remoteRadioList.length : ((typeof filtItems !== 'undefined' && filtItems) ? filtItems.length : null),
       logo: itemLogo(it),
+      nextPreview: nextIt ? {name: itemName(nextIt), logo: itemLogo(nextIt)} : null,
+      prevPreview: prevIt ? {name: itemName(prevIt), logo: itemLogo(prevIt)} : null,
       fullscreen: !!(document.fullscreenElement || (fsTarget() && fsTarget().classList.contains('_remoteFsActive'))),
       playBlocked: _lastPlayBlocked,
       epgOpenGuess: !!window.__flaskyRemoteEpgGuess
@@ -626,6 +712,22 @@ _REMOTE_UI_JS = r"""
   function volumeStep(delta){
     var v = (typeof vid !== 'undefined' && vid) ? Math.round(vid.volume * 100) : 50;
     setVolumeAbs(v + delta);
+  }
+
+  // ---- volume boost (Normal/Loud/Boost/Soft) ----
+  // Same Web Audio gain graph as the on-screen Audio Output modal's Volume
+  // rows (_gainApply()/_GAIN_STEPS in FlaskyIPTV_Player_byGG.py). _gainApply
+  // is called as a bare identifier, not window._gainApply — same reasoning
+  // as setVol above: it's a plain top-level function declaration in the
+  // main inline <script> block, so it's directly reachable here. Routing
+  // through the real _gainApply (rather than reimplementing gain-setting)
+  // keeps this remote and the on-screen modal reading/writing the exact
+  // same state, including _gainApply's own localStorage persistence.
+  function setBoost(v){
+    try {
+      if (typeof _gainApply === 'function') { _gainApply(v); }
+    } catch(e){ console.warn('[FlaskyRemote] _gainApply threw', e); }
+    report();
   }
 
   // ---- play a specific browsed item ----
@@ -752,6 +854,9 @@ _REMOTE_UI_JS = r"""
         return;
       case 'set_volume':
         if (typeof cmd.value === 'number') setVolumeAbs(cmd.value);
+        return;
+      case 'set_boost':
+        if (typeof cmd.value === 'number') setBoost(cmd.value);
         return;
       case 'mute_toggle':
         if (typeof vid !== 'undefined' && vid) vid.muted = !vid.muted;
