@@ -110,6 +110,35 @@
   input[type=range]::-moz-range-thumb{ width:18px; height:18px; border:none; border-radius:50%; background:var(--accent); cursor:pointer; }
   input[type=range]::-moz-range-track{ height:4px; border-radius:2px; background:var(--panel-2); }
 
+  /* ---------- next/prev preview ---------- */
+  .preview-row{ display:flex; align-items:stretch; justify-content:space-between; gap:10px; margin-top:-2px; }
+  .preview-chip{
+    display:none; align-items:center; gap:7px; max-width:47%; min-width:0;
+    background:rgba(14,14,36,.55); backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);
+    border:1px solid var(--border); border-radius:20px; padding:5px 11px 5px 6px; opacity:.68;
+  }
+  .preview-chip.show{ display:flex; }
+  .preview-chip.next{ padding:5px 6px 5px 11px; margin-left:auto; }
+  .preview-chip .pc-logo{ width:20px; height:20px; border-radius:5px; object-fit:contain; background:var(--panel-2); flex:none; border:1px solid var(--border); }
+  .preview-chip .pc-logo-empty{ width:20px; height:20px; border-radius:5px; background:var(--panel-2); flex:none; border:1px solid var(--border); }
+  .preview-chip .pc-text{ min-width:0; overflow:hidden; }
+  .preview-chip .pc-tag{ font-size:9.5px; font-weight:700; letter-spacing:.4px; color:var(--text-faint); text-transform:uppercase; }
+  .preview-chip .pc-name{ font-size:11.5px; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+  /* ---------- volume boost ---------- */
+  .boost-card{
+    background:var(--panel); border:1px solid var(--border); border-radius:var(--radius);
+    padding:10px 12px; display:flex; align-items:center; gap:10px;
+  }
+  .boost-label{ font-size:11px; color:var(--text-faint); flex:none; }
+  .boost-btns{ display:flex; gap:6px; flex:1; }
+  .boost-btn{
+    flex:1; background:var(--panel-2); border:1px solid var(--border); border-radius:20px;
+    padding:7px 4px; font-size:12px; font-weight:600; color:var(--text-dim); cursor:pointer; text-align:center;
+  }
+  .boost-btn.on{ background:var(--accent-soft); border-color:var(--accent); color:var(--text); }
+  .boost-btn:active{ transform:scale(.96); }
+
   /* ---------- browse ---------- */
   .browse-card{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; }
   .tabs{ display:flex; border-bottom:1px solid var(--border); }
@@ -279,6 +308,19 @@
       </button>
     </div>
 
+    <div class="preview-row">
+      <div class="preview-chip prev" id="prevChip">
+        <img class="pc-logo" id="prevChipLogo" alt="" style="display:none">
+        <div class="pc-logo-empty" id="prevChipLogoEmpty"></div>
+        <div class="pc-text"><div class="pc-tag">‹ Prev</div><div class="pc-name" id="prevChipName"></div></div>
+      </div>
+      <div class="preview-chip next" id="nextChip">
+        <div class="pc-text"><div class="pc-tag">Next ›</div><div class="pc-name" id="nextChipName"></div></div>
+        <img class="pc-logo" id="nextChipLogo" alt="" style="display:none">
+        <div class="pc-logo-empty" id="nextChipLogoEmpty"></div>
+      </div>
+    </div>
+
     <div class="row2">
       <button class="tbtn small" id="btnStop" title="Stop" aria-label="Stop">
         <svg viewBox="0 0 24 24"><path fill="currentColor" d="M6 6h12v12H6z"/></svg>
@@ -305,6 +347,16 @@
       <button class="tbtn" id="btnVolUp" title="Volume up" aria-label="Volume up">
         <svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 10v4h4l5 5V5L7 10z"/><rect x="16" y="11" width="6" height="2" fill="currentColor"/><rect x="18" y="9" width="2" height="6" fill="currentColor"/></svg>
       </button>
+    </div>
+
+    <div class="boost-card">
+      <span class="boost-label">Boost</span>
+      <div class="boost-btns" id="boostBtns">
+        <button class="boost-btn" type="button" data-value="0.5">Soft</button>
+        <button class="boost-btn" type="button" data-value="1">Normal</button>
+        <button class="boost-btn" type="button" data-value="1.5">Loud</button>
+        <button class="boost-btn" type="button" data-value="2">Boost</button>
+      </div>
     </div>
 
     <section class="browse-card">
@@ -449,6 +501,8 @@
       document.getElementById('npMeta').textContent = 'Open FlaskyIPTV and start watching something on that screen.';
       document.getElementById('npProgressBar').style.width = '0%';
       showBanner('');
+      renderPreviewChip('prevChip', null);
+      renderPreviewChip('nextChip', null);
       return;
     }
     document.getElementById('npTitle').textContent = state.stopped ? '⏹ Stopped' : (state.title || 'Unknown');
@@ -484,6 +538,14 @@
       document.getElementById('volNum').textContent = state.volume + ' %';
     }
 
+    var boostVal = (typeof state.boost === 'number') ? state.boost : 1;
+    document.querySelectorAll('.boost-btn').forEach(function(btn){
+      btn.classList.toggle('on', Math.abs(parseFloat(btn.getAttribute('data-value')) - boostVal) < 0.05);
+    });
+
+    renderPreviewChip('prevChip', state.prevPreview);
+    renderPreviewChip('nextChip', state.nextPreview);
+
     document.getElementById('btnEpg').classList.toggle('active', !!state.epgOpenGuess);
 
     var fsOn = !!state.fullscreen;
@@ -501,6 +563,24 @@
     var b = document.getElementById('npBanner');
     if (!msg){ b.classList.remove('show'); return; }
     b.textContent = msg; b.classList.add('show');
+  }
+
+  // id is 'prevChip' or 'nextChip'; preview is {name, logo} or null/undefined
+  // (null when ui.js's previewItem() couldn't determine one — see the
+  // Next/Previous preview bullet in remote_addon.py's KNOWN LIMITATIONS).
+  function renderPreviewChip(id, preview){
+    var chip = document.getElementById(id);
+    var hasName = !!(preview && preview.name);
+    chip.classList.toggle('show', hasName);
+    if (!hasName) return;
+    document.getElementById(id + 'Name').textContent = preview.name;
+    var img = document.getElementById(id + 'Logo'), empty = document.getElementById(id + 'LogoEmpty');
+    if (preview.logo){
+      img.src = preview.logo; img.style.display = ''; empty.style.display = 'none';
+      img.onerror = function(){ img.style.display = 'none'; empty.style.display = ''; };
+    } else {
+      img.style.display = 'none'; empty.style.display = '';
+    }
   }
 
   function applyStatus(data){
@@ -580,6 +660,12 @@
   });
   document.getElementById('btnVolUp').addEventListener('click', function(){ sendCommand('volume_up'); });
   document.getElementById('btnVolDown').addEventListener('click', function(){ sendCommand('volume_down'); });
+
+  document.querySelectorAll('.boost-btn').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      sendCommand('set_boost', {value: parseFloat(btn.getAttribute('data-value'))});
+    });
+  });
 
   var volSlider = document.getElementById('volSlider');
   var volDebounce = null;
