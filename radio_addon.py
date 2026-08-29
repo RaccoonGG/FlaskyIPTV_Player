@@ -2332,6 +2332,28 @@ window._rdioPlayRelative = function(direction){
   if(typeof toast === 'function') toast('No other playable stations in this list', 'w');
 };
 
+// Read-only sibling of _rdioPlayRelative(), for remote_addon.py's ui.js:
+// returns the station a Next/Previous press would actually land on —
+// without playing it or moving _rdioNavIndex — mirroring the same
+// skip-unplayable-entries loop above exactly, so a preview built from
+// this never shows a station _rdioPlayRelative() would actually skip
+// past. Returns null under the same conditions _rdioPlayRelative() would
+// just toast about (no nav list yet, or nothing playable in it) — e.g.
+// right after _rdioShuffle(), which deliberately clears the nav list
+// since a shuffled pick isn't "from" any particular browsed list.
+window._rdioNavPeek = function(direction){
+  if(!_rdioNavList || !_rdioNavList.length || _rdioNavIndex < 0) return null;
+  const n = _rdioNavList.length;
+  let idx = _rdioNavIndex;
+  for(let tries = 0; tries < n; tries++){
+    idx = (idx + direction + n) % n;
+    const s   = _rdioNavList[idx];
+    const url = s && (s.url_resolved || s.url || '').trim();
+    if(url) return s;
+  }
+  return null;
+};
+
 // Lazily append the 🎲 button to #rdio-np-bar on first bar show.
 function _rdioShuffleEnsureBtn(){
   if(document.getElementById('rdio-shuffle-btn')) return;
