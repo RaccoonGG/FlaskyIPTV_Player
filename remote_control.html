@@ -747,6 +747,12 @@
   function showSpinner(){ listEl().innerHTML = '<div class="spinner"></div>'; }
 
   function loadCategories(){
+    // Every list transition resets the filter — see renderItemsList()'s
+    // matching reset below for why (same fix, the two together cover
+    // every navigation path: forward into a category/episodes, and back
+    // out via the crumb button, since "back to root" lands here too).
+    searchTerm = '';
+    document.getElementById('searchBox').value = '';
     setCrumb(null);
     showSpinner();
     getJSON('/api/categories?mode=' + encodeURIComponent(browseMode)).then(function(data){
@@ -783,6 +789,15 @@
   }
 
   function renderItemsList(items, kind){
+    // A search typed while browsing categories (e.g. "sports" to find a
+    // category) has no business still filtering once you're inside it —
+    // it used to silently keep applying, hiding most/all of the new
+    // list until you noticed and cleared the box by hand. Every path
+    // that lands on a new list (loadItems, loadEpisodes, and the crumb
+    // button's "back with stack still non-empty" branch) all funnel
+    // through here, so resetting once, right here, covers all of them.
+    searchTerm = '';
+    document.getElementById('searchBox').value = '';
     currentItems = (items || []).map(function(it){ return {__cat: false, __kind: kind, raw: it}; });
     renderList();
   }
