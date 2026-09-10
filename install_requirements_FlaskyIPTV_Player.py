@@ -347,6 +347,79 @@ def check_m3u_proxy_addon():
     ok("M3U URL Proxy ready — no additional setup needed")
 
 
+# ── remote_addon check ─────────────────────────────────────────────────────
+def check_remote_addon():
+    hdr("Checking remote_addon.py …")
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    remote_file = os.path.join(script_dir, "remote_addon.py")
+    html_file = os.path.join(script_dir, "remote_control.html")
+
+    if not os.path.isfile(remote_file):
+        warn("remote_addon.py not found in this directory — Remote Control feature will be disabled")
+        info("Place remote_addon.py alongside the Flask app to enable Remote Control")
+        return
+
+    ok("remote_addon.py found")
+
+    # remote_control.html is served by remote_addon.py at /remote AND can be
+    # copied onto a phone and opened standalone — remote_addon.py alone
+    # isn't enough for either path to work, unlike every other optional
+    # addon here which is fully self-contained in its own .py file.
+    if os.path.isfile(html_file):
+        ok("remote_control.html found")
+    else:
+        err("remote_control.html MISSING — Remote Control will not work without it")
+        info("Place remote_control.html alongside FlaskyIPTV_Player_byGG.py "
+             "(served at /remote; also usable standalone, copied onto a phone)")
+
+    print()
+    print(f"  {BOLD}Remote Control requirements:{RESET}")
+    print(f"  • No extra Python packages needed beyond the core requirements")
+    print(f"  • Works over Server-Sent Events — no polling, no extra ports")
+    print(f"  • Optional PIN: set FLASKY_REMOTE_PIN before launching to require one")
+    print()
+
+    if os.path.isfile(html_file):
+        ok("Remote Control ready — open http://<flaskyiptv-ip>:5000/remote from a phone")
+
+
+# ── restream_addon check ─────────────────────────────────────────────────────
+def check_restream_addon():
+    hdr("Checking restream_addon.py …")
+
+    restream_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "restream_addon.py")
+    if not os.path.isfile(restream_file):
+        warn("restream_addon.py not found in this directory — Restream to LAN feature will be disabled")
+        info("Place restream_addon.py alongside the Flask app to enable LAN restreaming")
+        return
+
+    ok("restream_addon.py found")
+    print()
+    print(f"  {BOLD}Restream to LAN requirements:{RESET}")
+    print(f"  • ffmpeg  — required for LIVE channel restreaming (one process per")
+    print(f"              channel, shared across every LAN client watching it)")
+    print(f"  • requests — required for VOD/series restreaming (Range-proxy, no")
+    print(f"               ffmpeg involved — already a core requirement)")
+    print(f"  • On Linux/Termux, ffmpeg processes are protected against being")
+    print(f"    orphaned by an unexpected server shutdown (PR_SET_PDEATHSIG);")
+    print(f"    this protection does not exist on Windows")
+    print()
+
+    if shutil.which("ffmpeg"):
+        ok("ffmpeg available — live channel restreaming will work")
+    else:
+        warn("ffmpeg NOT found — live channel restreaming will not be able to start")
+        info("VOD/series restreaming does not need ffmpeg and will still work")
+        info("Install ffmpeg (see system dependencies section above) for live restreaming")
+
+    if check_import("requests"):
+        ok("requests available — VOD/series restreaming will work")
+    else:
+        warn("requests NOT installed — VOD/series restreaming will be unavailable")
+        info("Install with:  pip install requests")
+
+
 # ── Port availability check ───────────────────────────────────────────────────
 def check_port(port: int = 5000):
     import socket
@@ -408,6 +481,8 @@ def main():
     check_dvr_addon()
     check_radio_addon()
     check_m3u_proxy_addon()
+    check_remote_addon()
+    check_restream_addon()
     check_system_deps()
     check_port(5000)
 
