@@ -38,7 +38,7 @@ It is a local player interface — a front-end that connects to IPTV portals and
 ## Requirements
 
 - Python 3.9+ (tested on 3.14)
-- `ffmpeg` and `ffprobe` in PATH (required for recording, downloading, HEVC proxy, casting, DVR, and Multi-View)
+- `ffmpeg` and `ffprobe` in PATH (required for recording, downloading, HEVC proxy, casting, DVR, Multi-View, and restreaming)
 - `yt-dlp` in PATH (optional — used as HLS fallback and for YouTube/Twitch URL resolution in Multi-View tiles)
 - Python packages: `flask`, `aiohttp`, `requests`, `yt-dlp`
 - All files listed as **required** in the Files table below must be placed in the same directory as the main script
@@ -64,6 +64,7 @@ It is a local player interface — a front-end that connects to IPTV portals and
 | `m3u_proxy_addon.py` | optional | M3U URL proxy — convert any portal into a permanent token-refreshing M3U URL for TiviMate / VLC / Kodi |
 | `remote_addon.py` | optional | LAN remote control — control playback, browse, and adjust volume/EPG/fullscreen from a phone or any browser on the network |
 | `remote_control.html` | optional | Remote-control page served by `remote_addon.py` at `/remote`; also works copied onto a phone and opened as a standalone file |
+| `restream_addon.py` | optional | LAN restreaming — share one upstream connection with every device on the network watching the same channel, movie, or episode |
 | `multiview_layouts.json` | auto-created | Saved Multi-View layouts (created on first save) |
 | `dvr_jobs.json` | auto-created | Saved DVR job list (created on first scheduled recording) |
 
@@ -82,15 +83,17 @@ The installer will:
 - Check your Python version (3.9+ required)
 - Install all required pip packages (`flask`, `aiohttp`, `requests`)
 - Install `yt-dlp` as an optional package
-- Check if `ffmpeg` and `ffprobe` are available in PATH
 - **Verify required addon files** (`portal_clients.py`, `proxy_addon.py`, `download_addon.py`, `probe_addon.py`, `epg_addon.py`, `subtitles_addon.py`) are present
 - **Detect `cast_addon.py`** and interactively offer to install each cast protocol package
 - **Detect `multiview_addon.py`** and verify its dependencies (ffmpeg + yt-dlp)
 - **Detect `dvr_addon.py`** and verify its dependencies (ffmpeg required)
 - **Detect `radio_addon.py`** and confirm `requests` (already a core requirement) is available
 - **Detect `m3u_proxy_addon.py`** and confirm it requires no extra packages (stdlib + flask only)
-- On **Android/Termux** — automatically installs `ffmpeg` via `pkg install ffmpeg` if missing
-- On **Windows/macOS/Linux** — prints install instructions for your platform if ffmpeg is missing
+- **Detect `remote_addon.py`** and its companion `remote_control.html` (both required together — Remote Control won't work with only one of the two), confirming no extra packages are needed
+- **Detect `restream_addon.py`** and verify its dependencies (ffmpeg required — live, VOD, and series all share the same broadcaster)
+- Check if `ffmpeg` and `ffprobe` are available in PATH
+  - On **Android/Termux** — automatically installs `ffmpeg` via `pkg install ffmpeg` if missing
+  - On **Windows/macOS/Linux** — prints install instructions for your platform if ffmpeg is missing
 - Check that port 5000 is free
 
 **Platform-specific ffmpeg install (if not already installed):**
@@ -371,6 +374,39 @@ Playback state (current channel, playing/paused, volume) lives in whichever brow
 #### Security
 No login by default, matching the rest of FlaskyIPTV — anyone on the network can use the remote, same trust model as the main app. Set the `FLASKY_REMOTE_PIN` environment variable before launching to require a PIN; bookmark the phone link as `.../remote?pin=1234` and it's carried automatically from then on.
 
+### Restream to LAN (`restream_addon.py`)
+
+Share one provider connection with every device on your network instead of each one opening its own — a **📡** button in the header (next to Cast) opens the Restream panel. Works for live channels, movies, and episodes alike: click Restream, and any TV, phone, or PC on the network can open the resulting URL and watch along.
+
+**Requires:** `restream_addon.py` in the same directory, plus `ffmpeg`.
+
+#### How it works
+
+Restreaming anything — a channel, a movie, an episode — starts one ffmpeg process against the provider and fans that single stream out to every client that attaches, **including this app's own screen**. Clicking Restream switches the main FlaskyIPTV screen itself over to watching through that same shared connection, exactly like any other device on the network would — it isn't a separate, independent viewer of the same content. So two, five, or ten devices *and* the main screen, all watching the same restream, still cost the provider exactly one connection. That's the whole point: FlaskyIPTV is never running two connections for the same thing at once, one for itself and one for the restream — restreaming *becomes* how it's watching it.
+
+- **Restream what's currently playing** — the Now Playing tab restreams whatever's already on screen with one click
+- **Or pick anything** — the Browse tab lists categories with a **Live / VOD / Series** toggle, independent of what's currently playing. Restreaming something different from what's on screen switches the main screen over to that instead, since it becomes the shared viewing point for whatever's being restreamed
+- A small **📡 Restreaming** indicator appears on screen whenever this app's own playback is one of the attached clients, with a live viewer count, a **Copy URL** button, and its own Stop button
+- Copy/remux only (no re-encode) unless the content's codec needs it, decided automatically from the same codec probe used for normal playback
+- A slow or stalled LAN client is dropped automatically rather than backing up and affecting everyone else watching
+- Stops itself automatically ~20 seconds after the last device disconnects (or ~90 seconds if nothing ever connected after clicking start, to allow time to actually open the TV app)
+
+Movies and episodes play forward from the start, once, like tuning into a channel — there's no independent seeking once something is being restreamed, on this screen or any other device watching it, since everyone (main screen included) is now reading the same shared broadcast rather than their own independently seekable copy. A live channel that drops mid-stream auto-restarts and reconnects; a movie or episode reaching the end is normal completion, not a failure, so it just stops — restreaming it again starts over from the beginning.
+
+#### Active Restreams & Playlist
+
+- Shows every active restream — state, viewer count, throughput, data sent, codec, restart count (live only) — plus a running total of upstream vs. LAN-upload bandwidth across everything currently restreaming
+- **📋 Copy playlist URL** adds every currently-restreamed item to one M3U playlist — add it once in TiviMate / VLC / Kodi / any IPTV app on a device on the network
+- **Stop** ends the restream immediately for everyone watching it, including this screen if it was one of the viewers
+
+#### LAN IP
+
+The Settings tab shows the auto-detected LAN IP used in generated URLs. If it looks wrong — most commonly a `198.18.x.x`-style address from a VPN client's virtual interface — override it manually with the machine's real LAN IP.
+
+#### Security
+
+Every restream endpoint (start/stop/status, the playlist, and the stream URLs) rejects callers outside the private network — same unauthenticated-but-LAN-only trust model as Remote Control, applied a bit more strictly here since restreaming also spends real provider bandwidth.
+
 ### Stalker / MAC Portal Advanced Overrides
 For MAC/Stalker portals, an expandable **Stalker overrides** section in the connect panel lets you supply hardcoded device identity values instead of the auto-computed ones:
 
@@ -633,6 +669,7 @@ All settings are saved in browser localStorage and persist across sessions.
 - Radio addon uses a two-tier cache (10-minute memory + 24-hour disk) stored at `~/.flasky_radio_cache/`. RadioBrowser queries rotate across five geographically distributed API servers with automatic failover. Favourites persist at `~/.flasky_radio_cache/radio_favorites.json`.
 - M3U URL proxy (`m3u_proxy_addon.py`) stores up to 50 proxy playlists in an in-memory dict keyed by a 12-char UUID. Playlist content is generated dynamically per-request from `request.host` so stream links automatically reflect the correct IP for both localhost and LAN access. All state is lost on server restart.
 - Remote control (`remote_addon.py`) has no server-side view of "what's playing" — that state lives entirely in the browser tab running the player. It relays over two Server-Sent Event channels, mirroring the `/api/logs` pattern: the browser tab reports state changes, the remote posts commands that get pushed back to a small script injected into the tab (`/api/remote/ui.js`), which calls the same functions the on-screen controls use. Registered as its own Flask Blueprint so its CORS headers — needed because the standalone-file mode runs as a different browser origin — don't apply to the rest of the app.
+- Restreaming (`restream_addon.py`) uses one delivery mechanism for every content type: one ffmpeg process per restream, its stdout fanned out to a `queue.Queue` per attached LAN client and delivered through a streaming Flask response — the shared-process design used elsewhere in the app for the same reason (Multi-View's stream dedup, the DVR timeshift path). This app's own screen attaches to that same broadcast the same way any other device does — clicking Restream calls the existing `doPlay()` playback function with the restream's own URL, no different from playing any other resolved URL, so there's no separate backend path for "this app's own playback" versus "a LAN device's playback." That connection is tagged (`?viewer=main`) so it can be explicitly detached later — switching to a new restream, or to normal playback elsewhere, calls `/api/restream/leave_main` for whatever was previously on-air rather than just letting the old `<video>` source get abandoned client-side. That's deliberate: a browser switching a video element's source doesn't reliably or promptly tell the server the old connection is done, and without an explicit signal a stale registration can sit there indefinitely — still counted as "watching," the idle-timeout never triggering because the client list is never empty from the server's point of view. The only place live and vod/series genuinely differ is how a finished ffmpeg process is handled: live retries with backoff (the upstream connection dropped, not the broadcast itself ending), while vod/series treats any exit as normal completion and just stops — a movie reaching its own end isn't a failure to recover from, and auto-restarting would silently jump everyone still watching back to the beginning. A background thread reaps idle streams (a two-tier grace period: longer before any client has ever attached, shorter after the last one leaves); a SIGTERM handler and, on Linux, `PR_SET_PDEATHSIG` on each ffmpeg child ensure a stopped or killed server doesn't leave orphaned ffmpeg processes behind — see Known Limitations for the one case that isn't covered.
 
 ---
 
@@ -656,3 +693,8 @@ All settings are saved in browser localStorage and persist across sessions.
 - Fullscreen requested from the remote can fall back to a full-viewport CSS overlay instead of true browser fullscreen — this is a browser security restriction (a remote tap can't carry the "direct user gesture" requirement across devices), not a bug. The visual result is the same either way.
 - The remote's EPG guide button tracks open/closed by mirroring its own presses, not the panel's actual on-screen state — it can drift out of sync if EPG is opened or closed from the FlaskyIPTV screen directly instead of from the remote
 - `remote_control.html` opened as a standalone file (rather than via the `/remote` link) has no way to remember the PC's address between opens — nothing is persisted; re-enter it or use the `/remote` link + home screen icon instead if that's annoying
+- Restreamed movies and episodes have no independent seeking — they play forward from the start, once, shared by every device watching, the same as a live channel. This includes the main FlaskyIPTV screen itself once something is being restreamed, since it's watching through the same shared broadcast, not its own separate copy. This is deliberate scope, not a missing feature — see the Restream to LAN section above
+- Restreaming something other than what's currently on screen switches the main FlaskyIPTV screen over to it — restreaming is a "what am I watching" decision, not a background action, since the whole point is that this app's own playback and any LAN devices are all watching the same one connection
+- Restream registrations are stored in memory only and are lost on restart, the same as M3U URL proxy playlists above — LAN URLs need to be regenerated from the Restream panel afterward
+- ffmpeg orphan protection on an unexpected shutdown is Linux/Termux only (`PR_SET_PDEATHSIG`, applied automatically to every restream ffmpeg process, live or vod/series). A graceful stop (Ctrl+C, closing the terminal normally) cleans up on Windows too; a true hard kill (Task Manager "End Task" or similar) can leave `ffmpeg.exe` running until it's stopped manually — Windows has no equivalent kernel mechanism, and implementing the closest analogue (Job Objects) was intentionally left out rather than shipped untested
+- Restream throughput and LAN-upload figures in the Active Restreams tab are sampled on a watchdog tick (every couple of seconds) and smoothed over that window — they reflect recent throughput, not an instantaneous reading
