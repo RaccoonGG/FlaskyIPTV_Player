@@ -132,6 +132,13 @@ except ImportError:
     _REMOTE_AVAILABLE = False
     def register_remote_routes(*a, **kw): pass
 
+try:
+    from restream_addon import register_restream_routes
+    _RESTREAM_AVAILABLE = True
+except ImportError:
+    _RESTREAM_AVAILABLE = False
+    def register_restream_routes(*a, **kw): pass
+
 # ===================== OPTIONAL DEPS =====================
 
 try:
@@ -2303,6 +2310,7 @@ register_download_routes(flask_app, state, run_async, run_worker, _make_client,
                          _FFMPEG_AVAILABLE, YTDLP_AVAILABLE)
 register_epg_routes(flask_app, state, run_async, _make_client)
 register_m3u_proxy_routes(flask_app, state, run_async, _make_client)
+register_restream_routes(flask_app, state, run_async, _make_client, _FFMPEG_PATH, _FFPROBE_PATH)
 
 @flask_app.route("/api/status", methods=["GET"])
 def api_status():
@@ -3898,6 +3906,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M1 18v3h3c0-1.66-1.34-3-3-3zm0-4v2c2.76 0 5 2.24 5 5h2c0-3.87-3.13-7-7-7zm18-7H5c-1.1 0-2 .9-2 2v3h2v-3h14v12h-5v2h5c1.1 0 2-.9 2-2V9c0-1.1-.9-2-2-2zm-18 3v2c4.97 0 9 4.03 9 9h2c0-6.08-4.93-11-11-11z"/></svg>
         <span class="cast-badge" id="cast-nav-badge"></span>
       </button>
+      <button class="btn-ghost hdr-ico" id="restream-btn" onclick="openRestreamModal()" title="Restream to LAN" style="position:relative">📡<span class="restream-badge" id="restream-nav-badge"></span></button>
       <button class="btn-ghost hdr-ico" onclick="toggleCP()" title="Settings">⚙</button>
     </div>
   </div>
@@ -7315,6 +7324,22 @@ async function playItem(i){
   const itemMode = mode;
   // Store item for EPG lookup (live channels only)
   _epgItem = (itemMode==='live') ? it : null;
+  // Same idea, for the Restream panel: filtItems/pIdx/curCat get reset the
+  // moment the user browses to a different category or mode (see doConnect/
+  // mode-switch above), even though playback keeps going — so "restream
+  // what I'm currently watching" can't just read filtItems[pIdx] later.
+  // This snapshot is taken at the one moment we know for certain what's
+  // actually playing, and is left untouched by any later navigation. Covers
+  // all three modes (live/vod/series) — restreaming supports all three.
+  window._lastRestreamTarget = {item: it, mode: itemMode, category: curCat||{}};
+  // playItem() is only ever used for normal playback — restreaming calls
+  // doPlay() directly instead — so reaching this line means the main
+  // screen is about to show something else. If it was on-air for a
+  // restream, that needs to be told explicitly (see restream_addon.py's
+  // leave_main_screen()): the old connection closing on its own isn't a
+  // reliable enough signal, and without this a stale "still watching"
+  // registration can linger indefinitely.
+  if(typeof window._restreamNotifyNavigated === 'function') window._restreamNotifyNavigated();
   document.getElementById('epg-now').textContent='';
   document.getElementById('epgbtn').style.opacity=(itemMode==='live')?'1':'0.35';
   const _cuSupported=(itemMode==='live')&&_channelSupportsCatchup(it);
@@ -8563,6 +8588,24 @@ function _globalAudioGraph(){
     _gainSource = _audioCtx.createMediaElementSource(vid);
     _gainSource.connect(_gainNode);
     _gainNode.connect(_audioCtx.destination);
+    // createMediaElementSource() just silently took over #vid's audio
+    // output from whatever vid.setSinkId() had it routed to — if a
+    // non-default device was already selected THIS session (_aoCurrentId
+    // set — boot-time restore is a separate, already-correct path: at
+    // boot _aoCurrentId is still '' when _aoBoot() builds this graph, so
+    // this block is a no-op there and _aoBoot()'s own subsequent
+    // _aoApply(saved.deviceId) call is what restores it), re-apply that
+    // device to the new AudioContext now, so building this graph for the
+    // very first time — e.g. the first Volume boost/soft press from the
+    // remote — doesn't silently bounce audio back to system default.
+    if(_aoCurrentId && typeof _audioCtx.setSinkId === 'function'){
+      _audioCtx.setSinkId(_aoCurrentId).catch(()=>{
+        // Device no longer valid (e.g. unplugged) — fall back to
+        // default and keep _aoCurrentId/the toolbar badge honest about it.
+        _aoCurrentId = '';
+        _syncToolbarBtn();
+      });
+    }
   }catch(e){ _gainNode = null; return null; }
   return {ctx:_audioCtx, source:_gainSource, gain:_gainNode};
 }
@@ -10119,6 +10162,7 @@ window._rdioLocalCC = (_LOCALE_TAG_CANDIDATES[0] || '').toUpperCase().slice(0, 2
 <script src="/api/radio/ui.js"></script>
 <script src="/api/m3u_proxy/ui.js"></script>
 <script src="/api/remote/ui.js"></script>
+<script src="/api/restream/ui.js"></script>
 </body>
 </html>
 """
