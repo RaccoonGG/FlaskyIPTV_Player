@@ -825,10 +825,25 @@
         } else if (it.__kind === 'items' && browseMode === 'series'){
           loadEpisodes(it.raw);
         } else {
+          // `i` is this item's position in `items` — the array actually
+          // being rendered, which is a *search-narrowed subset* of
+          // currentItems whenever searchTerm is set (see above). The
+          // server has no idea a search happened at all: remotePlayItem()
+          // re-fetches the full item list for this mode+category and
+          // indexes straight into THAT with whatever number we send. So
+          // sending `i` here plays back whatever sits at that position in
+          // the FULL list, not the filtered one — right by coincidence
+          // with no search term (items === currentItems, positions match)
+          // but wrong the moment a search narrows/reorders the visible
+          // results. currentItems.indexOf(it) finds this exact same
+          // wrapper object's real position in the full list regardless of
+          // whether we're currently viewing a filtered view of it —
+          // filter() carries object references through unchanged, so
+          // identity lookup works whether or not a search is active.
           sendCommand('play_item', {
             mode: browseMode,
             category: (currentCategory && (currentCategory.raw || currentCategory)) || {},
-            index: i,
+            index: currentItems.indexOf(it),
             name: name
           });
         }
