@@ -139,6 +139,34 @@
   .boost-btn.on{ background:var(--accent-soft); border-color:var(--accent); color:var(--text); }
   .boost-btn:active{ transform:scale(.96); }
 
+  /* ---------- restream ---------- */
+  .restream-card{
+    background:var(--panel); border:1px solid var(--border); border-radius:var(--radius);
+    padding:12px 14px; display:flex; flex-direction:column; gap:10px;
+  }
+  .restream-row{ display:flex; align-items:center; gap:10px; }
+  .restream-label{ font-size:11.5px; color:var(--text-dim); flex:1; min-width:0; line-height:1.4; }
+  .restream-btn{
+    flex:none; border:1px solid var(--border); background:var(--panel-2); color:var(--text);
+    border-radius:var(--radius-sm); padding:0 14px; height:34px; font-size:12.5px; font-weight:600;
+    cursor:pointer; transition:background .15s, border-color .15s, opacity .15s;
+  }
+  .restream-btn:active{ transform:scale(.96); }
+  .restream-btn.start{ background:var(--accent-soft); border-color:var(--accent); }
+  .restream-btn.stop{ background:rgba(239,68,68,.14); border-color:var(--red); }
+  .restream-btn:disabled{ opacity:.35; pointer-events:none; }
+  .restream-url-row{ display:none; align-items:center; gap:8px; }
+  .restream-url-row.show{ display:flex; }
+  .restream-url-row input{
+    flex:1; min-width:0; height:32px; border-radius:var(--radius-sm); border:1px solid var(--border);
+    background:var(--panel-2); color:var(--text-dim); font-family:var(--mono); font-size:10.5px; padding:0 9px;
+  }
+  .restream-copy-btn{
+    flex:none; border:1px solid var(--border); background:var(--panel-2); color:var(--text);
+    border-radius:var(--radius-sm); padding:0 12px; height:32px; font-size:11.5px; font-weight:600; cursor:pointer;
+  }
+  .restream-copy-btn:active{ transform:scale(.94); }
+
   /* ---------- browse ---------- */
   .browse-card{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; }
   .tabs{ display:flex; border-bottom:1px solid var(--border); }
@@ -359,6 +387,18 @@
       </div>
     </div>
 
+    <div class="restream-card">
+      <div class="restream-row">
+        <span class="restream-label" id="restreamLabel">Open FlaskyIPTV and start watching something.</span>
+        <button class="restream-btn start" id="btnRestreamStart" type="button" disabled>Start Restream</button>
+        <button class="restream-btn stop" id="btnRestreamStop" type="button" style="display:none">Stop</button>
+      </div>
+      <div class="restream-url-row" id="restreamUrlRow">
+        <input type="text" id="restreamUrlInput" readonly inputmode="none" aria-label="Restream URL">
+        <button class="restream-copy-btn" id="btnRestreamCopy" type="button">Copy</button>
+      </div>
+    </div>
+
     <section class="browse-card">
       <div class="tabs" id="modeTabs">
         <button class="tab on" data-mode="live">Live</button>
@@ -503,6 +543,7 @@
       showBanner('');
       renderPreviewChip('prevChip', null);
       renderPreviewChip('nextChip', null);
+      renderRestream(null);
       return;
     }
     document.getElementById('npTitle').textContent = state.stopped ? '⏹ Stopped' : (state.title || 'Unknown');
@@ -557,6 +598,46 @@
     showBanner(state.playBlocked
       ? 'Playback may be blocked by the browser — tap once on the FlaskyIPTV screen to allow remote play.'
       : '');
+
+    renderRestream(state);
+  }
+
+  // state.restream is {key,url,name} while THIS screen's own playback is
+  // attached to an active restream (mirrors restream_addon.py's on-screen
+  // on-air indicator) — null otherwise. state.restreamAvailable is true
+  // when there's something playing that COULD be restreamed (mirrors the
+  // on-screen "Restream this X" button's own presence check), independent
+  // of whether one is already running. Falls back to the "not connected"
+  // wording when state itself is null (FlaskyIPTV tab not reporting).
+  function renderRestream(state){
+    var label = document.getElementById('restreamLabel');
+    var startBtn = document.getElementById('btnRestreamStart');
+    var stopBtn = document.getElementById('btnRestreamStop');
+    var urlRow = document.getElementById('restreamUrlRow');
+    var urlInput = document.getElementById('restreamUrlInput');
+    var onAir = state && state.restream;
+    if (onAir && onAir.url) {
+      label.textContent = 'Restreaming: ' + (onAir.name || 'Channel');
+      urlInput.value = onAir.url;
+      urlRow.classList.add('show');
+      startBtn.style.display = 'none';
+      stopBtn.style.display = '';
+      stopBtn.disabled = false;
+    } else {
+      urlRow.classList.remove('show');
+      stopBtn.style.display = 'none';
+      startBtn.style.display = '';
+      if (!state) {
+        startBtn.disabled = true;
+        label.textContent = 'Open FlaskyIPTV and start watching something.';
+      } else {
+        var avail = !!state.restreamAvailable;
+        startBtn.disabled = !avail;
+        label.textContent = avail
+          ? 'Share what\u2019s playing with other devices on your LAN.'
+          : 'Nothing playing to restream yet.';
+      }
+    }
   }
 
   function showBanner(msg){
@@ -666,6 +747,66 @@
       sendCommand('set_boost', {value: parseFloat(btn.getAttribute('data-value'))});
     });
   });
+
+  // ---------------------------------------------------------------------
+  // Restream: Start/Stop just relay a command — the actual state change
+  // (POST /api/restream/start|stop, switching FlaskyIPTV's own playback
+  // over to the restream) happens on the FlaskyIPTV tab, same as every
+  // other remote command. Briefly disabling the tapped button is just a
+  // debounce against double-taps while waiting for that round trip; the
+  // next status update (SSE push or the 2-3s poll) re-derives the real
+  // enabled/disabled state from renderRestream() regardless, so this
+  // never gets permanently stuck either way.
+  // ---------------------------------------------------------------------
+  document.getElementById('btnRestreamStart').addEventListener('click', function(){
+    var btn = this;
+    btn.disabled = true;
+    sendCommand('start_restream');
+    setTimeout(function(){ btn.disabled = false; }, 2500);
+  });
+  document.getElementById('btnRestreamStop').addEventListener('click', function(){
+    var btn = this;
+    btn.disabled = true;
+    sendCommand('stop_restream');
+    setTimeout(function(){ btn.disabled = false; }, 1500);
+  });
+  document.getElementById('btnRestreamCopy').addEventListener('click', copyRestreamUrl);
+
+  // navigator.clipboard.writeText requires a secure context (HTTPS or
+  // localhost) — this remote normally runs over plain http://<lan-ip>,
+  // which is NOT secure, so Chrome/Firefox/Safari all leave
+  // navigator.clipboard undefined there. Fall back to the old
+  // select-and-execCommand('copy') trick, and if even that's refused,
+  // leave the field selected so the user can still copy it manually
+  // (long-press on mobile).
+  function copyRestreamUrl(){
+    var input = document.getElementById('restreamUrlInput');
+    var text = input.value || '';
+    if (!text) return;
+    var btn = document.getElementById('btnRestreamCopy');
+    var orig = btn.textContent;
+    function flash(ok){
+      btn.textContent = ok ? 'Copied!' : 'Select & copy';
+      setTimeout(function(){ btn.textContent = orig; }, 1500);
+    }
+    function fallbackCopy(){
+      var ok = false;
+      try {
+        input.removeAttribute('readonly'); // iOS Safari needs this to allow selection
+        input.focus();
+        input.select();
+        input.setSelectionRange(0, text.length);
+        ok = document.execCommand('copy');
+      } catch(e){ ok = false; }
+      input.setAttribute('readonly', 'readonly');
+      flash(ok);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function(){ flash(true); })['catch'](fallbackCopy);
+    } else {
+      fallbackCopy();
+    }
+  }
 
   var volSlider = document.getElementById('volSlider');
   var volDebounce = null;
