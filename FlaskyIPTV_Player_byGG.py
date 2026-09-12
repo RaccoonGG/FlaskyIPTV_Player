@@ -4774,6 +4774,14 @@ let pUrl='', pName='', pIdx=-1;
 // module's own list-aware navigation instead of the TV-channel filtItems
 // list, which radio stations were never part of.
 let _curIsRadio=false;
+// True while the currently-playing media came from playDirectUrl() (a
+// pasted URL with no catalog item behind it — no id/category/etc.) rather
+// than playItem(). restream_addon.py's currentItem() checks this (and
+// _curIsRadio, and _playerStopped) before trusting window._lastRestreamTarget,
+// since none of those three can become true without a doPlay() having run
+// since the target was last set — see the comment there for the full
+// reasoning.
+let _curIsDirectPlay=false;
 let isStalker=false;  // true when connected to a stalker_portal MAC portal
 let _dlActive=false, _dlTaskType='', _dlItemNames=[];
 let hlsObj=null, mpegtsObj=null, recTmr=null, isRec=false, logEs=null, cpOpen=false;
@@ -5212,7 +5220,7 @@ function playDirectUrl(){
   const url = (document.getElementById('play-url-inp').value||'').trim();
   if(!url){ toast('Enter a URL first','wrn'); return; }
   const name = (()=>{ try{ return new URL(url).hostname; }catch(e){ return url.slice(0,40); } })();
-  doPlay(url, name, {isLive:true});
+  doPlay(url, name, {isLive:true, isDirectPlay:true});
   document.getElementById('play-url-inp').value='';
 }
 function setMode(m){
@@ -7374,6 +7382,7 @@ function _destroyPlayers(){
 function doPlay(url, name, opts={}){
   pUrl=url; pName=name||url;
   _curIsRadio = !!opts.isRadio;
+  _curIsDirectPlay = !!opts.isDirectPlay;
   const dlb=document.getElementById('dl-now-btn'); if(dlb) dlb.disabled=false;
   const dlbm=document.getElementById('dl-now-btn-mob'); if(dlbm) dlbm.disabled=false;
   // Capture this invocation's epoch so all async callbacks can detect when a
@@ -8333,6 +8342,7 @@ function playerPP(){vid.paused||vid.ended?vid.play().catch(()=>{}):vid.pause();}
 function playerStop(){
   _playerStopped = true;
   _curIsRadio = false;
+  _curIsDirectPlay = false;
   _destroyPlayers();
   pUrl=''; setNP('⏹ Stopped'); document.getElementById('pu').textContent='—';
   setNPTrack('');
