@@ -1,11 +1,23 @@
+# Copyright (C) 2017 AMM
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 """
 remote_addon.py — LAN remote-control addon for FlaskyIPTV Player by GG
 ========================================================================
 
 Lets a phone (or any browser) on the same network see what's playing and
 send transport commands (play/pause/resume/stop, next/previous, volume,
-volume boost, EPG toggle, fullscreen) to whichever machine has FlaskyIPTV
-open in a browser tab. Pairs with remote_control.html, which this addon also serves
+volume boost, EPG toggle, fullscreen, restream start/stop) to whichever
+machine has FlaskyIPTV open in a browser tab. Pairs with remote_control.html, which this addon also serves
 at /remote.
 
 WHY A RELAY, NOT DIRECT CONTROL
@@ -96,6 +108,17 @@ KNOWN LIMITATIONS (see remote_control.html for how these surface in the UI)
   behavior rather than falling short of it. Requires a radio_addon.py with
   _rdioNavPeek (added alongside this bullet); against an older one the
   preview just omits itself for that case rather than throwing.
+* Start Restream (and the on-air URL/Stop shown alongside it) requires a
+  restream_addon.py that exposes window._restreamCurrentItem/startRestream/
+  _restreamStopOnAir/_restreamOnAirSnapshot (added alongside this remote
+  feature). Against an older restream_addon.py, or none at all, the button
+  stays present but disabled, and Stop/the URL row simply never appear,
+  rather than throwing. It restreams whatever restream_addon.py's own
+  currentItem() currently considers "playing" — the exact same target the
+  on-screen Restream button uses, including its existing quirk of not
+  tracking radio (playItem() is never called for radio, so
+  window._lastRestreamTarget keeps pointing at the last live/vod/series
+  item played instead of the station).
 """
 
 import json
@@ -125,6 +148,7 @@ VALID_ACTIONS = {
     "fullscreen_on", "fullscreen_off",
     "play_item",
     "play_station",
+    "start_restream", "stop_restream",
 }
 
 _MAX_STATION_LIST = 500  # generous vs. the addon's own /top,/genre,/search caps (300-500)
@@ -640,7 +664,17 @@ _REMOTE_UI_JS = r"""
       prevPreview: prevIt ? {name: itemName(prevIt), logo: itemLogo(prevIt)} : null,
       fullscreen: !!(document.fullscreenElement || (fsTarget() && fsTarget().classList.contains('_remoteFsActive'))),
       playBlocked: _lastPlayBlocked,
-      epgOpenGuess: !!window.__flaskyRemoteEpgGuess
+      epgOpenGuess: !!window.__flaskyRemoteEpgGuess,
+      restreamAvailable: (function(){
+        try { return !!(typeof window._restreamCurrentItem === 'function' && window._restreamCurrentItem()); }
+        catch(e){ return false; }
+      })(),
+      restream: (function(){
+        try {
+          if (typeof window._restreamOnAirSnapshot === 'function') return window._restreamOnAirSnapshot();
+        } catch(e){}
+        return null;
+      })()
     };
   }
 
@@ -818,6 +852,44 @@ _REMOTE_UI_JS = r"""
     return false;
   }
 
+  // ---- restream (relayed via restream_addon.py's own start/stop) ----
+  // restream_addon.py owns the actual POST /api/restream/start|stop calls,
+  // the doPlay() hookup that switches this screen over to the shared
+  // broadcast, and the on-air key/url/name it tracks — exposed on window
+  // (window._restreamCurrentItem/startRestream/_restreamStopOnAir/
+  // _restreamOnAirSnapshot) specifically so this remote can trigger and
+  // read that same state instead of duplicating it. All calls are typeof-
+  // guarded, same pattern as _rdioNavPeek/_gainApply above: an app running
+  // without restream_addon.py (or an older one predating these hooks)
+  // just no-ops instead of throwing.
+  function remoteStartRestream(){
+    var cur = null;
+    try {
+      if (typeof window._restreamCurrentItem === 'function') cur = window._restreamCurrentItem();
+    } catch(e){ console.warn('[FlaskyRemote] _restreamCurrentItem threw', e); }
+    if (!cur || !cur.item || typeof window.startRestream !== 'function') { report(); return; }
+    var nm = itemName(cur.item) || 'Channel';
+    try {
+      var p = window.startRestream(cur.item, cur.mode, cur.category || {}, nm);
+      if (p && typeof p.then === 'function') { p.then(report)['catch'](report); }
+      else { setTimeout(report, 800); }
+    } catch(e){
+      console.warn('[FlaskyRemote] startRestream threw', e);
+      report();
+    }
+  }
+  function remoteStopRestream(){
+    if (typeof window._restreamStopOnAir !== 'function') { report(); return; }
+    try {
+      var p = window._restreamStopOnAir();
+      if (p && typeof p.then === 'function') { p.then(report)['catch'](report); }
+      else { setTimeout(report, 500); }
+    } catch(e){
+      console.warn('[FlaskyRemote] _restreamStopOnAir threw', e);
+      report();
+    }
+  }
+
   // ---- command dispatch ----
   function handleCommand(cmd){
     if (!cmd || !cmd.action) return;
@@ -878,6 +950,12 @@ _REMOTE_UI_JS = r"""
       case 'play_station':
         remotePlayStation(cmd);
         return; // remotePlayStation() reports when it resolves
+      case 'start_restream':
+        remoteStartRestream();
+        return; // reports once resolved (or immediately if unavailable)
+      case 'stop_restream':
+        remoteStopRestream();
+        return;
       default:
         console.warn('[FlaskyRemote] unknown action', cmd.action);
         return;
