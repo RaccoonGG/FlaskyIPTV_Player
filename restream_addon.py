@@ -1161,7 +1161,30 @@ _RESTREAM_UI_JS = r"""
   // something is playing but was started before this addon's hook existed
   // in a given page load (harmless — just won't survive navigation until a
   // fresh play happens).
+  //
+  // The three checks up front make this reflect what's ACTUALLY playing
+  // right now, not merely "the last item played via playItem()" — each of
+  // _playerStopped/_curIsRadio/_curIsDirectPlay can become true without
+  // playItem() ever running again (pressing Stop, playing a radio station,
+  // pasting a direct URL), which would otherwise leave
+  // window._lastRestreamTarget silently pointing at a stale, previously-
+  // played live/vod/series item. Radio and direct-URL playback are also
+  // both genuinely unrestreamable as things stand — RestreamManager.start()
+  // rejects any mode outside ("live","vod","series"), and neither a radio
+  // station nor a pasted URL is shaped like a catalog item (no id/
+  // category/etc.) the way _make_target_key() and the target/category
+  // display elsewhere in this modal expect — so null is correct here, not
+  // just a stopgap. Falling through to window._lastRestreamTarget (or the
+  // filtItems[pIdx] fallback below) is only reached once none of the three
+  // hold, which is exactly when it's guaranteed fresh: it's set in the same
+  // playItem() call that also sets pIdx, and none of the three gates above
+  // can be true without a doPlay() having run since.
   function currentItem(){
+    try{
+      if(typeof _playerStopped !== 'undefined' && _playerStopped) return null;
+      if(typeof _curIsRadio !== 'undefined' && _curIsRadio) return null;
+      if(typeof _curIsDirectPlay !== 'undefined' && _curIsDirectPlay) return null;
+    }catch(e){}
     try{
       if(window._lastRestreamTarget) return window._lastRestreamTarget;
     }catch(e){}
@@ -1202,6 +1225,7 @@ _RESTREAM_UI_JS = r"""
   onair.appendChild(onairStopBtn);
   let onAirKey = null;
   let onAirUrl = null;
+  let onAirName = null;
   function setOnAirText(name, clients){
     onairText.innerHTML = '';
     onairText.appendChild(document.createTextNode('Restreaming '));
@@ -1212,12 +1236,12 @@ _RESTREAM_UI_JS = r"""
     }
   }
   function showOnAir(key, url, name){
-    onAirKey = key; onAirUrl = url;
+    onAirKey = key; onAirUrl = url; onAirName = name;
     setOnAirText(name);
     onair.classList.add('show');
   }
   function clearOnAir(){
-    onAirKey = null; onAirUrl = null;
+    onAirKey = null; onAirUrl = null; onAirName = null;
     onair.classList.remove('show');
   }
   onairCopyBtn.addEventListener('click', function(){ if(onAirUrl) copyToClipboard(onAirUrl); });
@@ -1238,6 +1262,7 @@ _RESTREAM_UI_JS = r"""
       navigatedAway = (typeof pUrl !== 'undefined' && !!pUrl && pUrl.split('?')[0] !== onAirUrl);
     }catch(e){}
     if(!mine || navigatedAway){ clearOnAir(); return; }
+    onAirName = mine.name;
     setOnAirText(mine.name, mine.clients);
   }
   // Explicit, immediate counterpart to syncOnAir()'s passive pUrl check
@@ -1630,6 +1655,24 @@ _RESTREAM_UI_JS = r"""
       else toastSafe(d.error||'Could not stop', 'err');
     }catch(e){ toastSafe('Could not stop: '+e.message, 'err'); }
   }
+
+  // ---- external hooks for other addons (currently: remote_addon.py) --------
+  // Exposes the exact same start/stop/current-item functions this modal's
+  // own buttons already call, so a remote-relayed command can trigger a
+  // restream of "whatever's playing" identically to tapping Restream here
+  // — no duplicate start/stop logic, no second on-air tracker to keep in
+  // sync. _restreamStopOnAir() mirrors the on-air indicator's own Stop
+  // button (only ever stops the one THIS screen is attached to — a remote
+  // command has no other way to know a restream's key anyway).
+  window._restreamCurrentItem = currentItem;
+  window.startRestream = startRestream;
+  window._restreamStopOnAir = function(){
+    if(!onAirKey) return null;
+    return stopRestream(onAirKey);
+  };
+  window._restreamOnAirSnapshot = function(){
+    return onAirKey ? {key: onAirKey, url: onAirUrl, name: onAirName} : null;
+  };
 
   // ---- open / close ------------------------------------------------------------
   window.openRestreamModal = function(){
