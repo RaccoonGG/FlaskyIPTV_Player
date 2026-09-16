@@ -1,0 +1,842 @@
+<!--
+Copyright (C) 2017 AMM
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#060612">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<title>FlaskyIPTV Radio</title>
+<style>
+  :root{
+    --bg:#060612; --panel:#0e0e24; --panel-2:#14142e; --border:#23234a;
+    --accent:#7c3aed; --accent-soft:rgba(124,58,237,.18); --accent-glow:rgba(124,58,237,.45);
+    --text:#e4e8f5; --text-dim:#8b8fb0; --text-faint:#565a78;
+    --blue:#3b82f6; --cyan:#06b6d4; --green:#22c55e; --orange:#f59e0b; --red:#ef4444;
+    --radius:16px; --radius-sm:10px;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Menlo, Consolas, monospace;
+  }
+  *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body{ margin:0; padding:0; background:var(--bg); color:var(--text); font-family:var(--font); }
+  body{ padding-bottom: env(safe-area-inset-bottom, 0); min-height:100vh; }
+  .shell{ max-width:520px; margin:0 auto; min-height:100vh; display:flex; flex-direction:column; }
+  button{ font-family:inherit; color:inherit; cursor:pointer; }
+  input{ font-family:inherit; color:inherit; }
+
+  /* ---------- top bar ---------- */
+  .topbar{
+    position:sticky; top:0; z-index:20; display:flex; align-items:center; gap:10px;
+    padding:14px 16px calc(10px + env(safe-area-inset-top,0)); padding-top:calc(14px + env(safe-area-inset-top,0));
+    background:rgba(6,6,18,.85); backdrop-filter:blur(10px); border-bottom:1px solid var(--border);
+  }
+  .topbar h1{ font-size:15px; font-weight:600; margin:0; letter-spacing:.2px; }
+  .topbar .sub{ font-size:11px; color:var(--text-dim); margin-left:auto; }
+
+  main{ flex:1; padding:10px 14px 24px; display:flex; flex-direction:column; gap:10px; }
+
+  /* ---------- tabs ---------- */
+  .tabs{
+    display:flex; gap:6px; overflow-x:auto; padding-bottom:2px; -webkit-overflow-scrolling:touch;
+    scrollbar-width:none;
+  }
+  .tabs::-webkit-scrollbar{ display:none; }
+  .tab{
+    flex:none; border:1px solid var(--border); background:var(--panel); color:var(--text-dim);
+    border-radius:999px; padding:0 14px; height:32px; font-size:12.5px; font-weight:600; white-space:nowrap;
+  }
+  .tab.on{ background:var(--accent-soft); border-color:var(--accent); color:var(--text); }
+
+  /* ---------- crumb / search / history-actions rows ---------- */
+  .crumb-row, .search-row, .history-actions{
+    display:none; align-items:center; gap:8px;
+  }
+  .crumb-row.show, .search-row.show, .history-actions.show{ display:flex; }
+  .crumb-btn{
+    flex:none; border:1px solid var(--border); background:var(--panel-2); color:var(--text);
+    border-radius:var(--radius-sm); padding:0 12px; height:30px; font-size:12px;
+  }
+  .crumb-label{ font-size:12.5px; color:var(--text-dim); font-weight:600; }
+  .search-row input{
+    flex:1; min-width:0; height:36px; border-radius:var(--radius-sm); border:1px solid var(--border);
+    background:var(--panel-2); color:var(--text); padding:0 12px; font-size:13px;
+  }
+  .search-row button{
+    flex:none; border:1px solid var(--accent); background:var(--accent-soft); color:var(--text);
+    border-radius:var(--radius-sm); padding:0 16px; height:36px; font-size:13px; font-weight:600;
+  }
+  .history-actions{ justify-content:flex-end; }
+  .history-actions button{
+    border:1px solid var(--border); background:var(--panel-2); color:var(--text-dim);
+    border-radius:var(--radius-sm); padding:0 12px; height:30px; font-size:12px;
+  }
+
+  /* ---------- list ---------- */
+  .list{ display:flex; flex-direction:column; gap:6px; padding-bottom:70px; }
+  .empty-state{
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px;
+    padding:60px 20px; color:var(--text-faint); font-size:13px; text-align:center;
+  }
+  .empty-state .big{ font-size:34px; }
+  .list-item{
+    display:flex; align-items:center; gap:10px; padding:9px 10px;
+    background:var(--panel); border:1px solid var(--border); border-radius:var(--radius-sm);
+  }
+  .list-item:active{ background:var(--panel-2); }
+  .li-logo{
+    width:38px; height:38px; border-radius:8px; object-fit:contain; background:var(--panel-2);
+    flex:none; display:flex; align-items:center; justify-content:center; font-size:17px;
+  }
+  .li-name-wrap{ min-width:0; flex:1; }
+  .li-name{ font-size:13.5px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .li-meta{ font-size:11px; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:1px; }
+  .li-fav{
+    flex:none; border:none; background:transparent; color:var(--text-faint); font-size:19px;
+    width:32px; height:32px; border-radius:8px;
+  }
+  .li-fav.active{ color:#f5c518; }
+
+  /* ---------- pill grid (genres/countries/languages) ---------- */
+  .pill-grid{ display:flex; flex-wrap:wrap; gap:8px; }
+  .pill{
+    border:1px solid var(--border); background:var(--panel); color:var(--text);
+    border-radius:999px; padding:0 14px; height:34px; font-size:12.5px;
+  }
+
+  /* ---------- player bar ---------- */
+  .player-bar{
+    position:fixed; left:0; right:0; bottom:0; z-index:30;
+    display:flex; align-items:center; gap:10px;
+    padding:10px 14px calc(10px + env(safe-area-inset-bottom,0));
+    background:rgba(10,10,26,.92); backdrop-filter:blur(12px); border-top:1px solid var(--border);
+  }
+  .player-bar-inner{ max-width:520px; margin:0 auto; width:100%; display:flex; align-items:center; gap:10px; }
+  .player-logo{
+    width:40px; height:40px; border-radius:8px; object-fit:contain; background:var(--panel-2);
+    border:1px solid var(--border); flex:none;
+  }
+  .player-info{ min-width:0; flex:1; }
+  .player-name{ font-size:12.5px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .player-meta{ font-size:10.5px; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .player-btn{
+    flex:none; width:38px; height:38px; border-radius:50%; border:1px solid var(--accent);
+    background:var(--accent-soft); color:var(--text); font-size:15px; display:flex;
+    align-items:center; justify-content:center;
+  }
+  .player-btn:disabled{ opacity:.35; border-color:var(--border); background:var(--panel-2); }
+  .vol-slider{ flex:none; width:70px; accent-color:var(--accent); }
+
+  /* ---------- nearby helper ---------- */
+  .nearby-prompt{
+    display:flex; flex-direction:column; align-items:center; gap:10px; padding:40px 20px; text-align:center;
+  }
+  .nearby-prompt button{
+    border:1px solid var(--accent); background:var(--accent-soft); color:var(--text);
+    border-radius:var(--radius-sm); padding:0 18px; height:38px; font-size:13px; font-weight:600;
+  }
+
+  /* ---------- connect overlay (standalone-file mode only) ---------- */
+  .connect-overlay{
+    display:none; position:fixed; inset:0; z-index:999; background:var(--bg);
+    align-items:center; justify-content:center; padding:24px;
+  }
+  .connect-card{
+    max-width:360px; width:100%; background:var(--panel); border:1px solid var(--border);
+    border-radius:var(--radius); padding:22px; display:flex; flex-direction:column; gap:12px;
+  }
+  .connect-card h2{ margin:0; font-size:17px; text-shadow:0 0 18px var(--accent-glow); }
+  .connect-card p{ margin:0; font-size:12.5px; color:var(--text-dim); line-height:1.5; }
+  .connect-card input{
+    background:var(--panel-2); border:1px solid var(--border); border-radius:var(--radius-sm);
+    padding:11px 12px; font-size:14px; color:var(--text); font-family:var(--mono); width:100%;
+  }
+  .connect-card input::placeholder{ color:var(--text-faint); }
+  .connect-card input:focus{ outline:2px solid var(--accent); outline-offset:1px; }
+  .connect-card button{
+    background:var(--accent); border:none; border-radius:var(--radius-sm); padding:12px;
+    font-size:14px; font-weight:600; color:#fff; cursor:pointer; box-shadow:0 0 18px var(--accent-glow);
+  }
+  .connect-card button:active{ transform:scale(.98); }
+  .connect-card .connect-hint{ font-size:11px; color:var(--text-faint); }
+  .connect-card .connect-hint code{ font-family:var(--mono); color:var(--text-dim); }
+  .connect-quick-btn{
+    background:var(--panel-2); border:1px solid var(--border); border-radius:var(--radius-sm);
+    padding:12px; font-size:14px; font-weight:600; color:var(--text); cursor:pointer; width:100%;
+  }
+  .connect-quick-btn:active{ transform:scale(.98); background:var(--accent-soft); }
+  .connect-divider{ display:flex; align-items:center; gap:10px; margin:2px 0; }
+  .connect-divider::before, .connect-divider::after{ content:''; flex:1; height:1px; background:var(--border); }
+  .connect-divider span{ font-size:11px; color:var(--text-faint); white-space:nowrap; }
+  .connect-ip-row{ display:flex; align-items:center; gap:6px; }
+  .connect-ip-row input#connectIpInput{ flex:2.2; }
+  .connect-ip-row input#connectPortInput{ flex:1; text-align:center; }
+  .connect-colon{ color:var(--text-faint); font-family:var(--mono); font-size:15px; }
+</style>
+</head>
+<body>
+<div class="connect-overlay" id="connectOverlay">
+  <div class="connect-card">
+    <h2>Connect to FlaskyIPTV</h2>
+    <p>This copy is running as a standalone file. Pre-filled below with your PC's last known address — check it's still right, or edit it if not.</p>
+
+    <button id="connectSamePcBtn" class="connect-quick-btn" type="button">This PC (127.0.0.1)</button>
+
+    <div class="connect-divider"><span>or your PC's LAN IP</span></div>
+
+    <div class="connect-ip-row">
+      <input type="text" id="connectIpInput" placeholder="192.168.1.100" autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="decimal">
+      <span class="connect-colon">:</span>
+      <input type="text" id="connectPortInput" placeholder="5000" autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="numeric">
+    </div>
+    <button id="connectSubmitBtn" type="button">Connect</button>
+    <p class="connect-hint">If that address stopped working (PC's IP changed), find the new one in Wi-Fi settings on the PC — same one you'd use for the m3u playlist URL. This default isn't updated automatically, and nothing here is saved between opens; to skip re-checking it every time, open FlaskyIPTV's own <code>/radio</code> link once instead and bookmark/add-to-home-screen from there — that version already knows its own address.</p>
+  </div>
+</div>
+<div class="shell">
+  <div class="topbar">
+    <h1>📻 FlaskyIPTV Radio</h1>
+    <span class="sub" id="hintText">tap a station to play</span>
+  </div>
+
+  <main>
+    <div class="tabs" id="tabs">
+      <button class="tab on" data-tab="favorites">★ Favorites</button>
+      <button class="tab" data-tab="top">Top</button>
+      <button class="tab" data-tab="builtin">Built-in</button>
+      <button class="tab" data-tab="trending">Trending</button>
+      <button class="tab" data-tab="genres">Genres</button>
+      <button class="tab" data-tab="countries">Countries</button>
+      <button class="tab" data-tab="languages">Languages</button>
+      <button class="tab" data-tab="nearby">Nearby</button>
+      <button class="tab" data-tab="history">History</button>
+      <button class="tab" data-tab="search">Search</button>
+    </div>
+
+    <div class="crumb-row" id="crumbRow">
+      <button class="crumb-btn" id="crumbBtn" type="button">&lsaquo; Back</button>
+      <span class="crumb-label" id="crumbLabel"></span>
+    </div>
+
+    <div class="search-row" id="searchRow">
+      <input id="searchBox" placeholder="Search stations…" inputmode="search">
+      <button id="searchBtn" type="button">Go</button>
+    </div>
+
+    <div class="history-actions" id="historyActions">
+      <button id="clearHistoryBtn" type="button">Clear history</button>
+    </div>
+
+    <div class="list" id="list">
+      <div class="empty-state"><span class="big">📻</span>Loading…</div>
+    </div>
+  </main>
+
+  <div class="player-bar">
+    <div class="player-bar-inner">
+      <img class="player-logo" id="playerLogo" src="" style="display:none" referrerpolicy="no-referrer" loading="lazy" decoding="async">
+      <div class="player-logo" id="playerLogoFallback">📻</div>
+      <div class="player-info">
+        <div class="player-name" id="playerName">Nothing playing</div>
+        <div class="player-meta" id="playerMeta"></div>
+      </div>
+      <button class="player-btn" id="playPauseBtn" type="button" disabled>▶</button>
+      <input class="vol-slider" id="volSlider" type="range" min="0" max="100" value="80">
+      <audio id="audioEl" preload="none"></audio>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  'use strict';
+
+  // ---------------------------------------------------------------------
+  // If this copy is opened standalone (file://, or hosted somewhere else)
+  // instead of served by radio_addon.py at /radio, relative fetch('/api/
+  // radio/...') calls resolve against the file:// origin itself and fail
+  // outright — browsers refuse cross-origin requests from a 'null' file
+  // origin entirely, they don't even reach FlaskyIPTV to be blocked by its
+  // own CORS allowlist. Same fix as remote_control.html: fall back to an
+  // explicit ?server=http://<flaskyiptv-ip>:<port> in this page's own URL,
+  // or ask for one via the connect overlay below. No PIN needed here —
+  // unlike /api/remote/*, /api/radio/* has no auth of its own to pass
+  // through (see radio_addon.py's /radio route for why).
+  // ---------------------------------------------------------------------
+  var DEFAULT_SERVER_IP = '192.168.1.100';
+  var DEFAULT_SERVER_PORT = '5000';
+
+  var qs = new URLSearchParams(location.search);
+  var explicitServer = (qs.get('server') || '').trim().replace(/\/+$/, '');
+  // null (not '') specifically means "we don't know yet" — opened as a local
+  // file with no ?server= to go on. '' means "same origin", which is correct
+  // and known whenever this page was actually fetched from the addon.
+  var BASE = explicitServer || (location.protocol === 'file:' ? null : location.origin);
+
+  function api(path){ return BASE + path; }
+
+  function normalizeServerUrl(raw){
+    var v = (raw || '').trim().replace(/\/+$/, '');
+    if (!v) return '';
+    if (!/^https?:\/\//i.test(v)) v = 'http://' + v;
+    return v;
+  }
+  function buildConnectUrl(ip, port){
+    ip = (ip || '').trim();
+    if (!ip) return '';
+    if (/^https?:\/\//i.test(ip) || ip.indexOf(':') !== -1) return normalizeServerUrl(ip);
+    return normalizeServerUrl(ip + ':' + ((port || '').trim() || '5000'));
+  }
+
+  // -------------------------------------------------------------------
+  // HLS helpers — pure, no DOM/network access, so they're hoisted up
+  // here (rather than living inside startApp() where they're used) and
+  // exported below for the Node test suite to exercise directly. Plain
+  // <audio src="…"> only decodes formats the browser supports natively
+  // (MP3/AAC/OGG icy streams); Firefox and Chrome have no native HLS
+  // (.m3u8, "application/vnd.apple.mpegurl") support at all — only
+  // Safari does — so an HLS station (e.g. RTL's Quortex-hosted stream)
+  // silently fails to play unless routed through hls.js instead.
+  // -------------------------------------------------------------------
+  function isHlsUrl(url){ return /\.m3u8(?:[?#]|$)/i.test(String(url || '')); }
+
+  // Given a fatal hls.js error, decide what to do next. 'attempts' is how
+  // many recovery attempts have already been made for the CURRENT Hls
+  // instance — capped at 2 so a station stuck in a fail/retry loop gives
+  // up instead of hammering the stream server forever.
+  function decideHlsErrorRecovery(errorType, attempts, ErrorTypes){
+    if (attempts >= 2) return 'give-up';
+    if (errorType === ErrorTypes.NETWORK_ERROR) return 'retry-network';
+    if (errorType === ErrorTypes.MEDIA_ERROR) return 'retry-media';
+    return 'give-up';
+  }
+
+  // Test hook: exposes the pure helpers above (plus the pre-existing
+  // normalizeServerUrl/buildConnectUrl) so radio_lan.test.js can require
+  // this exact file and assert against the real implementation — no
+  // copy-pasted/duplicated logic to drift out of sync. No-ops in a
+  // normal browser beyond the one property assignment.
+  var __exportTarget = (typeof window !== 'undefined') ? window
+    : (typeof global !== 'undefined' ? global : null);
+  if (__exportTarget) {
+    __exportTarget.__radioLanTestHooks__ = {
+      isHlsUrl: isHlsUrl,
+      decideHlsErrorRecovery: decideHlsErrorRecovery,
+      normalizeServerUrl: normalizeServerUrl,
+      buildConnectUrl: buildConnectUrl
+    };
+  }
+
+  function startApp(){
+
+  // -------------------------------------------------------------------
+  // Small helpers
+  // -------------------------------------------------------------------
+  function byId(id){ return document.getElementById(id); }
+  function listEl(){ return byId('list'); }
+  function escapeHtml(s){
+    var d = document.createElement('div');
+    d.textContent = (s == null ? '' : String(s));
+    return d.innerHTML;
+  }
+  function getJSON(url){ return fetch(api(url)).then(function(r){ return r.json(); }); }
+  function postJSON(url, body){
+    return fetch(api(url), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body || {}),
+    }).then(function(r){ return r.json(); });
+  }
+  function deleteJSON(url){
+    return fetch(api(url), {method: 'DELETE'}).then(function(r){ return r.json(); });
+  }
+  function showSpinner(){
+    listEl().innerHTML = '<div class="empty-state"><span class="big">📻</span>Loading…</div>';
+  }
+  function showEmpty(icon, msg){
+    var d = document.createElement('div');
+    d.className = 'empty-state';
+    var span = document.createElement('span');
+    span.className = 'big';
+    span.textContent = icon;
+    d.appendChild(span);
+    d.appendChild(document.createTextNode(msg));
+    listEl().innerHTML = '';
+    listEl().appendChild(d);
+  }
+  function setCrumb(label){
+    var row = byId('crumbRow');
+    if (label){ row.classList.add('show'); byId('crumbLabel').textContent = label; }
+    else { row.classList.remove('show'); }
+  }
+
+  // -------------------------------------------------------------------
+  // Station helpers — same field conventions as remote_control.html's
+  // radio tab (this app's other consumer of these same /api/radio/*
+  // endpoints), so behavior stays consistent across both pages.
+  // -------------------------------------------------------------------
+  function stationName(s){ return (s && s.name) || 'Untitled'; }
+  function stationLogo(s){ return (s && (s.logo || s.icon_fallback)) || ''; }
+  function stationUrl(s){ return (s && (s.url_resolved || s.url)) || ''; }
+  function stationMeta(s){
+    if (!s) return '';
+    var bits = [];
+    if (s.countrycode) bits.push(String(s.countrycode).toUpperCase());
+    if (s.bitrate) bits.push(s.bitrate + 'kbps');
+    if (s.tags) {
+      var tags = String(s.tags).split(',').map(function(t){ return t.trim(); }).filter(Boolean).slice(0, 2);
+      if (tags.length) bits.push(tags.join(' \u00b7 '));
+    }
+    return bits.join('  \u00b7  ');
+  }
+
+  var currentTab = 'favorites';
+  var currentStations = [];
+  var lastGenreSel = null, lastCountrySel = null, lastLangSel = null;
+
+  function renderStationList(stations){
+    currentStations = stations || [];
+    if (!currentStations.length){ showEmpty('📭', 'No stations found.'); return; }
+    var list = listEl();
+    list.innerHTML = '';
+    var frag = document.createDocumentFragment();
+    currentStations.forEach(function(s){
+      var row = document.createElement('div');
+      row.className = 'list-item';
+      var logo = stationLogo(s);
+      var meta = stationMeta(s);
+      row.innerHTML =
+        (logo ? '<img class="li-logo" src="' + logo.replace(/"/g, '&quot;') + '" referrerpolicy="no-referrer" loading="lazy" decoding="async" onerror="this.outerHTML=\'<div class=&quot;li-logo&quot;>📻</div>\'">'
+              : '<div class="li-logo">📻</div>') +
+        '<div class="li-name-wrap"><div class="li-name"></div>' +
+        (meta ? '<div class="li-meta"></div>' : '') + '</div>' +
+        '<button class="li-fav' + (s._is_favorite ? ' active' : '') + '" type="button" title="Favorite">' +
+        (s._is_favorite ? '\u2605' : '\u2606') + '</button>';
+      row.querySelector('.li-name').textContent = stationName(s);
+      if (meta) row.querySelector('.li-meta').textContent = meta;
+      row.querySelector('.li-fav').addEventListener('click', function(e){
+        e.stopPropagation();
+        toggleFavorite(s, e.currentTarget);
+      });
+      row.addEventListener('click', function(){ playStation(s); });
+      frag.appendChild(row);
+    });
+    list.appendChild(frag);
+  }
+
+  function renderPillGrid(items, kind){
+    if (!items || !items.length){ showEmpty('📭', 'Nothing available.'); return; }
+    var list = listEl();
+    list.innerHTML = '';
+    var wrap = document.createElement('div');
+    wrap.className = 'pill-grid';
+    items.forEach(function(g){
+      var value, label, count;
+      if (kind === 'country'){
+        value = g.iso_3166_1 || g.name;
+        label = g.name || value;
+      } else {
+        value = (g && (g.name || g.tag)) || String(g);
+        label = value;
+      }
+      count = g && g.stationcount;
+      var btn = document.createElement('button');
+      btn.className = 'pill';
+      btn.type = 'button';
+      btn.textContent = label + (count ? ' (' + count + ')' : '');
+      btn.addEventListener('click', function(){ drillInto(kind, value, label); });
+      wrap.appendChild(btn);
+    });
+    list.appendChild(wrap);
+  }
+
+  function drillInto(kind, value, label){
+    setCrumb(label);
+    showSpinner();
+    var path = kind === 'genre'    ? '/api/radio/genre/' + encodeURIComponent(value)
+             : kind === 'country'  ? '/api/radio/country/' + encodeURIComponent(value)
+             : '/api/radio/language/' + encodeURIComponent(value);
+    if (kind === 'genre')    lastGenreSel = value;
+    if (kind === 'country')  lastCountrySel = {cc: value, label: label};
+    if (kind === 'language') lastLangSel = {lang: value, label: label};
+    getJSON(path).then(function(data){
+      if (!data || data.status === 'error'){ showEmpty('\u26a0\ufe0f', (data && data.message) || 'Could not load.'); return; }
+      renderStationList(data.data || []);
+    })['catch'](function(){ showEmpty('\u26a0\ufe0f', 'Could not reach FlaskyIPTV.'); });
+  }
+
+  function toggleFavorite(station, btn){
+    var willFavorite = !station._is_favorite;
+    station._is_favorite = willFavorite;
+    btn.classList.toggle('active', willFavorite);
+    btn.textContent = willFavorite ? '\u2605' : '\u2606';
+    var req = willFavorite
+      ? postJSON('/api/radio/favorites', station)
+      : deleteJSON('/api/radio/favorites/' + encodeURIComponent(station.stationuuid || station.url));
+    req.then(function(data){
+      var ok = data && (willFavorite ? data.added !== false : data.removed !== false);
+      if (!ok){
+        station._is_favorite = !willFavorite;
+        btn.classList.toggle('active', !willFavorite);
+        btn.textContent = !willFavorite ? '\u2605' : '\u2606';
+      } else if (currentTab === 'favorites' && !willFavorite){
+        loadTab('favorites'); // removed from the list it's currently shown in — drop the row
+      }
+    })['catch'](function(){
+      station._is_favorite = !willFavorite;
+      btn.classList.toggle('active', !willFavorite);
+      btn.textContent = !willFavorite ? '\u2605' : '\u2606';
+    });
+  }
+
+  // -------------------------------------------------------------------
+  // Player — entirely local to this page/device. Independent of whatever
+  // the main FlaskyIPTV screen (or any other device with this page open)
+  // is doing; this is the whole point of a LAN-reachable station picker
+  // rather than a remote that controls one shared screen. Radio stations
+  // are already public, unlimited-listener URLs — no portal connection or
+  // token involved — so playing them straight from this device's own
+  // <audio> element needs nothing from FlaskyIPTV beyond the URL itself.
+  // -------------------------------------------------------------------
+  var audioEl = byId('audioEl');
+  var playPauseBtn = byId('playPauseBtn');
+  var currentStation = null;
+
+  // hls.js is loaded lazily, on first HLS station, from jsDelivr (pinned
+  // to the v1 major line so it keeps picking up fixes without risking a
+  // future v2 breaking change). Most stations are plain MP3/AAC and never
+  // need it, so this keeps the LAN page's normal startup light. One Hls
+  // instance is reused/recreated per station and is always torn down
+  // before the next station plays, HLS or not, so a leftover instance
+  // never fights the plain <audio> path over who owns audioEl.src.
+  var hlsInstance = null;
+  var hlsLibPromise = null;
+
+  function loadHlsLib(){
+    if (window.Hls) return Promise.resolve(window.Hls);
+    if (hlsLibPromise) return hlsLibPromise;
+    hlsLibPromise = new Promise(function(resolve, reject){
+      var el = document.createElement('script');
+      el.src = 'https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js';
+      el.async = true;
+      el.onload = function(){
+        if (window.Hls) resolve(window.Hls);
+        else reject(new Error('hls.js loaded but window.Hls is missing'));
+      };
+      el.onerror = function(){ reject(new Error('Could not load hls.js from CDN')); };
+      document.head.appendChild(el);
+    });
+    return hlsLibPromise;
+  }
+
+  function destroyHls(){
+    if (hlsInstance){
+      try { hlsInstance.destroy(); } catch (e) {}
+      hlsInstance = null;
+    }
+  }
+
+  function showPlaybackError(msg){
+    playPauseBtn.disabled = true;
+    byId('playerMeta').textContent = msg || 'Could not play this station';
+  }
+
+  function setPlayerLogo(logo){
+    var img = byId('playerLogo');
+    var fallback = byId('playerLogoFallback');
+    if (logo){ img.src = logo; img.style.display = ''; fallback.style.display = 'none'; }
+    else { img.style.display = 'none'; img.src = ''; fallback.style.display = ''; }
+  }
+
+  // A blocked/broken third-party logo (dead link, hotlink protection, or
+  // a browser-level block like Firefox's OpaqueResponseBlocking on a
+  // mismatched Content-Type) fires the <img>'s own 'error' event — fall
+  // back to the emoji placeholder instead of showing a broken-image icon
+  // in the player bar. The per-row list logos already do this inline via
+  // onerror (see renderStationList above); this is the same idea for the
+  // one persistent player-bar logo.
+  byId('playerLogo').addEventListener('error', function(){
+    this.style.display = 'none';
+    byId('playerLogoFallback').style.display = '';
+  });
+
+  // Defensive: audioEl.play() always returns a Promise per spec, but
+  // don't let anything unexpected about it (a synchronous throw, a
+  // non-Promise return in some odd embedding) take the rest of the
+  // caller down with it.
+  function beginPlayback(){
+    try {
+      var p = audioEl.play();
+      if (p && typeof p.catch === 'function') p.catch(function(){});
+    } catch (e) {}
+  }
+
+  function playStation(s){
+    var url = stationUrl(s);
+    if (!url){ return; }
+    currentStation = s;
+    destroyHls();
+    playPauseBtn.disabled = false;
+
+    if (isHlsUrl(url) && !audioEl.canPlayType('application/vnd.apple.mpegurl')){
+      // Not Safari (the only browser with native HLS) — needs hls.js.
+      var recoverAttempts = 0;
+      loadHlsLib().then(function(Hls){
+        // playStation may have been called again (user tapped another
+        // station) while the library was still loading — bail out so
+        // the slower request doesn't clobber the newer one.
+        if (currentStation !== s) return;
+        if (!Hls.isSupported()){
+          showPlaybackError('This browser can\u2019t play this station (no HLS support)');
+          return;
+        }
+        var hls = new Hls();
+        hlsInstance = hls;
+        hls.on(Hls.Events.MANIFEST_PARSED, function(){ beginPlayback(); });
+        hls.on(Hls.Events.ERROR, function(_evt, data){
+          if (!data.fatal) return;
+          var action = decideHlsErrorRecovery(data.type, recoverAttempts, Hls.ErrorTypes);
+          if (action === 'give-up'){ destroyHls(); showPlaybackError('Could not play this station'); return; }
+          recoverAttempts++;
+          if (action === 'retry-network') hls.startLoad();
+          else hls.recoverMediaError();
+        });
+        hls.loadSource(url);
+        hls.attachMedia(audioEl);
+      })['catch'](function(){
+        if (currentStation === s) showPlaybackError('Could not load the streaming engine for this station');
+      });
+    } else {
+      // Plain MP3/AAC/OGG stream, or HLS on a browser (Safari) that
+      // decodes it itself without hls.js.
+      audioEl.src = url;
+      beginPlayback();
+    }
+
+    byId('playerName').textContent = stationName(s);
+    byId('playerMeta').textContent = stationMeta(s);
+    setPlayerLogo(stationLogo(s));
+    playPauseBtn.textContent = '\u23f8'; // ⏸, updated again by the 'playing' handler below
+    // Fire-and-forget: registers the click with RadioBrowser and pushes to
+    // this app's history, exactly like the on-screen player's own
+    // radioPlayStation() — deliberately not awaited, playback already
+    // started with the URL we already have.
+    postJSON('/api/radio/click', s).catch(function(){});
+  }
+
+  audioEl.addEventListener('playing', function(){ playPauseBtn.textContent = '\u23f8'; });
+  audioEl.addEventListener('pause',   function(){ playPauseBtn.textContent = '\u25b6'; });
+  audioEl.addEventListener('error',   function(){
+    showPlaybackError('Could not play this station');
+  });
+
+  playPauseBtn.addEventListener('click', function(){
+    if (!currentStation) return;
+    if (audioEl.paused) {
+      try {
+        var p = audioEl.play();
+        if (p && typeof p.catch === 'function') p.catch(function(){});
+      } catch (e) {}
+    } else {
+      audioEl.pause();
+    }
+  });
+
+  var volSlider = byId('volSlider');
+  audioEl.volume = (parseInt(volSlider.value, 10) || 80) / 100;
+  volSlider.addEventListener('input', function(){
+    audioEl.volume = (parseInt(volSlider.value, 10) || 0) / 100;
+  });
+
+  // -------------------------------------------------------------------
+  // Tabs
+  // -------------------------------------------------------------------
+  function loadTab(name){
+    currentTab = name;
+    setCrumb(null);
+    byId('searchRow').classList.toggle('show', name === 'search');
+    byId('historyActions').classList.toggle('show', name === 'history');
+    switch (name){
+      case 'favorites': loadSimple('/api/radio/favorites', '★', 'No favorites yet \u2014 star a station from any list to save it here.'); break;
+      case 'top':       loadSimple('/api/radio/top?limit=100'); break;
+      case 'builtin':   loadSimple('/api/radio/builtin'); break;
+      case 'trending':  loadSimple('/api/radio/trending'); break;
+      case 'history':   loadHistory(); break;
+      case 'genres':    loadPills('/api/radio/genres', 'genre'); break;
+      case 'countries': loadPills('/api/radio/countries', 'country'); break;
+      case 'languages': loadPills('/api/radio/languages', 'language'); break;
+      case 'nearby':    loadNearby(); break;
+      case 'search':
+        var q = byId('searchBox').value.trim();
+        if (q) runSearch(); else showEmpty('\ud83d\udd0d', 'Type a station name or genre and hit Go.');
+        break;
+    }
+  }
+
+  function loadSimple(path, emptyIcon, emptyMsg){
+    showSpinner();
+    getJSON(path).then(function(data){
+      if (!data || data.status === 'error'){ showEmpty('\u26a0\ufe0f', (data && data.message) || 'Could not load.'); return; }
+      var list = data.data || [];
+      if (!list.length && emptyIcon){ showEmpty(emptyIcon, emptyMsg); return; }
+      renderStationList(list);
+    })['catch'](function(){ showEmpty('\u26a0\ufe0f', 'Could not reach FlaskyIPTV.'); });
+  }
+
+  function loadPills(path, kind){
+    showSpinner();
+    getJSON(path).then(function(data){
+      renderPillGrid((data && data.data) || [], kind);
+    })['catch'](function(){ showEmpty('\u26a0\ufe0f', 'Could not load.'); });
+  }
+
+  function loadHistory(){
+    showSpinner();
+    getJSON('/api/radio/history').then(function(data){
+      var list = (data && data.data) || [];
+      if (!list.length){ showEmpty('\ud83d\udd52', 'Nothing played yet.'); return; }
+      renderStationList(list);
+    })['catch'](function(){ showEmpty('\u26a0\ufe0f', 'Could not load history.'); });
+  }
+
+  byId('clearHistoryBtn').addEventListener('click', function(){
+    deleteJSON('/api/radio/history').then(function(){ loadHistory(); })['catch'](function(){});
+  });
+
+  // Nearby needs the VISITING device's own location — a phone browsing
+  // this page from across the house has a different position than the
+  // machine actually running FlaskyIPTV, so this can't reuse a
+  // server-side location the way every other tab reuses server-side
+  // data. navigator.geolocation itself also typically requires a secure
+  // context (HTTPS or localhost) in modern browsers — this page is
+  // normally reached over plain http://<lan-ip>, so many browsers will
+  // refuse the permission prompt entirely; that's surfaced as a plain
+  // message rather than a dead-end, same philosophy as the clipboard
+  // fallback elsewhere in this app's companion pages.
+  function loadNearby(){
+    var list = listEl();
+    list.innerHTML = '';
+    var wrap = document.createElement('div');
+    wrap.className = 'nearby-prompt';
+    var span = document.createElement('span');
+    span.className = 'big';
+    span.textContent = '\ud83d\udccd';
+    var msg = document.createElement('div');
+    msg.textContent = 'Find stations near this device.';
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = 'Use my location';
+    btn.addEventListener('click', function(){
+      if (!('geolocation' in navigator)){
+        showEmpty('\u26a0\ufe0f', 'Location is not available in this browser.');
+        return;
+      }
+      showSpinner();
+      navigator.geolocation.getCurrentPosition(function(pos){
+        var p = new URLSearchParams({
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+        });
+        getJSON('/api/radio/nearby?' + p).then(function(data){
+          if (!data || data.status === 'error'){ showEmpty('\u26a0\ufe0f', (data && data.message) || 'Could not load.'); return; }
+          renderStationList(data.data || []);
+        })['catch'](function(){ showEmpty('\u26a0\ufe0f', 'Could not reach FlaskyIPTV.'); });
+      }, function(){
+        showEmpty('\u26a0\ufe0f', 'Location permission was denied or is unavailable \u2014 many browsers require a secure (https) connection for this, which a plain http://<lan-ip> address is not.');
+      }, {timeout: 10000});
+    });
+    wrap.appendChild(span);
+    wrap.appendChild(msg);
+    wrap.appendChild(btn);
+    list.appendChild(wrap);
+  }
+
+  function runSearch(){
+    var q = byId('searchBox').value.trim();
+    if (!q) return;
+    showSpinner();
+    getJSON('/api/radio/search?q=' + encodeURIComponent(q)).then(function(data){
+      if (!data || data.status === 'error'){ showEmpty('\u26a0\ufe0f', (data && data.message) || 'Search failed.'); return; }
+      renderStationList(data.data || []);
+    })['catch'](function(){ showEmpty('\u26a0\ufe0f', 'Could not reach FlaskyIPTV.'); });
+  }
+
+  byId('searchBtn').addEventListener('click', runSearch);
+  byId('searchBox').addEventListener('keydown', function(e){ if (e.key === 'Enter') runSearch(); });
+
+  byId('crumbBtn').addEventListener('click', function(){
+    setCrumb(null);
+    if (currentTab === 'genres')    loadPills('/api/radio/genres', 'genre');
+    else if (currentTab === 'countries') loadPills('/api/radio/countries', 'country');
+    else if (currentTab === 'languages') loadPills('/api/radio/languages', 'language');
+  });
+
+  document.querySelectorAll('.tab').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      document.querySelectorAll('.tab').forEach(function(b){ b.classList.remove('on'); });
+      btn.classList.add('on');
+      loadTab(btn.getAttribute('data-tab'));
+    });
+  });
+
+  loadTab('favorites');
+
+  } // end startApp()
+
+  // ---------------------------------------------------------------------
+  // Dispatch: normal case (served by radio_addon.py at /radio, or ?server=
+  // supplied) runs immediately. Opened as a bare local file with no
+  // ?server= shows an inline prompt instead of guessing — nothing is
+  // stored between opens (same as remote_control.html's identical
+  // pattern), so this asks again next time unless the page was reached
+  // via a bookmark/home-screen icon that already has ?server= baked into
+  // its URL.
+  // ---------------------------------------------------------------------
+  if (BASE !== null) {
+    startApp();
+  } else {
+    var overlay = document.getElementById('connectOverlay');
+    var ipInput = document.getElementById('connectIpInput');
+    var portInput = document.getElementById('connectPortInput');
+    overlay.style.display = 'flex';
+    ipInput.value = DEFAULT_SERVER_IP;
+    portInput.value = DEFAULT_SERVER_PORT;
+    ipInput.focus();
+    ipInput.select(); // pre-filled, not blank — select so overwriting it is one tap+type, not a manual clear first
+
+    function connectTo(url){
+      BASE = url;
+      overlay.style.display = 'none';
+      startApp();
+    }
+    function submitConnect(){
+      var v = buildConnectUrl(ipInput.value, portInput.value);
+      if (!v) { ipInput.focus(); return; }
+      connectTo(v);
+    }
+    document.getElementById('connectSamePcBtn').addEventListener('click', function(){
+      connectTo('http://127.0.0.1:' + ((portInput.value || '').trim() || '5000'));
+    });
+    document.getElementById('connectSubmitBtn').addEventListener('click', submitConnect);
+    [ipInput, portInput].forEach(function(el){
+      el.addEventListener('keydown', function(e){ if (e.key === 'Enter') submitConnect(); });
+    });
+  }
+})();
+</script>
+</body>
+</html>
