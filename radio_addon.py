@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import threading
 import time
 import urllib.parse
@@ -1174,7 +1175,28 @@ class RadioNowPlaying:
         # (rare but possible in real track names) while reliably stripping
         # the fixed-width padding that causes garbage iTunes queries.
         parts = [p.strip() for p in re.split(r' {3,}', title) if p.strip()]
-        return parts[0] if parts else title
+        title = parts[0] if parts else title
+        # A second, different garbage pattern: iHeartRadio-affiliated stations
+        # append a run of their own internal tracking fields directly onto
+        # StreamTitle as single-spaced key="value" pairs instead of the
+        # fixed-width padding above — e.g.
+        #   Ariana Grande / Zedd - text="Break Free" song_spot="M"
+        #   MediaBaseId="2035181" itunesTrackId="0" amgTrackId="-1" ...
+        # Detect where that run starts and drop it — none of those IDs are
+        # useful to show — but recover iHeart's own text="..." field first,
+        # since it's usually a second copy of the actual track title (here,
+        # the real title "Break Free" would otherwise be lost entirely,
+        # leaving just the artist half "Ariana Grande / Zedd").
+        kv_match = re.search(r'(?:^|\s+)[A-Za-z_][A-Za-z0-9_]*="', title)
+        if kv_match:
+            prefix = title[:kv_match.start()].strip(" -/,")
+            text_match = re.search(r'\btext="([^"]*)"', title[kv_match.start():])
+            text_value = text_match.group(1).strip() if text_match else ""
+            if text_value and text_value.lower() not in prefix.lower():
+                title = (prefix + " - " + text_value) if prefix else text_value
+            else:
+                title = prefix
+        return title
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1213,12 +1235,18 @@ def _instances():
 # FLASK BLUEPRINT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def register_radio_addon(app: Any) -> Any:
+def register_radio_addon(app: Any, state: Any = None) -> Any:
     """
     Mount all /api/radio/* routes onto the provided Flask app.
     Call once at app startup:
         from radio_addon import register_radio_addon
-        register_radio_addon(app)
+        register_radio_addon(app, state)
+
+    `state` is optional (defaults to None, and is used only to log a
+    "ready" line to the same Activity Log every other addon reports
+    startup through — see the bottom of this function) so existing
+    call sites that predate this parameter, or tests that construct
+    this addon standalone, keep working unchanged.
     """
     try:
         from flask import request, jsonify
@@ -1765,8 +1793,44 @@ def register_radio_addon(app: Any) -> Any:
             "count":       len(results),
         })
 
+    # ── /radio  (standalone LAN-reachable station browser + player) ──────────
+    # A separate, self-contained page — NOT the on-screen radio modal and NOT
+    # remote_control.html's Radio tab. Those exist to browse/pick a station
+    # for THIS machine's own screen (or, for the remote, to relay that same
+    # choice back to this machine). This one plays locally on whatever
+    # device opens it — independent, and simultaneously so across as many
+    # devices as want to open it — which only makes sense for radio in the
+    # first place because a station is already a public, unlimited-listener
+    # URL with no portal connection or session token to worry about sharing
+    # (see radio_lan.html's own header comment for the full reasoning, and
+    # why this deliberately does NOT go through restream_addon.py). No PIN
+    # or auth beyond being reachable on the LAN at all — the exact same
+    # model /remote already uses, and the /api/radio/* endpoints this page
+    # calls (favorites, search, etc.) already have no auth of their own
+    # either, so this adds no new exposure beyond what already existed.
+    @app.route("/radio")
+    def radio_lan_page():
+        return Response(_load_radio_lan_html(), mimetype="text/html")
+
+    # ── /api/radio/lan_url  GET ───────────────────────────────────────────────
+    # Lets the on-screen radio modal's own 🔗 button offer the /radio page's
+    # LAN-reachable address without the person needing to know their own
+    # machine's LAN IP — mirrors remote_addon.py's compute_lan_remote_url()
+    # for the exact same reason: someone sitting at this PC is almost always
+    # viewing it over loopback (localhost/127.0.0.1), which is NOT an address
+    # any other device on the network could use.
+    @app.route("/api/radio/lan_url")
+    def radio_lan_url():
+        return jsonify({"ok": True, "lan_url": compute_lan_radio_url(request.host)})
+
     # ── Frontend: radio modal + visualizer UI ───────────────────────────────
     _register_radio_ui_route(app)
+
+    if state is not None:
+        try:
+            state.log("[RADIO] LAN radio page ready (/radio)")
+        except Exception:
+            pass
 
     return app
 
@@ -1774,6 +1838,73 @@ def register_radio_addon(app: Any) -> Any:
 # ══════════════════════════════════════════════════════════════════════════════
 # PRIVATE UTILS
 # ══════════════════════════════════════════════════════════════════════════════
+
+_RADIO_LAN_HTML_FILENAME = "radio_lan.html"
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True when `host` (bare, or 'host:port') is a loopback/any address.
+
+    Copied rather than imported from remote_addon.py's identical helper —
+    each addon here is self-contained, so this doesn't create a dependency
+    on remote_addon.py being present."""
+    if not host:
+        return False
+    return host in _LOOPBACK_HOSTS or host.split(":")[0] in _LOOPBACK_HOSTS
+
+
+def _get_lan_ip() -> str:
+    """Best-effort LAN IP of this machine, via the standard UDP-connect
+    trick — no packet is actually sent, this just asks the OS routing table
+    which local address it would use. Returns '' on any failure (e.g. no
+    network interface). Same technique as remote_addon.py's get_lan_ip()."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return ""
+
+
+def compute_lan_radio_url(req_host: str) -> Optional[str]:
+    """Given the Host header a request arrived on (e.g. '127.0.0.1:5000'),
+    return the LAN-reachable http://.../radio URL if that request came in
+    via loopback and a LAN IP could be detected — otherwise None (the
+    client falls back to location.origin + '/radio', which is already
+    correct if the modal itself is being viewed from a non-loopback
+    address)."""
+    if not _is_loopback_host(req_host):
+        return None
+    ip = _get_lan_ip()
+    if not ip:
+        return None
+    port = req_host.split(":")[-1] if ":" in req_host else "80"
+    return "http://{}:{}/radio".format(ip, port)
+
+
+def _load_radio_lan_html() -> str:
+    """Read radio_lan.html fresh on every request (same reasoning as
+    remote_addon.py's _load_controller_html(): it's a small, standalone file
+    sitting next to this one, not embedded in this module, so editing its
+    markup/styling/copy takes effect on refresh with no FlaskyIPTV restart
+    needed)."""
+    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _RADIO_LAN_HTML_FILENAME)
+    try:
+        with open(html_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return (
+            "<!DOCTYPE html><html><body style=\"background:#060612;color:#e4e8f5;"
+            "font-family:system-ui,sans-serif;padding:2rem;line-height:1.5\">"
+            "<h1 style=\"color:#7c3aed\">radio_lan.html not found</h1>"
+            "<p>Place radio_lan.html in the same folder as radio_addon.py "
+            "and reload this page.</p></body></html>"
+        )
+
 
 def _clamp(value: Any, lo: int, hi: int) -> int:
     try:
@@ -3439,7 +3570,7 @@ class _RdioViz {
       if(!this._canvas) return;
       // Class-based overlays
       const classOpen = ['pl-overlay','vf-overlay','radio-overlay',
-                         'vod-expand-overlay','vod-expand-detail']
+                         'vod-expand-overlay','vod-expand-detail','audio-out-overlay']
         .some(id => { const el = document.getElementById(id); return el && el.classList.contains('open'); });
       // Style-based modals
       const styleOpen = ['item-menu','profile-modal']
@@ -3459,7 +3590,7 @@ class _RdioViz {
       }
     };
     this._modalObs = new MutationObserver(update);
-    ['pl-overlay','vf-overlay','radio-overlay','vod-expand-overlay','vod-expand-detail']
+    ['pl-overlay','vf-overlay','radio-overlay','vod-expand-overlay','vod-expand-detail','audio-out-overlay']
       .forEach(id => {
         const el = document.getElementById(id);
         if(el) this._modalObs.observe(el, {attributes:true, attributeFilter:['class']});
@@ -3973,6 +4104,59 @@ window._rdioVizToggle = function(){
   if(typeof toast === 'function') toast(_rdioVizEnabled ? 'Visualizer on' : 'Visualizer off', 'k');
 };
 
+// Copies the /radio standalone page's LAN-reachable URL — lets anyone
+// find it from right here in the modal instead of having to already know
+// this machine's own network address. Exposed on window for the same
+// onclick="" reason as _rdioVizToggle above.
+window._rdioCopyLanUrl = function(){
+  fetch('/api/radio/lan_url').then(function(r){ return r.json(); }).then(function(d){
+    // location.origin is already correct when this page itself is being
+    // viewed from a LAN address; the server round-trip above only matters
+    // for the common case of sitting at this PC over localhost/127.0.0.1,
+    // which no OTHER device could actually reach.
+    const url = (d && d.lan_url) || (location.origin + '/radio');
+    _rdioCopyToClipboard(url);
+  })['catch'](function(){
+    _rdioCopyToClipboard(location.origin + '/radio');
+  });
+};
+
+// Self-contained clipboard copy (this addon doesn't reach into
+// restream_addon.py's own copyToClipboard() — each addon's ui.js runs in
+// its own IIFE, so nothing there is reachable here anyway). Includes the
+// URL itself in the toast so it's still visible/legible even if the
+// clipboard write silently fails.
+//
+// navigator.clipboard is unavailable outside a secure context (HTTPS or
+// localhost) — this app is normally reached over plain http://<lan-ip>,
+// so the textarea+execCommand fallback below is the common path, not a
+// rare edge case.
+function _rdioCopyToClipboard(text){
+  function fallback(){
+    try{
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      if(typeof toast === 'function') toast((ok ? 'Copied: ' : 'Copy failed \u2014 ') + text, ok ? 'k' : 'w');
+    }catch(e){
+      if(typeof toast === 'function') toast('Copy failed \u2014 ' + text, 'w');
+    }
+  }
+  try{
+    if(navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext){
+      navigator.clipboard.writeText(text).then(function(){
+        if(typeof toast === 'function') toast('Copied: ' + text, 'k');
+      }).catch(fallback);
+      return;
+    }
+  }catch(e){}
+  fallback();
+}
+
 function _rdioVizSyncBtn(){
   const btn = document.getElementById('rdio-viz-btn');
   if(!btn) return;
@@ -4013,6 +4197,19 @@ function _rdioVizStop(stopNowPlaying = true){
   _rdioViz.stop();
   if(stopNowPlaying) _rdioNpStop();
 }
+
+// Fully stop radio, right now, synchronously — for callers (Multi-View's
+// toggle button) that need the visualizer canvas gone immediately rather
+// than waiting on doPlay()/playerStop()'s loadstart/emptied events, which
+// the HTML spec queues as async media-element tasks rather than firing
+// them inline. Safe to call unconditionally, even when radio isn't
+// playing (_curIsRadio false — e.g. a normal channel is up): it's then a
+// no-op, so it never interrupts non-radio playback.
+window.radioStop = function(){
+  if(_rdioVizActive) _rdioVizStop(true);
+  radioClose();
+  if(_curIsRadio && typeof playerStop === 'function') playerStop();
+};
 
 // Stop viz when user plays a non-radio stream.
 // Timestamp guard: doPlay() fires loadstart TWICE (clear old src + load new URL).
