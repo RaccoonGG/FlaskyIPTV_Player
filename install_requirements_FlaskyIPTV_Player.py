@@ -300,13 +300,34 @@ def check_dvr_addon():
 def check_radio_addon():
     hdr("Checking radio_addon.py …")
 
-    radio_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "radio_addon.py")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    radio_file = os.path.join(script_dir, "radio_addon.py")
+    html_file = os.path.join(script_dir, "radio_lan.html")
+
     if not os.path.isfile(radio_file):
         warn("radio_addon.py not found in this directory — Internet Radio feature will be disabled")
         info("Place radio_addon.py alongside the Flask app to enable internet radio browsing")
         return
 
     ok("radio_addon.py found")
+
+    # radio_lan.html is the standalone LAN radio browser/player served at
+    # /radio (and also usable copied onto a phone, standalone) — unlike
+    # remote_control.html, it's not required for anything else in this
+    # addon: the on-screen radio panel is fully self-contained in
+    # radio_addon.py, and /radio itself falls back to a friendly "file
+    # not found" message rather than breaking if it's missing, so this
+    # stays a warning rather than the harder error remote_control.html
+    # gets below.
+    if os.path.isfile(html_file):
+        ok("radio_lan.html found")
+    else:
+        warn("radio_lan.html not found — the standalone LAN radio page (/radio) will show a "
+             "\"file not found\" message instead of the station browser; the on-screen radio "
+             "panel itself is unaffected")
+        info("Place radio_lan.html alongside FlaskyIPTV_Player_byGG.py to enable it "
+             "(served at /radio; also usable standalone, copied onto a phone)")
+
     print()
     print(f"  {BOLD}Radio addon requirements:{RESET}")
     print(f"  • requests       — required for RadioBrowser API, Shoutcast, and M3U playlist loading")
@@ -320,6 +341,9 @@ def check_radio_addon():
     else:
         warn("requests NOT installed — radio station discovery will be unavailable")
         info("Install with:  pip install requests")
+
+    if os.path.isfile(html_file):
+        ok("Standalone LAN radio page ready — open http://<flaskyiptv-ip>:5000/radio from any device")
 
 
 # ── m3u_proxy_addon check ─────────────────────────────────────────────────────
