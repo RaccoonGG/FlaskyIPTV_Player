@@ -1954,6 +1954,17 @@ window.addEventListener('resize', _mvSyncDesktopBtn);
 // Toggle: open if closed, close if open.
 // Called from both the desktop pctrl-hdr button and the mobile botnav tab.
 function mvToggle(){
+  // Radio's ambient visualizer canvas is position:fixed directly on <body>
+  // (see radio_addon.py's _RdioViz._ensureCanvas — it has to escape normal
+  // stacking to sit above <video>'s hardware layer), so no z-index here
+  // would keep it from painting over the grid, and radio audio holds the
+  // same shared <video id="vid"> Multi-View's players need. Stop it the
+  // moment this button is clicked — window.radioStop() is a direct,
+  // synchronous stop (unlike playerStop() alone, which only stops the
+  // canvas indirectly via the async loadstart/emptied event chain, too
+  // late for what's about to render here) and a safe no-op when radio
+  // isn't what's currently playing.
+  if(typeof window.radioStop === 'function') window.radioStop();
   const isOpen = document.getElementById('p-mv').classList.contains('mv-active');
   if(isOpen){ mvClose(); } else { mvOpen(); }
 }
