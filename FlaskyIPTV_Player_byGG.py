@@ -1476,7 +1476,7 @@ if _DVR_AVAILABLE:
 
 register_subtitles_routes(flask_app, state)
 register_proxy_routes(flask_app, state)
-register_radio_addon(flask_app)
+register_radio_addon(flask_app, state)
 register_remote_routes(flask_app, state)
 
 @flask_app.route('/api/multiview/available')
@@ -4692,6 +4692,8 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           <rect x="10.5" y="3" width="2" height="10" fill="currentColor" rx="1"/>
         </svg>
       </button>
+      <button id="rdio-lanurl-btn" class="rdio-viz-toggle" style="font-size:13px"
+        onclick="_rdioCopyLanUrl()" title="Copy the link to browse/play radio from any device on your network">🔗</button>
       <button class="btn-ghost" onclick="radioClose()"
         style="height:28px;width:28px;padding:0;font-size:13px;flex-shrink:0">✕</button>
     </div>
