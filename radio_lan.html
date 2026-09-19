@@ -37,6 +37,19 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
        full ultrawide monitor. Past this width the page falls back to
        the flat --bg colour either side. One number to tweak. */
     --art-bg-width: 1100px;
+    /* Player-bar background alpha (0 = fully see-through, 1 = solid).
+       Full-width bar, so this is the difference between "glass over the
+       artwork" and "opaque strip that hides the bottom of the band" —
+       another one-number tweak. Paired with a text-shadow on the
+       player's own text/icons below so legibility doesn't depend on
+       guessing how bright a given track's artwork happens to be. */
+    --player-bar-alpha: 0.85;
+    /* .shell's own background alpha — deliberately much higher (more
+       opaque) than the player-bar/artwork band around it, since .shell
+       is "the app" and needs to read as one cohesive panel rather than
+       a loose scatter of individually-opaque tab pills/list rows with
+       the busy artwork band showing through every gap between them. */
+    --shell-alpha: 0.9;
   }
   *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html,body{ margin:0; padding:0; color:var(--text); font-family:var(--font); }
@@ -52,7 +65,33 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     background-image: radial-gradient(ellipse 1600px 900px at center, rgba(124,58,237,.10), rgba(124,58,237,0) 70%);
     background-repeat:no-repeat;
   }
-  .shell{ position:relative; z-index:1; max-width:520px; margin:0 auto; min-height:100vh; display:flex; flex-direction:column; }
+  .shell{
+    position:relative; z-index:1; max-width:520px; margin:0 auto; min-height:100vh;
+    display:flex; flex-direction:column;
+    /* Without a fill here, .shell itself is invisible — only its
+       individual children (each .tab pill, each .list-item) have their
+       own opaque backgrounds, so every gap between them (padding,
+       flex gaps, the space around the tab row) showed the artwork band
+       straight through. Once that band got bright/detailed enough to
+       actually look like a photo (see #pageArtBgImage above), that made
+       the tabs/list look like separate pieces floating over a busy
+       image rather than one cohesive app. This fill + the side borders
+       below turn .shell into an actual panel the artwork band sits
+       behind, not through. */
+    background:rgba(6,6,18, var(--shell-alpha));
+    border-left-width:1px; border-left-style:solid; border-left-color:var(--border);
+    border-right-width:1px; border-right-style:solid; border-right-color:var(--border);
+    /* DELIBERATELY no backdrop-filter/filter/transform/perspective/
+       will-change here (a real regression this once shipped with a
+       backdrop-filter on this rule): any of those on an ANCESTOR create
+       a new CSS containing block for position:fixed descendants — and
+       .player-bar is one, a direct child of .shell. With that in play,
+       .player-bar's bottom:0 resolved against .shell's own (content-
+       tall, scrolls-with-the-page) box instead of the true viewport,
+       so it visually slid down and off-screen behind a long station
+       list rather than staying pinned to the bottom of the window. See
+       the ancestor-containing-block test in the test suite. */
+  }
 
   /* ---------- dynamic now-playing artwork background ----------
      #pageArtBg is the BAND itself — a fixed, centered, width-limited
@@ -87,9 +126,22 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     position:absolute; inset:0; background-size:cover; background-position:center;
     /* brightness(.32) made even vivid cover art read as a barely-there
        dark smudge once combined with blur + this page's already-dark
-       theme underneath — brightened and de-blurred a bit so the art is
-       actually recognizable as art, not just a mood tint. */
-    filter:blur(45px) brightness(.6) saturate(1.5); opacity:0; transition:opacity 1s ease;
+       theme underneath — brightened it. 45px blur was still too heavy on
+       top of background-size:cover's own upscaling softness — a 600x600
+       cover stretched to fill a band this size already loses sharpness
+       before this filter even runs — so shapes/edges never read as
+       "artwork", just an amorphous glow. Cut down further so actual
+       photo content survives.
+       Feathered left/right via mask-image rather than left as a hard
+       cover-cropped rectangle: a photo is rarely evenly colourful
+       edge-to-edge, so a sharp cutoff right at the band's border can
+       read as "a photo pasted in a box" (worse for off-centre/dark-on-
+       one-side artwork) rather than ambient light bleeding out from the
+       app. Fading it into the band's own flat fill at both edges sells
+       the glow regardless of what a given cover looks like. */
+    -webkit-mask-image: linear-gradient(to right, transparent 0%, black 18%, black 82%, transparent 100%);
+    mask-image: linear-gradient(to right, transparent 0%, black 18%, black 82%, transparent 100%);
+    filter:blur(18px) brightness(.6) saturate(1.5); opacity:0; transition:opacity 1s ease;
   }
   #pageArtBgImage.active{ opacity:1; }
   button{ font-family:inherit; color:inherit; cursor:pointer; }
@@ -198,13 +250,24 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     border:1px solid var(--border); background:var(--panel); color:var(--text);
     border-radius:999px; padding:0 14px; height:34px; font-size:12.5px;
   }
+  .pill.local{ background:var(--accent-soft); color:var(--accent); border-color:var(--accent); font-weight:700; }
+  .pill.priority{ border-color:rgba(255,255,255,.18); }
 
   /* ---------- player bar ---------- */
   .player-bar{
     position:fixed; left:0; right:0; bottom:0; z-index:30;
     display:flex; align-items:center; gap:10px;
     padding:10px 14px calc(10px + env(safe-area-inset-bottom,0));
-    background:rgba(10,10,26,.92); backdrop-filter:blur(12px); border-top:1px solid var(--border);
+    /* Glass effect: this bar spans the full viewport width, so at the
+       previous .92 opacity it was flatly hiding the artwork band's
+       bottom edge behind a near-solid strip across the whole window —
+       there was nowhere for "the background behind the player" to show
+       through. Knocked down to a tunable alpha (one value below) with a
+       bit more backdrop-blur to compensate for legibility, so controls
+       stay readable while a wash of whatever's playing bleeds through
+       at the edges. */
+    background:rgba(10,10,26, var(--player-bar-alpha)); backdrop-filter:blur(16px);
+    border-top:1px solid var(--border);
   }
   .player-bar-inner{ max-width:520px; margin:0 auto; width:100%; display:flex; align-items:center; gap:10px; }
   .player-logo{
@@ -212,13 +275,16 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     border:1px solid var(--border); flex:none;
   }
   .player-info{ min-width:0; flex:1; }
-  .player-name{ font-size:12.5px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  /* text-shadow on all three lines: legibility insurance that doesn't
+     depend on how bright/busy a given track's own artwork happens to be
+     bleeding through the glass player bar above. */
+  .player-name{ font-size:12.5px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; text-shadow:0 1px 3px rgba(0,0,0,.7); }
   .player-now-playing{
     font-size:11px; font-weight:600; color:var(--accent); white-space:nowrap; overflow:hidden;
-    text-overflow:ellipsis; display:none;
+    text-overflow:ellipsis; display:none; text-shadow:0 1px 3px rgba(0,0,0,.7);
   }
   .player-now-playing.show{ display:block; }
-  .player-meta{ font-size:10.5px; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .player-meta{ font-size:10.5px; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; text-shadow:0 1px 3px rgba(0,0,0,.7); }
   .player-btn{
     flex:none; width:38px; height:38px; border-radius:50%; border:1px solid var(--accent);
     background:var(--accent-soft); color:var(--text); font-size:15px; display:flex;
@@ -229,6 +295,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   .mini-btn{
     flex:none; border:none; background:none; color:var(--text); opacity:.55; cursor:pointer;
     font-size:14px; width:26px; height:26px; padding:0; border-radius:6px;
+    text-shadow:0 1px 3px rgba(0,0,0,.7);
   }
   .mini-btn:not(:disabled):active{ opacity:.9; }
   .mini-btn:disabled{ opacity:.25; cursor:default; }
@@ -626,8 +693,75 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     if (filterInput && filterInput.value) applyListFilter(filterInput.value);
   }
 
+  // ---------------------------------------------------------------------
+  // Local-country guess — mirrors the on-screen player's country-tag
+  // ordering (window._rdioLocalCC there, set by the main app's own IIFE
+  // from "timezone / navigator.language" per its own comment). This
+  // standalone page has no access to that global at all, so it derives
+  // the same *kind* of no-permission-needed guess itself: primarily the
+  // region subtag of navigator.language ("en-US" -> "US"), falling back
+  // to a small IANA-timezone lookup for the common single-country zones
+  // when the locale carries no region. Not real geolocation, just the
+  // same rough heuristic used to bubble a likely-relevant country to the
+  // top of a list — silently gives up (empty string) if neither signal
+  // is available, same as the modal does.
+  // ---------------------------------------------------------------------
+  var TZ_COUNTRY_MAP = {
+    'America/New_York':'US','America/Chicago':'US','America/Denver':'US','America/Los_Angeles':'US',
+    'America/Anchorage':'US','America/Phoenix':'US','Pacific/Honolulu':'US',
+    'America/Toronto':'CA','America/Vancouver':'CA','America/Edmonton':'CA','America/Winnipeg':'CA','America/Halifax':'CA',
+    'Europe/London':'GB','Europe/Dublin':'IE','Europe/Paris':'FR','Europe/Berlin':'DE','Europe/Madrid':'ES',
+    'Europe/Rome':'IT','Europe/Amsterdam':'NL','Europe/Brussels':'BE','Europe/Vienna':'AT','Europe/Zurich':'CH',
+    'Europe/Warsaw':'PL','Europe/Prague':'CZ','Europe/Budapest':'HU','Europe/Bucharest':'RO','Europe/Athens':'GR',
+    'Europe/Lisbon':'PT','Europe/Stockholm':'SE','Europe/Oslo':'NO','Europe/Copenhagen':'DK','Europe/Helsinki':'FI',
+    'Europe/Moscow':'RU','Europe/Kiev':'UA','Europe/Kyiv':'UA','Europe/Istanbul':'TR',
+    'Asia/Tokyo':'JP','Asia/Shanghai':'CN','Asia/Hong_Kong':'HK','Asia/Seoul':'KR','Asia/Singapore':'SG',
+    'Asia/Kolkata':'IN','Asia/Calcutta':'IN','Asia/Bangkok':'TH','Asia/Jakarta':'ID','Asia/Manila':'PH',
+    'Asia/Dubai':'AE','Asia/Jerusalem':'IL',
+    'Australia/Sydney':'AU','Australia/Melbourne':'AU','Australia/Brisbane':'AU','Australia/Perth':'AU',
+    'Pacific/Auckland':'NZ',
+    'America/Sao_Paulo':'BR','America/Mexico_City':'MX','America/Bogota':'CO','America/Argentina/Buenos_Aires':'AR',
+    'Africa/Johannesburg':'ZA','Africa/Cairo':'EG','Africa/Lagos':'NG'
+  };
+
+  function guessLocalCountry(){
+    try {
+      var lang = navigator.language || (navigator.languages && navigator.languages[0]) || '';
+      var m = lang.match(/[-_]([A-Za-z]{2})$/);
+      if (m) return m[1].toUpperCase();
+    } catch (e) {}
+    try {
+      var tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (tz && TZ_COUNTRY_MAP[tz]) return TZ_COUNTRY_MAP[tz];
+    } catch (e) {}
+    return '';
+  }
+
+  var LOCAL_CC = guessLocalCountry();
+  var PRIORITY_CC = ['US', 'CA', 'GB'];
+
+  // Mirrors the on-screen player's _sortCountries(): local country first,
+  // then US/CA/GB (skipping any already shown as local), then everything
+  // else in the original stationcount-desc order the API already returns.
+  function sortCountries(list){
+    var byCC = {};
+    list.forEach(function(c){ byCC[(c.iso_3166_1 || '').toUpperCase()] = c; });
+    var used = {};
+    var result = [];
+    if (LOCAL_CC && byCC[LOCAL_CC]){ result.push(byCC[LOCAL_CC]); used[LOCAL_CC] = true; }
+    PRIORITY_CC.forEach(function(cc){
+      if (!used[cc] && byCC[cc]){ result.push(byCC[cc]); used[cc] = true; }
+    });
+    list.forEach(function(c){
+      var cc = (c.iso_3166_1 || '').toUpperCase();
+      if (!used[cc]){ result.push(c); used[cc] = true; }
+    });
+    return result;
+  }
+
   function renderPillGrid(items, kind, filterLabel){
     if (!items || !items.length){ showEmpty('📭', 'Nothing available.'); return; }
+    if (kind === 'country') items = sortCountries(items);
     var list = listEl();
     list.innerHTML = '';
     list.appendChild(makeFilterBar(filterLabel || (kind + 's')));
@@ -646,6 +780,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       var btn = document.createElement('button');
       btn.className = 'pill';
       btn.type = 'button';
+      if (kind === 'country'){
+        var cc = String(value).toUpperCase();
+        if (LOCAL_CC && cc === LOCAL_CC) btn.classList.add('local');
+        else if (PRIORITY_CC.indexOf(cc) !== -1) btn.classList.add('priority');
+      }
       btn.textContent = label + (count ? ' (' + count + ')' : '');
       btn.addEventListener('click', function(){ drillInto(kind, value, label); });
       wrap.appendChild(btn);
@@ -1242,12 +1381,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   // this page from across the house has a different position than the
   // machine actually running FlaskyIPTV, so this can't reuse a
   // server-side location the way every other tab reuses server-side
-  // data. navigator.geolocation itself also typically requires a secure
-  // context (HTTPS or localhost) in modern browsers — this page is
-  // normally reached over plain http://<lan-ip>, so many browsers will
-  // refuse the permission prompt entirely; that's surfaced as a plain
-  // message rather than a dead-end, same philosophy as the clipboard
-  // fallback elsewhere in this app's companion pages.
+  // data. navigator.geolocation itself also requires a secure context
+  // (HTTPS or localhost) in every modern browser — this page is normally
+  // reached over plain http://<lan-ip>, which isn't one, so the browser
+  // refuses the permission prompt outright. That's a browser security
+  // policy, not something any client or server code here can override —
+  // so rather than a dead end, denial/unavailability falls back to the
+  // same rough, no-permission-needed region guess used to prioritize the
+  // Countries tab (browser locale / timezone — see guessLocalCountry()
+  // above), showing stations from that country instead of nothing.
   function loadNearby(){
     teardownLoadMore();
     var list = listEl();
@@ -1264,7 +1406,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     btn.textContent = 'Use my location';
     btn.addEventListener('click', function(){
       if (!('geolocation' in navigator)){
-        showEmpty('\u26a0\ufe0f', 'Location is not available in this browser.');
+        nearbyFallback('Location isn\u2019t available in this browser.');
         return;
       }
       showSpinner();
@@ -1278,13 +1420,39 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           renderStationList(data.data || [], {filterLabel: 'nearby stations'});
         })['catch'](function(){ showEmpty('\u26a0\ufe0f', 'Could not reach FlaskyIPTV.'); });
       }, function(){
-        showEmpty('\u26a0\ufe0f', 'Location permission was denied or is unavailable \u2014 many browsers require a secure (https) connection for this, which a plain http://<lan-ip> address is not.');
+        nearbyFallback('Precise location needs a secure (https) connection, which a plain http://<lan-ip> address here isn\u2019t \u2014 showing stations from your browser\u2019s detected region instead.');
       }, {timeout: 10000});
     });
     wrap.appendChild(span);
     wrap.appendChild(msg);
     wrap.appendChild(btn);
     list.appendChild(wrap);
+  }
+
+  // Falls back to the guessed local country (see guessLocalCountry()
+  // above) when real geolocation is denied/unavailable — reuses the same
+  // paginated /api/radio/country/<cc> route the Countries tab drills
+  // into, rather than a second, separate code path.
+  function nearbyFallback(reason){
+    if (!LOCAL_CC){
+      showEmpty('\ud83d\udccd', reason + ' Couldn\u2019t guess a region from this browser either \u2014 try the Countries or Genres tab instead.');
+      return;
+    }
+    setCrumb(LOCAL_CC);
+    showSpinner();
+    teardownLoadMore();
+    var LIMIT = 200;
+    var fetchPage = function(offset){
+      return getJSON('/api/radio/country/' + encodeURIComponent(LOCAL_CC) + '?limit=' + LIMIT + '&offset=' + offset).then(function(r){
+        return { data: (r && r.data) || [], truncated: !!(r && r.truncated) };
+      });
+    };
+    fetchPage(0).then(function(d){
+      if (!d.data.length){ showEmpty('\ud83d\udccd', reason + ' No stations found for that region either.'); return; }
+      renderStationList(d.data, {filterLabel: 'stations near ' + LOCAL_CC});
+      startPagination(fetchPage, LIMIT, d.data.length, d.truncated);
+      showHint(reason, 8000);
+    })['catch'](function(){ showEmpty('\u26a0\ufe0f', 'Could not reach FlaskyIPTV.'); });
   }
 
   // Populated once at startup (see startApp() below) rather than lazily on
@@ -1331,6 +1499,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     else if (currentTab === 'countries') loadPills('/api/radio/countries', 'country', 'countries');
     else if (currentTab === 'languages') loadPills('/api/radio/languages', 'language', 'languages');
     else if (currentTab === 'sources')   loadSourcesList();
+    else if (currentTab === 'nearby')    loadNearby();
   });
 
   document.querySelectorAll('.tab').forEach(function(btn){
