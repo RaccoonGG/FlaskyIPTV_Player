@@ -31,11 +31,67 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     --radius:16px; --radius-sm:10px;
     --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     --mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Menlo, Consolas, monospace;
+    /* Width of the centered dynamic-artwork background band on wide
+       (desktop) viewports — the content column (.shell, 520px) plus
+       generous breathing room either side, but capped well short of a
+       full ultrawide monitor. Past this width the page falls back to
+       the flat --bg colour either side. One number to tweak. */
+    --art-bg-width: 1100px;
   }
   *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
-  html,body{ margin:0; padding:0; background:var(--bg); color:var(--text); font-family:var(--font); }
-  body{ padding-bottom: env(safe-area-inset-bottom, 0); min-height:100vh; }
-  .shell{ max-width:520px; margin:0 auto; min-height:100vh; display:flex; flex-direction:column; }
+  html,body{ margin:0; padding:0; color:var(--text); font-family:var(--font); }
+  body{
+    padding-bottom: env(safe-area-inset-bottom, 0); min-height:100vh;
+    background:var(--bg);
+    /* Subtle ambient wash so the true outer margins (past the artwork
+       band below) read as "dim room", not a flat black void — most
+       visible on a wide desktop window where there's a lot of that
+       margin either side of the band. Fades to plain --bg by the
+       real edges, so it costs nothing on a narrow/mobile viewport
+       where there's no margin left to show it in. */
+    background-image: radial-gradient(ellipse 1600px 900px at center, rgba(124,58,237,.10), rgba(124,58,237,0) 70%);
+    background-repeat:no-repeat;
+  }
+  .shell{ position:relative; z-index:1; max-width:520px; margin:0 auto; min-height:100vh; display:flex; flex-direction:column; }
+
+  /* ---------- dynamic now-playing artwork background ----------
+     #pageArtBg is the BAND itself — a fixed, centered, width-limited
+     frame behind .shell (see z-index above), permanently visible (flat
+     --panel fill + a border marking each edge) so the band reads as an
+     intentional part of the layout even before any artwork has loaded,
+     rather than only appearing once a track happens to resolve one.
+     Constrained to --art-bg-width and centered rather than the full
+     viewport: on a wide desktop window the content column (.shell,
+     520px) would otherwise sit in the middle of a treatment stretched
+     edge to edge, which reads as a lot of empty haze either side. Past
+     the band, body's own (slightly lighter-washed, see above) --bg
+     shows through untouched.
+     #pageArtBgImage is a second layer INSIDE the band that holds the
+     actual blurred/dimmed album art for whatever track is airing —
+     cleared on every new station and re-populated once that station's
+     first track resolves artwork (same debounce/skip-stale-response
+     logic as the on-screen player's modal background) — and crossfades
+     in/out via opacity on top of the band's permanent flat fill, so
+     "no artwork yet" and "artwork loaded" are just two states of the
+     same always-visible band rather than the band appearing/vanishing
+     outright. */
+  #pageArtBg{
+    position:fixed; top:0; bottom:0; left:50%; z-index:0;
+    width:min(var(--art-bg-width), 100vw); transform:translateX(-50%);
+    background:var(--panel);
+    border-left-width:1px; border-left-style:solid; border-left-color:var(--border);
+    border-right-width:1px; border-right-style:solid; border-right-color:var(--border);
+    overflow:hidden; pointer-events:none;
+  }
+  #pageArtBgImage{
+    position:absolute; inset:0; background-size:cover; background-position:center;
+    /* brightness(.32) made even vivid cover art read as a barely-there
+       dark smudge once combined with blur + this page's already-dark
+       theme underneath — brightened and de-blurred a bit so the art is
+       actually recognizable as art, not just a mood tint. */
+    filter:blur(45px) brightness(.6) saturate(1.5); opacity:0; transition:opacity 1s ease;
+  }
+  #pageArtBgImage.active{ opacity:1; }
   button{ font-family:inherit; color:inherit; cursor:pointer; }
   input{ font-family:inherit; color:inherit; }
 
@@ -53,9 +109,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   /* ---------- tabs ---------- */
   .tabs{
     display:flex; gap:6px; overflow-x:auto; padding-bottom:2px; -webkit-overflow-scrolling:touch;
-    scrollbar-width:none;
+    scrollbar-width:none; cursor:grab; user-select:none;
   }
   .tabs::-webkit-scrollbar{ display:none; }
+  .tabs.tabs-dragging{ cursor:grabbing; }
   .tab{
     flex:none; border:1px solid var(--border); background:var(--panel); color:var(--text-dim);
     border-radius:999px; padding:0 14px; height:32px; font-size:12.5px; font-weight:600; white-space:nowrap;
@@ -80,10 +137,30 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     flex:none; border:1px solid var(--accent); background:var(--accent-soft); color:var(--text);
     border-radius:var(--radius-sm); padding:0 16px; height:36px; font-size:13px; font-weight:600;
   }
+  .search-row select{
+    flex:none; width:104px; height:36px; border-radius:var(--radius-sm); border:1px solid var(--border);
+    background:var(--panel-2); color:var(--text); font-size:12px; padding:0 6px;
+  }
   .history-actions{ justify-content:flex-end; }
-  .history-actions button{
+  .history-actions button, .favorites-actions button{
     border:1px solid var(--border); background:var(--panel-2); color:var(--text-dim);
     border-radius:var(--radius-sm); padding:0 12px; height:30px; font-size:12px;
+  }
+  .favorites-actions{ display:none; justify-content:flex-end; }
+  .favorites-actions.show{ display:flex; }
+
+  /* ---------- in-list filter (client-side, over whatever's already loaded) ---------- */
+  .filter-bar{ margin-bottom:6px; }
+  .filter-input{
+    width:100%; height:32px; border-radius:var(--radius-sm); border:1px solid var(--border);
+    background:var(--panel-2); color:var(--text); padding:0 12px; font-size:12.5px;
+  }
+  .filter-empty{ display:none; }
+  .filter-empty.show{ display:flex; }
+
+  /* ---------- "load more" pagination sentinel ---------- */
+  .load-more-sentinel{
+    text-align:center; padding:14px; font-size:11px; color:var(--text-faint);
   }
 
   /* ---------- list ---------- */
@@ -110,6 +187,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     width:32px; height:32px; border-radius:8px;
   }
   .li-fav.active{ color:#f5c518; }
+  .li-load-btn{
+    flex:none; border:1px solid var(--accent); background:var(--accent-soft); color:var(--text);
+    border-radius:var(--radius-sm); padding:0 12px; height:30px; font-size:11.5px; font-weight:600;
+  }
 
   /* ---------- pill grid (genres/countries/languages) ---------- */
   .pill-grid{ display:flex; flex-wrap:wrap; gap:8px; }
@@ -132,6 +213,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   }
   .player-info{ min-width:0; flex:1; }
   .player-name{ font-size:12.5px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .player-now-playing{
+    font-size:11px; font-weight:600; color:var(--accent); white-space:nowrap; overflow:hidden;
+    text-overflow:ellipsis; display:none;
+  }
+  .player-now-playing.show{ display:block; }
   .player-meta{ font-size:10.5px; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .player-btn{
     flex:none; width:38px; height:38px; border-radius:50%; border:1px solid var(--accent);
@@ -140,6 +226,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   }
   .player-btn:disabled{ opacity:.35; border-color:var(--border); background:var(--panel-2); }
   .vol-slider{ flex:none; width:70px; accent-color:var(--accent); }
+  .mini-btn{
+    flex:none; border:none; background:none; color:var(--text); opacity:.55; cursor:pointer;
+    font-size:14px; width:26px; height:26px; padding:0; border-radius:6px;
+  }
+  .mini-btn:not(:disabled):active{ opacity:.9; }
+  .mini-btn:disabled{ opacity:.25; cursor:default; }
+  .mini-btn.active{ opacity:1; color:var(--accent); }
+  .mini-btn.spinning{ animation:mini-spin .6s linear infinite; opacity:.9; }
+  @keyframes mini-spin{ to{ transform:rotate(360deg); } }
 
   /* ---------- nearby helper ---------- */
   .nearby-prompt{
@@ -189,6 +284,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 </style>
 </head>
 <body>
+<div id="pageArtBg"><div id="pageArtBgImage"></div></div>
 <div class="connect-overlay" id="connectOverlay">
   <div class="connect-card">
     <h2>Connect to FlaskyIPTV</h2>
@@ -218,6 +314,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       <button class="tab on" data-tab="favorites">★ Favorites</button>
       <button class="tab" data-tab="top">Top</button>
       <button class="tab" data-tab="builtin">Built-in</button>
+      <button class="tab" data-tab="sources">Sources</button>
       <button class="tab" data-tab="trending">Trending</button>
       <button class="tab" data-tab="genres">Genres</button>
       <button class="tab" data-tab="countries">Countries</button>
@@ -233,12 +330,17 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     </div>
 
     <div class="search-row" id="searchRow">
+      <select id="searchCountry"><option value="">🌍 All countries</option></select>
       <input id="searchBox" placeholder="Search stations…" inputmode="search">
       <button id="searchBtn" type="button">Go</button>
     </div>
 
     <div class="history-actions" id="historyActions">
       <button id="clearHistoryBtn" type="button">Clear history</button>
+    </div>
+
+    <div class="favorites-actions" id="favoritesActions">
+      <button id="exportFavoritesBtn" type="button">⬇ Export M3U</button>
     </div>
 
     <div class="list" id="list">
@@ -252,8 +354,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       <div class="player-logo" id="playerLogoFallback">📻</div>
       <div class="player-info">
         <div class="player-name" id="playerName">Nothing playing</div>
+        <div class="player-now-playing" id="playerNowPlaying"></div>
         <div class="player-meta" id="playerMeta"></div>
       </div>
+      <button class="mini-btn" id="shuffleBtn" type="button" title="Shuffle — play similar station" disabled>🎲</button>
+      <button class="mini-btn" id="sleepBtn" type="button" title="Sleep timer  (15 / 30 / 45 / 60 min)">⏱</button>
       <button class="player-btn" id="playPauseBtn" type="button" disabled>▶</button>
       <input class="vol-slider" id="volSlider" type="range" min="0" max="100" value="80">
       <audio id="audioEl" preload="none"></audio>
@@ -404,44 +509,128 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     return bits.join('  \u00b7  ');
   }
 
+  // Mirrors the on-screen player's _rdioRelTime() — "how long ago" for a
+  // history row's _played_at (ISO-8601 UTC, e.g. "2026-09-17T12:34:56Z").
+  function relTime(isoStr){
+    if (!isoStr) return '';
+    var then = new Date(isoStr).getTime();
+    if (isNaN(then)) return '';
+    var sec = Math.floor((Date.now() - then) / 1000);
+    if (sec < 60) return 'Just now';
+    if (sec < 3600) return Math.floor(sec / 60) + ' min ago';
+    if (sec < 86400) return Math.floor(sec / 3600) + ' hr ago';
+    if (sec < 172800) return 'Yesterday';
+    return new Date(isoStr).toLocaleDateString();
+  }
+
   var currentTab = 'favorites';
   var currentStations = [];
   var lastGenreSel = null, lastCountrySel = null, lastLangSel = null;
 
-  function renderStationList(stations){
-    currentStations = stations || [];
-    if (!currentStations.length){ showEmpty('📭', 'No stations found.'); return; }
-    var list = listEl();
-    list.innerHTML = '';
-    var frag = document.createDocumentFragment();
-    currentStations.forEach(function(s){
-      var row = document.createElement('div');
-      row.className = 'list-item';
-      var logo = stationLogo(s);
-      var meta = stationMeta(s);
-      row.innerHTML =
-        (logo ? '<img class="li-logo" src="' + logo.replace(/"/g, '&quot;') + '" referrerpolicy="no-referrer" loading="lazy" decoding="async" onerror="this.outerHTML=\'<div class=&quot;li-logo&quot;>📻</div>\'">'
-              : '<div class="li-logo">📻</div>') +
-        '<div class="li-name-wrap"><div class="li-name"></div>' +
-        (meta ? '<div class="li-meta"></div>' : '') + '</div>' +
-        '<button class="li-fav' + (s._is_favorite ? ' active' : '') + '" type="button" title="Favorite">' +
-        (s._is_favorite ? '\u2605' : '\u2606') + '</button>';
-      row.querySelector('.li-name').textContent = stationName(s);
-      if (meta) row.querySelector('.li-meta').textContent = meta;
-      row.querySelector('.li-fav').addEventListener('click', function(e){
-        e.stopPropagation();
-        toggleFavorite(s, e.currentTarget);
-      });
-      row.addEventListener('click', function(){ playStation(s); });
-      frag.appendChild(row);
-    });
-    list.appendChild(frag);
+  // ---------------------------------------------------------------------
+  // In-list filter — a client-side text filter over whatever is already
+  // sitting in #list (station rows, source rows, or pill-grid buttons),
+  // mirroring the on-screen player's per-view filter box. Everything's
+  // already loaded from one batch fetch, so this is instant with no
+  // extra network round-trip per keystroke.
+  // ---------------------------------------------------------------------
+  function makeFilterBar(labelText){
+    var bar = document.createElement('div');
+    bar.className = 'filter-bar';
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'filter-input';
+    input.placeholder = 'Filter ' + labelText + '\u2026';
+    input.autocomplete = 'off';
+    input.addEventListener('input', function(){ applyListFilter(input.value); });
+    bar.appendChild(input);
+    return bar;
   }
 
-  function renderPillGrid(items, kind){
+  function makeFilterEmpty(){
+    var d = document.createElement('div');
+    d.id = 'filterEmpty';
+    d.className = 'empty-state filter-empty';
+    d.innerHTML = '<span class="big">\ud83d\udd0d</span>No matches';
+    return d;
+  }
+
+  function applyListFilter(q){
+    q = (q || '').trim().toLowerCase();
+    var list = listEl();
+    var items = list.querySelectorAll('.list-item, .pill');
+    var visible = 0;
+    items.forEach(function(el){
+      var match = !q || el.textContent.toLowerCase().indexOf(q) !== -1;
+      el.style.display = match ? '' : 'none';
+      if (match) visible++;
+    });
+    var empty = document.getElementById('filterEmpty');
+    if (empty) empty.classList.toggle('show', items.length > 0 && visible === 0);
+  }
+
+  function buildStationRow(s, opts){
+    opts = opts || {};
+    var row = document.createElement('div');
+    row.className = 'list-item';
+    var logo = stationLogo(s);
+    var meta = stationMeta(s);
+    var rel  = opts.showPlayedAt ? relTime(s._played_at) : '';
+    var metaText = rel ? (meta ? rel + '  \u00b7  ' + meta : rel) : meta;
+    row.innerHTML =
+      (logo ? '<img class="li-logo" src="' + logo.replace(/"/g, '&quot;') + '" referrerpolicy="no-referrer" loading="lazy" decoding="async" onerror="this.outerHTML=\'<div class=&quot;li-logo&quot;>📻</div>\'">'
+            : '<div class="li-logo">📻</div>') +
+      '<div class="li-name-wrap"><div class="li-name"></div>' +
+      (metaText ? '<div class="li-meta"></div>' : '') + '</div>' +
+      '<button class="li-fav' + (s._is_favorite ? ' active' : '') + '" type="button" title="Favorite">' +
+      (s._is_favorite ? '\u2605' : '\u2606') + '</button>';
+    row.querySelector('.li-name').textContent = stationName(s);
+    if (metaText) row.querySelector('.li-meta').textContent = metaText;
+    row.querySelector('.li-fav').addEventListener('click', function(e){
+      e.stopPropagation();
+      toggleFavorite(s, e.currentTarget);
+    });
+    row.addEventListener('click', function(){ playStation(s); });
+    return row;
+  }
+
+  function renderStationList(stations, opts){
+    opts = opts || {};
+    currentStations = stations || [];
+    if (!currentStations.length){ showEmpty(opts.emptyIcon || '📭', opts.emptyMsg || 'No stations found.'); return; }
+    var list = listEl();
+    list.innerHTML = '';
+    list.appendChild(makeFilterBar(opts.filterLabel || 'stations'));
+    var container = document.createElement('div');
+    container.id = 'stationRows';
+    var frag = document.createDocumentFragment();
+    currentStations.forEach(function(s){ frag.appendChild(buildStationRow(s, opts)); });
+    container.appendChild(frag);
+    list.appendChild(container);
+    list.appendChild(makeFilterEmpty());
+  }
+
+  // Appends a page of stations fetched by the pagination "load more"
+  // sentinel (see startPagination() below) without wiping what's already
+  // rendered, and re-applies whatever filter text is currently typed so
+  // freshly-appended rows are filtered consistently with the rest.
+  function appendStationRows(newStations){
+    var container = document.getElementById('stationRows');
+    if (!container || !newStations || !newStations.length) return;
+    currentStations = currentStations.concat(newStations);
+    var sentinel = document.getElementById('loadMoreSentinel');
+    var frag = document.createDocumentFragment();
+    newStations.forEach(function(s){ frag.appendChild(buildStationRow(s, {})); });
+    if (sentinel) container.insertBefore(frag, sentinel); else container.appendChild(frag);
+    var filterInput = document.querySelector('.filter-input');
+    if (filterInput && filterInput.value) applyListFilter(filterInput.value);
+  }
+
+  function renderPillGrid(items, kind, filterLabel){
     if (!items || !items.length){ showEmpty('📭', 'Nothing available.'); return; }
     var list = listEl();
     list.innerHTML = '';
+    list.appendChild(makeFilterBar(filterLabel || (kind + 's')));
     var wrap = document.createElement('div');
     wrap.className = 'pill-grid';
     items.forEach(function(g){
@@ -462,21 +651,149 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       wrap.appendChild(btn);
     });
     list.appendChild(wrap);
+    list.appendChild(makeFilterEmpty());
+  }
+
+  // ---------------------------------------------------------------------
+  // "Load more" pagination — mirrors the on-screen player's
+  // _rdioStartPagination()/_rdioSetupLoadMoreSentinel()/_rdioLoadMoreFetch().
+  // fetchMore(offset) must resolve {data, truncated}. Appends a sentinel
+  // <div> after the last row and watches it with an IntersectionObserver;
+  // scrolling it into view triggers the next page fetch. No-ops (silently
+  // caps the list at page one) on browsers without IntersectionObserver.
+  // ---------------------------------------------------------------------
+  var loadMore = null;
+  var loadMoreObserver = null;
+
+  function startPagination(fetchMore, limit, firstPageCount, truncated){
+    if (!truncated || firstPageCount === 0){ loadMore = null; return; }
+    loadMore = { fetchMore: fetchMore, limit: limit, offset: firstPageCount, hasMore: true, loading: false };
+    setupLoadMoreSentinel();
+  }
+
+  function setupLoadMoreSentinel(){
+    if (loadMoreObserver){ loadMoreObserver.disconnect(); loadMoreObserver = null; }
+    var old = document.getElementById('loadMoreSentinel');
+    if (old) old.remove();
+    if (!loadMore || !loadMore.hasMore) return;
+    var container = document.getElementById('stationRows');
+    if (!container) return;
+    var sentinel = document.createElement('div');
+    sentinel.id = 'loadMoreSentinel';
+    sentinel.className = 'load-more-sentinel';
+    sentinel.textContent = 'Loading more\u2026';
+    container.appendChild(sentinel);
+    if (typeof IntersectionObserver !== 'function') return;
+    loadMoreObserver = new IntersectionObserver(function(entries){
+      if (entries.some(function(e){ return e.isIntersecting; })) loadMoreFetch();
+    }, { root: null, rootMargin: '400px', threshold: 0 });
+    loadMoreObserver.observe(sentinel);
+  }
+
+  function loadMoreFetch(){
+    if (!loadMore || loadMore.loading || !loadMore.hasMore) return;
+    loadMore.loading = true;
+    var sentinel = document.getElementById('loadMoreSentinel');
+    if (sentinel) sentinel.textContent = 'Loading more\u2026';
+    loadMore.fetchMore(loadMore.offset).then(function(r){
+      if (!loadMore) return;
+      var newStations = r.data || [];
+      loadMore.offset += newStations.length;
+      loadMore.hasMore = !!r.truncated && newStations.length > 0;
+      if (newStations.length) appendStationRows(newStations);
+      if (loadMore){
+        if (!loadMore.hasMore) teardownLoadMore();
+        else loadMore.loading = false;
+      }
+    })['catch'](function(){
+      if (sentinel) sentinel.textContent = 'Couldn\u2019t load more \u2014 scroll to retry';
+      if (loadMore) loadMore.loading = false;
+    });
+  }
+
+  function teardownLoadMore(){
+    if (loadMoreObserver){ loadMoreObserver.disconnect(); loadMoreObserver = null; }
+    var sentinel = document.getElementById('loadMoreSentinel');
+    if (sentinel) sentinel.remove();
+    loadMore = null;
   }
 
   function drillInto(kind, value, label){
     setCrumb(label);
     showSpinner();
-    var path = kind === 'genre'    ? '/api/radio/genre/' + encodeURIComponent(value)
+    teardownLoadMore();
+    var LIMIT = 200;
+    var basePath = kind === 'genre'    ? '/api/radio/genre/' + encodeURIComponent(value)
              : kind === 'country'  ? '/api/radio/country/' + encodeURIComponent(value)
              : '/api/radio/language/' + encodeURIComponent(value);
     if (kind === 'genre')    lastGenreSel = value;
     if (kind === 'country')  lastCountrySel = {cc: value, label: label};
     if (kind === 'language') lastLangSel = {lang: value, label: label};
-    getJSON(path).then(function(data){
-      if (!data || data.status === 'error'){ showEmpty('\u26a0\ufe0f', (data && data.message) || 'Could not load.'); return; }
-      renderStationList(data.data || []);
+    var fetchPage = function(offset){
+      return getJSON(basePath + '?limit=' + LIMIT + '&offset=' + offset).then(function(r){
+        if (!r || r.status === 'error') throw new Error((r && r.message) || 'Could not load.');
+        return { data: r.data || [], truncated: !!r.truncated };
+      });
+    };
+    fetchPage(0).then(function(d){
+      renderStationList(d.data, {filterLabel: label});
+      startPagination(fetchPage, LIMIT, d.data.length, d.truncated);
+    })['catch'](function(e){ showEmpty('\u26a0\ufe0f', (e && e.message) || 'Could not reach FlaskyIPTV.'); });
+  }
+
+  // ---------------------------------------------------------------------
+  // M3U "Sources" tab — curated playlist sources configured server-side
+  // (radio_addon.py's M3U_SOURCES), same /api/radio/sources +
+  // /api/radio/load_source endpoints the on-screen player's Sources tab
+  // uses. Two levels: pick a source, then browse (paginated) the
+  // stations it loaded.
+  // ---------------------------------------------------------------------
+  function loadSourcesList(){
+    showSpinner();
+    teardownLoadMore();
+    getJSON('/api/radio/sources').then(function(data){
+      var names = (data && data.sources) || [];
+      if (!names.length){ showEmpty('📂', 'No M3U sources configured.'); return; }
+      renderSourcesList(names);
     })['catch'](function(){ showEmpty('\u26a0\ufe0f', 'Could not reach FlaskyIPTV.'); });
+  }
+
+  function renderSourcesList(names){
+    var list = listEl();
+    list.innerHTML = '';
+    list.appendChild(makeFilterBar('sources'));
+    var frag = document.createDocumentFragment();
+    names.forEach(function(name){
+      var row = document.createElement('div');
+      row.className = 'list-item';
+      row.innerHTML =
+        '<div class="li-logo">\ud83d\udcc2</div>' +
+        '<div class="li-name-wrap"><div class="li-name"></div></div>' +
+        '<button class="li-load-btn" type="button">Load</button>';
+      row.querySelector('.li-name').textContent = name;
+      row.querySelector('.li-load-btn').addEventListener('click', function(){ loadSourceStations(name); });
+      frag.appendChild(row);
+    });
+    list.appendChild(frag);
+    list.appendChild(makeFilterEmpty());
+  }
+
+  function loadSourceStations(name){
+    setCrumb(name);
+    showSpinner();
+    teardownLoadMore();
+    var PAGE_SIZE = 500;
+    var fetchPage = function(offset){
+      return postJSON('/api/radio/load_source', { source: name, limit: PAGE_SIZE, offset: offset }).then(function(r){
+        if (!r || r.status === 'error') throw new Error((r && r.message) || 'Could not load source.');
+        return { data: r.data || [], truncated: !!r.truncated };
+      });
+    };
+    fetchPage(0).then(function(d){
+      if (!d.data.length){ showEmpty('📂', 'No stations found.'); return; }
+      renderStationList(d.data, {filterLabel: name});
+      startPagination(fetchPage, PAGE_SIZE, d.data.length, d.truncated);
+    })['catch'](function(e){ showEmpty('\u26a0\ufe0f', (e && e.message) || 'Could not reach FlaskyIPTV.'); });
   }
 
   function toggleFavorite(station, btn){
@@ -585,12 +902,132 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     } catch (e) {}
   }
 
+  // ---------------------------------------------------------------------
+  // Transient status text — repurposes the topbar's existing hint line
+  // (normally "tap a station to play") for brief one-off feedback (e.g.
+  // shuffle finding nothing), reverting automatically. No separate
+  // toast/snackbar component needed.
+  // ---------------------------------------------------------------------
+  var HINT_DEFAULT = byId('hintText') ? byId('hintText').textContent : '';
+  var hintTimer = null;
+  function showHint(msg, ms){
+    var el = byId('hintText');
+    if (!el) return;
+    el.textContent = msg;
+    if (hintTimer) clearTimeout(hintTimer);
+    hintTimer = setTimeout(function(){ el.textContent = HINT_DEFAULT; }, ms || 2500);
+  }
+
+  // ---------------------------------------------------------------------
+  // Now Playing (ICY StreamTitle) + artwork + MediaSession + dynamic
+  // page background. Mirrors the on-screen player's _rdioNpStart()/
+  // _rdioOnTrackChange()/_rdioSetMediaSession(), applied to the whole
+  // page's background instead of one modal.
+  // ---------------------------------------------------------------------
+  var npTimer = null;
+  var npUrl = '';
+  var lastNpTitle = '';
+  var artworkTimer = null;
+  var npFetchToken = 0;
+
+  function stopNowPlaying(){
+    if (npTimer) clearInterval(npTimer);
+    npTimer = null;
+    npUrl = '';
+    lastNpTitle = '';
+    if (artworkTimer) clearTimeout(artworkTimer);
+    artworkTimer = null;
+  }
+
+  // First check after 4s (give the stream a moment to connect), then
+  // every 20s — same cadence as the on-screen player.
+  function startNowPlaying(url){
+    stopNowPlaying();
+    npUrl = url;
+    setPageArtBg(null);
+    setMediaSessionMeta(null, null);
+    var npEl = byId('playerNowPlaying');
+    npEl.textContent = '';
+    npEl.classList.remove('show');
+    setTimeout(npFetch, 4000);
+    npTimer = setInterval(npFetch, 20000);
+  }
+
+  function npFetch(){
+    if (!npUrl || !currentStation) return;
+    var url = npUrl;
+    var token = ++npFetchToken;
+    getJSON('/api/radio/nowplaying?url=' + encodeURIComponent(url)).then(function(data){
+      if (token !== npFetchToken || url !== npUrl) return; // stale — station changed mid-fetch
+      onTrackChange((data && data.result && data.result.stream_title) || '');
+    })['catch'](function(){});
+  }
+
+  function onTrackChange(title){
+    title = (title || '').trim();
+    var npEl = byId('playerNowPlaying');
+    if (title){ npEl.textContent = '\u266a ' + title; npEl.classList.add('show'); }
+    else { npEl.textContent = ''; npEl.classList.remove('show'); }
+    if (title === lastNpTitle) return;
+    lastNpTitle = title;
+    if (artworkTimer) clearTimeout(artworkTimer);
+    if (!title){ setPageArtBg(null); setMediaSessionMeta(null, null); return; }
+    // Debounce 5s so a title that flickers through a couple of ICY
+    // updates right as a track starts doesn't fire one lookup per update.
+    artworkTimer = setTimeout(function(){
+      if (title !== lastNpTitle) return;
+      getJSON('/api/radio/artwork?track=' + encodeURIComponent(title)).then(function(data){
+        if (title !== lastNpTitle) return; // track moved on while this was in flight
+        var url = data && data.url;
+        setPageArtBg(url);
+        setMediaSessionMeta(title, url);
+      })['catch'](function(){});
+    }, 5000);
+  }
+
+  // The artwork crossfade layer inside the (always-visible) #pageArtBg
+  // band — see the CSS comment on #pageArtBg/#pageArtBgImage. Cleared on
+  // every new station, re-populated once that station's current track
+  // resolves real cover art via /api/radio/artwork.
+  function setPageArtBg(url){
+    var el = byId('pageArtBgImage');
+    if (!el) return;
+    if (url){
+      el.style.backgroundImage = 'url("' + url.replace(/"/g, '%22') + '")';
+      el.classList.add('active');
+    } else {
+      el.classList.remove('active');
+    }
+  }
+
+  // OS-level lock-screen/notification media controls. Set immediately on
+  // play with just the station name — so lock-screen controls work even
+  // for stations that never send ICY titles — then upgraded to
+  // "Artist – Title" + real artwork once a track resolves.
+  function setMediaSessionMeta(title, artworkUrl){
+    if (!('mediaSession' in navigator) || typeof MediaMetadata !== 'function') return;
+    var artist = 'FlaskyIPTV Radio';
+    var trackTitle = currentStation ? stationName(currentStation) : 'Radio';
+    if (title){
+      var sepIdx = title.indexOf(' - ');
+      if (sepIdx > 0){ artist = title.slice(0, sepIdx).trim(); trackTitle = title.slice(sepIdx + 3).trim(); }
+      else { trackTitle = title; }
+    }
+    var artwork = [];
+    var art = artworkUrl || (currentStation && stationLogo(currentStation));
+    if (art) artwork.push({ src: art, sizes: '600x600', type: 'image/png' });
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({ title: trackTitle, artist: artist, artwork: artwork });
+    } catch (e) {}
+  }
+
   function playStation(s){
     var url = stationUrl(s);
     if (!url){ return; }
     currentStation = s;
     destroyHls();
     playPauseBtn.disabled = false;
+    byId('shuffleBtn').disabled = false;
 
     if (isHlsUrl(url) && !audioEl.canPlayType('application/vnd.apple.mpegurl')){
       // Not Safari (the only browser with native HLS) — needs hls.js.
@@ -631,6 +1068,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     byId('playerMeta').textContent = stationMeta(s);
     setPlayerLogo(stationLogo(s));
     playPauseBtn.textContent = '\u23f8'; // ⏸, updated again by the 'playing' handler below
+    // Now-playing polling + lock-screen metadata + dynamic art background —
+    // reset for the new station, populated once its first track resolves.
+    startNowPlaying(url);
     // Fire-and-forget: registers the click with RadioBrowser and pushes to
     // this app's history, exactly like the on-screen player's own
     // radioPlayStation() — deliberately not awaited, playback already
@@ -662,23 +1102,76 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     audioEl.volume = (parseInt(volSlider.value, 10) || 0) / 100;
   });
 
+  // ---------------------------------------------------------------------
+  // Sleep timer — cycle off → 15 → 30 → 45 → 60 → off … Fully client-side,
+  // zero backend, independent of whichever station is currently playing
+  // (mirrors the on-screen player's sleep button).
+  // ---------------------------------------------------------------------
+  var SLEEP_MINS = [15, 30, 45, 60];
+  var sleepIdx = -1;
+  var sleepTimer = null;
+  var sleepBtn = byId('sleepBtn');
+
+  function sleepClear(){
+    if (sleepTimer) clearTimeout(sleepTimer);
+    sleepTimer = null;
+    sleepIdx = -1;
+    sleepBtn.textContent = '\u23f1';
+    sleepBtn.classList.remove('active');
+  }
+
+  function sleepFire(){
+    audioEl.pause();
+    sleepClear();
+  }
+
+  sleepBtn.addEventListener('click', function(){
+    sleepIdx++;
+    if (sleepIdx >= SLEEP_MINS.length){ sleepClear(); return; }
+    if (sleepTimer) clearTimeout(sleepTimer);
+    var mins = SLEEP_MINS[sleepIdx];
+    sleepTimer = setTimeout(sleepFire, mins * 60 * 1000);
+    sleepBtn.textContent = '\u23f1 ' + mins + 'm';
+    sleepBtn.classList.add('active');
+  });
+
+  // ---------------------------------------------------------------------
+  // Shuffle — picks a random station sharing a genre tag with whatever's
+  // currently playing (mirrors the on-screen player's 🎲 "more like this").
+  // ---------------------------------------------------------------------
+  byId('shuffleBtn').addEventListener('click', function(){
+    if (!currentStation) return;
+    var tags = String(currentStation.tags || '').split(',').map(function(t){ return t.trim(); }).filter(Boolean);
+    if (!tags.length){ showHint('No genre tags for this station'); return; }
+    var tag = tags[Math.floor(Math.random() * tags.length)];
+    getJSON('/api/radio/genre/' + encodeURIComponent(tag) + '?limit=50').then(function(data){
+      var list = (data && data.data) || [];
+      var pool = list.filter(function(s){ return stationUrl(s) && stationUrl(s) !== stationUrl(currentStation); });
+      if (!pool.length){ showHint('Couldn\u2019t find a similar station'); return; }
+      playStation(pool[Math.floor(Math.random() * pool.length)]);
+    })['catch'](function(){ showHint('Couldn\u2019t reach FlaskyIPTV'); });
+  });
+
   // -------------------------------------------------------------------
   // Tabs
   // -------------------------------------------------------------------
   function loadTab(name){
     currentTab = name;
     setCrumb(null);
+    teardownLoadMore();
     byId('searchRow').classList.toggle('show', name === 'search');
     byId('historyActions').classList.toggle('show', name === 'history');
+    byId('favoritesActions').classList.toggle('show', name === 'favorites');
     switch (name){
-      case 'favorites': loadSimple('/api/radio/favorites', '★', 'No favorites yet \u2014 star a station from any list to save it here.'); break;
-      case 'top':       loadSimple('/api/radio/top?limit=100'); break;
-      case 'builtin':   loadSimple('/api/radio/builtin'); break;
-      case 'trending':  loadSimple('/api/radio/trending'); break;
+      case 'favorites': loadSimple('/api/radio/favorites', '★', 'No favorites yet \u2014 star a station from any list to save it here.', 'favorites'); break;
+      case 'top':       loadTop(); break;
+      case 'builtin':   loadSimple('/api/radio/builtin', null, null, 'built-in stations'); break;
+      case 'sources':   loadSourcesList(); break;
+      case 'trending':  loadSimple('/api/radio/trending', null, null, 'trending stations'); break;
       case 'history':   loadHistory(); break;
-      case 'genres':    loadPills('/api/radio/genres', 'genre'); break;
-      case 'countries': loadPills('/api/radio/countries', 'country'); break;
-      case 'languages': loadPills('/api/radio/languages', 'language'); break;
+      case 'genres':    loadPills('/api/radio/genres', 'genre', 'genres'); break;
+      case 'countries': loadPills('/api/radio/countries', 'country', 'countries'); break;
+      case 'languages': loadPills('/api/radio/languages', 'language', 'languages'); break;
       case 'nearby':    loadNearby(); break;
       case 'search':
         var q = byId('searchBox').value.trim();
@@ -687,34 +1180,62 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     }
   }
 
-  function loadSimple(path, emptyIcon, emptyMsg){
+  function loadSimple(path, emptyIcon, emptyMsg, filterLabel){
     showSpinner();
     getJSON(path).then(function(data){
       if (!data || data.status === 'error'){ showEmpty('\u26a0\ufe0f', (data && data.message) || 'Could not load.'); return; }
       var list = data.data || [];
-      if (!list.length && emptyIcon){ showEmpty(emptyIcon, emptyMsg); return; }
-      renderStationList(list);
+      renderStationList(list, {emptyIcon: emptyIcon, emptyMsg: emptyMsg, filterLabel: filterLabel});
     })['catch'](function(){ showEmpty('\u26a0\ufe0f', 'Could not reach FlaskyIPTV.'); });
   }
 
-  function loadPills(path, kind){
+  // Paginated Top view — mirrors the on-screen player's _loadTop(). Plain
+  // loadSimple() hard-capped this at one page of 100; RadioBrowser's "top"
+  // ranking runs into the thousands, so this one gets "load more" like
+  // the genre/country/language drilldowns below.
+  function loadTop(){
     showSpinner();
+    teardownLoadMore();
+    var LIMIT = 100;
+    var fetchPage = function(offset){
+      return getJSON('/api/radio/top?limit=' + LIMIT + '&offset=' + offset).then(function(r){
+        return { data: (r && r.data) || [], truncated: !!(r && r.truncated) };
+      });
+    };
+    fetchPage(0).then(function(d){
+      renderStationList(d.data, {filterLabel: 'top stations'});
+      startPagination(fetchPage, LIMIT, d.data.length, d.truncated);
+    })['catch'](function(){ showEmpty('\u26a0\ufe0f', 'Could not reach FlaskyIPTV.'); });
+  }
+
+  function loadPills(path, kind, filterLabel){
+    showSpinner();
+    teardownLoadMore();
     getJSON(path).then(function(data){
-      renderPillGrid((data && data.data) || [], kind);
+      renderPillGrid((data && data.data) || [], kind, filterLabel);
     })['catch'](function(){ showEmpty('\u26a0\ufe0f', 'Could not load.'); });
   }
 
   function loadHistory(){
     showSpinner();
+    teardownLoadMore();
     getJSON('/api/radio/history').then(function(data){
       var list = (data && data.data) || [];
       if (!list.length){ showEmpty('\ud83d\udd52', 'Nothing played yet.'); return; }
-      renderStationList(list);
+      renderStationList(list, {showPlayedAt: true, filterLabel: 'history'});
     })['catch'](function(){ showEmpty('\u26a0\ufe0f', 'Could not load history.'); });
   }
 
   byId('clearHistoryBtn').addEventListener('click', function(){
     deleteJSON('/api/radio/history').then(function(){ loadHistory(); })['catch'](function(){});
+  });
+
+  byId('exportFavoritesBtn').addEventListener('click', function(){
+    // Server-rendered download (Content-Disposition: attachment) of
+    // whatever's in the shared server-side favorites store — the same
+    // store this page's own star button reads/writes, and (as of this
+    // change) the same one the on-screen player uses too.
+    window.open(api('/api/radio/favorites/export.m3u'), '_self');
   });
 
   // Nearby needs the VISITING device's own location — a phone browsing
@@ -728,6 +1249,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   // message rather than a dead-end, same philosophy as the clipboard
   // fallback elsewhere in this app's companion pages.
   function loadNearby(){
+    teardownLoadMore();
     var list = listEl();
     list.innerHTML = '';
     var wrap = document.createElement('div');
@@ -753,7 +1275,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         });
         getJSON('/api/radio/nearby?' + p).then(function(data){
           if (!data || data.status === 'error'){ showEmpty('\u26a0\ufe0f', (data && data.message) || 'Could not load.'); return; }
-          renderStationList(data.data || []);
+          renderStationList(data.data || [], {filterLabel: 'nearby stations'});
         })['catch'](function(){ showEmpty('\u26a0\ufe0f', 'Could not reach FlaskyIPTV.'); });
       }, function(){
         showEmpty('\u26a0\ufe0f', 'Location permission was denied or is unavailable \u2014 many browsers require a secure (https) connection for this, which a plain http://<lan-ip> address is not.');
@@ -765,24 +1287,50 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     list.appendChild(wrap);
   }
 
+  // Populated once at startup (see startApp() below) rather than lazily on
+  // first Search-tab visit, so the dropdown is already usable the instant
+  // someone taps in — the fetch is small and doesn't block anything else.
+  function loadSearchCountries(){
+    getJSON('/api/radio/countries').then(function(data){
+      var list = (data && data.data) || [];
+      var sel = byId('searchCountry');
+      list.filter(function(c){ return c.name && (c.stationcount || 0) > 5; })
+        .slice(0, 150)
+        .forEach(function(c){
+          var o = document.createElement('option');
+          o.value = c.iso_3166_1 || c.name;
+          o.textContent = c.name + (c.stationcount ? ' (' + c.stationcount + ')' : '');
+          sel.appendChild(o);
+        });
+    })['catch'](function(){});
+  }
+
   function runSearch(){
     var q = byId('searchBox').value.trim();
     if (!q) return;
     showSpinner();
-    getJSON('/api/radio/search?q=' + encodeURIComponent(q)).then(function(data){
+    teardownLoadMore();
+    var p = new URLSearchParams({ q: q });
+    var cc = byId('searchCountry').value;
+    if (cc) p.set('country', cc);
+    getJSON('/api/radio/search?' + p.toString()).then(function(data){
       if (!data || data.status === 'error'){ showEmpty('\u26a0\ufe0f', (data && data.message) || 'Search failed.'); return; }
-      renderStationList(data.data || []);
+      renderStationList(data.data || [], {filterLabel: 'results'});
     })['catch'](function(){ showEmpty('\u26a0\ufe0f', 'Could not reach FlaskyIPTV.'); });
   }
 
   byId('searchBtn').addEventListener('click', runSearch);
   byId('searchBox').addEventListener('keydown', function(e){ if (e.key === 'Enter') runSearch(); });
+  byId('searchCountry').addEventListener('change', function(){
+    if (byId('searchBox').value.trim()) runSearch();
+  });
 
   byId('crumbBtn').addEventListener('click', function(){
     setCrumb(null);
-    if (currentTab === 'genres')    loadPills('/api/radio/genres', 'genre');
-    else if (currentTab === 'countries') loadPills('/api/radio/countries', 'country');
-    else if (currentTab === 'languages') loadPills('/api/radio/languages', 'language');
+    if (currentTab === 'genres')    loadPills('/api/radio/genres', 'genre', 'genres');
+    else if (currentTab === 'countries') loadPills('/api/radio/countries', 'country', 'countries');
+    else if (currentTab === 'languages') loadPills('/api/radio/languages', 'language', 'languages');
+    else if (currentTab === 'sources')   loadSourcesList();
   });
 
   document.querySelectorAll('.tab').forEach(function(btn){
@@ -793,7 +1341,60 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     });
   });
 
+  // ---------------------------------------------------------------------
+  // Tab bar drag-to-scroll + wheel-pan (desktop mouse) — same technique as
+  // the on-screen player's #rdio-tabs. Touch devices already get native
+  // momentum scroll for free from overflow-x:auto; a plain vertical mouse
+  // wheel over a horizontal-only overflow does nothing in most desktop
+  // browsers without this, which is the whole reason this exists.
+  //   • tabs-dragging is added only after >5px of movement, so a normal
+  //     click never gets it and tab buttons stay fully clickable.
+  //   • the capture-phase click handler swallows the click only when a
+  //     real drag happened, so releasing a drag over a tab doesn't also
+  //     activate it.
+  (function(){
+    var el = byId('tabs');
+    if (!el) return;
+    var down = false, dragged = false, startX = 0, startScrollLeft = 0;
+
+    el.addEventListener('mousedown', function(e){
+      if (e.button !== 0) return;
+      down = true;
+      dragged = false;
+      startX = e.clientX;
+      startScrollLeft = el.scrollLeft;
+    });
+
+    window.addEventListener('mouseup', function(){
+      if (!down) return;
+      down = false;
+      el.classList.remove('tabs-dragging');
+    });
+
+    window.addEventListener('mousemove', function(e){
+      if (!down) return;
+      var dx = e.clientX - startX;
+      if (Math.abs(dx) > 5){
+        dragged = true;
+        el.classList.add('tabs-dragging');
+      }
+      if (dragged) el.scrollLeft = startScrollLeft - dx;
+    });
+
+    el.addEventListener('click', function(e){
+      if (dragged){ e.stopPropagation(); e.preventDefault(); dragged = false; }
+    }, true);
+
+    // Vertical wheel → horizontal pan (Shift+scroll on standard mice,
+    // native horizontal swipe on trackpads).
+    el.addEventListener('wheel', function(e){
+      e.preventDefault();
+      el.scrollLeft += (e.deltaX || e.deltaY) * 0.8;
+    }, { passive: false });
+  })();
+
   loadTab('favorites');
+  loadSearchCountries();
 
   } // end startApp()
 
