@@ -2064,9 +2064,7 @@ _RADIO_UI_JS = r"""
 })();
 
 // ── state ─────────────────────────────────────────────────────────────────
-const _FAV_KEY = 'rdio_favs_v1';
 let _curTab       = 'search';
-let _favs         = [];
 let _ctriesLoaded = false;
 // Flat array of station objects for the currently visible list.
 // List-item onclicks use an index into this instead of a serialised JSON
@@ -2127,7 +2125,6 @@ window.radioOpen = function(){
   document.getElementById('radio-open-btn').classList.add('active');
   _rdioVizSyncBtn();
   _rdioNpBarShow();   // always visible now — show it (idle state if nothing playing yet)
-  _favsLoad();
   if(!_ctriesLoaded) _loadCountryDropdown();
   _rdioInjectLangTab();   // idempotent — adds Language tab if not already present
   // activate the current tab (re-entering keeps previous tab selected,
@@ -2585,7 +2582,7 @@ async function _loadHistory(){
       const iconFb = (s.icon_fallback || '').trim();
       const codec  = (s.codec || '').toUpperCase().replace('MPEG','MP3');
       const uuid   = s.stationuuid || '';
-      const fav    = _isFav(url, uuid);
+      const fav    = !!s._is_favorite;
       // Logo chain: primary logo → homepage favicon → 📻
       const logoH = logo
         ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(logo)}"
@@ -2672,31 +2669,10 @@ async function _loadNearby(){
 
 // ── M3U export from localStorage favorites ────────────────────────────────
 window._rdioExportM3U = function(){
-  _favsLoad();
-  if(!_favs.length){
-    if(typeof toast==='function') toast('No favorites to export','w');
-    return;
-  }
-  const lines = ['#EXTM3U'];
-  for(const s of _favs){
-    const url = (s.url_resolved||s.url||'').trim();
-    if(!url) continue;
-    const name  = (s.name||'Unknown').replace(/,/g,' ');
-    const logo  = (s.logo||'').replace(/"/g,'');
-    const group = (s.tags||s.countrycode||'Radio').replace(/"/g,'');
-    lines.push(`#EXTINF:-1 tvg-logo="${logo}" group-title="${group}",${name}`);
-    lines.push(url);
-  }
-  const blob = new Blob([lines.join('\n')+'\n'], {type:'audio/x-mpegurl;charset=utf-8'});
-  const a    = document.createElement('a');
-  a.href     = URL.createObjectURL(blob);
-  a.download = 'radio_favorites.m3u';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
-  const n = _favs.filter(s=>s.url).length;
-  if(typeof toast==='function') toast(`Exported ${n} station${n!==1?'s':''} 💾`,'k');
+  // Server-rendered download (Content-Disposition: attachment) of the
+  // shared server-side favorites store — the same store this modal's own
+  // ☆ buttons and the /radio LAN page both read and write.
+  window.open('/api/radio/favorites/export.m3u', '_self');
 };
 
 // ── _currentList index helpers ─────────────────────────────────────────────
@@ -2724,12 +2700,7 @@ window._rdioPlayIdx = function(i){
 window._rdioFavIdx = function(btn, i){
   const s = _currentList[i];
   if(!s) return;
-  _rdioToggleFav(
-    btn,
-    encodeURIComponent(s.url_resolved || s.url),
-    encodeURIComponent(s.stationuuid || ''),
-    encodeURIComponent(JSON.stringify(s))
-  );
+  _rdioToggleFav(btn, s);
 };
 
 // ── sleep timer ────────────────────────────────────────────────────────────
@@ -2942,46 +2913,60 @@ function _rdioNpBarShow(){
 }
 
 // ── favorites ─────────────────────────────────────────────────────────────
-function _favsLoad(){
-  try{ _favs = JSON.parse(localStorage.getItem(_FAV_KEY) || '[]'); }
-  catch(e){ _favs = []; }
-}
-function _favsSave(){
-  try{ localStorage.setItem(_FAV_KEY, JSON.stringify(_favs)); }
-  catch(e){}
-}
-function _isFav(url, uuid){
-  return _favs.some(f => (uuid && f.stationuuid && f.stationuuid === uuid) || f.url === url);
-}
-
-window._rdioToggleFav = function(btn, urlEnc, uuidEnc, stJsonEnc){
-  const url  = decodeURIComponent(urlEnc);
-  const uuid = decodeURIComponent(uuidEnc);
-  _favsLoad();
-  if(_isFav(url, uuid)){
-    _favs = _favs.filter(f => !((uuid && f.stationuuid && f.stationuuid===uuid) || f.url===url));
-    btn.classList.remove('active'); btn.textContent = '☆';
-    if(typeof toast === 'function') toast('Removed from Radio Favorites','k');
-  } else {
-    let st;
-    try{ st = JSON.parse(decodeURIComponent(stJsonEnc)); }
-    catch(e){ st = {name:'Unknown', url}; }
-    _favs.push(st);
-    btn.classList.add('active'); btn.textContent = '★';
-    if(typeof toast === 'function') toast('Added to Radio Favorites ★','k');
-  }
-  _favsSave();
-  // If we're on the favorites tab, refresh it live
-  if(_curTab === 'favorites') _renderFavs();
+// Server-persisted (/api/radio/favorites, backed by radio_favorites.json) —
+// the SAME store the standalone /radio LAN page's Favorites tab reads and
+// writes. Previously this lived in this browser's own localStorage only,
+// entirely disconnected from anything favorited via /radio (or vice
+// versa); every /api/radio/* list route already annotates each station
+// with _is_favorite server-side (see _mark_favorites() in radio_addon.py),
+// so rendering just trusts that flag instead of keeping a second,
+// independent copy of the favorites list client-side.
+window._rdioToggleFav = function(btn, station){
+  const willFav = !station._is_favorite;
+  station._is_favorite = willFav;
+  btn.classList.toggle('active', willFav);
+  btn.textContent = willFav ? '★' : '☆';
+  const req = willFav
+    ? fetch('/api/radio/favorites', {
+        method:  'POST',
+        headers: {'Content-Type': 'application/json'},
+        body:    JSON.stringify(station),
+      })
+    : fetch('/api/radio/favorites/' + encodeURIComponent(station.stationuuid || station.url_resolved || station.url), {
+        method: 'DELETE',
+      });
+  req.then(r => r.json()).then(data => {
+    const ok = data && (willFav ? data.added !== false : data.removed !== false);
+    if(!ok) throw new Error('rejected');
+    if(typeof toast === 'function') toast(willFav ? 'Added to Radio Favorites ★' : 'Removed from Radio Favorites','k');
+    // If we're on the favorites tab, refresh it live so a removal
+    // actually drops the row (an addition doesn't need a refetch — the
+    // button itself already reflects the new state).
+    if(_curTab === 'favorites' && !willFav) _renderFavs();
+  }).catch(() => {
+    station._is_favorite = !willFav;
+    btn.classList.toggle('active', !willFav);
+    btn.textContent = !willFav ? '★' : '☆';
+    if(typeof toast === 'function') toast('Could not update favorites','w');
+  });
 };
 
-function _renderFavs(){
-  _favsLoad();
-  if(!_favs.length){
+async function _renderFavs(){
+  _setBody(_loadingHtml());
+  let favs;
+  try{
+    const d = await _api('/api/radio/favorites');
+    favs = d.data || [];
+  }catch(e){
+    _setBody(_emptyHtml('⚠️', 'Could not reach the favorites store.'));
+    return;
+  }
+  if(!favs.length){
     _setBody(_emptyHtml('★', 'No favorites yet — tap ☆ on any station to save it'));
     return;
   }
-  _renderList(_favs, '', false);
+  favs.forEach(f => { f._is_favorite = true; });
+  _renderList(favs, '', false);
   // Prepend export button without duplicating list rendering
   const body = document.getElementById('rdio-body');
   if(body){
@@ -3031,7 +3016,7 @@ function _stationLiHtml(s, idx){
   const logo   = (s.logo          || '').trim();
   const iconFb = (s.icon_fallback || '').trim();
   const uuid  = s.stationuuid || '';
-  const fav   = _isFav(url, uuid);
+  const fav   = !!s._is_favorite;
   const logoH = logo
     ? `<img class="rdio-item-logo" loading="lazy" src="${_esc(logo)}"
          onerror="${iconFb
