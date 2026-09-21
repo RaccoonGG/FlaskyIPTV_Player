@@ -27,7 +27,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     --bg:#060612; --panel:#0e0e24; --panel-2:#14142e; --border:#23234a;
     --accent:#7c3aed; --accent-soft:rgba(124,58,237,.18); --accent-glow:rgba(124,58,237,.45);
     --text:#e4e8f5; --text-dim:#8b8fb0; --text-faint:#565a78;
-    --blue:#3b82f6; --cyan:#06b6d4; --green:#22c55e; --orange:#f59e0b; --red:#ef4444;
     --radius:16px; --radius-sm:10px;
     --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     --mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Menlo, Consolas, monospace;
@@ -579,11 +578,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   // -------------------------------------------------------------------
   function byId(id){ return document.getElementById(id); }
   function listEl(){ return byId('list'); }
-  function escapeHtml(s){
-    var d = document.createElement('div');
-    d.textContent = (s == null ? '' : String(s));
-    return d.innerHTML;
-  }
   function getJSON(url){ return fetch(api(url)).then(function(r){ return r.json(); }); }
   function postJSON(url, body){
     return fetch(api(url), {
