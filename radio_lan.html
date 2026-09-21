@@ -40,16 +40,33 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     /* Player-bar background alpha (0 = fully see-through, 1 = solid).
        Full-width bar, so this is the difference between "glass over the
        artwork" and "opaque strip that hides the bottom of the band" —
-       another one-number tweak. Paired with a text-shadow on the
-       player's own text/icons below so legibility doesn't depend on
-       guessing how bright a given track's artwork happens to be. */
-    --player-bar-alpha: 0.85;
-    /* .shell's own background alpha — deliberately much higher (more
-       opaque) than the player-bar/artwork band around it, since .shell
-       is "the app" and needs to read as one cohesive panel rather than
-       a loose scatter of individually-opaque tab pills/list rows with
-       the busy artwork band showing through every gap between them. */
-    --shell-alpha: 0.9;
+       another one-number tweak. History here: .78 -> .85 (chasing an
+       unrelated legibility complaint, see below) -> .7 -> this. G has
+       now said "not transparent at all" against .7 as tested, twice
+       total across the .85 and .7 attempts — going decisively lower so
+       there's no ambiguity left, with the text-shadow on the player's
+       own text/icons below still carrying legibility regardless of how
+       transparent the background itself is. If this STILL doesn't read
+       as visibly glass, the next thing to check is whether the browser
+       is actually serving a fresh copy of this file at all (see the
+       Cache-Control fix on the /radio route in radio_addon.py) rather
+       than tuning this number a fourth time. */
+    --player-bar-alpha: 0.5;
+    /* Layered glass: .shell is the BACK layer (behind everything —
+       tabs, rows, pills all sit "in front of" it) and stays quite
+       see-through; --chrome-alpha is the individual tabs/list-items/
+       pills sitting ON that layer, more opaque so their own text stays
+       legible, but still tinted-glass rather than flatly solid.
+       .shell was .9 (near-opaque) originally to stop tabs/rows looking
+       like they floated separately over the busy artwork with nothing
+       unifying them — that solved the floating problem, but also meant
+       NONE of the artwork ever showed through the content column itself
+       (G, with a 3rd screenshot of the Sources list specifically —
+       "that part needs to be itself transparent... different levels of
+       transparency"). Lower base + a distinct, more-opaque foreground
+       layer gets both: still one cohesive panel, but with real depth. */
+    --shell-alpha: 0.5;
+    --chrome-alpha: 0.75;
   }
   *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html,body{ margin:0; padding:0; color:var(--text); font-family:var(--font); }
@@ -126,22 +143,41 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     position:absolute; inset:0; background-size:cover; background-position:center;
     /* brightness(.32) made even vivid cover art read as a barely-there
        dark smudge once combined with blur + this page's already-dark
-       theme underneath — brightened it. 45px blur was still too heavy on
-       top of background-size:cover's own upscaling softness — a 600x600
-       cover stretched to fill a band this size already loses sharpness
-       before this filter even runs — so shapes/edges never read as
-       "artwork", just an amorphous glow. Cut down further so actual
-       photo content survives.
+       theme underneath — brightened it. 45px, then 18px, blur was STILL
+       too heavy on top of background-size:cover's own upscaling
+       softness — the source is a genuine 600x600 iTunes image
+       (/api/radio/artwork upgrades artworkUrl100 to 600x600bb, this
+       isn't a small thumbnail problem), but stretching even that to
+       fill a band this size needs real upscaling, which already softens
+       it before this filter ever runs. G called "still blurry" twice
+       running — going much lower this time so actual photo content
+       clearly survives; the residual softness from upscaling alone is
+       enough to keep this from looking like a hard image crop. */
        Feathered left/right via mask-image rather than left as a hard
        cover-cropped rectangle: a photo is rarely evenly colourful
        edge-to-edge, so a sharp cutoff right at the band's border can
        read as "a photo pasted in a box" (worse for off-centre/dark-on-
        one-side artwork) rather than ambient light bleeding out from the
        app. Fading it into the band's own flat fill at both edges sells
-       the glow regardless of what a given cover looks like. */
-    -webkit-mask-image: linear-gradient(to right, transparent 0%, black 18%, black 82%, transparent 100%);
-    mask-image: linear-gradient(to right, transparent 0%, black 18%, black 82%, transparent 100%);
-    filter:blur(18px) brightness(.6) saturate(1.5); opacity:0; transition:opacity 1s ease;
+       the glow regardless of what a given cover looks like.
+       Kept SMALL (5%, not the original 18%): the visible strip of the
+       band either side of .shell (the "gutter") is only
+       (band_width - 520px) / 2 wide, which shrinks fast as the window
+       narrows — 18% of the band's own width doesn't shrink at the same
+       rate, so on anything short of a very wide desktop window it ate
+       nearly the entire gutter, leaving almost nothing visible (G,
+       again with a screenshot — "too blurry... regressed" back to
+       before the brightness/blur fix, when really the art was just
+       faded into transparency). A calc()-based fixed-pixel fade would
+       track the gutter even more precisely, but jsdom's CSS engine
+       can't parse calc() inside a gradient stop at all (silently drops
+       the whole mask-image to "none"), which would leave this
+       untestable — 5% is a deliberate compromise: a real browser still
+       shows most of the gutter clearly at any width that has one worth
+       showing, and it stays a plain, verifiable percentage. */
+    -webkit-mask-image: linear-gradient(to right, transparent 0%, black 5%, black 95%, transparent 100%);
+    mask-image: linear-gradient(to right, transparent 0%, black 5%, black 95%, transparent 100%);
+    filter:blur(6px) brightness(.7) saturate(1.5); opacity:0; transition:opacity 1s ease;
   }
   #pageArtBgImage.active{ opacity:1; }
   button{ font-family:inherit; color:inherit; cursor:pointer; }
@@ -166,8 +202,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   .tabs::-webkit-scrollbar{ display:none; }
   .tabs.tabs-dragging{ cursor:grabbing; }
   .tab{
-    flex:none; border:1px solid var(--border); background:var(--panel); color:var(--text-dim);
+    flex:none; border:1px solid var(--border); color:var(--text-dim);
     border-radius:999px; padding:0 14px; height:32px; font-size:12.5px; font-weight:600; white-space:nowrap;
+    /* --chrome-alpha (see :root) — small, bounded count of these
+       (~11 tabs max) so a backdrop-filter here is cheap; unlike
+       .list-item/.pill below, which can run into the hundreds with
+       pagination, where the same blur repeated per-row would be a real
+       rendering cost for comparatively little visible benefit. */
+    background:rgba(14,14,36, var(--chrome-alpha)); backdrop-filter:blur(8px);
   }
   .tab.on{ background:var(--accent-soft); border-color:var(--accent); color:var(--text); }
 
@@ -224,9 +266,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   .empty-state .big{ font-size:34px; }
   .list-item{
     display:flex; align-items:center; gap:10px; padding:9px 10px;
-    background:var(--panel); border:1px solid var(--border); border-radius:var(--radius-sm);
+    /* --chrome-alpha, not backdrop-filter: a list can run into the
+       hundreds of rows with pagination, and a backdrop-filter repeated
+       per row is a real rendering cost (unlike .tab above, which is a
+       small bounded count) — the tinted background alone still shows a
+       hint of the artwork through every row without that cost. */
+    background:rgba(14,14,36, var(--chrome-alpha)); border:1px solid var(--border); border-radius:var(--radius-sm);
   }
-  .list-item:active{ background:var(--panel-2); }
+  .list-item:active{ background:rgba(20,20,46, var(--chrome-alpha)); }
   .li-logo{
     width:38px; height:38px; border-radius:8px; object-fit:contain; background:var(--panel-2);
     flex:none; display:flex; align-items:center; justify-content:center; font-size:17px;
@@ -247,10 +294,22 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   /* ---------- pill grid (genres/countries/languages) ---------- */
   .pill-grid{ display:flex; flex-wrap:wrap; gap:8px; }
   .pill{
-    border:1px solid var(--border); background:var(--panel); color:var(--text);
+    border:1px solid var(--border); color:var(--text);
     border-radius:999px; padding:0 14px; height:34px; font-size:12.5px;
+    /* --chrome-alpha, not backdrop-filter — same reasoning as
+       .list-item: a genre/country grid can render 100+ pills at once. */
+    background:rgba(14,14,36, var(--chrome-alpha));
   }
-  .pill.local{ background:var(--accent-soft); color:var(--accent); border-color:var(--accent); font-weight:700; }
+  /* Solid-ish fill, not --accent-soft (only 18% opacity) — every other
+     pill sits at --chrome-alpha (75%) and reads fine; this one is
+     meant to stand out as THE most important entry (the user's own
+     detected country), so it should be the most reliably legible one
+     on the list, not the least. At 18% opacity it let the artwork band
+     bleed straight through the text (G, with a screenshot — hard to
+     read against a busy background) — white text on a near-opaque
+     accent fill instead, so contrast never depends on what happens to
+     be playing. */
+  .pill.local{ background:rgba(124,58,237,.85); color:#fff; border-color:var(--accent); font-weight:700; }
   .pill.priority{ border-color:rgba(255,255,255,.18); }
 
   /* ---------- player bar ---------- */
@@ -694,47 +753,153 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   }
 
   // ---------------------------------------------------------------------
-  // Local-country guess — mirrors the on-screen player's country-tag
-  // ordering (window._rdioLocalCC there, set by the main app's own IIFE
-  // from "timezone / navigator.language" per its own comment). This
-  // standalone page has no access to that global at all, so it derives
-  // the same *kind* of no-permission-needed guess itself: primarily the
-  // region subtag of navigator.language ("en-US" -> "US"), falling back
-  // to a small IANA-timezone lookup for the common single-country zones
-  // when the locale carries no region. Not real geolocation, just the
-  // same rough heuristic used to bubble a likely-relevant country to the
-  // top of a list — silently gives up (empty string) if neither signal
-  // is available, same as the modal does.
+  // Local-country guess — ported from the MAIN APP's own
+  // _LOCALE_TAG_CANDIDATES (window._rdioLocalCC is set from
+  // `_LOCALE_TAG_CANDIDATES[0]`, which the main app's own comment
+  // confirms is "always the clean ISO-2 code"). radio_addon.py's modal
+  // only ever *reads* window._rdioLocalCC — it's the main app's own IIFE
+  // that computes it, and this standalone page has no access to that
+  // global at all, so it recomputes the same thing itself.
+  // This is a faithful copy of that logic, not a re-guess: same full
+  // IANA-timezone table, and — this was the actual bug in the first
+  // version of this — the SAME priority order. Timezone wins over
+  // language here (`fromTZ || fromLang` in the main app), not the other
+  // way around: `navigator.language` reports the OS/browser's display
+  // language, which for a great many people (English-language Windows
+  // installs are extremely common well outside English-speaking
+  // countries) has nothing to do with where they actually are, while
+  // the IANA timezone the OS resolves to is tied to their real location.
+  // Checking language first, as this used to, meant anyone with an
+  // English OS locale got bumped to the US/GB/etc. regardless of their
+  // real timezone — which is exactly what G was seeing.
   // ---------------------------------------------------------------------
   var TZ_COUNTRY_MAP = {
-    'America/New_York':'US','America/Chicago':'US','America/Denver':'US','America/Los_Angeles':'US',
-    'America/Anchorage':'US','America/Phoenix':'US','Pacific/Honolulu':'US',
-    'America/Toronto':'CA','America/Vancouver':'CA','America/Edmonton':'CA','America/Winnipeg':'CA','America/Halifax':'CA',
-    'Europe/London':'GB','Europe/Dublin':'IE','Europe/Paris':'FR','Europe/Berlin':'DE','Europe/Madrid':'ES',
-    'Europe/Rome':'IT','Europe/Amsterdam':'NL','Europe/Brussels':'BE','Europe/Vienna':'AT','Europe/Zurich':'CH',
-    'Europe/Warsaw':'PL','Europe/Prague':'CZ','Europe/Budapest':'HU','Europe/Bucharest':'RO','Europe/Athens':'GR',
-    'Europe/Lisbon':'PT','Europe/Stockholm':'SE','Europe/Oslo':'NO','Europe/Copenhagen':'DK','Europe/Helsinki':'FI',
-    'Europe/Moscow':'RU','Europe/Kiev':'UA','Europe/Kyiv':'UA','Europe/Istanbul':'TR',
-    'Asia/Tokyo':'JP','Asia/Shanghai':'CN','Asia/Hong_Kong':'HK','Asia/Seoul':'KR','Asia/Singapore':'SG',
-    'Asia/Kolkata':'IN','Asia/Calcutta':'IN','Asia/Bangkok':'TH','Asia/Jakarta':'ID','Asia/Manila':'PH',
-    'Asia/Dubai':'AE','Asia/Jerusalem':'IL',
-    'Australia/Sydney':'AU','Australia/Melbourne':'AU','Australia/Brisbane':'AU','Australia/Perth':'AU',
-    'Pacific/Auckland':'NZ',
-    'America/Sao_Paulo':'BR','America/Mexico_City':'MX','America/Bogota':'CO','America/Argentina/Buenos_Aires':'AR',
-    'Africa/Johannesburg':'ZA','Africa/Cairo':'EG','Africa/Lagos':'NG'
+    // ── Europe ──────────────────────────────────────────────────────
+    'europe/belgrade':'RS','europe/sarajevo':'BA','europe/zagreb':'HR',
+    'europe/ljubljana':'SI','europe/skopje':'MK','europe/podgorica':'ME',
+    'europe/tirane':'AL',
+    'europe/london':'GB','europe/dublin':'IE','europe/isle_of_man':'GB','europe/jersey':'GB','europe/guernsey':'GB',
+    'europe/paris':'FR','europe/berlin':'DE','europe/rome':'IT',
+    'europe/madrid':'ES','europe/lisbon':'PT',
+    'europe/amsterdam':'NL','europe/brussels':'BE',
+    'europe/warsaw':'PL','europe/prague':'CZ','europe/bratislava':'SK',
+    'europe/budapest':'HU','europe/bucharest':'RO','europe/sofia':'BG',
+    'europe/athens':'GR','europe/nicosia':'CY',
+    'europe/vienna':'AT','europe/zurich':'CH',
+    'europe/stockholm':'SE','europe/oslo':'NO','europe/copenhagen':'DK',
+    'europe/helsinki':'FI','atlantic/reykjavik':'IS',
+    'europe/moscow':'RU','europe/kyiv':'UA','europe/kiev':'UA','europe/minsk':'BY',
+    'europe/chisinau':'MD','europe/tiraspol':'MD',
+    'europe/riga':'LV','europe/tallinn':'EE','europe/vilnius':'LT',
+    'europe/istanbul':'TR','europe/ankara':'TR',
+    'europe/kaliningrad':'RU','europe/samara':'RU','europe/volgograd':'RU',
+    'europe/saratov':'RU','europe/ulyanovsk':'RU','europe/astrakhan':'RU',
+    'europe/luxembourg':'LU','europe/monaco':'MC','europe/andorra':'AD',
+    'europe/valletta':'MT','europe/san_marino':'IT','europe/vatican':'IT',
+    'europe/mariehamn':'FI',
+    'atlantic/azores':'PT','atlantic/madeira':'PT','atlantic/canary':'ES',
+    'atlantic/faroe':'DK',
+    // ── Asia ────────────────────────────────────────────────────────
+    'asia/dubai':'AE','asia/abu_dhabi':'AE',
+    'asia/riyadh':'SA','asia/jeddah':'SA',
+    'asia/kuwait':'KW','asia/qatar':'QA','asia/bahrain':'BH','asia/muscat':'OM',
+    'asia/baghdad':'IQ','asia/tehran':'IR',
+    'asia/jerusalem':'IL','asia/tel_aviv':'IL',
+    'asia/beirut':'LB','asia/damascus':'SY',
+    'asia/amman':'JO',
+    'asia/karachi':'PK','asia/lahore':'PK',
+    'asia/kolkata':'IN','asia/calcutta':'IN','asia/mumbai':'IN',
+    'asia/dhaka':'BD','asia/colombo':'LK','asia/kathmandu':'NP',
+    'asia/kabul':'AF',
+    'asia/tashkent':'UZ','asia/samarkand':'UZ',
+    'asia/almaty':'KZ','asia/qyzylorda':'KZ','asia/aqtau':'KZ','asia/aqtobe':'KZ','asia/oral':'KZ',
+    'asia/ashgabat':'TM','asia/dushanbe':'TJ','asia/bishkek':'KG',
+    'asia/tbilisi':'GE','asia/yerevan':'AM','asia/baku':'AZ',
+    'asia/tokyo':'JP','asia/seoul':'KR','asia/pyongyang':'KP',
+    'asia/shanghai':'CN','asia/chongqing':'CN','asia/harbin':'CN','asia/urumqi':'CN',
+    'asia/hong_kong':'HK','asia/taipei':'TW','asia/singapore':'SG',
+    'asia/kuala_lumpur':'MY','asia/kuching':'MY',
+    'asia/jakarta':'ID','asia/makassar':'ID','asia/jayapura':'ID',
+    'asia/manila':'PH','asia/bangkok':'TH','asia/vientiane':'LA',
+    'asia/ho_chi_minh':'VN','asia/hanoi':'VN',
+    'asia/yangon':'MM','asia/phnom_penh':'KH','asia/ulaanbaatar':'MN',
+    'asia/brunei':'BN','asia/dili':'TL',
+    'indian/maldives':'MV','indian/mauritius':'MU',
+    // ── Pacific / Oceania ───────────────────────────────────────────
+    'pacific/auckland':'NZ','pacific/chatham':'NZ',
+    'australia/sydney':'AU','australia/melbourne':'AU','australia/brisbane':'AU',
+    'australia/adelaide':'AU','australia/darwin':'AU','australia/perth':'AU',
+    'australia/hobart':'AU','australia/lord_howe':'AU',
+    'pacific/honolulu':'US','pacific/johnston':'US',
+    'pacific/guam':'US','pacific/saipan':'US',
+    'pacific/port_moresby':'PG','pacific/fiji':'FJ',
+    // ── Americas ────────────────────────────────────────────────────
+    'america/new_york':'US','america/los_angeles':'US','america/chicago':'US',
+    'america/denver':'US','america/phoenix':'US','america/anchorage':'US',
+    'america/adak':'US','america/juneau':'US','america/sitka':'US','america/nome':'US',
+    'america/boise':'US','america/detroit':'US','america/kentucky/louisville':'US',
+    'america/kentucky/monticello':'US','america/indiana/indianapolis':'US',
+    'america/indiana/vincennes':'US','america/indiana/winamac':'US',
+    'america/indiana/marengo':'US','america/indiana/tell_city':'US',
+    'america/indiana/vevay':'US','america/north_dakota/center':'US',
+    'america/north_dakota/new_salem':'US','america/north_dakota/beulah':'US',
+    'america/puerto_rico':'US','america/virgin':'US',
+    'america/toronto':'CA','america/vancouver':'CA','america/montreal':'CA',
+    'america/winnipeg':'CA','america/edmonton':'CA','america/halifax':'CA',
+    'america/st_johns':'CA','america/regina':'CA','america/whitehorse':'CA',
+    'america/yellowknife':'CA','america/dawson':'CA','america/iqaluit':'CA',
+    'america/mexico_city':'MX','america/tijuana':'MX','america/monterrey':'MX',
+    'america/merida':'MX','america/chihuahua':'MX','america/hermosillo':'MX',
+    'america/mazatlan':'MX','america/cancun':'MX','america/ojinaga':'MX',
+    'america/bogota':'CO',
+    'america/santiago':'CL','america/buenos_aires':'AR','america/argentina/buenos_aires':'AR',
+    'america/argentina/cordoba':'AR','america/argentina/salta':'AR',
+    'america/sao_paulo':'BR','america/manaus':'BR','america/belem':'BR',
+    'america/fortaleza':'BR','america/recife':'BR','america/noronha':'BR',
+    'america/cuiaba':'BR','america/porto_velho':'BR','america/boa_vista':'BR',
+    'america/caracas':'VE','america/havana':'CU',
+    'america/lima':'PE','america/la_paz':'BO','america/asuncion':'PY',
+    'america/montevideo':'UY','america/guayaquil':'EC','america/guyana':'GY',
+    'america/paramaribo':'SR','america/cayenne':'GF',
+    'america/panama':'PA','america/costa_rica':'CR','america/managua':'NI',
+    'america/tegucigalpa':'HN','america/el_salvador':'SV','america/guatemala':'GT',
+    'america/belize':'BZ','america/nassau':'BS','america/kingston':'JM',
+    'america/port-au-prince':'HT','america/santo_domingo':'DO',
+    'america/port_of_spain':'TT','america/barbados':'BB','america/curacao':'CW',
+    // ── Africa ──────────────────────────────────────────────────────
+    'africa/cairo':'EG','africa/johannesburg':'ZA','africa/lagos':'NG',
+    'africa/nairobi':'KE','africa/casablanca':'MA','africa/tunis':'TN',
+    'africa/algiers':'DZ','africa/accra':'GH','africa/addis_ababa':'ET',
+    'africa/dakar':'SN','africa/abidjan':'CI','africa/douala':'CM',
+    'africa/kinshasa':'CD','africa/brazzaville':'CG','africa/luanda':'AO',
+    'africa/maputo':'MZ','africa/harare':'ZW','africa/lusaka':'ZM',
+    'africa/dar_es_salaam':'TZ','africa/kampala':'UG','africa/kigali':'RW',
+    'africa/bujumbura':'BI','africa/lilongwe':'MW','africa/windhoek':'NA',
+    'africa/gaborone':'BW','africa/mbabane':'SZ','africa/maseru':'LS',
+    'africa/tripoli':'LY','africa/khartoum':'SD','africa/juba':'SS',
+    'africa/ndjamena':'TD','africa/niamey':'NE','africa/bamako':'ML',
+    'africa/ouagadougou':'BF','africa/conakry':'GN','africa/freetown':'SL',
+    'africa/monrovia':'LR','africa/bissau':'GW','africa/banjul':'GM',
+    'africa/nouakchott':'MR','africa/el_aaiun':'EH','africa/lome':'TG',
+    'africa/porto-novo':'BJ','africa/libreville':'GA','africa/malabo':'GQ',
+    'africa/sao_tome':'ST','africa/djibouti':'DJ','africa/asmara':'ER',
+    'africa/mogadishu':'SO','africa/antananarivo':'MG',
+    'indian/reunion':'RE','indian/comoro':'KM'
   };
 
   function guessLocalCountry(){
+    var fromLang = '';
     try {
-      var lang = navigator.language || (navigator.languages && navigator.languages[0]) || '';
-      var m = lang.match(/[-_]([A-Za-z]{2})$/);
-      if (m) return m[1].toUpperCase();
+      var lang = (navigator.language || (navigator.languages && navigator.languages[0]) || '').toUpperCase();
+      if (lang.indexOf('-') !== -1) fromLang = lang.split('-').pop();
     } catch (e) {}
+    var fromTZ = '';
     try {
-      var tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      if (tz && TZ_COUNTRY_MAP[tz]) return TZ_COUNTRY_MAP[tz];
+      var tz = (Intl.DateTimeFormat().resolvedOptions().timeZone || '').toLowerCase();
+      fromTZ = TZ_COUNTRY_MAP[tz] || '';
     } catch (e) {}
-    return '';
+    // Timezone wins — see the comment block above for why.
+    return (fromTZ || fromLang || '').toUpperCase().slice(0, 2);
   }
 
   var LOCAL_CC = guessLocalCountry();
