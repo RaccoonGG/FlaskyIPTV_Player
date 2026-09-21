@@ -2064,7 +2064,7 @@ _RADIO_UI_JS = r"""
 })();
 
 // ── state ─────────────────────────────────────────────────────────────────
-let _curTab       = 'search';
+let _curTab       = 'favorites';
 let _ctriesLoaded = false;
 // Flat array of station objects for the currently visible list.
 // List-item onclicks use an index into this instead of a serialised JSON
@@ -2128,9 +2128,12 @@ window.radioOpen = function(){
   if(!_ctriesLoaded) _loadCountryDropdown();
   _rdioInjectLangTab();   // idempotent — adds Language tab if not already present
   // activate the current tab (re-entering keeps previous tab selected,
-  // and restores a country/genre drill-down if one was left active)
+  // and restores a country/genre drill-down if one was left active).
+  // Which tab shows on the very first open is decided purely by which
+  // button carries class="rdio-tab active" in the static markup — see
+  // the tab bar in FlaskyIPTV_Player_byGG.py (#rdio-tabs).
   const activeTab = document.querySelector('.rdio-tab.active');
-  const tabName   = activeTab ? activeTab.dataset.tab : 'search';
+  const tabName   = activeTab ? activeTab.dataset.tab : 'favorites';
   _activateTab(tabName, activeTab, true);
 };
 
