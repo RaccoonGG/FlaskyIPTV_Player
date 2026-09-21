@@ -4700,12 +4700,12 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 
     <!-- tabs -->
     <div class="rdio-tabs" id="rdio-tabs">
-      <button class="rdio-tab active" data-tab="search"   onclick="radioTab(this,'search')"  >🔍 Search</button>
+      <button class="rdio-tab"        data-tab="search"   onclick="radioTab(this,'search')"  >🔍 Search</button>
+      <button class="rdio-tab active" data-tab="favorites"onclick="radioTab(this,'favorites')">★ Favorites</button>
       <button class="rdio-tab"        data-tab="top"      onclick="radioTab(this,'top')"     >🔥 Top 100</button>
       <button class="rdio-tab"        data-tab="builtin"  onclick="radioTab(this,'builtin')" >⚡ Quick</button>
       <button class="rdio-tab"        data-tab="country"  onclick="radioTab(this,'country')" >🌍 Country</button>
       <button class="rdio-tab"        data-tab="genre"    onclick="radioTab(this,'genre')"   >🎵 Genre</button>
-      <button class="rdio-tab"        data-tab="favorites"onclick="radioTab(this,'favorites')">★ Favorites</button>
       <button class="rdio-tab"        data-tab="sources"  onclick="radioTab(this,'sources')" >📂 M3U</button>
       <button class="rdio-tab"        data-tab="trending" onclick="radioTab(this,'trending')">📈 Trending</button>
       <button class="rdio-tab"        data-tab="history"  onclick="radioTab(this,'history')" >🕐 History</button>
