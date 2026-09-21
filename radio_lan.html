@@ -257,7 +257,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   }
 
   /* ---------- list ---------- */
-  .list{ display:flex; flex-direction:column; gap:6px; padding-bottom:70px; }
+  /* padding-bottom is the room reserved under the last row so it can be
+     scrolled clear of the fixed .player-bar (main adds another 24px). The
+     bar is ~105px tall now that it has two rows (was ~61px with one) —
+     114px keeps the same ~33px of breathing room the old 70px had. If the
+     bar's height changes again, this has to move with it. */
+  .list{ display:flex; flex-direction:column; gap:6px; padding-bottom:114px; }
   .empty-state{
     display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px;
     padding:60px 20px; color:var(--text-faint); font-size:13px; text-align:center;
@@ -327,7 +332,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     background:rgba(10,10,26, var(--player-bar-alpha)); backdrop-filter:blur(16px);
     border-top:1px solid var(--border);
   }
-  .player-bar-inner{ max-width:520px; margin:0 auto; width:100%; display:flex; align-items:center; gap:10px; }
+  /* Two stacked rows: now-playing info on top (logo + station / ♪ track /
+     meta, with the whole bar width to itself), controls underneath (🎲 ⏱
+     ▶ volume). Everything used to share ONE row, which left the info
+     column ~78px wide on a phone — every line ellipsised down to almost
+     nothing. */
+  .player-bar-inner{ max-width:520px; margin:0 auto; width:100%; display:flex; flex-direction:column; gap:6px; }
+  .player-info-row{ display:flex; align-items:center; gap:10px; min-width:0; }
+  .player-controls-row{ display:flex; align-items:center; gap:10px; }
   .player-logo{
     width:40px; height:40px; border-radius:8px; object-fit:contain; background:var(--panel-2);
     border:1px solid var(--border); flex:none;
@@ -349,7 +361,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     align-items:center; justify-content:center;
   }
   .player-btn:disabled{ opacity:.35; border-color:var(--border); background:var(--panel-2); }
-  .vol-slider{ flex:none; width:70px; accent-color:var(--accent); }
+  .vol-slider{ flex:1; min-width:0; accent-color:var(--accent); }
   .mini-btn{
     flex:none; border:none; background:none; color:var(--text); opacity:.55; cursor:pointer;
     font-size:14px; width:26px; height:26px; padding:0; border-radius:6px;
@@ -435,18 +447,22 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   </div>
 
   <main>
+    <!-- Tab order mirrors the on-screen radio modal (radio_addon.py, see
+         _rdioOrderTabs): Search first, Favorites second, then the modal's own
+         order. Keep the two in step if either changes. Favorites is still the
+         tab this page opens on (see loadTab('favorites') at the bottom). -->
     <div class="tabs" id="tabs">
+      <button class="tab" data-tab="search">Search</button>
       <button class="tab on" data-tab="favorites">★ Favorites</button>
       <button class="tab" data-tab="top">Top</button>
       <button class="tab" data-tab="builtin">Built-in</button>
+      <button class="tab" data-tab="countries">Countries</button>
+      <button class="tab" data-tab="genres">Genres</button>
       <button class="tab" data-tab="sources">Sources</button>
       <button class="tab" data-tab="trending">Trending</button>
-      <button class="tab" data-tab="genres">Genres</button>
-      <button class="tab" data-tab="countries">Countries</button>
+      <button class="tab" data-tab="history">History</button>
       <button class="tab" data-tab="languages">Languages</button>
       <button class="tab" data-tab="nearby">Nearby</button>
-      <button class="tab" data-tab="history">History</button>
-      <button class="tab" data-tab="search">Search</button>
     </div>
 
     <div class="crumb-row" id="crumbRow">
@@ -475,18 +491,22 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   <div class="player-bar">
     <div class="player-bar-inner">
-      <img class="player-logo" id="playerLogo" src="" style="display:none" referrerpolicy="no-referrer" loading="lazy" decoding="async">
-      <div class="player-logo" id="playerLogoFallback">📻</div>
-      <div class="player-info">
-        <div class="player-name" id="playerName">Nothing playing</div>
-        <div class="player-now-playing" id="playerNowPlaying"></div>
-        <div class="player-meta" id="playerMeta"></div>
+      <div class="player-info-row">
+        <img class="player-logo" id="playerLogo" src="" style="display:none" referrerpolicy="no-referrer" loading="lazy" decoding="async">
+        <div class="player-logo" id="playerLogoFallback">📻</div>
+        <div class="player-info">
+          <div class="player-name" id="playerName">Nothing playing</div>
+          <div class="player-now-playing" id="playerNowPlaying"></div>
+          <div class="player-meta" id="playerMeta"></div>
+        </div>
       </div>
-      <button class="mini-btn" id="shuffleBtn" type="button" title="Shuffle — play similar station" disabled>🎲</button>
-      <button class="mini-btn" id="sleepBtn" type="button" title="Sleep timer  (15 / 30 / 45 / 60 min)">⏱</button>
-      <button class="player-btn" id="playPauseBtn" type="button" disabled>▶</button>
-      <input class="vol-slider" id="volSlider" type="range" min="0" max="100" value="80">
-      <audio id="audioEl" preload="none"></audio>
+      <div class="player-controls-row">
+        <button class="mini-btn" id="shuffleBtn" type="button" title="Shuffle — play similar station" disabled>🎲</button>
+        <button class="mini-btn" id="sleepBtn" type="button" title="Sleep timer  (15 / 30 / 45 / 60 min)">⏱</button>
+        <button class="player-btn" id="playPauseBtn" type="button" disabled>▶</button>
+        <input class="vol-slider" id="volSlider" type="range" min="0" max="100" value="80">
+        <audio id="audioEl" preload="none"></audio>
+      </div>
     </div>
   </div>
 </div>
