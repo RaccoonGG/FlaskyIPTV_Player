@@ -938,6 +938,21 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     return result;
   }
 
+  function appendPill(wrap, kind, value, label, count, known){
+    var btn = document.createElement('button');
+    btn.className = 'pill';
+    btn.type = 'button';
+    if (kind === 'country'){
+      var cc = String(value).toUpperCase();
+      if (LOCAL_CC && cc === LOCAL_CC) btn.classList.add('local');
+      else if (PRIORITY_CC.indexOf(cc) !== -1) btn.classList.add('priority');
+    }
+    btn.textContent = label + (count ? ' (' + count + ')' : '');
+    btn.addEventListener('click', function(){ drillInto(kind, value, label); });
+    wrap.appendChild(btn);
+    if (known) known[String(value).toLowerCase()] = true;
+  }
+
   function renderPillGrid(items, kind, filterLabel){
     if (!items || !items.length){ showEmpty('📭', 'Nothing available.'); return; }
     if (kind === 'country') items = sortCountries(items);
@@ -946,6 +961,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     list.appendChild(makeFilterBar(filterLabel || (kind + 's')));
     var wrap = document.createElement('div');
     wrap.className = 'pill-grid';
+    var known = {};   // lowercase value -> true, so a later live genre search can skip dupes
     items.forEach(function(g){
       var value, label, count;
       if (kind === 'country'){
@@ -956,20 +972,52 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         label = value;
       }
       count = g && g.stationcount;
-      var btn = document.createElement('button');
-      btn.className = 'pill';
-      btn.type = 'button';
-      if (kind === 'country'){
-        var cc = String(value).toUpperCase();
-        if (LOCAL_CC && cc === LOCAL_CC) btn.classList.add('local');
-        else if (PRIORITY_CC.indexOf(cc) !== -1) btn.classList.add('priority');
-      }
-      btn.textContent = label + (count ? ' (' + count + ')' : '');
-      btn.addEventListener('click', function(){ drillInto(kind, value, label); });
-      wrap.appendChild(btn);
+      appendPill(wrap, kind, value, label, count, known);
     });
     list.appendChild(wrap);
     list.appendChild(makeFilterEmpty());
+    // Genres only: the grid above is RadioBrowser's ~80 most-popular tags by
+    // station count, so a real but niche genre (e.g. "true crime") can have
+    // just a handful of stations and never crack that list. Wire the filter
+    // box to also live-search the FULL tag database once typing pauses, so
+    // such a tag can still be found. Countries has no such cap (it already
+    // returns every country) and Languages isn't the reported gap, so this
+    // stays genre-only rather than broadened to every kind.
+    if (kind === 'genre') wireGenreSearch(wrap, known);
+  }
+
+  // See radio_addon.py's _rdioWireGenreSearch/_rdioGenreSearchTags (the
+  // on-screen player's equivalent) for the full rationale — this mirrors it
+  // for the standalone LAN page. Debounced (350ms); a seq counter plus a
+  // couple of staleness checks discard a response that's no longer
+  // relevant (input changed, or the pill grid isn't on screen anymore)
+  // rather than letting late responses race and clobber a newer view.
+  var genreSearchTimer = null, genreSearchSeq = 0;
+  function wireGenreSearch(wrap, known){
+    var input = document.querySelector('.filter-input');
+    if (!input) return;
+    input.addEventListener('input', function(){
+      clearTimeout(genreSearchTimer);
+      var q = input.value.trim();
+      if (q.length < 2) return;   // too short to be worth a round trip
+      genreSearchTimer = setTimeout(function(){ searchMoreGenres(q, wrap, known, input); }, 350);
+    });
+  }
+
+  function searchMoreGenres(q, wrap, known, input){
+    var seq = ++genreSearchSeq;
+    getJSON('/api/radio/genres?q=' + encodeURIComponent(q) + '&limit=150').then(function(d){
+      if (seq !== genreSearchSeq) return;              // superseded by a later keystroke
+      if (!document.body.contains(wrap)) return;        // user left the Genres tab meanwhile
+      if (input.value.trim() !== q) return;              // input changed while this was in flight
+      ((d && d.data) || []).forEach(function(t){
+        var nm = (t && t.name || '').trim();
+        if (!nm || !(t.stationcount > 0)) return;
+        if (known[nm.toLowerCase()]) return;
+        appendPill(wrap, 'genre', nm, nm, t.stationcount, known);
+      });
+      applyListFilter(input.value);   // re-apply current text to the now-augmented grid
+    })['catch'](function(){ /* best-effort enhancement — top-80 list stays usable on failure */ });
   }
 
   // ---------------------------------------------------------------------
