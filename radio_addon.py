@@ -562,10 +562,25 @@ class RadioBrowserClient:
             {"order": "stationcount", "reverse": "true"},
         )
 
-    def genres(self, limit: int = 80) -> List[Dict]:
-        """Popular genre tags with station counts."""
+    def genres(self, limit: int = 80, filter_q: Optional[str] = None) -> List[Dict]:
+        """Genre tags with station counts.
+
+        Without filter_q: the most popular tags (by station count) — what
+        the Genre tab's grid shows by default. A real but niche genre (say
+        "true crime") can exist with only a handful of stations and never
+        crack this top-N list, which is dominated by tags like pop/rock/
+        news with thousands of stations each — so it would never appear
+        here no matter the limit.
+
+        With filter_q: EVERY tag in RadioBrowser's whole tag database
+        (thousands of them, not just the popular ones) whose name contains
+        filter_q as a substring, via their dedicated /json/tags/<filter>
+        endpoint (see https://docs.radio-browser.info/#list-of-tags) —
+        this is what actually lets a niche genre be found.
+        """
+        endpoint = f"tags/{urllib.parse.quote(filter_q.strip())}" if filter_q else "tags"
         return self._request(
-            "tags",
+            endpoint,
             {"limit": limit, "order": "stationcount", "reverse": "true", "hidebroken": "true"},
         )
 
@@ -1384,12 +1399,17 @@ def register_radio_addon(app: Any, state: Any = None) -> Any:
         return jsonify({"status": "ok", "data": data, "count": len(data)})
 
     # ── /api/radio/genres ─────────────────────────────────────────────────────
+    # ?limit=80 [&q=crime] — q searches EVERY tag in RadioBrowser's database
+    # for the given substring, not just the popular top-N; see
+    # RadioBrowserClient.genres(). Backward compatible: omitting q behaves
+    # exactly as before.
 
     @app.route("/api/radio/genres")
     def radio_genres():
         limit = _clamp(request.args.get("limit", 80), 1, 300)
-        data  = rb.genres(limit=limit)
-        return jsonify({"status": "ok", "data": data, "count": len(data)})
+        q     = request.args.get("q", "").strip()
+        data  = rb.genres(limit=limit, filter_q=q or None)
+        return jsonify({"status": "ok", "data": data, "count": len(data), "query": q})
 
     # ── /api/radio/languages ──────────────────────────────────────────────────
 
@@ -2295,6 +2315,13 @@ window._rdioByCountry = async function(cc, label){
 };
 
 // ── genre grid → stations ─────────────────────────────────────────────────
+// Default view: RadioBrowser's ~80 most-popular tags (by station count) —
+// good for browsing, but a real, niche genre (e.g. "true crime") can exist
+// with only a handful of stations and never crack that top-80 list, so it
+// would never show up no matter how the visible pills are filtered. Typing
+// in the filter box (see _rdioWireGenreSearch below) also live-searches
+// RadioBrowser's WHOLE tag database for a match, so a real tag surfaces
+// even when it's nowhere near the top 80.
 async function _loadGenreGrid(){
   _setBody(_loadingHtml());
   try{
@@ -2302,16 +2329,65 @@ async function _loadGenreGrid(){
     const ts = (d.data || []).filter(t => t.name && (t.stationcount||0) > 0);
     if(!ts.length){ _setBody(_emptyHtml('🎵','No genre data available')); return; }
     let h = _filterHeaderHtml('genres');
-    h += '<div class="rdio-tag-grid">';
-    for(const t of ts){
-      const name  = _esc(t.name);
-      const count = t.stationcount ? `<span style="font-size:9px;opacity:.45;margin-left:3px">${t.stationcount}</span>` : '';
-      h += `<button class="rdio-tag" onclick="_rdioByGenre('${name}')">${name}${count}</button>`;
-    }
+    h += '<div class="rdio-tag-grid" id="rdio-genre-grid">';
+    for(const t of ts) h += _rdioGenreTagBtnHtml(t.name, t.stationcount);
     h += '</div>';
     h += _filterEmptyHtml();
     _setBody(h);
+    _rdioWireGenreSearch();
   }catch(e){ _setBody(_emptyHtml('⚠️', _esc(e.message))); }
+}
+
+function _rdioGenreTagBtnHtml(name, count){
+  const n = _esc(name);
+  const c = count ? `<span style="font-size:9px;opacity:.45;margin-left:3px">${count}</span>` : '';
+  return `<button class="rdio-tag" data-genre-name="${n.toLowerCase()}" onclick="_rdioByGenre('${n}')">${n}${c}</button>`;
+}
+
+// Beyond the top-80 grid already on screen, also live-search RadioBrowser's
+// full tag list (thousands of tags — /api/radio/genres?q=…, backed by their
+// /json/tags/<filter> substring-search endpoint) once typing pauses, and
+// append any newly-found tag as an extra pill. Debounced (350ms) so it's
+// one request per pause in typing, not one per keystroke; a seq counter
+// plus a couple of staleness checks discard a response that's no longer
+// relevant (input changed, or the user left the Genre tab) rather than
+// letting late responses race and clobber a newer view.
+let _rdioGenreSearchTimer = null;
+let _rdioGenreSearchSeq   = 0;
+function _rdioWireGenreSearch(){
+  const input = document.getElementById('rdio-cat-filter');
+  const grid  = document.getElementById('rdio-genre-grid');
+  if(!input || !grid) return;
+  input.addEventListener('input', () => {
+    clearTimeout(_rdioGenreSearchTimer);
+    const q = input.value.trim();
+    if(q.length < 2) return;   // too short to be worth a round trip
+    _rdioGenreSearchTimer = setTimeout(() => _rdioGenreSearchTags(q, grid, input), 350);
+  });
+}
+
+async function _rdioGenreSearchTags(q, grid, input){
+  const seq = ++_rdioGenreSearchSeq;
+  try{
+    const d = await _api(`/api/radio/genres?q=${encodeURIComponent(q)}&limit=150`);
+    if(seq !== _rdioGenreSearchSeq) return;        // superseded by a later keystroke
+    if(!document.body.contains(grid)) return;      // user left the Genre tab meanwhile
+    if(input.value.trim() !== q) return;           // input changed while this was in flight
+    const have = new Set(Array.from(grid.querySelectorAll('button.rdio-tag'))
+      .map(b => b.dataset.genreName || ''));
+    let added = '';
+    for(const t of (d.data || [])){
+      const nm = (t.name || '').trim();
+      if(!nm || (t.stationcount||0) <= 0) continue;
+      if(have.has(nm.toLowerCase())) continue;
+      have.add(nm.toLowerCase());
+      added += _rdioGenreTagBtnHtml(nm, t.stationcount);
+    }
+    if(added) grid.insertAdjacentHTML('beforeend', added);
+    // Re-apply whatever's currently typed so newly-appended pills are
+    // shown/hidden consistently with the rest of the (now live-augmented) grid.
+    window._rdioFilterCategory(input);
+  }catch(e){ /* best-effort enhancement — top-80 list stays usable on failure */ }
 }
 
 window._rdioByGenre = async function(tag){
