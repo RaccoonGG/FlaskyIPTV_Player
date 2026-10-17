@@ -10163,6 +10163,129 @@ window._rdioLocalCC = (_LOCALE_TAG_CANDIDATES[0] || '').toUpperCase().slice(0, 2
 
 
 </script>
+<script>
+/* FLASKY-EXIT-GUARD:BEGIN — ask before the page is left (phone Back, desktop tab/window close, reload) */
+(function(){
+  'use strict';
+  var armed = false, bypass = false, bypassTimer = null, dlg = null, prevFocus = null;
+  var GESTURES = ['pointerup', 'mousedown', 'touchend', 'click', 'keydown'];
+
+  function isOurs(s){ return !!(s && s.flExitGuard); }
+
+  // Let intentional navigation (e.g. a future reload button) skip the prompt once.
+  window.flaskyExitGuardSkip = function(ms){
+    bypass = true;
+    clearTimeout(bypassTimer);
+    bypassTimer = setTimeout(function(){ bypass = false; }, ms || 3000);
+  };
+
+  // ── Desktop: X / Ctrl+W / reload → browser's native "Leave site?" prompt ──
+  // addEventListener (not window.onbeforeunload=) so it coexists with the
+  // recording/DVR handler, which cannot clobber it and vice-versa.
+  window.addEventListener('beforeunload', function(e){
+    if(bypass) return;
+    e.preventDefault();
+    e.returnValue = '';
+    return '';
+  });
+
+  // ── Phone Back button / mouse Back: a history sentinel turns "leave" into a popstate ──
+  // Chrome skips history entries a page adds without a user gesture, so the
+  // sentinel is only pushed on the first real gesture (not at page load).
+  function arm(){
+    if(armed) return true;
+    if(isOurs(history.state)){ armed = true; return true; }   // survived a reload
+    try{ history.pushState({ flExitGuard: 1 }, '', location.href); armed = true; }catch(_){}
+    return armed;
+  }
+  function onGesture(e){
+    if(e.type === 'keydown' && e.key === 'Escape') return;    // Esc is not an activating key
+    var ua = navigator.userActivation;
+    if(ua && !ua.hasBeenActive) return;                        // wait for a genuine gesture
+    if(arm()) GESTURES.forEach(function(n){ document.removeEventListener(n, onGesture, true); });
+  }
+  if(isOurs(history.state)) armed = true;
+  else GESTURES.forEach(function(n){ document.addEventListener(n, onGesture, true); });
+
+  window.addEventListener('popstate', function(e){
+    if(!armed || isOurs(e.state)) return;                      // only react to stepping back off our entry
+    ask();
+  });
+
+  function closeDlg(){
+    if(dlg && dlg.parentNode) dlg.parentNode.removeChild(dlg);
+    dlg = null;
+    document.removeEventListener('keydown', onDlgKey, true);
+    try{ if(prevFocus && prevFocus.focus) prevFocus.focus(); }catch(_){}
+    prevFocus = null;
+  }
+  function stay(){
+    closeDlg();
+    try{ history.pushState({ flExitGuard: 1 }, '', location.href); }catch(_){}   // re-arm for the next Back
+  }
+  function leave(){
+    closeDlg();
+    armed = false;                                             // let the next Back behave natively
+    window.flaskyExitGuardSkip(3000);
+    history.back();
+    // A tab with no earlier history can't go back from script — tell the user how to finish leaving.
+    setTimeout(function(){ note('Press Back once more to exit'); }, 800);
+  }
+  function onDlgKey(e){
+    if(e.key === 'Escape'){ e.preventDefault(); e.stopPropagation(); stay(); }
+  }
+  function note(msg){
+    var n = document.createElement('div');
+    n.id = 'exit-confirm-note';
+    n.textContent = msg;
+    n.style.cssText = 'position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:9200;' +
+      'background:var(--s4);color:var(--txt);border:1px solid var(--bdr2);border-radius:8px;' +
+      'padding:9px 14px;font-size:13px;box-shadow:0 8px 32px rgba(0,0,0,.6);max-width:90vw;text-align:center';
+    document.body.appendChild(n);
+    setTimeout(function(){ if(n.parentNode) n.parentNode.removeChild(n); }, 3000);
+  }
+
+  function mk(tag, css, text){
+    var el = document.createElement(tag);
+    if(css) el.style.cssText = css;
+    if(text != null) el.textContent = text;
+    return el;
+  }
+  function ask(){
+    if(dlg) return;
+    try{   // an element in fullscreen hides everything outside it — leave fullscreen so the prompt is visible
+      if(document.fullscreenElement || document.webkitFullscreenElement)
+        (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    }catch(_){}
+    prevFocus = document.activeElement;
+    dlg = mk('div', 'position:fixed;inset:0;z-index:9200;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center');
+    dlg.id = 'exit-confirm-overlay';
+    dlg.setAttribute('role', 'alertdialog');
+    dlg.setAttribute('aria-modal', 'true');
+    var box = mk('div', 'background:var(--s2);border:1px solid var(--bdr2);border-radius:12px;padding:18px 16px 14px;' +
+      'width:min(360px,92vw);box-shadow:0 8px 32px rgba(0,0,0,.6);color:var(--txt);display:flex;flex-direction:column;gap:10px');
+    var title = mk('div', 'font-size:15px;font-weight:700', 'Leave FlaskyIPTV?');
+    var msg = mk('div', 'font-size:13px;color:var(--txt2);line-height:1.5', 'Playback will stop if you leave this page.');
+    var row = mk('div', 'display:flex;gap:8px;justify-content:flex-end;margin-top:4px');
+    var btnLeave = mk('button', 'height:36px;padding:0 16px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;' +
+      'background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3)', 'Leave');
+    btnLeave.id = 'exit-confirm-leave';
+    var btnStay = mk('button', 'height:36px;padding:0 18px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:700;' +
+      'background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;border:none', 'Stay');
+    btnStay.id = 'exit-confirm-stay';
+    btnLeave.addEventListener('click', leave);
+    btnStay.addEventListener('click', stay);
+    dlg.addEventListener('click', function(e){ if(e.target === dlg) stay(); });   // tap outside = Stay
+    row.appendChild(btnLeave); row.appendChild(btnStay);
+    box.appendChild(title); box.appendChild(msg); box.appendChild(row);
+    dlg.appendChild(box);
+    document.body.appendChild(dlg);
+    document.addEventListener('keydown', onDlgKey, true);
+    try{ btnStay.focus(); }catch(_){}                                              // safe default
+  }
+})();
+/* FLASKY-EXIT-GUARD:END */
+</script>
 <script src="/api/dl/ui.js"></script>
 <script src="/api/mv/ui.js"></script>
 <script src="/api/cast/ui.js"></script>
