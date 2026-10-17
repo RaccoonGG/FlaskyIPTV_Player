@@ -2995,6 +2995,8 @@ async function openExternal(i){
         catch(e){prompt('Copy stream URL:',url);}
         return;
       }
+      // intent: launches hand off to another app without unloading this page; keep the exit-guard quiet for it
+      if(window.flaskyExitGuardSkip) window.flaskyExitGuardSkip(3000);
       if(player==='ask'){
         // No package → Android shows only installed handlers
         // S.browser_fallback_url=about:blank prevents Play Store from opening
