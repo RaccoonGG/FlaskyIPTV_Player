@@ -10168,11 +10168,13 @@ window._rdioLocalCC = (_LOCALE_TAG_CANDIDATES[0] || '').toUpperCase().slice(0, 2
 (function(){
   'use strict';
   var armed = false, bypass = false, bypassTimer = null, dlg = null, prevFocus = null;
+  var leaving = false, othersPrompted = false;
   var GESTURES = ['pointerup', 'mousedown', 'touchend', 'click', 'keydown'];
 
   function isOurs(s){ return !!(s && s.flExitGuard); }
 
-  // Let intentional navigation (e.g. a future reload button) skip the prompt once.
+  // Let intentional navigation (reload button, intent: launches) skip THIS guard once.
+  // Other guards (the recording/download one in dl/ui.js) are deliberately not affected.
   window.flaskyExitGuardSkip = function(ms){
     bypass = true;
     clearTimeout(bypassTimer);
@@ -10181,13 +10183,23 @@ window._rdioLocalCC = (_LOCALE_TAG_CANDIDATES[0] || '').toUpperCase().slice(0, 2
 
   // ── Desktop: X / Ctrl+W / reload → browser's native "Leave site?" prompt ──
   // addEventListener (not window.onbeforeunload=) so it coexists with the
-  // recording/DVR handler, which cannot clobber it and vice-versa.
+  // recording/download handler in dl/ui.js; several handlers still yield ONE prompt.
   window.addEventListener('beforeunload', function(e){
     if(bypass) return;
     e.preventDefault();
     e.returnValue = '';
     return '';
   });
+
+  // Registered after every script has run (load), so e.defaultPrevented reflects the
+  // other guards too: lets leave() tell "user cancelled someone's prompt" from "nowhere to go back to".
+  function watchOthers(){
+    window.addEventListener('beforeunload', function(e){
+      if(leaving && (e.defaultPrevented || (typeof e.returnValue === 'string' && e.returnValue))) othersPrompted = true;
+    });
+  }
+  if(document.readyState === 'complete') watchOthers();
+  else window.addEventListener('load', watchOthers);
 
   // ── Phone Back button / mouse Back: a history sentinel turns "leave" into a popstate ──
   // Chrome skips history entries a page adds without a user gesture, so the
@@ -10204,13 +10216,25 @@ window._rdioLocalCC = (_LOCALE_TAG_CANDIDATES[0] || '').toUpperCase().slice(0, 2
     if(ua && !ua.hasBeenActive) return;                        // wait for a genuine gesture
     if(arm()) GESTURES.forEach(function(n){ document.removeEventListener(n, onGesture, true); });
   }
+  function listenForGesture(){
+    GESTURES.forEach(function(n){ document.addEventListener(n, onGesture, true); });
+  }
   if(isOurs(history.state)) armed = true;
-  else GESTURES.forEach(function(n){ document.addEventListener(n, onGesture, true); });
+  else listenForGesture();
 
   window.addEventListener('popstate', function(e){
     if(!armed || isOurs(e.state)) return;                      // only react to stepping back off our entry
     ask();
   });
+
+  // Same signals dl/ui.js uses for its own prompt (its server-polled flag is private to it).
+  function jobActive(){
+    try{
+      return !!((typeof isRec !== 'undefined' && isRec) ||
+                (typeof _dvrJobs !== 'undefined' && _dvrJobs.length) ||
+                (typeof _dlmActive !== 'undefined' && _dlmActive.length));
+    }catch(_){ return false; }
+  }
 
   function closeDlg(){
     if(dlg && dlg.parentNode) dlg.parentNode.removeChild(dlg);
@@ -10225,11 +10249,18 @@ window._rdioLocalCC = (_LOCALE_TAG_CANDIDATES[0] || '').toUpperCase().slice(0, 2
   }
   function leave(){
     closeDlg();
-    armed = false;                                             // let the next Back behave natively
+    // Disarm until the next gesture: if the page is still here afterwards (another guard's prompt
+    // was cancelled, or there was no earlier history) Back must not be trapped again mid-navigation.
+    armed = false;
+    listenForGesture();
+    leaving = true; othersPrompted = false;
     window.flaskyExitGuardSkip(3000);
     history.back();
-    // A tab with no earlier history can't go back from script — tell the user how to finish leaving.
-    setTimeout(function(){ note('Press Back once more to exit'); }, 800);
+    setTimeout(function(){
+      leaving = false;
+      // Still here and nobody prompted: a tab with no earlier history can't go back from script.
+      if(!othersPrompted) note('Press Back once more to exit');
+    }, 800);
   }
   function onDlgKey(e){
     if(e.key === 'Escape'){ e.preventDefault(); e.stopPropagation(); stay(); }
@@ -10265,7 +10296,10 @@ window._rdioLocalCC = (_LOCALE_TAG_CANDIDATES[0] || '').toUpperCase().slice(0, 2
     var box = mk('div', 'background:var(--s2);border:1px solid var(--bdr2);border-radius:12px;padding:18px 16px 14px;' +
       'width:min(360px,92vw);box-shadow:0 8px 32px rgba(0,0,0,.6);color:var(--txt);display:flex;flex-direction:column;gap:10px');
     var title = mk('div', 'font-size:15px;font-weight:700', 'Leave FlaskyIPTV?');
-    var msg = mk('div', 'font-size:13px;color:var(--txt2);line-height:1.5', 'Playback will stop if you leave this page.');
+    var msg = mk('div', 'font-size:13px;color:var(--txt2);line-height:1.5', jobActive()
+      ? 'A recording or download is active or scheduled. Leaving this page may interrupt it.'
+      : 'Playback will stop if you leave this page.');
+    msg.id = 'exit-confirm-msg';
     var row = mk('div', 'display:flex;gap:8px;justify-content:flex-end;margin-top:4px');
     var btnLeave = mk('button', 'height:36px;padding:0 16px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;' +
       'background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3)', 'Leave');
