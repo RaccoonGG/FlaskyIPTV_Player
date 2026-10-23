@@ -67,6 +67,7 @@ That's it — no other files required.
 # ─────────────────────────────────────────────────────────────────────────────
 # Standard library
 # ─────────────────────────────────────────────────────────────────────────────
+import collections
 import json
 import logging
 import os
@@ -97,6 +98,16 @@ MAX_PLAYERS: int = 9
 # Internal tuning — not in server.js, chosen for MPEG-TS chunk alignment
 _FFMPEG_CHUNK_BYTES: int = 65536       # 64 KB read size from ffmpeg stdout
 _CLIENT_QUEUE_MAXSIZE: int = 64        # chunks buffered per client before drop
+
+# A live ffmpeg that has produced no output for this long is HUNG (stalled
+# HLS/segment fetch, upstream socket that died without erroring).  The process
+# is still "alive", so is_alive() alone would keep handing the same dead
+# broadcaster to every client that reconnects.  Only consulted when a client
+# (re)connects, so a lowish value is safe; it must stay below what the browser
+# needs to notice a freeze (~20 s) plus its soft-reconnect delay (2 s), so that
+# the FIRST reconnect after a freeze already gets a fresh ffmpeg.
+_BROADCASTER_STALL_SECS: float = 15.0
+_STDERR_TAIL_LINES: int = 12           # last ffmpeg stderr lines kept for diagnostics
 
 # Layout persistence — JSON file alongside the Flask app script
 LAYOUTS_FILE: str = os.path.join(
@@ -201,6 +212,15 @@ class StreamBroadcaster:
         self.last_access: float = time.time()
         self._stopped:    bool  = False
 
+        # Health / diagnostics (read by is_healthy(), /api/multiview/status and
+        # the unexpected-exit report in _read_loop)
+        self.last_data:   float = time.time()   # when the last chunk left ffmpeg
+        self.exit_code:   Optional[int] = None  # ffmpeg return code once output ends
+        self.stderr_tail: 'collections.deque[str]' = collections.deque(
+            maxlen=_STDERR_TAIL_LINES)
+        self._stderr_lock: threading.Lock = threading.Lock()
+        self._stderr_thread: Optional[threading.Thread] = None
+
         self._lock:          threading.Lock      = threading.Lock()
         self._client_queues: Set[queue.Queue]    = set()
 
@@ -208,11 +228,12 @@ class StreamBroadcaster:
 
         if self.process:
             # Drain stderr in background so the pipe never blocks ffmpeg
-            threading.Thread(
+            self._stderr_thread = threading.Thread(
                 target=self._drain_stderr,
                 daemon=True,
                 name=f'mv-stderr-{stream_key[:20]}',
-            ).start()
+            )
+            self._stderr_thread.start()
             # Reader thread fans stdout to all client queues
             threading.Thread(
                 target=self._read_loop,
@@ -301,6 +322,8 @@ class StreamBroadcaster:
                 line = raw_line.decode('utf-8', errors='replace').rstrip()
                 if line:
                     LOG.debug('[MV][ffmpeg] %s', line)
+                    with self._stderr_lock:
+                        self.stderr_tail.append(line)
         except Exception:
             pass
 
@@ -316,13 +339,22 @@ class StreamBroadcaster:
         Here we explicitly copy each chunk into every client's queue.
         Slow clients whose queue is full have chunks silently dropped —
         the same behaviour as TCP backpressure in the Node.js pipe model.
+
+        read1() instead of read(): read(n) blocks until n bytes have arrived (or
+        EOF), so a low-bitrate stream (360p YouTube, radio-like audio) sat on a
+        half-filled 64 KB buffer for several seconds, which both added latency and
+        made "no data for N seconds" meaningless.  read1() returns as soon as ANY
+        data is available.
         """
+        stdout = self.process.stdout
+        read = getattr(stdout, 'read1', None) or stdout.read
         try:
             while not self._stopped:
-                chunk = self.process.stdout.read(_FFMPEG_CHUNK_BYTES)
+                chunk = read(_FFMPEG_CHUNK_BYTES)
                 if not chunk:
                     # ffmpeg exited or pipe closed
                     break
+                self.last_data = time.time()
                 with self._lock:
                     for q in set(self._client_queues):
                         try:
@@ -334,13 +366,59 @@ class StreamBroadcaster:
             LOG.error('[MV] _read_loop error  key=%s  %s', self.stream_key, exc)
         finally:
             # Signal every waiting client generator that the stream has ended
+            # FIRST — the exit report below may block for a moment (process.wait)
+            # and clients must not sit on a dead stream while it does.
             with self._lock:
                 for q in self._client_queues:
                     try:
                         q.put(None)
                     except Exception:
                         pass
+            try:
+                self._report_exit()
+            except Exception as exc:
+                LOG.warning('[MV] exit report failed  key=%s  %s', self.stream_key, exc)
             LOG.info('[MV] _read_loop ended  key=%s', self.stream_key)
+
+    def _report_exit(self) -> None:
+        """
+        Record ffmpeg's exit code and, when the output ended WITHOUT anyone
+        asking it to (stop()/janitor), make that visible.
+
+        Before this, an ffmpeg that died on its own (expired YouTube manifest,
+        403 from the CDN, upstream reset) just closed the HTTP stream: the only
+        trace was a DEBUG line nobody sees, and the browser got a clean end-of-
+        stream with no error at all.
+        """
+        proc = self.process
+        rc = None
+        if proc is not None:
+            try:
+                rc = proc.wait(timeout=2)
+            except Exception:
+                rc = proc.poll()
+        self.exit_code = rc
+        if self._stopped:
+            return
+        # Let the stderr thread flush its last lines (they usually carry the reason)
+        t = self._stderr_thread
+        if t is not None:
+            t.join(timeout=0.5)
+        tail = self.last_error
+        LOG.warning('[MV] ffmpeg output ended unexpectedly  key=%s  exit=%s  stderr: %s',
+                    self.stream_key, rc, tail or '(none)')
+        if _mv_state:
+            try:
+                _mv_state.log(f'[MV] \u26a0 Stream ended unexpectedly  key={self.stream_key[:20]}'
+                              f'  exit={rc}  {tail[:200]}')
+            except Exception:
+                pass
+
+    @property
+    def last_error(self) -> str:
+        """Most recent ffmpeg stderr lines, joined (empty when ffmpeg was quiet)."""
+        with self._stderr_lock:
+            return ' | '.join(self.stderr_tail)
 
     # ── Client queue management ───────────────────────────────────────────────
 
@@ -432,6 +510,13 @@ class StreamBroadcaster:
         """True if the underlying ffmpeg process is still running."""
         return bool(self.process and self.process.poll() is None)
 
+    def is_healthy(self, stall_secs: float = _BROADCASTER_STALL_SECS) -> bool:
+        """
+        Alive AND still producing output.  A hung ffmpeg passes is_alive() but
+        never recovers by itself, so it must not be handed to reconnecting clients.
+        """
+        return self.is_alive() and (time.time() - self.last_data) <= stall_secs
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 4 — STREAM REGISTRY
@@ -480,17 +565,37 @@ def _get_or_create_broadcaster(stream_key: str, channel_url: str,
         race we discard ours and return theirs.
     """
     # -- Phase 1: check registry under lock -----------------------------------
+    # A broadcaster is reusable only if it is alive AND still producing output.
+    # A hung ffmpeg (alive, silent) used to be handed straight back to every
+    # reconnecting client, so no amount of client-side retrying could recover.
+    stale = None
     with _mv_streams_lock:
         existing = _mv_streams.get(stream_key)
         if existing:
-            if existing.is_alive():
+            if existing.is_healthy():
                 LOG.info('[MV] Reusing existing broadcaster  key=%s  refs=%d',
                          stream_key, existing.references)
                 return existing
-            LOG.warning('[MV] Dead broadcaster found in registry  key=%s  -- replacing',
-                        stream_key)
-            existing.stop()
+            if existing.is_alive():
+                idle = time.time() - existing.last_data
+                LOG.warning('[MV] Stalled broadcaster found in registry  key=%s  '
+                            '(no output for %.0fs) -- replacing', stream_key, idle)
+                if _mv_state:
+                    try:
+                        _mv_state.log(f'[MV] \u26a0 Stalled stream replaced  key={stream_key[:20]}'
+                                      f'  (no output for {idle:.0f}s)')
+                    except Exception:
+                        pass
+            else:
+                LOG.warning('[MV] Dead broadcaster found in registry  key=%s  -- replacing',
+                            stream_key)
             del _mv_streams[stream_key]
+            stale = existing
+    # stop() blocks in process.wait() (up to 3 s) — never while holding the
+    # registry lock (see _stop_broadcaster for the same rule).  It also wakes
+    # every client still attached to the old broadcaster so they reconnect.
+    if stale is not None:
+        stale.stop()
 
     # -- Phase 2: spawn ffmpeg OUTSIDE the lock -------------------------------
     broadcaster = StreamBroadcaster(stream_key, channel_url, user_agent,
@@ -906,6 +1011,10 @@ def register_multiview_routes(app, state=None) -> None:
                     'alive':      b.is_alive(),
                     'pid':        b.process.pid if b.process else None,
                     'idle_secs':  round(time.time() - b.last_access, 1),
+                    'healthy':    b.is_healthy(),
+                    'data_age_secs': round(time.time() - b.last_data, 1),
+                    'exit_code':  b.exit_code,
+                    'last_error': b.last_error,
                 }
                 for k, b in _mv_streams.items()
             ]
@@ -1776,11 +1885,43 @@ function _mvNeedsResolve(url){
   return /youtube\.com\/|youtu\.be\/|twitch\.tv\/|dailymotion\.com|vimeo\.com/i.test(url);
 }
 
+// Resolve a YouTube/Twitch/etc. page URL to a streamable URL via yt-dlp.
+// Shared by the first play AND by every auto-recovery attempt, so a retry always
+// gets a FRESH manifest instead of replaying a URL that may already be dead.
+//  - client_id is per widget, so several widgets recovering at once don't trip the
+//    server's per-client 2 s cooldown on each other.
+//  - HTTP 429 (cooldown / concurrency cap) is transient: wait, then try again.
+// Returns {ok:true, d} or {ok:false, error, thrown?}.
+async function _mvResolveExternal(wid, rawUrl, quality){
+  const TRIES = 3;
+  for(let i = 0; i < TRIES; i++){
+    let r, d;
+    try {
+      r = await fetch('/api/multiview/resolve_url', {
+        method:  'POST',
+        headers: {'Content-Type':'application/json'},
+        body:    JSON.stringify({url: rawUrl, quality, client_id: mvClientId + '::' + wid})
+      });
+      d = await r.json();
+    } catch(e){
+      return {ok:false, error:String(e), thrown:true};
+    }
+    if(r.status === 429 && i < TRIES - 1){ await _mvSleep(2500); continue; }
+    if(!d || d.error) return {ok:false, error:(d && d.error) || 'empty response'};
+    return {ok:true, d};
+  }
+  return {ok:false, error:'resolver busy'};
+}
+
 // Play an arbitrary URL (IPTV direct stream, YouTube, etc.) inside a widget.
 // If the URL belongs to a supported site, we call /api/multiview/resolve_url
 // first to get a streamable direct URL, then feed it through the normal
 // mpegts.js + ffmpeg proxy pipeline.
-async function _mvPlayFromUrl(wid, rawUrl, cEl){
+// opts.retryGen is passed only by the auto-recovery path (_mvRetryStart): a failure
+// here then feeds the retry budget instead of dead-ending the widget.
+async function _mvPlayFromUrl(wid, rawUrl, cEl, opts){
+  opts = opts || {};
+  const isRetry = typeof opts.retryGen === 'number';
   if(!cEl){ toast('Multiview: slot not found (wid='+wid+')', 'err'); return; }
   rawUrl = (rawUrl||'').trim();
   if(!rawUrl){ toast('Enter a URL first', 'wrn'); return; }
@@ -1801,32 +1942,34 @@ async function _mvPlayFromUrl(wid, rawUrl, cEl){
 
   if(_mvNeedsResolve(rawUrl)){
     // Ask the server to resolve via yt-dlp
-    try {
-      const r = await fetch('/api/multiview/resolve_url', {
-        method:  'POST',
-        headers: {'Content-Type':'application/json'},
-        body:    JSON.stringify({url: rawUrl, quality})
-      });
-      const d = await r.json();
-      if(d.error){
-        toast('Resolve error: ' + d.error, 'err');
-        if(titleEl) titleEl.textContent = 'No Channel';
-        return;
-      }
-      finalUrl    = d.url;
-      channelName = d.title || '';
-      isLive      = d.is_live !== false;
-      if(d.duration) cEl._mvKnownDuration = d.duration;
-      // video_proxy only works for pre-muxed formats (single URL has both video+audio).
-      // Merged formats (separate video+audio) need the multiview ffmpeg proxy to merge them.
-      cEl._mvUseVideoProxy = (!isLive && d.via === 'yt-dlp' && !d.audio_url);
-      // For merged formats, pass audio_url to the multiview proxy
-      cEl._mvAudioUrl = d.audio_url || '';
-    } catch(e){
-      toast('Could not resolve URL: ' + e, 'err');
+    const res = await _mvResolveExternal(wid, rawUrl, quality);
+    // The user stopped / changed this widget while we were resolving — a late retry
+    // must never clobber their newer choice.
+    if(isRetry && cEl._mvGen !== opts.retryGen) return;
+    if(!res.ok){
+      if(isRetry){ _mvScheduleFresh(wid, cEl, 'could not re-resolve stream'); return; }
+      toast(res.thrown ? 'Could not resolve URL: ' + res.error : 'Resolve error: ' + res.error, 'err');
       if(titleEl) titleEl.textContent = 'No Channel';
       return;
     }
+    const d = res.d;
+    // A live stream that yt-dlp now reports as NOT live has ended (or turned into a
+    // recording): stop, rather than silently replaying it as VOD from 0:00.
+    if(isRetry && d.is_live === false && cEl._mvIsLive !== false){
+      toast('Live stream ended: ' + (d.title || rawUrl), 'wrn');
+      cEl._mvRetries = 0; cEl._mvSoft = 0;
+      _mvStopCleanup(wid, true);
+      return;
+    }
+    finalUrl    = d.url;
+    channelName = d.title || '';
+    isLive      = d.is_live !== false;
+    if(d.duration) cEl._mvKnownDuration = d.duration;
+    // video_proxy only works for pre-muxed formats (single URL has both video+audio).
+    // Merged formats (separate video+audio) need the multiview ffmpeg proxy to merge them.
+    cEl._mvUseVideoProxy = (!isLive && d.via === 'yt-dlp' && !d.audio_url);
+    // For merged formats, pass audio_url to the multiview proxy
+    cEl._mvAudioUrl = d.audio_url || '';
   }
 
   // Build a friendly display name from the URL if yt-dlp didn't give one
@@ -1848,6 +1991,7 @@ async function _mvPlayFromUrl(wid, rawUrl, cEl){
   };
 
   mvExternalUrlWidgets.add(wid);
+  if(isRetry) cEl._mvIsRetrying = true;   // keep the retry budget (not a user-initiated play)
   await _mvPlayChannel(wid, synth, cEl);
 }
 
@@ -2295,6 +2439,15 @@ function _mvAttachListeners(cEl, wid){
   videoEl.addEventListener('play',  ()=>{ ppBtn.textContent='⏸'; });
   videoEl.addEventListener('pause', ()=>{ ppBtn.textContent='▶'; });
 
+  // A live stream never ends on purpose.  When ffmpeg / yt-dlp dies, the proxy just
+  // closes the HTTP stream CLEANLY, so mpegts.js raises no error: the <video> simply
+  // reaches 'ended'.  That used to leave the tile frozen with no retry.  (VOD ends
+  // normally — _mvRecover ignores 'ended' for non-live sessions.)
+  videoEl.addEventListener('ended', ()=>{
+    const s = cEl._mvSess;
+    if(s) _mvRecover(wid, cEl, s, 'ended', 'playback ended');
+  });
+
   // Volume slider — mirrors multiview.js volume-slider listener
   cEl.querySelector('.mv-vol').addEventListener('input', e=>{
     e.stopPropagation();
@@ -2505,6 +2658,279 @@ function _mvAttachListeners(cEl, wid){
   });
 }
 
+// ── LIVE AUTO-RECOVERY ───────────────────────────────────────────────────────
+//
+// Parity with the main player's retry layers (doPlay in the main file):
+//   1. soft reconnect — player.unload()/load() on the same player
+//      (main: mpegts "reconnect attempts" + the stall watchdog's silent recovery)
+//   2. fresh restart  — tear everything down, RE-RESOLVE the source (a new
+//      yt-dlp manifest for YouTube, a new play_token for Stalker/MAC), then a
+//      new player + a new server-side ffmpeg
+//      (main: fresh-instance restart + the live "ended" fresh-retry)
+//
+// Every failure signal funnels into _mvRecover(), which de-duplicates them (one
+// real failure usually fires ERROR + LOADING_COMPLETE + 'ended' together):
+//   mpegts ERROR                       → 'error'
+//   mpegts LOADING_COMPLETE (live EOF) → 'eof'    ┐ ffmpeg / yt-dlp died: the HTTP
+//   <video> 'ended' (live only)        → 'ended'  ┘ stream just ENDS, no error at all
+//   currentTime frozen (watchdog)      → 'stall'    hung ffmpeg / dead segment fetch
+//
+// Retry budgets are earned back after _MV_HEALTHY_MS of continuous playback, so a
+// stream that hiccups a few times over hours never runs out of retries (it used
+// to: the counter was only ever reset by the user picking a channel again).
+
+const _MV_SOFT_RETRIES  = 2;                           // unload()/load() attempts per failure streak
+const _MV_SOFT_DELAY_MS = 2000;
+const _MV_FRESH_DELAYS  = [3000, 6000, 12000, 20000];  // full re-resolve + new player + new ffmpeg
+const _MV_HEALTHY_MS    = 20000;                       // continuous playback that earns the budgets back
+const _MV_STALL_TICK_MS = 5000;
+const _MV_STALL_TICKS   = 4;                           // 4 x 5 s frozen currentTime = stalled
+const _MV_START_TICKS   = 9;                           // 9 x 5 s allowed before the very first frame
+const _MV_SINK_TIMEOUT  = 1500;                        // never let setSinkId delay playback longer than this
+
+function _mvSleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+// Writes to the main app's Activity Log when it is available.
+function _mvLog(msg, lvl){
+  try { if(typeof alog === 'function') alog('[MV] ' + msg, lvl || 'i'); } catch(e){}
+}
+
+function _mvWidgetName(cEl, wid){
+  const ch = cEl && cEl._mvChannel;
+  return (ch && (ch.name || ch.o_name)) || wid;
+}
+
+// ── Play session: one per _mvPlayChannel run ─────────────────────────────────
+// Every handler of a session checks it, so anything left over from a previous
+// channel / retry / closed panel is a harmless no-op.
+let _mvSessSeq = 0;
+
+function _mvNewSession(cEl){
+  _mvEndSession(cEl);
+  const s = { id: ++_mvSessSeq, dead: false, recovering: false, live: false,
+              player: null, wd: null, lastCt: null, stallTicks: 0,
+              everPlayed: false, playingSince: 0 };
+  cEl._mvSess = s;
+  return s;
+}
+
+function _mvEndSession(cEl){
+  const s = cEl && cEl._mvSess;
+  if(!s) return;
+  s.dead = true;
+  if(s.wd){ clearInterval(s.wd); s.wd = null; }
+  cEl._mvSess = null;
+}
+
+function _mvSessLive(wid, cEl, sess){
+  if(!sess || sess.dead || !cEl || cEl._mvSess !== sess) return false;
+  if(!document.getElementById('mwc-' + wid)) return false;
+  const p = document.getElementById('p-mv');
+  return !!(p && p.classList.contains('mv-active'));
+}
+
+// ── Failure entry point ──────────────────────────────────────────────────────
+function _mvRecover(wid, cEl, sess, kind, detail){
+  if(!_mvSessLive(wid, cEl, sess) || sess.recovering) return;
+  // VOD: only hard errors are retried — reaching the end is normal for VOD.
+  if(!sess.live && kind !== 'error') return;
+  sess.recovering = true;
+  const name = _mvWidgetName(cEl, wid);
+  _mvLog(name + ': ' + kind + (detail ? ' \u2014 ' + detail : ''), 'w');
+
+  // Deterministic failures (the browser cannot decode this stream) fail the same
+  // way on every retry — don't spend a minute of retries on them.
+  if(kind === 'error' && /CodecUnsupported|FormatUnsupported/i.test(detail || '')){
+    _mvGiveUp(wid, cEl, name);
+    return;
+  }
+
+  // 1) soft reconnect — live errors/stalls on a still-valid player.  EOF/'ended'
+  //    mean the source is gone, so re-opening the same player cannot help.
+  if(sess.live && (kind === 'error' || kind === 'stall') && sess.player
+     && typeof sess.player.unload === 'function' && typeof sess.player.load === 'function'
+     && (cEl._mvSoft || 0) < _MV_SOFT_RETRIES){
+    cEl._mvSoft = (cEl._mvSoft || 0) + 1;
+    const gen = cEl._mvGen;
+    if(cEl._mvRetryTimer) clearTimeout(cEl._mvRetryTimer);
+    cEl._mvRetryTimer = setTimeout(()=>{
+      cEl._mvRetryTimer = null;
+      if(!_mvSessLive(wid, cEl, sess) || cEl._mvGen !== gen) return;
+      try {
+        sess.player.unload();
+        sess.player.load();
+        const v = cEl.querySelector('.mv-video');
+        const pr = v && v.play();
+        if(pr && typeof pr.catch === 'function') pr.catch(()=>{});
+        sess.recovering = false;
+        sess.lastCt = null; sess.stallTicks = 0; sess.playingSince = 0;
+      } catch(e){
+        _mvScheduleFresh(wid, cEl, 'error');   // session stays 'recovering' (dedup) until torn down
+      }
+    }, _MV_SOFT_DELAY_MS);
+    return;
+  }
+
+  // 2) fresh restart
+  _mvScheduleFresh(wid, cEl,
+    (kind === 'ended' || kind === 'eof') ? 'stream ended' : (kind === 'stall' ? 'stalled' : 'error'));
+}
+
+function _mvGiveUp(wid, cEl, name){
+  cEl._mvRetries = 0;
+  cEl._mvSoft    = 0;
+  toast('\u2715 Stream failed: ' + (name || wid), 'err');
+  _mvStopCleanup(wid, true);
+}
+
+// Schedule the next fresh restart, or give up once the budget is spent.
+function _mvScheduleFresh(wid, cEl, why){
+  const name = _mvWidgetName(cEl, wid);
+  const used = cEl._mvRetries || 0;
+  if(used >= _MV_FRESH_DELAYS.length){ _mvGiveUp(wid, cEl, name); return; }
+  cEl._mvRetries = used + 1;
+  const delay = _MV_FRESH_DELAYS[used];
+  const gen   = cEl._mvGen;
+  toast('\u26a0 ' + name + ' ' + why + ' \u2014 reconnecting ' + cEl._mvRetries + '/'
+        + _MV_FRESH_DELAYS.length + ' in ' + (delay / 1000) + 's', 'wrn');
+  if(cEl._mvRetryTimer) clearTimeout(cEl._mvRetryTimer);
+  cEl._mvRetryTimer = setTimeout(()=>{
+    cEl._mvRetryTimer = null;
+    _mvRetryStart(wid, cEl, gen);
+  }, delay);
+}
+
+// The fresh restart itself.  `gen` is the widget generation captured when the retry
+// was scheduled; the user stopping the widget or picking something else bumps it,
+// which makes this (and any re-resolve it started) abandon itself.
+async function _mvRetryStart(wid, cEl, gen){
+  const alive = ()=> !!document.getElementById('mwc-' + wid) && cEl._mvGen === gen
+    && document.getElementById('p-mv').classList.contains('mv-active');
+  if(!alive()) return;
+  const channel = cEl._mvChannel;
+  // Awaited: the old ffmpeg must be confirmed dead before a new one connects to the
+  // same source (providers enforce a connection limit).
+  await _mvStopCleanup(wid, false);
+  if(!alive()) return;
+  if(cEl._mvRawUrl && mvExternalUrlWidgets.has(wid)){
+    // YouTube / external URL: ask yt-dlp again.  The manifest we were playing may be
+    // dead or expired; replaying the cached one was the reason retries never helped.
+    await _mvPlayFromUrl(wid, cEl._mvRawUrl, cEl, { retryGen: gen });
+  } else if(channel){
+    cEl._mvIsRetrying = true;
+    await _mvPlayChannel(wid, channel, cEl);
+  }
+}
+
+// ── Stall watchdog (live) ────────────────────────────────────────────────────
+// Covers what no event reports: ffmpeg alive but silent, a segment fetch that never
+// returns, MSE starved.  (The main player's watchdog skips readyState < 2, i.e. the
+// fully-starved case; this one does not.)
+function _mvArmWatchdog(wid, cEl, videoEl, sess){
+  if(sess.wd) clearInterval(sess.wd);
+  sess.wd = setInterval(()=>{
+    if(!_mvSessLive(wid, cEl, sess)){ clearInterval(sess.wd); sess.wd = null; return; }
+    // Hidden tabs get throttled timers / MSE feeding, so a frozen currentTime there is
+    // no evidence of a dead stream (the event-driven signals still work while hidden).
+    // A paused/ended video is not "stalled" either.
+    if(document.hidden || videoEl.paused || videoEl.ended){
+      sess.lastCt = null; sess.stallTicks = 0; sess.playingSince = 0;
+      return;
+    }
+    const ct  = videoEl.currentTime;
+    const now = Date.now();
+    if(sess.lastCt !== null && ct > sess.lastCt){
+      sess.stallTicks = 0;
+      sess.everPlayed = true;
+      if(!sess.playingSince) sess.playingSince = now;
+      if(now - sess.playingSince >= _MV_HEALTHY_MS){
+        cEl._mvRetries = 0;      // earned back: a later, unrelated failure gets a full budget
+        cEl._mvSoft    = 0;
+      }
+    } else if(sess.lastCt !== null){
+      sess.playingSince = 0;
+      sess.stallTicks++;
+      const limit = sess.everPlayed ? _MV_STALL_TICKS : _MV_START_TICKS;
+      if(sess.stallTicks >= limit){
+        sess.stallTicks = 0;
+        _mvRecover(wid, cEl, sess, 'stall', 'no playback progress');
+      }
+    }
+    sess.lastCt = ct;
+  }, _MV_STALL_TICK_MS);
+}
+
+// Hooks one mpegts.js player into the recovery system (both live play paths).
+function _mvWirePlayer(wid, cEl, videoEl, sess, player){
+  sess.player = player;
+  player.on(mpegts.Events.ERROR, (errType, errDetail, errInfo)=>{
+    const msg = String(errDetail || '') + (errInfo && errInfo.msg ? ' ' + errInfo.msg : '');
+    _mvRecover(wid, cEl, sess, 'error', (errType ? errType + ': ' : '') + msg);
+  });
+  if(sess.live){
+    // The server closing the stream cleanly (ffmpeg/yt-dlp exited, or its 30 s
+    // no-data timeout) is NOT an error to mpegts.js — it is just the end of the data.
+    player.on(mpegts.Events.LOADING_COMPLETE,
+      ()=> _mvRecover(wid, cEl, sess, 'eof', 'stream closed by server'));
+    _mvArmWatchdog(wid, cEl, videoEl, sess);
+  }
+}
+
+// play() rejected.  AbortError = superseded by a newer load (not a failure).
+function _mvPlayRejected(wid, cEl, sess, e, name, stopOnFail){
+  if(!e || e.name === 'AbortError') return;
+  if(sess.dead || cEl._mvSess !== sess) return;     // stale — must not tear down the NEW playback
+  if(sess.live && e.name !== 'NotAllowedError' && _mvSessLive(wid, cEl, sess)){
+    _mvRecover(wid, cEl, sess, 'error', 'play() rejected: ' + (e.name || e));
+    return;
+  }
+  if(stopOnFail){
+    if(document.getElementById('p-mv').classList.contains('mv-active'))
+      toast('Could not play: ' + name, 'err');
+    _mvStopCleanup(wid, true);
+  } else {
+    toast('Playback error: ' + (e.message || e), 'err');
+  }
+}
+
+// ── Audio output device (parity with the main player's Output Device panel) ──
+// The main player routes ITS <video id="vid"> via setSinkId(); every multiview tile
+// is a separate <video>, so none of them followed that choice.  The in-session value
+// (_aoCurrentId — a global of the main script) wins; the saved choice
+// (localStorage 'audio_out_device', written by the main player) covers the rest.
+function _mvOutputDeviceId(){
+  try { if(typeof _aoCurrentId === 'string' && _aoCurrentId) return _aoCurrentId; } catch(e){}
+  try {
+    const s = JSON.parse(localStorage.getItem('audio_out_device') || 'null');
+    if(s && typeof s.deviceId === 'string') return s.deviceId;
+  } catch(e){}
+  return '';
+}
+
+// Never throws and never holds playback up: unsupported browser (Android), device
+// unplugged, permission refused, or a hung call all just leave the default output.
+async function _mvApplySink(videoEl){
+  if(!videoEl || typeof videoEl.setSinkId !== 'function') return false;
+  const id = _mvOutputDeviceId();
+  if(!id && !videoEl._mvSinkSet) return false;   // never configured — leave the default alone
+  if(videoEl._mvSinkSet && videoEl._mvSinkId === id) return true;
+  let timer = null;
+  try {
+    await Promise.race([
+      videoEl.setSinkId(id),
+      new Promise((_, rej)=>{ timer = setTimeout(()=>rej(new Error('setSinkId timeout')), _MV_SINK_TIMEOUT); }),
+    ]);
+    videoEl._mvSinkId  = id;
+    videoEl._mvSinkSet = true;
+    return true;
+  } catch(e){
+    console.warn('[MV] could not switch output device:', e && (e.message || e));
+    return false;
+  } finally {
+    if(timer) clearTimeout(timer);
+  }
+}
+
 // ── PLAY ─────────────────────────────────────────────────────────────────────
 
 // mirrors multiview.js playChannelInWidget(widgetId, channel, gridstackItemContentEl)
@@ -2519,13 +2945,18 @@ async function _mvPlayChannel(wid, channel, cEl){
 
   // If this is a user-initiated channel change (not a retry), reset the counter.
   // _mvIsRetrying is set to true by the retry setTimeout before it calls us.
-  if(!cEl._mvIsRetrying){
+  const _isRetryAttempt = !!cEl._mvIsRetrying;
+  if(!_isRetryAttempt){
     cEl._mvRetries        = 0;
+    cEl._mvSoft           = 0;
     cEl._mvLastChannelRef = null;
+    // User-initiated: invalidate any pending retry timer / in-flight re-resolve.
+    cEl._mvGen = (cEl._mvGen || 0) + 1;
     if(cEl._mvRetryTimer){ clearTimeout(cEl._mvRetryTimer); cEl._mvRetryTimer = null; }
   }
   cEl._mvIsRetrying     = false;   // consume the flag
   cEl._mvLastChannelRef = _mvChannelRef;
+  const _gen = cEl._mvGen;
 
   // mirrors: await stopAndCleanupPlayer(widgetId, false)  ← cleanup without UI reset
   await _mvStopCleanup(wid, false);
@@ -2536,6 +2967,9 @@ async function _mvPlayChannel(wid, channel, cEl){
 
   titleEl.textContent = channel.name || 'Channel';
   if(placeholder) placeholder.dataset.channelId = channel.id || '';
+
+  // Follow the main player's Output Device choice (each tile is its own <video>).
+  await _mvApplySink(videoEl);
 
   // Show video, hide placeholder
   videoEl.classList.remove('mv-hidden');
@@ -2585,7 +3019,16 @@ async function _mvPlayChannel(wid, channel, cEl){
     } catch(e){ toast('MV: resolve error: ' + e, 'err'); }
   }
 
+  // The user stopped/changed this widget while we were resolving — abandon.
+  if(cEl._mvGen !== _gen) return;
+
   if(!resolvedUrl){
+    // During an automatic retry a transient resolve failure (portal/network blip)
+    // must feed the retry budget instead of silently killing the widget.
+    if(_isRetryAttempt && cEl._mvChannel && cEl._mvIsLive !== false){
+      _mvScheduleFresh(wid, cEl, 'could not re-resolve stream');
+      return;
+    }
     toast('Could not resolve URL for: ' + (channel.name || '?'), 'err');
     _mvStopCleanup(wid, true); return;
   }
@@ -2621,6 +3064,10 @@ async function _mvPlayChannel(wid, channel, cEl){
   // Store the RAW channel URL (not the proxy URL) so _mvStopCleanup can
   // send the right URL to /api/multiview/stream/stop for key matching.
   mvUrls.set(wid, resolvedUrl);
+
+  // One session per play run: all error/ended/stall/retry handlers below check it.
+  const sess = _mvNewSession(cEl);
+  sess.live  = cEl._mvIsLive !== false;
 
   // ── Record portal metadata for the connection-count badge ─────────────────
   // Allow caller to override portal info (e.g. when playing a custom URL)
@@ -2705,34 +3152,8 @@ async function _mvPlayChannel(wid, channel, cEl){
       liveBufferLatencyMaxLatency: _hlsIsLive ? 8 : undefined,
       liveBufferLatencyMinRemain:  _hlsIsLive ? 2 : undefined,
     });
-    player.on(mpegts.Events.ERROR, (errType, errDetail)=>{
-      // Ignore stale handlers after channel switch or panel close
-      if(cEl._mvLastChannelRef !== _mvChannelRef) return;
-      if(!document.getElementById('p-mv').classList.contains('mv-active')) return;
-
-      const MAX_RETRIES   = 3;
-      const RETRY_DELAYS  = [2000, 5000, 10000];
-      const attempt       = cEl._mvRetries || 0;
-
-      if(attempt < MAX_RETRIES){
-        cEl._mvRetries = attempt + 1;
-        const delay    = RETRY_DELAYS[attempt];
-        toast(`\u26a0 ${channel.name||'Stream'} error \u2014 retry ${cEl._mvRetries}/${MAX_RETRIES} in ${delay/1000}s`, 'wrn');
-        if(cEl._mvRetryTimer) clearTimeout(cEl._mvRetryTimer);
-        cEl._mvRetryTimer = setTimeout(async ()=>{
-          cEl._mvRetryTimer = null;
-          if(!document.getElementById('mwc-' + wid)) return;
-          if(cEl._mvLastChannelRef !== _mvChannelRef) return;
-          cEl._mvIsRetrying = true;
-          await _mvStopCleanup(wid, false);
-          await _mvPlayChannel(wid, channel, cEl);
-        }, delay);
-      } else {
-        cEl._mvRetries = 0;
-        toast('\u2715 Stream failed: ' + (channel.name||wid), 'err');
-        _mvStopCleanup(wid, true);
-      }
-    });
+    sess.live = sess.live && _hlsIsLive;
+    _mvWirePlayer(wid, cEl, videoEl, sess, player);
     mvPlayers.set(wid, player);
     player.attachMediaElement(videoEl);
     player.load();
@@ -2741,7 +3162,7 @@ async function _mvPlayChannel(wid, channel, cEl){
       const muteBtn = cEl.querySelector('.mv-mute-btn');
       if(mvPlayers.size === 1){ videoEl.muted=false; if(muteBtn) muteBtn.textContent='🔊'; }
       else if(muteBtn) muteBtn.textContent = videoEl.muted?'🔇':'🔊';
-    } catch(e){ if(e && e.name !== 'AbortError') toast('Playback error: '+(e.message||e), 'err'); }
+    } catch(e){ _mvPlayRejected(wid, cEl, sess, e, channel.name||wid, false); }
     // For VOD: show seek bar once duration is known
     if(!_hlsIsLive){
       const seekWrap2 = cEl.querySelector('.mv-seek-wrap');
@@ -2786,36 +3207,11 @@ async function _mvPlayChannel(wid, channel, cEl){
     liveBufferLatency: 2.0,
   });
 
-  // mirrors multiview.js player.on(mpegts.Events.ERROR ...)
-  player.on(mpegts.Events.ERROR, (errType, errDetail)=>{
-    // Ignore errors after the panel has been closed or the channel changed
-    if(cEl._mvLastChannelRef !== _mvChannelRef) return;
-    if(!document.getElementById('p-mv').classList.contains('mv-active')) return;
-
-    const MAX_RETRIES   = 3;
-    const RETRY_DELAYS  = [2000, 5000, 10000];  // ms: 2 s, 5 s, 10 s
-    const attempt       = cEl._mvRetries || 0;
-
-    if(attempt < MAX_RETRIES){
-      cEl._mvRetries = attempt + 1;
-      const delay    = RETRY_DELAYS[attempt];
-      toast(`\u26a0 ${channel.name||'Stream'} error \u2014 retry ${cEl._mvRetries}/${MAX_RETRIES} in ${delay/1000}s`, 'wrn');
-      if(cEl._mvRetryTimer) clearTimeout(cEl._mvRetryTimer);
-      cEl._mvRetryTimer = setTimeout(async ()=>{
-        cEl._mvRetryTimer = null;
-        // Abort if widget was removed or user already changed the channel
-        if(!document.getElementById('mwc-' + wid)) return;
-        if(cEl._mvLastChannelRef !== _mvChannelRef) return;
-        cEl._mvIsRetrying = true;
-        await _mvStopCleanup(wid, false);
-        await _mvPlayChannel(wid, channel, cEl);
-      }, delay);
-    } else {
-      cEl._mvRetries = 0;
-      toast('\u2715 Stream failed: ' + (channel.name||wid), 'err');
-      _mvStopCleanup(wid, true);
-    }
-  });
+  // Error / end-of-stream / stall handling: shared live-recovery system (see
+  // LIVE AUTO-RECOVERY).  Replaces the old ERROR-only handler that retried by
+  // replaying the same (possibly dead) URL and never saw a clean stream end.
+  sess.live = sess.live && _mpIsLive;
+  _mvWirePlayer(wid, cEl, videoEl, sess, player);
 
   // mirrors multiview.js: players.set(widgetId, player)
   mvPlayers.set(wid, player);
@@ -2844,11 +3240,7 @@ async function _mvPlayChannel(wid, channel, cEl){
     _mvSetActive(wid);
   } catch(e){
     // mirrors multiview.js: if(err.name !== 'AbortError')
-    if(e && e.name !== 'AbortError'){
-      if(document.getElementById('p-mv').classList.contains('mv-active'))
-        toast('Could not play: ' + (channel.name||wid), 'err');
-      _mvStopCleanup(wid, true);
-    }
+    _mvPlayRejected(wid, cEl, sess, e, channel.name||wid, true);
   }
 }
 
@@ -2856,6 +3248,16 @@ async function _mvPlayChannel(wid, channel, cEl){
 
 // mirrors multiview.js stopAndCleanupPlayer(widgetId, resetUI)
 async function _mvStopCleanup(wid, resetUI){
+  // Retire this widget's play session first: every error/ended/stall/retry handler of
+  // the old session checks it and becomes a no-op.  A user-level stop (resetUI) also
+  // bumps the generation, so retry timers / in-flight re-resolves already scheduled
+  // for this widget abandon themselves.
+  const _cEl0 = document.getElementById('mwc-' + wid);
+  if(_cEl0){
+    _mvEndSession(_cEl0);
+    if(resetUI) _cEl0._mvGen = (_cEl0._mvGen || 0) + 1;
+  }
+
   // 1. Tell the server to kill the ffmpeg process for this widget.
   //
   //    RACE CONDITION FIX:
@@ -2919,6 +3321,7 @@ async function _mvStopCleanup(wid, resetUI){
       // Clear auto-reconnect state so a manually stopped widget starts fresh
       cEl._mvIsRetrying    = false;
       cEl._mvRetries       = 0;
+      cEl._mvSoft          = 0;
       cEl._mvLastChannelRef = null;
       if(cEl._mvRetryTimer){ clearTimeout(cEl._mvRetryTimer); cEl._mvRetryTimer = null; }
     }
