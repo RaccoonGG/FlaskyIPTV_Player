@@ -36,6 +36,10 @@ import time
 import queue
 import warnings
 import gzip as _gzip
+import ipaddress as _ipaddress
+import socket as _socket
+import functools as _functools
+import ntpath as _ntpath
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse, urlunparse, quote, quote_plus, unquote, parse_qs, parse_qsl, urlencode
@@ -1442,6 +1446,302 @@ async def _connect_with_failover_async(alt_urls, alt_macs, alt_accounts, alt_m3u
 
 flask_app = Flask(__name__)
 flask_app.config["SECRET_KEY"] = os.urandom(24)
+
+# ===================== NETWORK ACCESS GATE =====================
+# FlaskyIPTV binds 0.0.0.0 on purpose (phone remote, /radio, the M3U proxy,
+# restream and cast devices all connect from other machines) but has no login.
+# Two layers keep it LAN-only and keep this-PC actions off the network:
+#   1. _install_net_gate(): EVERY request on EVERY route (addons included) must
+#      come from loopback or a private-range address, otherwise 403.
+#   2. @_local_only: routes that act on THIS PC (native file dialogs, reading
+#      files, launching programs) additionally need the caller to be this
+#      machine, a Host name DNS rebinding can't fake, and a same-origin
+#      browser request (so a random web page can't POST to localhost).
+# The TCP peer address is used on purpose; X-Forwarded-For is never trusted.
+# NOTE: a reverse proxy / tunnel running on this PC makes every caller look like
+# loopback and defeats both layers — don't put one in front of FlaskyIPTV.
+#
+# Env vars (all optional):
+#   FLASKY_ALLOW_NETS        extra CIDRs to allow, e.g. "100.64.0.0/10" (Tailscale)
+#   FLASKY_ALLOW_PUBLIC=1    switch layer 1 off (not recommended)
+#   FLASKY_LOCAL_HOSTS       extra Host names accepted by this-PC-only routes
+#   FLASKY_TRUSTED_ORIGINS   extra browser origins accepted by this-PC-only routes
+#   FLASKY_EXTERNAL_PLAYERS  extra external players: file names or full paths,
+#                            separated by ';' (Windows) or ':' (Linux/Termux)
+#   FLASKY_HOST              bind address (default 0.0.0.0)
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_nets(raw: str) -> tuple:
+    """'10.0.0.0/8, junk, fd00::/8' -> tuple of ip_network (junk ignored)."""
+    nets = []
+    for part in re.split(r"[,\s;]+", raw or ""):
+        if not part:
+            continue
+        try:
+            nets.append(_ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            pass
+    return tuple(nets)
+
+
+_NET_ALLOW_PUBLIC = _env_flag("FLASKY_ALLOW_PUBLIC")
+_EXTRA_NETS = _parse_nets(os.environ.get("FLASKY_ALLOW_NETS", ""))
+
+
+def _client_ip(addr):
+    """str -> ip_address (IPv4-mapped IPv6 unwrapped, zone id dropped) or None."""
+    if not addr:
+        return None
+    try:
+        ip = _ipaddress.ip_address(str(addr).split("%", 1)[0])
+    except ValueError:
+        return None
+    return getattr(ip, "ipv4_mapped", None) or ip
+
+
+def _is_private_client(addr, extra_nets=None) -> bool:
+    """Loopback, RFC1918 / ULA / link-local, or inside FLASKY_ALLOW_NETS."""
+    ip = _client_ip(addr)
+    if ip is None:
+        return False
+    if ip.is_loopback or ip.is_private or ip.is_link_local:
+        return True
+    nets = _EXTRA_NETS if extra_nets is None else extra_nets
+    return any(ip in n for n in nets)
+
+
+_LOCAL_IPS_CACHE = {"t": 0.0, "ips": frozenset()}
+
+
+def _local_machine_ips() -> frozenset:
+    """This machine's own addresses (cached 30 s) — so opening the app via the
+    PC's own LAN IP still counts as 'this PC'."""
+    now = time.time()
+    if now - _LOCAL_IPS_CACHE["t"] < 30:
+        return _LOCAL_IPS_CACHE["ips"]
+    found = set()
+    try:
+        for info in _socket.getaddrinfo(_socket.gethostname(), None):
+            ip = _client_ip(info[4][0])
+            if ip is not None:
+                found.add(ip)
+    except Exception:
+        pass
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        try:
+            s.connect(("10.255.255.255", 1))  # UDP connect — sends nothing
+            ip = _client_ip(s.getsockname()[0])
+            if ip is not None:
+                found.add(ip)
+        finally:
+            s.close()
+    except Exception:
+        pass
+    _LOCAL_IPS_CACHE["t"] = now
+    _LOCAL_IPS_CACHE["ips"] = frozenset(found)
+    return _LOCAL_IPS_CACHE["ips"]
+
+
+def _is_local_client(addr) -> bool:
+    ip = _client_ip(addr)
+    return ip is not None and (ip.is_loopback or ip in _local_machine_ips())
+
+
+def _host_is_local(host_header: str) -> bool:
+    """Host a DNS-rebinding page can't use: localhost, an IP literal, or this
+    machine's own name (also NAME.local / .lan / .home.arpa)."""
+    host = (host_header or "").strip().lower()
+    if host.startswith("["):
+        host = host[1:].split("]", 1)[0]
+    elif host.count(":") == 1:
+        host = host.rsplit(":", 1)[0]
+    host = host.rstrip(".")
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        _ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    own = {h.strip().lower() for h in os.environ.get("FLASKY_LOCAL_HOSTS", "").split(",") if h.strip()}
+    try:
+        own.add(_socket.gethostname().lower())
+    except Exception:
+        pass
+    if host in own:
+        return True
+    for suffix in (".local", ".lan", ".home.arpa"):
+        if host.endswith(suffix) and host[: -len(suffix)] in own:
+            return True
+    return False
+
+
+def _origin_is_same(req) -> bool:
+    """Reject browser requests that come from another origin. Non-browser
+    clients (curl, native apps) send neither header and pass."""
+    sfs = (req.headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if sfs and sfs not in ("same-origin", "none"):
+        return False
+    origin = req.headers.get("Origin")
+    if origin is None:
+        return True
+    origin = origin.strip().lower().rstrip("/")
+    if origin in {o.strip().lower().rstrip("/")
+                  for o in os.environ.get("FLASKY_TRUSTED_ORIGINS", "").split(",") if o.strip()}:
+        return True
+    try:
+        return origin != "null" and urlparse(origin).netloc == (req.host or "").strip().lower()
+    except Exception:
+        return False
+
+
+_GATE_LOG_SEEN: dict = {}
+
+
+def _gate_log(addr, what: str) -> None:
+    """Log a blocked request — at most once a minute per (address, what)."""
+    now = time.time()
+    key = (str(addr), what)
+    if now - _GATE_LOG_SEEN.get(key, 0.0) < 60:
+        return
+    if len(_GATE_LOG_SEEN) > 256:
+        _GATE_LOG_SEEN.clear()
+    _GATE_LOG_SEEN[key] = now
+    try:
+        state.log(f"[SECURITY] \U0001F6E1\uFE0F Blocked {what} from {addr}")
+    except Exception:
+        pass
+
+
+def _install_net_gate(app) -> None:
+    """Layer 1 — private-network-only for every route on `app`."""
+    @app.before_request
+    def _net_gate():
+        if _NET_ALLOW_PUBLIC or _is_private_client(request.remote_addr):
+            return None
+        _gate_log(request.remote_addr, f"{request.method} {request.path}")
+        return jsonify({"error": "Forbidden: FlaskyIPTV only accepts connections from your local network"}), 403
+
+
+def _local_only_denial(req):
+    """Reason string if `req` may not use a this-PC-only route, else None."""
+    if not _is_local_client(req.remote_addr):
+        return "this action is only available on the PC running FlaskyIPTV"
+    if not _host_is_local(req.host):
+        return "unexpected Host header"
+    if not _origin_is_same(req):
+        return "cross-origin request refused"
+    return None
+
+
+def _local_only(view):
+    """Layer 2 — decorator for routes that act on this PC (put BELOW @route)."""
+    @_functools.wraps(view)
+    def wrapper(*args, **kwargs):
+        why = _local_only_denial(request)
+        if why:
+            _gate_log(request.remote_addr, f"{request.method} {request.path} ({why})")
+            return jsonify({"error": f"Forbidden: {why}"}), 403
+        return view(*args, **kwargs)
+    return wrapper
+
+
+# --- external players: /api/open_external takes `exe` from the request, so it
+# may only start a recognised media player, a program the user picked with the
+# native "Browse" dialog this session, or one named in FLASKY_EXTERNAL_PLAYERS.
+_EXT_PLAYER_STEMS = (
+    "vlc", "mpv", "mpc-hc", "mpc-be", "potplayer", "kodi", "ffplay", "smplayer",
+    "mplayer", "kmplayer", "gomplayer", "gom", "bsplayer", "zoomplayer",
+    "celluloid", "haruna", "totem", "iina", "wmplayer",
+)
+_EXT_PLAYER_APPROVED: set = set()
+
+
+def _is_unc_path(p: str) -> bool:
+    r"""\\host\share, //host/share, \\?\UNC\..., \\.\device — but not \\?\C:\ (extended local)."""
+    q = (p or "").replace("/", "\\")
+    return q.startswith("\\\\") and not re.match(r"^\\\\\?\\[A-Za-z]:\\", q)
+
+
+def _nt_local_absolute(path: str, drive_type=None) -> bool:
+    r"""Windows rule: needs a drive letter AND a rooted remainder (so not 'C:vlc.exe'
+    or '\\vlc.exe'), and the drive must not be a mapped network drive.
+    drive_type(root) -> Win32 GetDriveType code; 4 == DRIVE_REMOTE."""
+    drive, rest = _ntpath.splitdrive(path)
+    if not drive or rest[:1] not in ("\\", "/"):
+        return False
+    return not (drive_type is not None and drive_type(drive + "\\") == 4)
+
+
+def _win_drive_type(root: str) -> int:
+    import ctypes
+    return ctypes.windll.kernel32.GetDriveTypeW(root)
+
+
+def _is_local_absolute_path(path) -> bool:
+    r"""True only for an absolute path on a local drive. Everything that can be
+    decided from the string/drive letter is decided BEFORE any filesystem call:
+    os.path.isfile()/realpath() on \\attacker\share\x.exe makes Windows open an
+    SMB connection and hand over the user's NTLM hash, and a share can also host
+    a fake-named 'vlc.exe'. Relative paths are refused too (they'd resolve
+    against the working directory)."""
+    if not path or not isinstance(path, str) or "\x00" in path:
+        return False
+    if path.replace("/", "\\").startswith("\\\\"):
+        return False                      # UNC, \\?\ and \\.\ forms, any slash mix
+    if os.name == "nt":
+        try:
+            if not _nt_local_absolute(path, _win_drive_type):
+                return False              # drive-less/relative, or a mapped network drive
+        except Exception:
+            return False                  # can't tell -> refuse
+    elif not os.path.isabs(path):
+        return False
+    try:
+        real = os.path.realpath(path)     # follow symlinks/junctions...
+    except (OSError, ValueError):
+        return False
+    return not _is_unc_path(real)         # ...and make sure the real target is local too
+
+
+def _norm_exe(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _approve_external_player(path: str) -> None:
+    if path:
+        _EXT_PLAYER_APPROVED.add(_norm_exe(path))
+
+
+def _external_player_allowed(exe: str) -> bool:
+    if not exe or not _is_local_absolute_path(exe):
+        return False
+    norm = _norm_exe(exe)
+    if norm in _EXT_PLAYER_APPROVED:
+        return True
+    base = os.path.basename(exe).strip().lower()
+    for item in os.environ.get("FLASKY_EXTERNAL_PLAYERS", "").split(os.pathsep):
+        item = item.strip()
+        if not item:
+            continue
+        if os.path.isabs(item):
+            if _norm_exe(item) == norm:
+                return True
+        elif item.lower() == base:
+            return True
+    stem, ext = os.path.splitext(base)
+    if ext not in (".exe", ".appimage", ""):
+        return False  # .bat/.cmd/.com/.ps1/... only via the Browse picker
+    return any(stem.startswith(s) for s in _EXT_PLAYER_STEMS)
+
+
+_install_net_gate(flask_app)
 if _CAST_AVAILABLE:
     register_cast_routes(flask_app, state, run_async, _make_client)
 if _MULTIVIEW_AVAILABLE:
@@ -2488,6 +2788,7 @@ def api_logs():
 
 
 @flask_app.route("/api/browse_exe", methods=["GET"])
+@_local_only
 def api_browse_exe():
     """Open a native OS file picker and return the selected executable path."""
     try:
@@ -2504,12 +2805,14 @@ def api_browse_exe():
             ],
         )
         root.destroy()
+        _approve_external_player(path)  # picked by a person at this PC's native dialog
         return jsonify({"path": path or ""})
     except Exception as e:
         return jsonify({"path": "", "error": str(e)})
 
 
 @flask_app.route("/api/browse_folder", methods=["GET"])
+@_local_only
 def api_browse_folder():
     """Desktop only: open a native OS folder picker (askdirectory)."""
     try:
@@ -2526,6 +2829,7 @@ def api_browse_folder():
 
 
 @flask_app.route("/api/reveal_in_folder", methods=["POST"])
+@_local_only
 def api_reveal_in_folder():
     """Open the folder containing a file and highlight it (Windows Explorer / macOS Finder / Linux)."""
     data = request.get_json(force=True)
@@ -2585,6 +2889,7 @@ def api_get_tmdb_id():
 
 
 @flask_app.route("/api/browse_m3u", methods=["GET"])
+@_local_only
 def api_browse_m3u():
     """Desktop only: open a native OS file picker for M3U/M3U8 files."""
     try:
@@ -2604,6 +2909,7 @@ def api_browse_m3u():
 
 
 @flask_app.route("/api/browse_dir_m3u", methods=["POST"])
+@_local_only
 def api_browse_dir_m3u():
     """List directory contents for the mobile M3U file browser (.m3u/.m3u8 files only)."""
     data = request.get_json(force=True)
@@ -2632,6 +2938,7 @@ def api_browse_dir_m3u():
 
 
 @flask_app.route("/api/read_m3u_path", methods=["POST"])
+@_local_only
 def api_read_m3u_path():
     """Read an M3U file from an absolute server-side path and return its text content."""
     data = request.get_json(force=True)
@@ -2741,6 +3048,7 @@ def _watch_external_player_exit(proc, player_name: str, started_at: float, log_f
 
 
 @flask_app.route("/api/open_external", methods=["POST"])
+@_local_only
 def api_open_external():
     """Resolve item URL then launch it in the configured external player."""
     data = request.get_json(force=True)
@@ -2752,8 +3060,18 @@ def api_open_external():
 
     if not exe:
         return jsonify({"error": "No external player configured"}), 400
+    if not _is_local_absolute_path(exe):  # before ANY filesystem call on `exe` (see helper)
+        state.log(f"[SECURITY] \U0001F6E1\uFE0F Refused non-local/relative player path: {exe}")
+        return jsonify({"error": (
+            "Player path must be an absolute path on a local drive — network shares "
+            "(\\\\server\\...), mapped network drives and relative paths aren't allowed.")}), 403
     if not os.path.isfile(exe):
         return jsonify({"error": f"Player not found: {exe}"}), 400
+    if not _external_player_allowed(exe):
+        state.log(f"[SECURITY] \U0001F6E1\uFE0F Refused to launch unrecognised program: {exe}")
+        return jsonify({"error": (
+            "Not a recognised media player. Re-select it with Browse in Settings "
+            "or add its file name to the FLASKY_EXTERNAL_PLAYERS environment variable.")}), 403
 
     try:
         if pre_url:
@@ -2765,6 +3083,9 @@ def api_open_external():
             url = run_async(_resolve())
         if not url:
             return jsonify({"error": "Could not resolve stream URL"}), 400
+        url = str(url)
+        if url.startswith("-") or any(c in url for c in "\r\n\x00"):
+            return jsonify({"error": "Refusing to pass an option-like or malformed URL to the player"}), 400
 
         ua = state.stream_ua
         cmd = [exe, *_external_player_ua_args(exe, ua), url]
@@ -10375,11 +10696,16 @@ _HTML_BYTES_GZ: bytes = _gzip_mod.compress(_HTML_BYTES, compresslevel=6)
 # ===================== ENTRY POINT =====================
 
 if __name__ == "__main__":
-    host = "0.0.0.0"
+    host = os.environ.get("FLASKY_HOST", "").strip() or "0.0.0.0"
     port = int(os.environ.get("PORT", 5000))
     print(f"🚀  IPTV Portal Builder starting on http://{host}:{port}")
     print(f"    ffmpeg: {'found ✓' if _FFMPEG_AVAILABLE else 'NOT FOUND ✗'}")
     print(f"    yt-dlp: {'found ✓' if YTDLP_AVAILABLE else 'not available'}")
+    if _NET_ALLOW_PUBLIC:
+        print("    ⚠ network gate DISABLED (FLASKY_ALLOW_PUBLIC) — any address can connect")
+    else:
+        print("    network gate: loopback / private-range clients only"
+              + (f" (+{len(_EXTRA_NETS)} custom net(s))" if _EXTRA_NETS else ""))
     # Silence urllib3 InsecureRequestWarning — we use verify=False intentionally
     # for IPTV portals that have self-signed certs.
     warnings.filterwarnings("ignore", message="Unverified HTTPS request")
