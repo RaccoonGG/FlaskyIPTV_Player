@@ -68,10 +68,13 @@ That's it — no other files required.
 # Standard library
 # ─────────────────────────────────────────────────────────────────────────────
 import collections
+import datetime
+import importlib.util
 import json
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -107,7 +110,23 @@ _CLIENT_QUEUE_MAXSIZE: int = 64        # chunks buffered per client before drop
 # needs to notice a freeze (~20 s) plus its soft-reconnect delay (2 s), so that
 # the FIRST reconnect after a freeze already gets a fresh ffmpeg.
 _BROADCASTER_STALL_SECS: float = 15.0
-_STDERR_TAIL_LINES: int = 12           # last ffmpeg stderr lines kept for diagnostics
+_STDERR_TAIL_LINES: int = 20           # last ffmpeg stderr lines kept for diagnostics
+_CLIENT_IDLE_TIMEOUT: float = 30.0     # a client stream with no data for this long is closed
+# 'warning', not 'error': the exact upstream HTTP status (456/458 are both just
+# "4XX Client Error" at 'error') and the "Failed to open segment" / "HTTP error 403"
+# lines that explain a dying live stream are WARNING-level.  A healthy stream prints
+# nothing at this level.
+_FFMPEG_LOGLEVEL: str = 'warning'
+_EXIT_INFO_TTL: float = 300.0          # how long the reason a stream ended stays queryable
+
+# Refusal storm: ffmpeg's HLS demuxer SKIPS segments the CDN refuses (HTTP 403/404...)
+# and keeps running forever, so a stream the CDN has cut off just goes silent and
+# the only symptom is the 30 s no-data timeout.  Several refusals in a short window
+# while no data is leaving ffmpeg = that stream is dead: end it now so the player can
+# reconnect (and re-resolve) in seconds instead of staring at a frozen tile.
+_REFUSAL_LIMIT: int = 3
+_REFUSAL_WINDOW: float = 10.0
+_REFUSAL_SILENCE: float = 4.0
 
 # Layout persistence — JSON file alongside the Flask app script
 LAYOUTS_FILE: str = os.path.join(
@@ -201,7 +220,14 @@ class StreamBroadcaster:
                  user_agent: str = 'Mozilla/5.0',
                  transcode: bool = False,
                  audio_only: bool = False,
-                 audio_url: str = '') -> None:
+                 audio_url: str = '',
+                 headers: Optional[Dict[str, str]] = None) -> None:
+        # Extra request headers for the source (YouTube: what yt-dlp itself would send)
+        self.headers:     Dict[str, str] = dict(headers or {})
+        self.abort_reason: str  = ''     # set when WE ended a dead stream (refusal storm)
+        self._refusal_timer: Optional[threading.Timer] = None
+        self._refused:    'collections.deque[float]' = collections.deque(maxlen=16)
+        self._skipped:    'collections.deque[float]' = collections.deque(maxlen=16)
         self.stream_key:  str   = stream_key
         self.channel_url: str   = channel_url
         self.audio_url:   str   = audio_url   # separate audio stream (e.g. YouTube 720p+)
@@ -214,6 +240,10 @@ class StreamBroadcaster:
 
         # Health / diagnostics (read by is_healthy(), /api/multiview/status and
         # the unexpected-exit report in _read_loop)
+        self.started_at:  float = time.time()
+        self.bytes_total: int   = 0
+        self.base_key:    str   = _base_key(stream_key)
+        self._timeout_logged: bool = False
         self.last_data:   float = time.time()   # when the last chunk left ffmpeg
         self.exit_code:   Optional[int] = None  # ffmpeg return code once output ends
         self.stderr_tail: 'collections.deque[str]' = collections.deque(
@@ -279,13 +309,19 @@ class StreamBroadcaster:
 
         ua_args = ['-user_agent', self.user_agent, '-reconnect', '1',
                    '-reconnect_streamed', '1', '-reconnect_delay_max', '5']
+        # googlevideo (YouTube) ties its signed URLs to the client they were minted for;
+        # yt-dlp's own ffmpeg downloader sends the format's http_headers, so do the same.
+        # (User-Agent travels via -user_agent above; ffmpeg wants CRLF-terminated lines.)
+        extra = {k: v for k, v in self.headers.items() if k.lower() != 'user-agent'}
+        if extra:
+            ua_args += ['-headers', ''.join(f'{k}: {v}\r\n' for k, v in extra.items())]
 
         if self.audio_url:
             # Two separate streams (e.g. YouTube 720p+): video + audio inputs
             # Always encode video to H.264 — YouTube separate streams may be VP9/AV1
             LOG.info('[MV] Spawning ffmpeg with merged video+audio (H.264 encode)  key=%s', self.stream_key)
             cmd = [
-                ffmpeg, '-hide_banner', '-loglevel', 'error',
+                ffmpeg, '-hide_banner', '-loglevel', _FFMPEG_LOGLEVEL,
             ] + ua_args + ['-i', self.channel_url,
             ] + ua_args + ['-i', self.audio_url,
                 '-map', '0:v:0', '-map', '1:a:0',
@@ -295,7 +331,7 @@ class StreamBroadcaster:
             ]
         else:
             cmd = [
-                ffmpeg, '-hide_banner', '-loglevel', 'error',
+                ffmpeg, '-hide_banner', '-loglevel', _FFMPEG_LOGLEVEL,
             ] + ua_args + ['-i', self.channel_url,
             ] + codec_args + ['-f', 'mpegts', 'pipe:1']
         try:
@@ -324,8 +360,58 @@ class StreamBroadcaster:
                     LOG.debug('[MV][ffmpeg] %s', line)
                     with self._stderr_lock:
                         self.stderr_tail.append(line)
+                    self._check_refusals(line)
         except Exception:
             pass
+
+    def _check_refusals(self, line: str) -> None:
+        """
+        See _REFUSAL_LIMIT.  Counts HTTP 401/403/404/410 lines and skipped segments;
+        when enough pile up within the window while ffmpeg is producing no data, the
+        stream is dead — kill ffmpeg so clients get a clean end now (with the reason
+        recorded), instead of after the 30 s no-data timeout.
+        """
+        now = time.time()
+        if _REFUSED_RE.search(line):
+            self._refused.append(now)
+        if _SEGFAIL_RE.search(line):
+            self._skipped.append(now)
+        self._evaluate_refusals()
+
+    def _evaluate_refusals(self) -> None:
+        if self._stopped or self.abort_reason:
+            return
+        now = time.time()
+        n_ref  = sum(1 for t in self._refused if now - t <= _REFUSAL_WINDOW)
+        n_skip = sum(1 for t in self._skipped if now - t <= _REFUSAL_WINDOW)
+        n = max(n_ref, n_skip)
+        if n < _REFUSAL_LIMIT:
+            return
+        quiet_for = now - self.last_data
+        if quiet_for < _REFUSAL_SILENCE:
+            # Enough refusals, but data was still flowing a moment ago.  If nothing more
+            # is printed we would never look again, so look again once the silence is
+            # long enough (one pending re-check at a time).
+            if self._refusal_timer is None:
+                self._refusal_timer = threading.Timer(
+                    _REFUSAL_SILENCE - quiet_for + 0.05, self._recheck_refusals)
+                self._refusal_timer.daemon = True
+                self._refusal_timer.start()
+            return
+        with self._stderr_lock:
+            status = _parse_http_status(list(self.stderr_tail))
+        self.abort_reason = (f'upstream kept refusing requests '
+                             f'(HTTP {status or "4xx"}, {n} in {_REFUSAL_WINDOW:.0f}s) '
+                             f'and no data was flowing')
+        LOG.warning('[MV] ending dead stream  key=%s  %s', self.stream_key, self.abort_reason)
+        try:
+            self.process.kill()
+        except Exception:
+            pass
+
+    def _recheck_refusals(self) -> None:
+        self._refusal_timer = None
+        self._evaluate_refusals()
 
     def _read_loop(self) -> None:
         """
@@ -355,6 +441,7 @@ class StreamBroadcaster:
                     # ffmpeg exited or pipe closed
                     break
                 self.last_data = time.time()
+                self.bytes_total += len(chunk)
                 with self._lock:
                     for q in set(self._client_queues):
                         try:
@@ -380,15 +467,79 @@ class StreamBroadcaster:
                 LOG.warning('[MV] exit report failed  key=%s  %s', self.stream_key, exc)
             LOG.info('[MV] _read_loop ended  key=%s', self.stream_key)
 
+    def snapshot(self, reason: str) -> dict:
+        """What is known about this stream right now, as a JSON-able dict."""
+        with self._stderr_lock:
+            tail = list(self.stderr_tail)
+        rc = self.process.poll() if self.process else None
+        info = {
+            'reason':      reason,                      # 'ffmpeg_exit' | 'no_data_timeout'
+            'alive':       rc is None,
+            'rc':          self.exit_code if self.exit_code is not None else rc,
+            'http':        _parse_http_status(tail),
+            'up_secs':     round(time.time() - self.started_at, 1),
+            'silent_secs': round(time.time() - self.last_data, 1),
+            'bytes':       self.bytes_total,
+            'expiry':      _url_expiry_note(self.channel_url),
+            'tail':        tail[-3:],
+            'killed':      self.abort_reason,
+            'hint':        '',
+        }
+        if info['http'] in (401, 403) and ('googlevideo.com' in self.channel_url
+                                           or 'youtube' in self.channel_url):
+            info['hint'] = ('YouTube refused the segments - if this keeps happening, '
+                            'update yt-dlp (pip install -U yt-dlp)')
+        info['text'] = self._describe(info, tail)
+        return info
+
+    @staticmethod
+    def _describe(info: dict, tail) -> str:
+        """One human line: what happened, how long it had been up, and why if known."""
+        up = _fmt_dur(info['up_secs'])
+        if info['reason'] == 'no_data_timeout':
+            what = (f"no data for {info['silent_secs']:.0f}s after {up} up - ffmpeg "
+                    + ('still running (silent socket / stalled upstream)' if info['alive']
+                       else f"already exited (rc={info['rc']})"))
+        elif info.get('killed'):
+            what = f"ffmpeg ended by multiview after {up}: {info['killed']}"
+        else:
+            what = f"ffmpeg exited (rc={info['rc']}) after {up}"
+        if info['http'] and not info.get('killed'):
+            what += f", upstream HTTP {info['http']}"
+        # most informative stderr line: the newest error-looking one, else the newest
+        pick = next((l for l in reversed(list(tail)) if _ERRORISH_RE.search(l)),
+                    tail[-1] if tail else '')
+        if pick:
+            what += f' - "{pick.strip()[:110]}"'
+        if info['expiry']:
+            what += f" ({info['expiry']})"
+        if info.get('hint'):
+            what += f" | {info['hint']}"
+        return what[:420]
+
+    def note_client_timeout(self, secs: float) -> None:
+        """
+        A client stream was closed because this broadcaster produced no data for `secs`.
+        Previously this left no trace in the Activity Log at all (only a Python-logger
+        warning), which made a silent ffmpeg stall look like a mystery.
+        """
+        info = self.snapshot('no_data_timeout')
+        _record_exit(self.base_key, info)
+        if self._timeout_logged:          # several clients may time out together: log once
+            return
+        self._timeout_logged = True
+        LOG.warning('[MV] Client queue timeout  key=%s  %s', self.stream_key, info['text'])
+        if _mv_state:
+            try:
+                _mv_state.log(f'[MV] \u26a0 Stream stalled  key={self.stream_key[:20]}  {info["text"]}')
+            except Exception:
+                pass
+
     def _report_exit(self) -> None:
         """
         Record ffmpeg's exit code and, when the output ended WITHOUT anyone
-        asking it to (stop()/janitor), make that visible.
-
-        Before this, an ffmpeg that died on its own (expired YouTube manifest,
-        403 from the CDN, upstream reset) just closed the HTTP stream: the only
-        trace was a DEBUG line nobody sees, and the browser got a clean end-of-
-        stream with no error at all.
+        asking it to (stop()/janitor), make that visible: Activity Log line +
+        a record the browser can fetch (/api/multiview/exit_info).
         """
         proc = self.process
         rc = None
@@ -404,13 +555,14 @@ class StreamBroadcaster:
         t = self._stderr_thread
         if t is not None:
             t.join(timeout=0.5)
-        tail = self.last_error
-        LOG.warning('[MV] ffmpeg output ended unexpectedly  key=%s  exit=%s  stderr: %s',
-                    self.stream_key, rc, tail or '(none)')
+        info = self.snapshot('ffmpeg_exit')
+        _record_exit(self.base_key, info)
+        LOG.warning('[MV] ffmpeg output ended unexpectedly  key=%s  %s',
+                    self.stream_key, info['text'])
         if _mv_state:
             try:
                 _mv_state.log(f'[MV] \u26a0 Stream ended unexpectedly  key={self.stream_key[:20]}'
-                              f'  exit={rc}  {tail[:200]}')
+                              f'  {info["text"]}')
             except Exception:
                 pass
 
@@ -519,6 +671,263 @@ class StreamBroadcaster:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# WHY A STREAM ENDED — diagnostics shared with the browser
+#
+# A live stream can end for very different reasons that look identical to the
+# player (a clean end of data): ffmpeg exited (expired URL, HTTP 403/458 ...), or
+# ffmpeg is still running but its socket went silent (network drop, CDN stall) and
+# the 30 s no-data timeout closed the client stream.  The reason is recorded here,
+# logged to the Activity Log, and served at /api/multiview/exit_info so the tile
+# can act on it (hard-stop on 456/458, show the reason) instead of guessing.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_KEY_SUFFIXES = ('::transcode', '::audio_only', '::merged')
+_HTTP_STATUS_RE = re.compile(r'HTTP error (\d{3})|Server returned (\d{3})')
+_EXPIRE_RE = re.compile(r'[/?&,]expire[/=](\d{9,11})')
+_ERRORISH_RE = re.compile(r'error|fail|forbidden|denied|refused|reset|timed? ?out|not found|unavailable', re.I)
+
+_REFUSED_RE = re.compile(r'HTTP error (?:401|403|404|410)\b|Server returned (?:401|403|404|410)\b')
+_SEGFAIL_RE = re.compile(r'failed too many times')
+
+_mv_recent_exits: Dict[str, dict] = {}
+_mv_exits_lock = threading.Lock()
+
+_HDR_NAME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9-]{0,63}$')
+_HDR_DROP = frozenset({'host', 'content-length', 'connection', 'accept-encoding',
+                       'transfer-encoding'})
+
+
+def _safe_headers(raw) -> Dict[str, str]:
+    """
+    HTTP headers (yt-dlp's per-format http_headers, sent by the browser as ?hdrs=)
+    made safe for ffmpeg's -headers option: plain str->str, valid header names, no
+    CR/LF (header injection), no hop-by-hop headers, bounded size.
+    """
+    out: Dict[str, str] = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        if len(out) >= 20:
+            break
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        if not _HDR_NAME_RE.match(k) or k.lower() in _HDR_DROP:
+            continue
+        if '\r' in v or '\n' in v or len(v) > 2048:
+            continue
+        out[k] = v
+    return out
+
+
+def _base_key(stream_key: str) -> str:
+    """Registry key without the ::transcode / ::audio_only / ::merged mode suffix."""
+    for suf in _KEY_SUFFIXES:
+        if stream_key.endswith(suf):
+            return stream_key[:-len(suf)]
+    return stream_key
+
+
+def _parse_http_status(lines) -> Optional[int]:
+    """Newest upstream HTTP status found in ffmpeg stderr lines, or None."""
+    for line in reversed(list(lines)):
+        m = _HTTP_STATUS_RE.search(line)
+        if m:
+            return int(m.group(1) or m.group(2))
+    return None
+
+
+def _fmt_dur(secs: float) -> str:
+    secs = int(max(0, secs))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f'{h}h{m:02d}m'
+    if m:
+        return f'{m}m{s:02d}s'
+    return f'{s}s'
+
+
+def _url_expiry_note(url: str) -> str:
+    """
+    Signed CDN URLs (YouTube/googlevideo) carry an `expire` unix timestamp.  Saying
+    whether it has passed immediately separates "the URL expired" from "the network
+    dropped" when a stream goes quiet.
+    """
+    m = _EXPIRE_RE.search(url or '')
+    if not m:
+        return ''
+    delta = int(m.group(1)) - time.time()
+    if delta >= 0:
+        return f'signed URL expires in {_fmt_dur(delta)}'
+    return f'signed URL expired {_fmt_dur(-delta)} ago'
+
+
+def _record_exit(base_key: str, info: dict) -> None:
+    info = dict(info)
+    info['at'] = time.time()
+    with _mv_exits_lock:
+        _mv_recent_exits[base_key] = info
+        if len(_mv_recent_exits) > 200:
+            cutoff = time.time() - _EXIT_INFO_TTL
+            for k in [k for k, v in _mv_recent_exits.items() if v['at'] < cutoff]:
+                del _mv_recent_exits[k]
+
+
+def _clear_exit(base_key: str) -> None:
+    with _mv_exits_lock:
+        _mv_recent_exits.pop(base_key, None)
+
+
+def _get_exit(base_key: str) -> Optional[dict]:
+    with _mv_exits_lock:
+        info = _mv_recent_exits.get(base_key)
+        if not info:
+            return None
+        age = time.time() - info['at']
+        if age > _EXIT_INFO_TTL:
+            del _mv_recent_exits[base_key]
+            return None
+        out = dict(info)
+    out['age_secs'] = round(age, 1)
+    return out
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# yt-dlp: resolving, and explaining WHY it can't
+#
+# Since late 2025 YouTube needs a JavaScript runtime (to solve its "n" challenge)
+# plus the solver scripts (yt-dlp-ejs) and sometimes a PO token.  When they are
+# missing, yt-dlp does not fail loudly: it quietly skips every stream it could not
+# make playable and warns — and this app ran yt-dlp with warnings switched off.  The
+# result was either streams cut off by the CDN after a few seconds (old yt-dlp offers
+# them anyway) or "Requested format is not available" (new yt-dlp drops them).
+# Everything below exists so that the reason is visible and actionable.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+_YTDLP_INSTALL_CMD = 'pip install -U "yt-dlp[default,deno]"'
+
+
+class _YtdlpLog:
+    """yt-dlp logger that KEEPS its warnings/errors (quiet + no_warnings discarded them)."""
+
+    def __init__(self) -> None:
+        self.warnings: list = []
+        self.errors: list = []
+
+    def debug(self, msg) -> None:
+        pass
+
+    def info(self, msg) -> None:
+        pass
+
+    def warning(self, msg) -> None:
+        self._add(self.warnings, msg)
+
+    def error(self, msg) -> None:
+        self._add(self.errors, msg)
+
+    @staticmethod
+    def _add(bucket: list, msg) -> None:
+        text = _ANSI_RE.sub('', str(msg))
+        text = re.sub(r'^\s*(WARNING|ERROR):\s*', '', text.strip())
+        text = re.sub(r'\s+', ' ', text)
+        if text and text not in bucket:
+            bucket.append(text)
+
+
+def _ytdlp_age_days(version: str, today: Optional[datetime.date] = None) -> Optional[int]:
+    """yt-dlp versions are dates (2026.03.17).  None if the string isn't one."""
+    m = re.match(r'^(\d{4})\.(\d{1,2})\.(\d{1,2})', version or '')
+    if not m:
+        return None
+    try:
+        released = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+    return ((today or datetime.date.today()) - released).days
+
+
+def _ytdlp_environment(yt_dlp_module=None) -> dict:
+    """What the installed yt-dlp has to work with on this machine."""
+    ver = getattr(getattr(yt_dlp_module, 'version', None), '__version__', '?') if yt_dlp_module else '?'
+    return {
+        'version':  ver,
+        'age_days': _ytdlp_age_days(ver),
+        # yt-dlp enables only Deno by default; the others are listed so advice can say so
+        'js_runtimes': [n for n in ('deno', 'node', 'bun', 'quickjs') if shutil.which(n)],
+        'ejs':      importlib.util.find_spec('yt_dlp_ejs') is not None,
+    }
+
+
+def _ytdlp_env_line(env: dict) -> str:
+    rt = ', '.join(env['js_runtimes']) or 'none'
+    age = f", {env['age_days']} days old" if env.get('age_days') is not None else ''
+    return f"yt-dlp {env['version']}{age} | JS runtime on PATH: {rt} | yt-dlp-ejs: {'yes' if env['ejs'] else 'MISSING'}"
+
+
+def _ytdlp_advice(env: dict) -> str:
+    """One actionable sentence when the setup is the likely problem; '' when it looks fine."""
+    problems = []
+    has_deno = 'deno' in env['js_runtimes']
+    if not has_deno:
+        others = [r for r in env['js_runtimes'] if r != 'deno']
+        problems.append('no Deno JavaScript runtime'
+                        + (f" ({', '.join(others)} found, but yt-dlp only uses Deno unless told otherwise)"
+                           if others else ''))
+    if not env['ejs']:
+        problems.append('yt-dlp-ejs (YouTube challenge solver) is not installed')
+    age = env.get('age_days')
+    old = age is not None and age > 60
+    if not problems and not old:
+        return ''
+    out = []
+    if problems:
+        out.append('YouTube streams need a JS runtime + solver, and ' + ' and '.join(problems)
+                   + f' - yt-dlp then skips the streams it cannot solve. Fix: {_YTDLP_INSTALL_CMD}  (then restart)')
+    if old:
+        out.append(f'yt-dlp is {age} days old - YouTube changes constantly, keep it updated')
+    return '. '.join(out)
+
+
+def _is_video_format(f: dict) -> bool:
+    """A real picture stream — not an audio-only track, storyboard or thumbnail."""
+    if not f.get('url'):
+        return False
+    if f.get('protocol') == 'mhtml' or f.get('ext') == 'mhtml' or f.get('format_note') == 'storyboard':
+        return False
+    return f.get('vcodec') != 'none'
+
+
+def _fmt_summary(formats) -> str:
+    counts: Dict[str, int] = {}
+    for f in formats or []:
+        k = str(f.get('protocol') or f.get('ext') or '?')
+        counts[k] = counts.get(k, 0) + 1
+    return ', '.join(f'{k}:{v}' for k, v in sorted(counts.items())) or 'none'
+
+
+def _pick_live_hls(formats, h_cap: int):
+    """
+    Best live HLS rendition within h_cap -> (video_format, audio_format_or_None).
+    YouTube normally offers muxed H.264+AAC variants; if only separate video-only and
+    audio-only renditions exist (newer yt-dlp can return those), pair them.
+    """
+    hls = [f for f in (formats or [])
+           if f.get('protocol') in ('m3u8', 'm3u8_native') and f.get('url')]
+    video = sorted((f for f in hls if _is_video_format(f)),
+                   key=lambda f: f.get('height') or 0, reverse=True)
+    pick = next((f for f in video if (f.get('height') or 99999) <= h_cap),
+                video[0] if video else None)
+    audio = None
+    if pick is not None and pick.get('acodec') == 'none':
+        tracks = sorted((f for f in hls if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
+                        key=lambda f: f.get('abr') or f.get('tbr') or 0, reverse=True)
+        audio = tracks[0] if tracks else None
+    return pick, audio
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # SECTION 4 — STREAM REGISTRY
 #
 # Mirrors server.js:
@@ -548,7 +957,8 @@ def _get_or_create_broadcaster(stream_key: str, channel_url: str,
                                 user_agent: str,
                                 transcode: bool = False,
                                 audio_only: bool = False,
-                                audio_url: str = '') -> Optional[StreamBroadcaster]:
+                                audio_url: str = '',
+                                headers: Optional[Dict[str, str]] = None) -> Optional[StreamBroadcaster]:
     """
     Return existing broadcaster for stream_key (if alive) or create a new one.
 
@@ -600,9 +1010,10 @@ def _get_or_create_broadcaster(stream_key: str, channel_url: str,
     # -- Phase 2: spawn ffmpeg OUTSIDE the lock -------------------------------
     broadcaster = StreamBroadcaster(stream_key, channel_url, user_agent,
                                     transcode=transcode, audio_only=audio_only,
-                                    audio_url=audio_url)
+                                    audio_url=audio_url, headers=headers)
     if not broadcaster.process:
         return None
+    _clear_exit(broadcaster.base_key)      # a new run: older "why it ended" is stale
 
     # -- Phase 3: insert under lock, handle the race --------------------------
     with _mv_streams_lock:
@@ -812,6 +1223,14 @@ def register_multiview_routes(app, state=None) -> None:
         transcode   = request.args.get('transcode', '0') == '1'
         audio_only  = request.args.get('audio_only', '0') == '1' and not transcode
         audio_url   = request.args.get('audio_url', '').strip()
+        # Source request headers (yt-dlp's http_headers for YouTube...): JSON object
+        headers: Dict[str, str] = {}
+        hdrs_raw = request.args.get('hdrs', '')
+        if hdrs_raw and len(hdrs_raw) <= 8192:
+            try:
+                headers = _safe_headers(json.loads(hdrs_raw))
+            except (ValueError, TypeError):
+                headers = {}
 
         if not channel_url:
             return 'url parameter is required', 400
@@ -831,7 +1250,8 @@ def register_multiview_routes(app, state=None) -> None:
         broadcaster = _get_or_create_broadcaster(stream_key, channel_url, user_agent,
                                                  transcode=transcode,
                                                  audio_only=audio_only,
-                                                 audio_url=audio_url)
+                                                 audio_url=audio_url,
+                                                 headers=headers)
         if not broadcaster:
             return 'Failed to start ffmpeg stream process', 500
 
@@ -856,10 +1276,11 @@ def register_multiview_routes(app, state=None) -> None:
             try:
                 while True:
                     try:
-                        chunk = client_queue.get(timeout=30)
+                        chunk = client_queue.get(timeout=_CLIENT_IDLE_TIMEOUT)
                     except queue.Empty:
-                        # Stream stalled for 30 s — give up
-                        LOG.warning('[MV] Client queue timeout  key=%s', stream_key)
+                        # Stream stalled — give up (the browser sees a clean end of
+                        # data).  Record WHY, so it is not a silent mystery.
+                        broadcaster.note_client_timeout(_CLIENT_IDLE_TIMEOUT)
                         break
                     if chunk is None:
                         # Broadcaster signalled end-of-stream
@@ -878,6 +1299,20 @@ def register_multiview_routes(app, state=None) -> None:
                 'Access-Control-Allow-Origin': '*',
             },
         )
+
+    # ── GET /api/multiview/exit_info ─────────────────────────────────────────
+    #
+    # Why did the stream for (url, client_id) last end?  Lets the tile tell
+    # "upstream said 458 / 403" (stop, or fresh-resolve) from "silent stall"
+    # (reconnect), and puts the reason in the Activity Log.
+    #
+    @app.route('/api/multiview/exit_info')
+    def multiview_exit_info():
+        channel_url = request.args.get('url', '').strip()
+        client_id   = request.args.get('client_id', '').strip()
+        if not channel_url or not client_id:
+            return jsonify({'error': 'url and client_id are required'}), 400
+        return jsonify(_get_exit(_build_stream_key(client_id, channel_url)) or {})
 
     # ── POST /api/multiview/stream/stop ──────────────────────────────────────
     #
@@ -1106,6 +1541,7 @@ def register_multiview_routes(app, state=None) -> None:
                     'via':     'direct',
                 })
 
+            ylog = _YtdlpLog()      # collects yt-dlp's own warnings for the Activity Log
             try:
                 ydl_opts = {
                     'quiet':            True,
@@ -1118,8 +1554,22 @@ def register_multiview_routes(app, state=None) -> None:
                     # Hard timeout so the endpoint never hangs indefinitely
                     'socket_timeout':   15,
                 }
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(raw_url, download=False)
+                ydl_opts['logger'] = ylog      # keep yt-dlp's own warnings (they say WHY)
+                ytenv = _ytdlp_environment(yt_dlp)
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(raw_url, download=False)
+                except Exception as first_exc:
+                    if 'requested format is not available' not in str(first_exc).lower():
+                        raise
+                    # Our H.264/m4a selector matched nothing.  Live HLS is chosen below from
+                    # the full format list anyway, so ask for any format and don't let yt-dlp
+                    # abort; if there really are none, _pick/the checks below explain why.
+                    LOG.warning('[MV][resolve_url] strict format selector matched nothing - '
+                                'retrying with a permissive one')
+                    retry_opts = dict(ydl_opts, format='bv*+ba/b', ignore_no_formats_error=True)
+                    with yt_dlp.YoutubeDL(retry_opts) as ydl:
+                        info = ydl.extract_info(raw_url, download=False)
 
                 if not info:
                     return jsonify({'error': 'yt-dlp returned no info'}), 502
@@ -1132,6 +1582,8 @@ def register_multiview_routes(app, state=None) -> None:
                 resolved       = None
                 resolved_audio = None
                 formats        = info.get('formats') or []
+                hls_picked     = None
+                req_fmts       = []
 
                 if is_live:
                     # For live streams, select an HLS manifest that matches the
@@ -1143,25 +1595,17 @@ def register_multiview_routes(app, state=None) -> None:
                     except (ValueError, TypeError):
                         h_cap = 99999
 
-                    def _hls_formats(fmts):
-                        """All HLS formats sorted best (highest height) first."""
-                        return sorted(
-                            [f for f in fmts
-                             if f.get('protocol') in ('m3u8', 'm3u8_native') and f.get('url')],
-                            key=lambda f: f.get('height') or 0,
-                            reverse=True,
-                        )
-
-                    hls_fmts = _hls_formats(formats)
-                    # Pick the best HLS that fits within h_cap
-                    hls_picked = next(
-                        (f for f in hls_fmts if (f.get('height') or 99999) <= h_cap),
-                        hls_fmts[0] if hls_fmts else None,   # fallback: best available
-                    )
+                    hls_picked, hls_audio = _pick_live_hls(formats, h_cap)
                     hls = hls_picked.get('url') if hls_picked else None
+                    if hls_audio:
+                        resolved_audio = hls_audio.get('url')
 
-                    # Last resort: info.get('url') may itself be an HLS manifest
-                    resolved = hls or info.get('url') or (formats[-1].get('url') if formats else None)
+                    # Last resort: info['url'] may itself be a manifest.  Only real picture
+                    # streams qualify — never a storyboard / thumbnail / audio-only URL.
+                    fallback_vid = next((f for f in sorted(
+                        (f for f in formats if _is_video_format(f)),
+                        key=lambda f: f.get('height') or 0, reverse=True)), None)
+                    resolved = hls or info.get('url') or (fallback_vid or {}).get('url')
                     actual_h = hls_picked.get('height') if hls_picked else None
                 else:
                     # For VOD: extract video URL and optional separate audio URL
@@ -1210,12 +1654,38 @@ def register_multiview_routes(app, state=None) -> None:
                     resolved_audio = audio_url_out
 
                 if not resolved:
-                    return jsonify({'error': 'yt-dlp could not extract a stream URL'}), 502
+                    advice = _ytdlp_advice(ytenv)
+                    why = '; '.join(ylog.warnings[:2] + ylog.errors[:1])
+                    LOG.error('[MV][resolve_url] no playable stream  formats=%s  warnings=%s',
+                              _fmt_summary(formats), ylog.warnings)
+                    if _mv_state:
+                        try:
+                            _mv_state.log(f'[MV] \u26a0 yt-dlp found no playable stream '
+                                          f'(formats: {_fmt_summary(formats)}) | {_ytdlp_env_line(ytenv)}')
+                            for w in ylog.warnings[:3]:
+                                _mv_state.log(f'[MV] yt-dlp says: {w[:220]}')
+                            if advice:
+                                _mv_state.log(f'[MV] \u26a0 {advice}')
+                        except Exception:
+                            pass
+                    msg = 'yt-dlp found no playable stream for this video'
+                    if advice:
+                        msg += f' - {advice}'
+                    elif why:
+                        msg += f' ({why[:200]})'
+                    return jsonify({'error': msg}), 502
 
                 duration_secs = None if is_live else info.get('duration')
 
                 LOG.info('[MV][resolve_url] resolved  title=%r  live=%s  quality=%s  height=%s  merged=%s  via=yt-dlp',
                          title, is_live, quality, actual_h, 'yes' if (not is_live and resolved_audio) else 'no')
+                # The headers yt-dlp itself would send for the chosen format.  For YouTube this
+                # carries the User-Agent of the client the signed URL was minted for;
+                # googlevideo refuses segment requests from a different identity (typically
+                # after the first few segments), which is exactly a silent mid-stream 403.
+                src_fmt = hls_picked if is_live else (req_fmts[0] if req_fmts else None)
+                http_headers = _safe_headers((src_fmt or {}).get('http_headers')
+                                             or info.get('http_headers') or {})
                 resp = {
                     'url':      resolved,
                     'title':    title,
@@ -1225,14 +1695,47 @@ def register_multiview_routes(app, state=None) -> None:
                     'duration': duration_secs,
                     'via':      'yt-dlp',
                 }
+                if http_headers:
+                    resp['http_headers'] = http_headers
+                if _mv_state:
+                    try:
+                        ver = getattr(getattr(yt_dlp, 'version', None), '__version__', '?')
+                        _mv_state.log(f'[MV] yt-dlp {ver}: "{title[:50]}" - '
+                                      f'{"live HLS" if is_live else "VOD"} {actual_h or "?"}p'
+                                      f'{" +separate audio" if resolved_audio and is_live else ""}, '
+                                      f'{len(http_headers)} header(s) forwarded to ffmpeg')
+                        for w in ylog.warnings[:3]:
+                            _mv_state.log(f'[MV] yt-dlp says: {w[:220]}')
+                        advice = _ytdlp_advice(ytenv)
+                        if advice:
+                            _mv_state.log(f'[MV] \u26a0 {_ytdlp_env_line(ytenv)}')
+                            _mv_state.log(f'[MV] \u26a0 {advice}')
+                    except Exception:
+                        pass
                 # Include separate audio URL for merged formats (e.g. YouTube 720p+)
-                if not is_live and resolved_audio:
+                if resolved_audio:                     # merged VOD, or live with separate renditions
                     resp['audio_url'] = resolved_audio
                 return jsonify(resp)
 
             except Exception as exc:
                 LOG.error('[MV][resolve_url] yt-dlp error: %s', exc)
-                return jsonify({'error': str(exc)}), 502
+                msg = str(exc)
+                try:
+                    env = _ytdlp_environment(yt_dlp)
+                    advice = _ytdlp_advice(env)
+                    warns = list(ylog.warnings)
+                    if _mv_state:
+                        _mv_state.log(f'[MV] \u26a0 yt-dlp could not resolve: {_ANSI_RE.sub("", msg)[:200]}')
+                        _mv_state.log(f'[MV] {_ytdlp_env_line(env)}')
+                        for w in warns[:3]:
+                            _mv_state.log(f'[MV] yt-dlp says: {w[:220]}')
+                        if advice:
+                            _mv_state.log(f'[MV] \u26a0 {advice}')
+                    if advice and 'format is not available' in msg.lower():
+                        msg = f'{_ANSI_RE.sub("", msg)[:160]} - {advice}'
+                except Exception:
+                    pass
+                return jsonify({'error': msg}), 502
 
         finally:
             _ydl_semaphore.release()
@@ -1351,7 +1854,8 @@ _MV_UI_JS = r"""
   flex:1;max-width:360px;
 }
 /* Close-multiview button — prominent, uses the same ⊞ icon as the entry button */
-#mv-close-btn{
+#mv-close-btn,
+#mv-actlog-btn{
   font-size:13px;font-weight:700;letter-spacing:.5px;
   padding:0 12px;
   color:var(--txt) !important;
@@ -1361,7 +1865,8 @@ _MV_UI_JS = r"""
   gap:4px;
   transition:background .15s,border-color .15s,color .15s;
 }
-#mv-close-btn:hover{
+#mv-close-btn:hover,
+#mv-actlog-btn:hover{
   background:var(--acc) !important;
   border-color:var(--acc2) !important;
   color:#fff !important;
@@ -1646,6 +2151,28 @@ _MV_UI_JS = r"""
 .mv-save-btns{display:flex;gap:7px;justify-content:flex-end}
 .mv-save-btns button{height:32px;padding:0 14px;font-size:12px}
 
+/* Activity Log popup — Multi-View covers the main Activity Log panel */
+#mv-log-overlay{
+  display:none;position:fixed;inset:0;z-index:1250;
+  background:rgba(0,0,0,.75);align-items:center;justify-content:center;
+}
+#mv-log-overlay.open{display:flex}
+#mv-log-modal{
+  background:var(--s2);border-radius:var(--r);border:1px solid var(--bdr2);
+  width:min(1100px,96vw);height:min(80vh,760px);
+  display:flex;flex-direction:column;box-shadow:var(--sh);overflow:hidden;
+}
+#mv-log-hdr{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:8px 12px;background:var(--s3);border-bottom:1px solid var(--bdr2);
+}
+#mv-log-hdr h3{font-size:11px;font-weight:800;text-transform:uppercase;
+  letter-spacing:1.5px;color:var(--txt2);margin:0}
+.mv-log-btns{display:flex;gap:6px}
+.mv-log-btns button{height:24px;padding:0 10px;font-size:11px;border-radius:var(--rss)}
+#mv-log-host{flex:1;min-height:0;display:flex;flex-direction:column;background:var(--bg)}
+#mv-log-host > *{flex:1;min-height:0}
+
 /* Confirm overlay for layout operations */
 #mv-confirm-overlay{
   display:none;position:fixed;inset:0;z-index:1300;
@@ -1677,6 +2204,7 @@ _MV_UI_JS = r"""
         <span id="mv-tb-arrow">▾</span> Controls
       </button>
       <div style="flex:1"></div>
+      <button class="btn-ghost" id="mv-actlog-btn" title="Activity Log">\u25a4 Log</button>
       <button class="btn-ghost" id="mv-close-btn" title="Close Multi-View">⊞ Multi-View ✕</button>
     </div>
     <!-- Collapsible body — hidden on mobile after load -->
@@ -1737,6 +2265,20 @@ _MV_UI_JS = r"""
 
 <!-- ── Save layout modal ───────────────────────────────────
      Mirrors saveLayoutModal in multiview.js              -->
+<div id="mv-log-overlay">
+  <div id="mv-log-modal">
+    <div id="mv-log-hdr">
+      <h3>Activity Log</h3>
+      <div class="mv-log-btns">
+        <button class="btn-ghost" id="mv-log-copy">Copy</button>
+        <button class="btn-ghost" id="mv-log-clear">Clear</button>
+        <button class="btn-ghost" id="mv-log-close" title="Close (Esc)">\u2715</button>
+      </div>
+    </div>
+    <div id="mv-log-host"></div>
+  </div>
+</div>
+
 <div id="mv-save-overlay">
   <div id="mv-save-modal">
     <h3>Save Layout</h3>
@@ -1939,6 +2481,7 @@ async function _mvPlayFromUrl(wid, rawUrl, cEl, opts){
   let finalUrl    = rawUrl;
   let channelName = '';
   let isLive      = true;   // assumed live unless yt-dlp says otherwise
+  let httpHeaders = null;   // what yt-dlp would send for this format (YouTube: its client's UA...)
 
   if(_mvNeedsResolve(rawUrl)){
     // Ask the server to resolve via yt-dlp
@@ -1962,6 +2505,7 @@ async function _mvPlayFromUrl(wid, rawUrl, cEl, opts){
       return;
     }
     finalUrl    = d.url;
+    httpHeaders = d.http_headers || null;
     channelName = d.title || '';
     isLive      = d.is_live !== false;
     if(d.duration) cEl._mvKnownDuration = d.duration;
@@ -1988,6 +2532,7 @@ async function _mvPlayFromUrl(wid, rawUrl, cEl, opts){
     id:               'custom-url-' + Date.now(),
     _portal_override: { key: _synthKey, name: _synthName },
     _is_live:         isLive,     // passed to mpegts isLive flag for VOD seek support
+    _http_headers:    httpHeaders,
   };
 
   mvExternalUrlWidgets.add(wid);
@@ -2114,6 +2659,76 @@ function mvToggle(){
 }
 
 // Called from ⊞ button in pctrl-hdr (desktop) and botnav t-mv tab (mobile).
+// ── Activity Log popup ───────────────────────────────────────────────────────
+// Multi-View is a full overlay, so the main Activity Log panel is hidden behind it.
+// The popup MOVES the real log element into the modal (not a copy): it keeps every
+// style/id-scoped rule main gives it, main's alog() keeps appending to it, and main's
+// own Copy / Clear act on it.  It goes back exactly where it was on close.
+let _mvLogState = null;
+
+function _mvLogSourceNode(){
+  const d = document.getElementById('desktop-logout');   // desktop layout
+  const m = document.getElementById('logout');           // mobile layout (its own tab)
+  let desktop = false;
+  try { const dl = document.getElementById('desktop-log');
+        desktop = !!dl && getComputedStyle(dl).display !== 'none'; } catch(e){}
+  return desktop ? (d || m) : (m || d);
+}
+
+function mvLogOpen(){
+  const ovl  = document.getElementById('mv-log-overlay');
+  const host = document.getElementById('mv-log-host');
+  if(!ovl || !host || _mvLogState) return;
+  const node = _mvLogSourceNode();
+  if(!node){ toast('Activity log not available', 'wrn'); return; }
+  const st = { node, parent: node.parentNode, next: node.nextSibling,
+               cssText: node.style.cssText, atBottom: true, onScroll: null, observer: null };
+  _mvLogState = st;
+  node.style.height    = '100%';
+  node.style.maxHeight = 'none';
+  host.appendChild(node);
+  ovl.classList.add('open');
+  node.scrollTop = node.scrollHeight;
+  st.onScroll = ()=>{ st.atBottom = (node.scrollHeight - node.scrollTop - node.clientHeight) < 40; };
+  node.addEventListener('scroll', st.onScroll);
+  if(typeof MutationObserver !== 'undefined'){
+    // follow new lines — unless the user scrolled up to read something
+    st.observer = new MutationObserver(()=>{ if(st.atBottom) node.scrollTop = node.scrollHeight; });
+    st.observer.observe(node, {childList: true, subtree: true, characterData: true});
+  }
+}
+
+function mvLogClose(){
+  const ovl = document.getElementById('mv-log-overlay');
+  if(ovl) ovl.classList.remove('open');
+  const st = _mvLogState;
+  if(!st) return;
+  _mvLogState = null;
+  try { st.node.removeEventListener('scroll', st.onScroll); if(st.observer) st.observer.disconnect(); } catch(e){}
+  st.node.style.cssText = st.cssText;
+  if(st.parent) st.parent.insertBefore(st.node, (st.next && st.next.parentNode === st.parent) ? st.next : null);
+}
+
+(function(){
+  const on = (id, fn) => { const el = document.getElementById(id); if(el) el.addEventListener('click', fn); };
+  on('mv-actlog-btn', ()=> mvLogOpen());
+  on('mv-log-copy',   ()=> mvLogCopy());
+  on('mv-log-clear',  ()=> mvLogClear());
+  on('mv-log-close',  ()=> mvLogClose());
+  const ovl = document.getElementById('mv-log-overlay');
+  if(ovl) ovl.addEventListener('click', e=>{ if(e.target === ovl) mvLogClose(); });   // backdrop only
+})();
+
+function mvLogCopy(){
+  if(typeof copyLog === 'function'){ copyLog(); return; }
+  const n = _mvLogState && _mvLogState.node;
+  if(n && navigator.clipboard) navigator.clipboard.writeText(n.innerText || n.textContent || '').catch(()=>{});
+}
+function mvLogClear(){
+  if(typeof clearLog === 'function'){ clearLog(); return; }
+  if(_mvLogState) _mvLogState.node.textContent = '';
+}
+
 function mvOpen(){
   _mvUpdateTop();
   const panel = document.getElementById('p-mv');
@@ -2179,6 +2794,7 @@ function mvOpen(){
 
 // mirrors multiview.js cleanupMultiView()
 async function mvClose(){
+  mvLogClose();                       // give the Activity Log back to the main panel
   document.getElementById('p-mv').classList.remove('mv-active');
   document.getElementById('mv-confirm-overlay').classList.remove('open');
   document.getElementById('mv-sel-overlay').classList.remove('open');
@@ -2709,7 +3325,8 @@ function _mvNewSession(cEl){
   _mvEndSession(cEl);
   const s = { id: ++_mvSessSeq, dead: false, recovering: false, live: false,
               player: null, wd: null, lastCt: null, stallTicks: 0,
-              everPlayed: false, playingSince: 0 };
+              everPlayed: false, playingSince: 0,
+              t0: Date.now(), srcUrl: '' };   // srcUrl: set when the stream goes through /api/multiview/stream
   cEl._mvSess = s;
   return s;
 }
@@ -2734,15 +3351,76 @@ function _mvRecover(wid, cEl, sess, kind, detail){
   if(!_mvSessLive(wid, cEl, sess) || sess.recovering) return;
   // VOD: only hard errors are retried — reaching the end is normal for VOD.
   if(!sess.live && kind !== 'error') return;
-  sess.recovering = true;
-  const name = _mvWidgetName(cEl, wid);
-  _mvLog(name + ': ' + kind + (detail ? ' \u2014 ' + detail : ''), 'w');
+  sess.recovering = true;          // de-duplicates ERROR + EOF + 'ended' fired together
+  _mvDecide(wid, cEl, sess, kind, detail).catch(()=>{
+    // Diagnostics must never be able to strand a tile: fall back to a plain fresh restart.
+    if(_mvSessLive(wid, cEl, sess)) _mvScheduleFresh(wid, cEl, 'error');
+  });
+}
 
-  // Deterministic failures (the browser cannot decode this stream) fail the same
-  // way on every retry — don't spend a minute of retries on them.
-  if(kind === 'error' && /CodecUnsupported|FormatUnsupported/i.test(detail || '')){
-    _mvGiveUp(wid, cEl, name);
-    return;
+// Why did the server end this stream?  (ffmpeg exit + upstream HTTP status, or a silent
+// stall.)  Null when unknown, unreachable, or the record belongs to an earlier run.
+async function _mvFetchExitInfo(sess){
+  if(!sess || !sess.srcUrl) return null;
+  const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  const timer = setTimeout(()=>{ try{ if(ctl) ctl.abort(); }catch(e){} }, 1500);
+  try {
+    const r = await fetch('/api/multiview/exit_info?url=' + encodeURIComponent(sess.srcUrl)
+                          + '&client_id=' + encodeURIComponent(mvClientId), ctl ? {signal: ctl.signal} : undefined);
+    if(!r.ok) return null;
+    const d = await r.json();
+    if(!d || !d.reason) return null;
+    // ignore a record left over from an earlier broadcaster of the same stream
+    if(typeof d.age_secs === 'number' && d.age_secs > (Date.now() - sess.t0) / 1000 + 5) return null;
+    return d;
+  } catch(e){ return null; }
+  finally { clearTimeout(timer); }
+}
+
+// Parity with the main player: 456/458 are never retried; 503/403/404 mean "channel
+// unavailable" for portal channels.  For an externally resolved URL (YouTube...) a
+// 403/404 only means THAT signed URL is dead — a fresh resolve is exactly the cure.
+function _mvTerminalHttp(wid, code){
+  if(code === 456 || code === 458) return true;
+  if(mvExternalUrlWidgets.has(wid)) return false;
+  return code === 503 || code === 403 || code === 404;
+}
+function _mvHttpMessage(code){
+  if(code === 456) return 'Wrong location \u2014 use a VPN (456)';
+  if(code === 458) return 'Max connections already in use (458)';
+  return 'Channel unavailable (' + code + ')';
+}
+
+async function _mvDecide(wid, cEl, sess, kind, detail){
+  const name = _mvWidgetName(cEl, wid);
+  detail = detail || '';
+  const info = (kind === 'stall') ? null : await _mvFetchExitInfo(sess);
+  if(!_mvSessLive(wid, cEl, sess)) return;           // user stopped/switched while we asked
+  _mvLog(name + ': ' + kind + (detail ? ' \u2014 ' + detail : '')
+         + (info && info.text ? '  [server: ' + info.text + ']' : ''), 'w');
+
+  // Upstream refused in a way retrying cannot fix.
+  const http = info && info.http;
+  if(http && _mvTerminalHttp(wid, http)){ _mvGiveUp(wid, cEl, name, _mvHttpMessage(http)); return; }
+
+  if(kind === 'error'){
+    const isFmt = /FormatUnsupported/i.test(detail);       // not MPEG-TS at all: deterministic
+    const isMse = !isFmt && /MediaError/i.test(detail) && /MSE|Unsupported/i.test(detail);
+    if(isFmt){ _mvGiveUp(wid, cEl, name, 'unsupported stream format'); return; }
+    if(isMse){
+      // Browser can't decode it (typically HEVC).  Main re-encodes to H.264 once per play
+      // session; so do we — once, without spending retry budget.  Failing again = give up.
+      const ch = cEl._mvChannel;
+      const canTranscode = !cEl._mvForceTranscode && !(ch && (ch._mv_transcode || ch._mv_hls_transcode));
+      if(canTranscode){
+        cEl._mvForceTranscode = true;
+        toast('\u26a0 ' + name + ': codec not supported by the browser \u2014 re-encoding via ffmpeg (H.264)', 'wrn');
+        _mvScheduleFresh(wid, cEl, '', {free: true});
+        return;
+      }
+      _mvGiveUp(wid, cEl, name, 'transcode failed \u2014 ffmpeg may not support this codec');
+      return;
+    }
   }
 
   // 1) soft reconnect — live errors/stalls on a still-valid player.  EOF/'ended'
@@ -2776,23 +3454,32 @@ function _mvRecover(wid, cEl, sess, kind, detail){
     (kind === 'ended' || kind === 'eof') ? 'stream ended' : (kind === 'stall' ? 'stalled' : 'error'));
 }
 
-function _mvGiveUp(wid, cEl, name){
-  cEl._mvRetries = 0;
-  cEl._mvSoft    = 0;
-  toast('\u2715 Stream failed: ' + (name || wid), 'err');
+function _mvGiveUp(wid, cEl, name, why){
+  cEl._mvRetries        = 0;
+  cEl._mvSoft           = 0;
+  cEl._mvForceTranscode = false;
+  toast('\u2715 Stream failed: ' + (name || wid) + (why ? ' \u2014 ' + why : ''), 'err');
   _mvStopCleanup(wid, true);
 }
 
 // Schedule the next fresh restart, or give up once the budget is spent.
-function _mvScheduleFresh(wid, cEl, why){
+// opts.free: a restart that is part of a fallback (codec -> transcode), not a failure
+// retry — short delay, no budget spent.
+function _mvScheduleFresh(wid, cEl, why, opts){
+  opts = opts || {};
   const name = _mvWidgetName(cEl, wid);
-  const used = cEl._mvRetries || 0;
-  if(used >= _MV_FRESH_DELAYS.length){ _mvGiveUp(wid, cEl, name); return; }
-  cEl._mvRetries = used + 1;
-  const delay = _MV_FRESH_DELAYS[used];
-  const gen   = cEl._mvGen;
-  toast('\u26a0 ' + name + ' ' + why + ' \u2014 reconnecting ' + cEl._mvRetries + '/'
-        + _MV_FRESH_DELAYS.length + ' in ' + (delay / 1000) + 's', 'wrn');
+  let delay;
+  if(opts.free){
+    delay = 1000;
+  } else {
+    const used = cEl._mvRetries || 0;
+    if(used >= _MV_FRESH_DELAYS.length){ _mvGiveUp(wid, cEl, name); return; }
+    cEl._mvRetries = used + 1;
+    delay = _MV_FRESH_DELAYS[used];
+    toast('\u26a0 ' + name + ' ' + why + ' \u2014 reconnecting ' + cEl._mvRetries + '/'
+          + _MV_FRESH_DELAYS.length + ' in ' + (delay / 1000) + 's', 'wrn');
+  }
+  const gen = cEl._mvGen;
   if(cEl._mvRetryTimer) clearTimeout(cEl._mvRetryTimer);
   cEl._mvRetryTimer = setTimeout(()=>{
     cEl._mvRetryTimer = null;
@@ -2907,10 +3594,57 @@ function _mvOutputDeviceId(){
   return '';
 }
 
+// Volume boost / soft (parity with the main player's Output panel).  Main routes #vid
+// through ONE shared AudioContext + GainNode (_globalAudioGraph) — built only when a
+// boost/soft level is saved or has been used, so nobody pays for it otherwise.  Tiles
+// join that same graph under the same rule: the level applies to them, and the output
+// device then follows the AudioContext's sink (set by main) instead of the element's.
+// Returns true when the tile is routed through the graph.
+function _mvWireGain(videoEl){
+  if(!videoEl) return false;
+  if(videoEl._mvGainSrc) return true;
+  try {
+    if(typeof _gainNode === 'undefined' || !_gainNode) return false;
+    if(typeof window._globalAudioGraph !== 'function') return false;
+    const g = window._globalAudioGraph();
+    if(!g || !g.ctx || !g.gain) return false;
+    if(g.ctx.state === 'suspended'){ const p = g.ctx.resume(); if(p && p.catch) p.catch(()=>{}); }
+    const src = g.ctx.createMediaElementSource(videoEl);
+    src.connect(g.gain);
+    videoEl._mvGainSrc = src;
+    return true;
+  } catch(e){
+    console.warn('[MV] could not join the shared gain graph:', e && (e.message || e));
+    return false;
+  }
+}
+
+// Video filters (parity with main's Video Filters panel: brightness/contrast/...),
+// persisted by main in localStorage 'vid_filters'.  Same CSS string main builds.
+function _mvVideoFilterCss(){
+  try {
+    const raw = localStorage.getItem('vid_filters');
+    if(!raw) return '';
+    const f = Object.assign({brightness:1, contrast:1, saturate:1, hue:0, grayscale:0, sepia:0}, JSON.parse(raw));
+    const p = [];
+    if(f.brightness !== 1) p.push('brightness(' + Number(f.brightness).toFixed(2) + ')');
+    if(f.contrast   !== 1) p.push('contrast('   + Number(f.contrast).toFixed(2)   + ')');
+    if(f.saturate   !== 1) p.push('saturate('   + Number(f.saturate).toFixed(2)   + ')');
+    if(f.hue        !== 0) p.push('hue-rotate(' + f.hue + 'deg)');
+    if(f.grayscale  !== 0) p.push('grayscale('  + Number(f.grayscale).toFixed(2)  + ')');
+    if(f.sepia      !== 0) p.push('sepia('      + Number(f.sepia).toFixed(2)      + ')');
+    return p.join(' ');
+  } catch(e){ return ''; }
+}
+function _mvApplyVideoFilter(videoEl){
+  if(videoEl) videoEl.style.filter = _mvVideoFilterCss();
+}
+
 // Never throws and never holds playback up: unsupported browser (Android), device
 // unplugged, permission refused, or a hung call all just leave the default output.
 async function _mvApplySink(videoEl){
   if(!videoEl || typeof videoEl.setSinkId !== 'function') return false;
+  if(videoEl._mvGainSrc) return true;            // routed via the shared AudioContext: its sink rules
   const id = _mvOutputDeviceId();
   if(!id && !videoEl._mvSinkSet) return false;   // never configured — leave the default alone
   if(videoEl._mvSinkSet && videoEl._mvSinkId === id) return true;
@@ -2949,6 +3683,7 @@ async function _mvPlayChannel(wid, channel, cEl){
   if(!_isRetryAttempt){
     cEl._mvRetries        = 0;
     cEl._mvSoft           = 0;
+    cEl._mvForceTranscode = false;
     cEl._mvLastChannelRef = null;
     // User-initiated: invalidate any pending retry timer / in-flight re-resolve.
     cEl._mvGen = (cEl._mvGen || 0) + 1;
@@ -2968,8 +3703,10 @@ async function _mvPlayChannel(wid, channel, cEl){
   titleEl.textContent = channel.name || 'Channel';
   if(placeholder) placeholder.dataset.channelId = channel.id || '';
 
-  // Follow the main player's Output Device choice (each tile is its own <video>).
-  await _mvApplySink(videoEl);
+  // Follow the main player's audio + picture settings (each tile is its own <video>):
+  // Volume boost/soft (shared gain graph) or Output Device, plus Video Filters.
+  if(!_mvWireGain(videoEl)) await _mvApplySink(videoEl);
+  _mvApplyVideoFilter(videoEl);
 
   // Show video, hide placeholder
   videoEl.classList.remove('mv-hidden');
@@ -3096,7 +3833,14 @@ async function _mvPlayChannel(wid, channel, cEl){
       hlsInst.loadSource(proxyVideoUrl);
       hlsInst.attachMedia(videoEl);
       hlsInst.on(Hls.Events.MANIFEST_PARSED, ()=>{ videoEl.play().catch(()=>{}); });
-      hlsInst.on(Hls.Events.ERROR, (_,d)=>{ if(d.fatal){ toast('Stream error','err'); _mvStopCleanup(wid,true); }});
+      hlsInst.on(Hls.Events.ERROR, (_,d)=>{
+        if(!d.fatal) return;
+        // same status codes the main player's hls handler singles out
+        const hc = (d.response && d.response.code) || (d.networkDetails && d.networkDetails.status) || 0;
+        const known = (hc === 456 || hc === 458 || hc === 503 || hc === 403 || hc === 404);
+        toast(known ? '\u2715 ' + _mvHttpMessage(hc) : 'Stream error', 'err');
+        _mvStopCleanup(wid,true);
+      });
       mvPlayers.set(wid, {pause:()=>videoEl.pause(), unload:()=>hlsInst.stopLoad(),
         detachMediaElement:()=>hlsInst.detachMedia(), destroy:()=>hlsInst.destroy()});
     } else {
@@ -3149,8 +3893,8 @@ async function _mvPlayChannel(wid, channel, cEl){
       lazyLoad:               false,
       seekType:               _hlsIsLive ? 'range' : 'range',
       liveBufferLatencyChasing:   _hlsIsLive,
-      liveBufferLatencyMaxLatency: _hlsIsLive ? 8 : undefined,
-      liveBufferLatencyMinRemain:  _hlsIsLive ? 2 : undefined,
+      liveBufferLatencyMaxLatency: _hlsIsLive ? 12 : undefined,   // main's values
+      liveBufferLatencyMinRemain:  _hlsIsLive ? 3 : undefined,
     });
     sess.live = sess.live && _hlsIsLive;
     _mvWirePlayer(wid, cEl, videoEl, sess, player);
@@ -3178,13 +3922,21 @@ async function _mvPlayChannel(wid, channel, cEl){
   // dedup and reference counting server-side.
   // Pass the session's effective User-Agent so ffmpeg identifies to the IPTV
   // server with the same UA that all other session requests use.
-  const _mvUa = (window._mvEffectiveUa || 'VLC/3.0.0 LibVLC/3.0.0');
+  // Streams resolved by yt-dlp (YouTube...) must identify as yt-dlp's own downloader would:
+  // the format's http_headers.  Everything else keeps the portal session's UA.
+  const _hh    = channel._http_headers || null;
+  const _uaKey = _hh ? Object.keys(_hh).find(k => k.toLowerCase() === 'user-agent') : null;
+  const _mvUa  = (_uaKey && _hh[_uaKey]) || window._mvEffectiveUa || 'VLC/3.0.0 LibVLC/3.0.0';
+  const _hdrs  = {};
+  if(_hh) Object.keys(_hh).forEach(k => { if(k !== _uaKey) _hdrs[k] = _hh[k]; });
   const proxyUrl = '/api/multiview/stream?'
     + 'url='        + encodeURIComponent(resolvedUrl)
     + '&client_id=' + encodeURIComponent(mvClientId)
     + '&ua='        + encodeURIComponent(_mvUa)
-    + (channel._mv_transcode ? '&transcode=1' : '')
+    + (Object.keys(_hdrs).length ? '&hdrs=' + encodeURIComponent(JSON.stringify(_hdrs)) : '')
+    + ((channel._mv_transcode || cEl._mvForceTranscode) ? '&transcode=1' : '')
     + (cEl._mvAudioUrl ? '&audio_url=' + encodeURIComponent(cEl._mvAudioUrl) : '');
+  sess.srcUrl = resolvedUrl;   // how the server knows this stream (for /api/multiview/exit_info)
 
   // ── Create mpegts.js player ────────────────────────────────────────────────
   // mirrors multiview.js mpegts.createPlayer block exactly
@@ -3204,7 +3956,15 @@ async function _mvPlayChannel(wid, channel, cEl){
   }, {
     enableStashBuffer: true,
     stashInitialSize:  4096,
-    liveBufferLatency: 2.0,
+    // Same live-latency chasing as the main player.  This used to say
+    // `liveBufferLatency: 2.0`, which is not an mpegts.js option — so tiles on this
+    // (primary) path never caught up after a stall and drifted further behind live.
+    // 12 s / 3 s are main's values: wide enough that bursty portals don't make the
+    // chaser speed playback up aggressively.
+    liveBufferLatencyChasing:    _mpIsLive,
+    liveBufferLatencyMaxLatency: _mpIsLive ? 12 : undefined,
+    liveBufferLatencyMinRemain:  _mpIsLive ? 3 : undefined,
+    autoCleanupSourceBuffer:     !_mpIsLive,
   });
 
   // Error / end-of-stream / stall handling: shared live-recovery system (see
@@ -3322,6 +4082,7 @@ async function _mvStopCleanup(wid, resetUI){
       cEl._mvIsRetrying    = false;
       cEl._mvRetries       = 0;
       cEl._mvSoft          = 0;
+      cEl._mvForceTranscode = false;
       cEl._mvLastChannelRef = null;
       if(cEl._mvRetryTimer){ clearTimeout(cEl._mvRetryTimer); cEl._mvRetryTimer = null; }
     }
@@ -4283,7 +5044,9 @@ function _mvSetupListeners(){
 
     // Multiview-only modals — only when multiview panel is active
     if(document.getElementById('p-mv').classList.contains('mv-active')){
-      if(document.getElementById('mv-confirm-overlay').classList.contains('open')){
+      if(document.getElementById('mv-log-overlay').classList.contains('open')){
+        mvLogClose();
+      } else if(document.getElementById('mv-confirm-overlay').classList.contains('open')){
         document.getElementById('mv-confirm-overlay').classList.remove('open');
       } else if(document.getElementById('mv-save-overlay').classList.contains('open')){
         document.getElementById('mv-save-overlay').classList.remove('open');
