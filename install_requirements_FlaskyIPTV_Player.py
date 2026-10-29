@@ -14,6 +14,8 @@
 """
 Installer for MAC/Xtream/M3U Portal Builder — Flask/WebView Edition
 Installs all required Python packages and checks system dependencies.
+yt-dlp is installed with the extras YouTube needs (solver + Deno) and checked for updates;
+ffmpeg is version-checked (an old ffmpeg cannot read newer YouTube live streams).
 Run with:  python install_requirements_FlaskyIPTV_Player.py
 """
 
@@ -21,6 +23,11 @@ import subprocess
 import sys
 import shutil
 import os
+import re
+import json
+import datetime
+import urllib.request
+from typing import Optional, Tuple
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 if sys.platform == "win32":
@@ -106,6 +113,248 @@ def pkg_install(pkg_name: str) -> bool:
     return result.returncode == 0
 
 
+# --- yt-dlp (YouTube / Twitch / ...) ----------------------------------------------------------
+# YouTube needs more than a bare `pip install yt-dlp`: the challenge solver (yt-dlp-ejs, from the
+# [default] extra) and a Deno JavaScript runtime (the [deno] extra).  Without them yt-dlp quietly
+# drops every stream it cannot solve and reports "Requested format is not available".  YouTube also
+# changes constantly, so an old yt-dlp stops working: hence the version check against PyPI.
+YTDLP_STALE_DAYS = 60                      # only used when PyPI cannot be reached
+YTDLP_UPDATE_CMD = 'pip install -U "yt-dlp[default,deno]"'
+FFMPEG_UPDATE_HOWTO = (
+    "Windows: winget upgrade Gyan.FFmpeg, or a current build from https://www.gyan.dev/ffmpeg/builds/ | "
+    "Termux: pkg upgrade ffmpeg | macOS: brew upgrade ffmpeg | Linux: your package manager"
+)
+
+
+def ytdlp_spec() -> str:
+    """What to pip-install.  Deno has no Termux build, so Termux gets [default] only."""
+    return "yt-dlp[default]" if IS_TERMUX else "yt-dlp[default,deno]"
+
+
+def version_tuple(v: str) -> Tuple[int, ...]:
+    """'2026.10.21' -> (2026, 10, 21);  dev suffixes are ignored."""
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")[:4])
+
+
+def ytdlp_age_days(version: Optional[str], today: Optional[datetime.date] = None) -> Optional[int]:
+    """yt-dlp versions are dates.  None when the string is not one."""
+    m = re.match(r"^(\d{4})\.(\d{1,2})\.(\d{1,2})", version or "")
+    if not m:
+        return None
+    try:
+        released = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+    return ((today or datetime.date.today()) - released).days
+
+
+def installed_ytdlp_version() -> Optional[str]:
+    r = subprocess.run(
+        [sys.executable, "-c", "import yt_dlp.version as v; print(v.__version__)"],
+        capture_output=True, text=True)
+    out = (r.stdout or "").strip()
+    return out if r.returncode == 0 and out else None
+
+
+def latest_ytdlp_version(timeout: float = 8) -> Optional[str]:
+    """Newest yt-dlp release on PyPI; None when offline / PyPI unreachable."""
+    try:
+        with urllib.request.urlopen("https://pypi.org/pypi/yt-dlp/json", timeout=timeout) as resp:
+            return str(json.load(resp)["info"]["version"])
+    except Exception:
+        return None
+
+
+def find_deno() -> Tuple[Optional[str], bool]:
+    """(path, on_path).  pip puts the Deno executable into Python's scripts folder, which is often not
+    on PATH, and yt-dlp only looks for "deno" by name."""
+    p = shutil.which("deno")
+    if p:
+        return p, True
+    r = subprocess.run(
+        [sys.executable, "-c", "import deno; print(deno.find_deno_bin())"],
+        capture_output=True, text=True)
+    path = (r.stdout or "").strip()
+    if r.returncode == 0 and path and os.path.isfile(path):
+        return path, False
+    return None, False
+
+
+def ytdlp_status(latest: Optional[str] = None, today: Optional[datetime.date] = None) -> dict:
+    ver = installed_ytdlp_version()
+    st = {"installed": ver, "latest": latest, "age_days": ytdlp_age_days(ver, today), "outdated": False,
+          "ejs": False, "deno": None, "deno_on_path": False}
+    if not ver:
+        return st
+    if latest:
+        st["outdated"] = version_tuple(ver) < version_tuple(latest)
+    else:                                   # offline: judge by age
+        st["outdated"] = st["age_days"] is not None and st["age_days"] > YTDLP_STALE_DAYS
+    st["ejs"] = check_import("yt_dlp_ejs")
+    st["deno"], st["deno_on_path"] = find_deno()
+    return st
+
+
+def ytdlp_problems(st: dict) -> list:
+    """Plain-language list of what is wrong with the yt-dlp setup (empty = fine)."""
+    out = []
+    if st["outdated"]:
+        if st["latest"]:
+            out.append(f"newer release available ({st['latest']})")
+        else:
+            out.append(f"{st['age_days']} days old")
+    if not st["ejs"]:
+        out.append("the yt-dlp-ejs YouTube challenge solver is missing")
+    if not st["deno"] and not IS_TERMUX:
+        out.append("no Deno JavaScript runtime found")
+    return out
+
+
+def install_ytdlp() -> bool:
+    """Install/upgrade yt-dlp with its YouTube extras; fall back to smaller sets if a platform has no
+    wheel for one of them, so a Deno problem never leaves the user with no yt-dlp at all."""
+    specs = [ytdlp_spec()]
+    if not IS_TERMUX:
+        specs.append("yt-dlp[default]")
+    specs.append("yt-dlp")
+    for i, spec in enumerate(specs):
+        if pip_install(spec):
+            if i > 0:
+                warn(f"Installed {spec} only - the fuller {specs[0]} could not be installed on this system")
+            return True
+        if i + 1 < len(specs):
+            warn(f"{spec} failed to install - trying {specs[i + 1]}")
+    return False
+
+
+def ensure_ytdlp():
+    """Install yt-dlp with its YouTube extras, or update it when it is outdated / missing a piece."""
+    latest = latest_ytdlp_version()
+    st = ytdlp_status(latest)
+
+    if not st["installed"]:
+        info("yt-dlp not installed - installing it with the YouTube extras ...")
+        if not install_ytdlp():
+            warn("yt-dlp - failed to install (optional)  (URL resolver for YouTube/Twitch in Multi-View)")
+            info(f"Try manually:  {YTDLP_UPDATE_CMD}")
+            return
+        st = ytdlp_status(latest)
+        if not st["installed"]:
+            warn("yt-dlp - installed but import failed (optional)")
+            return
+    else:
+        problems = ytdlp_problems(st)
+        if not problems:
+            deno_note = "Deno found" if st["deno"] else "no Deno (Termux)"
+            ok(f"yt-dlp {st['installed']} - up to date  (solver present, {deno_note})")
+            return
+        warn(f"yt-dlp {st['installed']}: " + "; ".join(problems))
+        info(f"Updating:  {YTDLP_UPDATE_CMD}")
+        if not install_ytdlp():
+            warn("yt-dlp update failed - run it yourself:")
+            info(f"  {YTDLP_UPDATE_CMD}")
+            return
+        st = ytdlp_status(latest)
+
+    if st["outdated"]:
+        # pip said "success" but the version did not change: it most likely went into a different
+        # Python than the one that runs FlaskyIPTV (common with several Pythons on Windows)
+        warn(f"yt-dlp is still {st['installed']} after the update - pip probably installed into a different Python")
+        info(f'Use the one that runs the app:  "{sys.executable}" -m pip install -U "{ytdlp_spec()}"')
+    else:
+        ok(f"yt-dlp {st['installed']} ready  (YouTube/Twitch URL playback in Multi-View)")
+    if st["deno"] and not st["deno_on_path"]:
+        folder = os.path.dirname(st["deno"])
+        warn(f"Deno is installed ({st['deno']}) but that folder is not on PATH, so yt-dlp cannot find it by name")
+        info(f"Multi-View finds it by itself; for other yt-dlp users add this folder to PATH: {folder}")
+    elif not st["deno"] and not IS_TERMUX:
+        warn("Deno could not be installed - YouTube streams may not resolve")
+        info("Install Deno from https://deno.com (then restart) or run:  " + YTDLP_UPDATE_CMD)
+    if IS_TERMUX:
+        info("Termux: Deno has no Android build, so YouTube support through yt-dlp may be limited")
+    if not st["ejs"]:
+        warn("yt-dlp-ejs (the YouTube challenge solver) is still missing - YouTube streams may not resolve")
+    if latest is None:
+        info("Could not reach PyPI to look for a newer yt-dlp (offline?) - judged by age only")
+    info("To update later:  " + YTDLP_UPDATE_CMD)
+
+
+# --- ffmpeg version ---------------------------------------------------------------------------
+def parse_ffmpeg_version(first_line: str, today: Optional[datetime.date] = None) -> dict:
+    """First line of `ffmpeg -version` -> {'version', 'old'}.  'old' only when it can be told: a release
+    older than 6.0, or a dated (e.g. gyan.dev) build more than ~18 months old.  Git builds (N-123-g...)
+    are unknowable and never reported as old.  (Old ffmpeg cannot open the newer HLS that YouTube live
+    uses: it fails at input open with "Invalid data found when processing input".)"""
+    m = re.search(r"ffmpeg version\s+(\S+)", first_line or "")
+    raw = m.group(1) if m else ""
+    today = today or datetime.date.today()
+    old = False
+    d = re.match(r"^(\d{4})-(\d{2})-(\d{2})", raw)
+    if d:
+        try:
+            old = (today - datetime.date(int(d.group(1)), int(d.group(2)), int(d.group(3)))).days > 548
+        except ValueError:
+            old = False
+    else:
+        v = re.match(r"^[nN]?(\d+)(?:\.\d+)?", raw)
+        old = bool(v and int(v.group(1)) < 6)
+    return {"version": raw, "old": old}
+
+
+def ffmpeg_version_info() -> Optional[dict]:
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "-version"], capture_output=True, text=True, timeout=8)
+        return parse_ffmpeg_version((r.stdout or "").split("\n", 1)[0])
+    except Exception:
+        return {"version": "", "old": False}
+
+
+def update_ffmpeg() -> bool:
+    """Best-effort ffmpeg update for this platform.  Returns True if an update command ran OK."""
+    if IS_TERMUX:
+        info("Running: pkg upgrade -y ffmpeg ...")
+        return subprocess.run(["pkg", "upgrade", "-y", "ffmpeg"], text=True).returncode == 0
+    if sys.platform == "win32" and shutil.which("winget"):
+        try:
+            answer = input("  Run 'winget upgrade Gyan.FFmpeg' now? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer in ("y", "yes"):
+            rc = subprocess.run(
+                ["winget", "upgrade", "--id", "Gyan.FFmpeg", "-e",
+                 "--accept-source-agreements", "--accept-package-agreements"], text=True).returncode
+            if rc != 0:
+                info("winget could not upgrade it (ffmpeg installed by hand?) - download a current build from "
+                     "https://www.gyan.dev/ffmpeg/builds/ and replace the old one")
+            return rc == 0
+        return False
+    print("       Update ffmpeg:  " + FFMPEG_UPDATE_HOWTO)
+    return False
+
+
+def check_ffmpeg_version():
+    st = ffmpeg_version_info()
+    if not st or not st["version"]:
+        ok("ffmpeg found")
+        return
+    if not st["old"]:
+        ok(f"ffmpeg found (version {st['version']})")
+        return
+    warn(f"ffmpeg {st['version']} is old - newer YouTube live streams fail with 'Invalid data found when "
+         f"processing input', and other sources may misbehave")
+    if update_ffmpeg():
+        new = ffmpeg_version_info()
+        if new and new["version"] and not new["old"]:
+            ok(f"ffmpeg updated (version {new['version']})")
+        else:
+            warn("ffmpeg still looks old - an older copy may come first on PATH (check with: where ffmpeg)")
+    else:
+        info("Update ffmpeg, then re-run this installer:  " + FFMPEG_UPDATE_HOWTO)
+
+
 # ── System dependency checks ──────────────────────────────────────────────────
 def check_system_deps():
     hdr("Checking system dependencies …")
@@ -115,7 +364,7 @@ def check_system_deps():
 
     # ffmpeg
     if shutil.which("ffmpeg"):
-        ok("ffmpeg found")
+        check_ffmpeg_version()
     else:
         if IS_TERMUX:
             warn("ffmpeg NOT found — attempting automatic install via pkg …")
@@ -263,12 +512,14 @@ def check_multiview_addon():
         warn("ffmpeg NOT found — Multi-View will not be able to stream channels")
         info("Install ffmpeg (see system dependencies section above)")
 
-    # yt-dlp is optional — only needed for URL-play feature
+    # yt-dlp is optional - only needed for URL-play feature (the real install/update happens above)
     if check_import("yt_dlp"):
-        ok("yt-dlp available — YouTube/Twitch URL playback in Multi-View tiles is enabled")
+        ok("yt-dlp available - YouTube/Twitch URL playback in Multi-View tiles is enabled")
+        info("If YouTube tiles stop working: update yt-dlp AND ffmpeg, then try again:")
+        info("   " + YTDLP_UPDATE_CMD)
     else:
-        warn("yt-dlp NOT installed — YouTube/Twitch/Vimeo URLs in Multi-View tiles won't resolve")
-        info("Install with:  pip install yt-dlp")
+        warn("yt-dlp NOT installed - YouTube/Twitch/Vimeo URLs in Multi-View tiles won't resolve")
+        info("Install with:  " + YTDLP_UPDATE_CMD)
         info("Direct IPTV stream URLs and .m3u8 links still work without yt-dlp")
 
 
@@ -478,6 +729,9 @@ def main():
 
     all_ok = True
     for pip_name, import_name, required, desc in PACKAGES:
+        if import_name == "yt_dlp":
+            ensure_ytdlp()          # extras (solver + Deno), update check, PATH check
+            continue
         if check_import(import_name):
             ok(f"{pip_name} — already installed  ({desc})")
         else:
@@ -515,6 +769,8 @@ def main():
         ok("All required packages installed — ready to run!")
         print()
         info(f"Start the server:  python {SCRIPT_NAME}")
+        info("If YouTube streams stop playing: update yt-dlp and ffmpeg, then try again:")
+        info("   " + YTDLP_UPDATE_CMD + "      (re-running this installer also checks both)")
         info(f"Then open:         http://{'localhost' if IS_TERMUX else '127.0.0.1'}:5000")
         print()
         input("Press enter to exit …")
